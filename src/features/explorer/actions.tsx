@@ -4,6 +4,7 @@ import {
   Code2,
   FileCode2,
   FilePlus2,
+  GitCompareArrows,
   Hash,
   KeyRound,
   Leaf,
@@ -42,6 +43,7 @@ import {
   getConnection,
   newQueryTab,
   openCollection,
+  openCompare,
   openTable,
   refreshConnection
 } from '@/lib/workspace'
@@ -170,6 +172,11 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
               label: 'Design table…',
               icon: <Pencil />,
               onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
+            },
+            {
+              label: 'Compare with…',
+              icon: <GitCompareArrows />,
+              onSelect: () => openCompare(connectionId, database, obj.schema, obj.name)
             }
           ]
         : []),

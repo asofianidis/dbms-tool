@@ -39,7 +39,8 @@ import {
   Trash2,
   Unplug,
   X,
-  Zap
+  Zap,
+  GitCompareArrows
 } from 'lucide-react'
 import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
@@ -62,6 +63,7 @@ import {
   openCollection,
   openConnectionDialog,
   openBackup,
+  openCompare,
   openDiagram,
   openServer,
   openTable,
@@ -572,6 +574,11 @@ function DatabaseNode({
         icon: <ShieldCheck />,
         onSelect: () => openPermissionsDesigner(connection.id, database)
       })
+      items.push({
+        label: 'Compare with…',
+        icon: <GitCompareArrows />,
+        onSelect: () => openCompare(connection.id, database, null)
+      })
     }
     showContextMenu(e, items)
   }
@@ -674,6 +681,11 @@ function SchemaNode({
               label: 'Open diagram',
               icon: <Network />,
               onSelect: () => openDiagram(connection.id, database, schema)
+            },
+            {
+              label: 'Compare with…',
+              icon: <GitCompareArrows />,
+              onSelect: () => openCompare(connection.id, database, schema)
             },
             {
               label: 'Edit schema…',

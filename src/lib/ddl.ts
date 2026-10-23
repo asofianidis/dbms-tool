@@ -386,7 +386,11 @@ function columnDefinition(
   return parts.join(' ')
 }
 
-function foreignKeyClause(dialect: Dialect, draft: TableDraft, fk: ForeignKeyDraft): string {
+export function foreignKeyClause(
+  dialect: Dialect,
+  draft: TableDraft,
+  fk: ForeignKeyDraft
+): string {
   const target = qualified(dialect, { schema: fk.refSchema, name: fk.refTable })
   let clause = `CONSTRAINT ${quoteIdent(dialect, foreignKeyName(draft, fk))} FOREIGN KEY (${columnList(
     dialect,

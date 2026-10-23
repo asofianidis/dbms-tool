@@ -8,6 +8,7 @@ import {
   Eye,
   FileCode2,
   FunctionSquare,
+  GitCompareArrows,
   Home,
   LayoutDashboard,
   Leaf,
@@ -61,6 +62,8 @@ export function tabTitle(tab: Tab): string {
       return tab.mode === 'backup'
         ? `Back up ${tab.database || 'database'}`
         : `Restore${tab.database ? ` ${tab.database}` : ''}`
+    case 'compare':
+      return `Compare ${tab.table ?? tab.schema ?? tab.database}`
   }
 }
 
@@ -103,6 +106,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       ) : (
         <ArchiveRestore className={cn(c, 'text-warn')} />
       )
+    case 'compare':
+      return <GitCompareArrows className={cn(c, 'text-info')} />
   }
 }
 

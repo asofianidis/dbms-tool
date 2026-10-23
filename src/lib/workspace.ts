@@ -1,6 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { api, isAppError, type ConnectionConfig, type ObjectKind, type ServerInfo } from './api'
+import type { CompareScope } from './compare'
 import { ENGINES } from './engines'
 import type { QueryState } from './filters'
 import { createPersistentStore, createStore } from './store'
@@ -80,6 +81,25 @@ export type Tab =
       database: string
       mode: 'backup' | 'restore'
     }
+  | {
+      id: string
+      kind: 'compare'
+      /** The source: the side the target is changed to match */
+      connectionId: string
+      database: string
+      schema: string | null
+      table: string | null
+      scope: CompareScope
+      target: CompareTarget | null
+    }
+
+/** The side of a comparison the migration script runs against. */
+export interface CompareTarget {
+  connectionId: string
+  database: string
+  schema: string | null
+  table: string | null
+}
 
 export type TabOf<K extends Tab['kind']> = Extract<Tab, { kind: K }>
 
@@ -408,6 +428,26 @@ export function openBackup(
       t.database === database &&
       t.mode === mode
   )
+}
+
+/** Opens a comparison of a database, schema or table (`table` set) against one chosen in the tab. */
+export function openCompare(
+  connectionId: string,
+  database: string,
+  schema: string | null,
+  table: string | null = null
+): void {
+  const scope: CompareScope = table ? 'table' : schema ? 'schema' : 'database'
+  openTab({
+    id: tabId(),
+    kind: 'compare',
+    connectionId,
+    database,
+    schema,
+    table,
+    scope,
+    target: null
+  })
 }
 
 export function openDashboard(dashboardId: string): void {

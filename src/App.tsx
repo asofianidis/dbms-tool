@@ -18,6 +18,7 @@ import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
 import { BackupTab } from './features/backup/BackupTab'
+import { CompareTab } from './features/compare/CompareTab'
 import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { DashboardTab } from './features/dashboard/DashboardTab'
@@ -75,6 +76,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <CloudTab />
     case 'backup':
       return <BackupTab tab={tab} />
+    case 'compare':
+      return <CompareTab tab={tab} />
   }
 })
 

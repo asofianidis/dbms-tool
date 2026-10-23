@@ -7,6 +7,7 @@ import {
   CornerDownLeft,
   Database,
   DatabaseBackup,
+  GitCompareArrows,
   Eye,
   FileCode2,
   FunctionSquare,
@@ -40,6 +41,7 @@ import {
   layoutStore,
   newQueryTab,
   openBackup,
+  openCompare,
   openCloud,
   openCollection,
   openConnectionDialog,
@@ -130,6 +132,27 @@ function backupCommands(): Item[] {
   ]
 }
 
+/** Schema comparison from the active tab's connection and database. */
+function compareCommands(): Item[] {
+  const tab = activeTab()
+  if (!tab || !('connectionId' in tab) || tab.kind === 'compare') return []
+  const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
+  if (!connection || connection.engine === 'mongo') return []
+  const database = 'database' in tab ? tab.database : ''
+  const schema = 'schema' in tab ? tab.schema : null
+  const table = tab.kind === 'table' && tab.objectKind === 'table' ? tab.name : null
+  return [
+    {
+      id: 'compare',
+      group: 'Commands',
+      label: `Compare ${table ?? schema ?? (database || 'database')} with…`,
+      detail: connectionLabel(connection),
+      icon: <GitCompareArrows />,
+      run: () => openCompare(connection.id, database, schema, table)
+    }
+  ]
+}
+
 export function CommandPalette(): React.JSX.Element | null {
   const { open, query } = paletteStore.use()
   if (!open) return null
@@ -164,6 +187,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         run: openCloud
       },
       ...backupCommands(),
+      ...compareCommands(),
       {
         id: 'new-query',
         group: 'Commands',
