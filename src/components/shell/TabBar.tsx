@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import {
   Braces,
+  Cloud,
   Code2,
   Eye,
   FileCode2,
@@ -46,6 +47,8 @@ export function tabTitle(tab: Tab): string {
       return tab.collection
     case 'server':
       return 'Server'
+    case 'cloud':
+      return 'Cloud databases'
     case 'diagram':
       return `${tab.schema ?? tab.database} diagram`
   }
@@ -78,6 +81,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       )
     case 'server':
       return <Server className={c} />
+    case 'cloud':
+      return <Cloud className={cn(c, 'text-info')} />
     case 'diagram':
       return <Network className={cn(c, 'text-syn-keyword')} />
   }

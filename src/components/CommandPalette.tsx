@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Bookmark,
   BookmarkPlus,
+  Cloud,
   CornerDownLeft,
   Database,
   Eye,
@@ -34,6 +35,7 @@ import {
   disconnect,
   layoutStore,
   newQueryTab,
+  openCloud,
   openCollection,
   openConnectionDialog,
   openSettings,
@@ -108,6 +110,13 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'New connection',
         icon: <Plus />,
         run: () => openConnectionDialog()
+      },
+      {
+        id: 'cloud',
+        group: 'Commands',
+        label: 'Cloud databases (AWS, Google Cloud, Azure)',
+        icon: <Cloud />,
+        run: openCloud
       },
       {
         id: 'new-query',

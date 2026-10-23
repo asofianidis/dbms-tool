@@ -1,3 +1,4 @@
+mod cloud;
 mod commands;
 mod config;
 mod drivers;
@@ -52,6 +53,8 @@ pub fn run() {
             commands::file_read_text,
             commands::state_load_all,
             commands::state_save,
+            commands::cloud_tools,
+            commands::cloud_cli,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

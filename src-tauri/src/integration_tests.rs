@@ -40,6 +40,7 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         color: String::new(),
         group: String::new(),
         last_used: None,
+        cloud: None,
     };
     if engine == Engine::Mongo {
         c.uri = raw;

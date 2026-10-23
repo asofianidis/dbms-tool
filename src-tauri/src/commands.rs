@@ -341,3 +341,20 @@ pub fn state_save(app: tauri::AppHandle, key: String, value: String) -> AppResul
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
+
+#[tauri::command]
+pub fn cloud_tools() -> Vec<crate::cloud::CloudTool> {
+    crate::cloud::tools()
+}
+
+/// Runs a cloud CLI; `{secret}` in `args` becomes the path of a temporary file
+/// holding `secret`.
+#[tauri::command]
+pub async fn cloud_cli(
+    provider: crate::cloud::Provider,
+    args: Vec<String>,
+    secret: Option<String>,
+    timeout_secs: Option<u64>,
+) -> AppResult<String> {
+    crate::cloud::run(provider, args, secret, timeout_secs).await
+}

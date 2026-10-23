@@ -24,6 +24,17 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 - Dark and light themes (or follow the OS) with a title-bar toggle, an accent override, and a
   theme editor with live preview and JSON import/export for sharing.
 
+**Cloud**
+
+- Finds databases in AWS (RDS, Aurora, DocumentDB), Google Cloud (Cloud SQL) and Azure (PostgreSQL
+  and MySQL flexible servers, Azure SQL) and connects with host, user and TLS filled in, including
+  the master password when AWS keeps it in Secrets Manager.
+- Provisioning designer for new databases: engine, version, size, storage, credentials and network
+  access (just this machine, anywhere, or private), with a preview of the exact CLI commands. The
+  connection is saved once the database is ready.
+- Works through the official `aws`, `gcloud` and `az` CLIs, so existing profiles, SSO and MFA
+  apply; passwords reach the CLI in a temporary file, never on the command line.
+
 **SQL**
 
 - CodeMirror editor with dialect-aware highlighting and schema completion.
@@ -136,6 +147,7 @@ src-tauri/src/
                          mssql (tiberius; SQL Server + Babelfish), mongo (official driver)
   manager.rs             open connections and per-tab sessions, cancellation
   commands.rs            Tauri command surface
+  cloud.rs               runs the aws / gcloud / az CLIs for cloud discovery and provisioning
 src-tauri/vendor/tiberius  tiberius 0.13 with small patches (see PATCHES.md)
 ```
 

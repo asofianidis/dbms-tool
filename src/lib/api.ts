@@ -22,6 +22,29 @@ export interface ConnectionConfig {
   color: string
   group: string
   lastUsed?: number | null
+  /** The cloud resource this connection was found in or provisioned as */
+  cloud?: CloudRef | null
+}
+
+export type CloudProvider = 'aws' | 'gcp' | 'azure'
+
+/** Where a database lives in a cloud account, enough to look it up again. */
+export interface CloudRef {
+  provider: CloudProvider
+  /** AWS profile, GCP project or Azure subscription; empty for the CLI default */
+  context: string
+  region: string
+  /** Instance / cluster / server name */
+  resource: string
+  /** aws: instance | cluster; azure: postgres | mysql | sql */
+  kind: string
+  resourceGroup?: string
+}
+
+export interface CloudTool {
+  provider: CloudProvider
+  /** Resolved executable, null when the CLI isn't installed */
+  path: string | null
 }
 
 export interface ServerInfo {
@@ -305,5 +328,19 @@ export const api = {
     invoke<void>('file_write_bytes', contents, {
       headers: { 'x-path': encodeURIComponent(path) }
     }),
-  readText: (path: string) => invoke<string>('file_read_text', { path })
+  readText: (path: string) => invoke<string>('file_read_text', { path }),
+
+  cloudTools: () => invoke<CloudTool[]>('cloud_tools'),
+  /** Runs a cloud CLI and returns stdout; `{secret}` in `args` becomes a temp file holding `secret` */
+  cloudCli: (
+    provider: CloudProvider,
+    args: string[],
+    options: { secret?: string; timeoutSecs?: number } = {}
+  ) =>
+    invoke<string>('cloud_cli', {
+      provider,
+      args,
+      secret: options.secret ?? null,
+      timeoutSecs: options.timeoutSecs ?? null
+    })
 }

@@ -78,6 +78,10 @@ pub struct ConnectionConfig {
     /// Opaque to the backend; the frontend sorts by it
     #[serde(default)]
     pub last_used: Option<i64>,
+    /// Opaque to the backend; the cloud resource this connection was found in
+    /// or provisioned as
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<serde_json::Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]

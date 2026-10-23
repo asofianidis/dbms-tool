@@ -62,6 +62,7 @@ export type Tab =
       view: CollectionView
     }
   | { id: string; kind: 'server'; connectionId: string }
+  | { id: string; kind: 'cloud' }
   | {
       id: string
       kind: 'diagram'
@@ -369,6 +370,10 @@ export function openServer(connectionId: string): void {
   )
 }
 
+export function openCloud(): void {
+  openTab({ id: 'cloud', kind: 'cloud' }, (t) => t.kind === 'cloud')
+}
+
 export function openDiagram(connectionId: string, database: string, schema: string | null): void {
   openTab(
     { id: tabId(), kind: 'diagram', connectionId, database, schema },
@@ -396,12 +401,18 @@ export const connectionDialogStore = createStore<{
   open: boolean
   editing?: ConnectionConfig
   duplicate?: boolean
+  /** A new connection with fields already filled in, e.g. from a cloud database */
+  prefill?: { config: ConnectionConfig; password?: string }
 }>({
   open: false
 })
 
 export function openConnectionDialog(editing?: ConnectionConfig, duplicate = false): void {
   connectionDialogStore.set({ open: true, editing, duplicate })
+}
+
+export function openPrefilledConnection(config: ConnectionConfig, password?: string): void {
+  connectionDialogStore.set({ open: true, prefill: { config, password } })
 }
 
 export function closeConnectionDialog(): void {

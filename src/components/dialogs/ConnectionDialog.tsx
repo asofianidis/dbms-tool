@@ -1,5 +1,14 @@
 import { useMemo, useState } from 'react'
-import { CheckCircle2, ChevronLeft, ClipboardPaste, Info, Loader2, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardPaste,
+  Cloud,
+  Info,
+  Loader2,
+  XCircle
+} from 'lucide-react'
 import { api, type ConnectionConfig, type Engine, type ServerInfo } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import {
@@ -17,6 +26,7 @@ import {
   connectionsStore,
   loadConnections,
   disconnect,
+  openCloud,
   statusOf
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
@@ -29,6 +39,7 @@ export function ConnectionDialogHost(): React.JSX.Element | null {
       key={state.editing?.id ?? 'new'}
       editing={state.editing}
       duplicate={state.duplicate}
+      prefill={state.prefill}
     />
   )
 }
@@ -41,10 +52,12 @@ type TestState =
 
 function ConnectionDialog({
   editing,
-  duplicate
+  duplicate,
+  prefill
 }: {
   editing?: ConnectionConfig
   duplicate?: boolean
+  prefill?: { config: ConnectionConfig; password?: string }
 }): React.JSX.Element {
   const isNew = !editing || duplicate
   const [config, setConfig] = useState<ConnectionConfig | null>(() =>
@@ -53,9 +66,9 @@ function ConnectionDialog({
           ...editing,
           ...(duplicate ? { id: '', name: `${editing.name || editing.host} copy` } : {})
         }
-      : null
+      : (prefill?.config ?? null)
   )
-  const [password, setPassword] = useState('')
+  const [password, setPassword] = useState(prefill?.password ?? '')
   const [paste, setPaste] = useState('')
   const [test, setTest] = useState<TestState>({ state: 'idle' })
   const [saving, setSaving] = useState(false)
@@ -131,6 +144,25 @@ function ConnectionDialog({
             )
           })}
         </div>
+        <button
+          type="button"
+          onClick={() => {
+            closeConnectionDialog()
+            openCloud()
+          }}
+          className="mt-2.5 flex w-full items-center gap-3 rounded-lg border border-line-strong bg-raised/60 p-3 text-left transition-colors hover:border-accent/50 hover:bg-hover"
+        >
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-info/15 text-info">
+            <Cloud className="size-5" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block font-medium text-bright">Cloud databases</span>
+            <span className="mt-0.5 block text-xs leading-snug text-muted">
+              Find databases in AWS, Google Cloud or Azure, or provision a new one
+            </span>
+          </span>
+          <ChevronRight className="size-4 text-faint" />
+        </button>
         <div className="mt-4">
           <Field
             label="Or paste a connection string"
