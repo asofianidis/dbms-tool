@@ -1,7 +1,10 @@
+import { readPersisted } from './persist'
 import { createPersistentStore } from './store'
 
 export interface Settings {
   accent: string
+  /** Bumped when the default accent changes, so old defaults can be migrated */
+  accentVersion: number
   editorFontSize: number
   /** Rows kept per result set; the rest are counted but not transferred */
   maxRows: number
@@ -14,11 +17,14 @@ export interface Settings {
   sidebarWidth: number
 }
 
-export const DEFAULT_ACCENT = '#c4f042'
+export const DEFAULT_ACCENT = '#a8c7fa'
+
+/** The default before the switch to blue; installs still on it move to the new default */
+const PREVIOUS_DEFAULT_ACCENT = '#c4f042'
 
 export const ACCENTS = [
-  { value: '#c4f042', label: 'Lime' },
   { value: '#a8c7fa', label: 'Sky' },
+  { value: '#c4f042', label: 'Lime' },
   { value: '#5fe0c8', label: 'Teal' },
   { value: '#d49bff', label: 'Violet' },
   { value: '#ff9e64', label: 'Orange' },
@@ -28,6 +34,7 @@ export const ACCENTS = [
 
 export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1', {
   accent: DEFAULT_ACCENT,
+  accentVersion: 2,
   editorFontSize: 13,
   maxRows: 10_000,
   pageSize: 200,
@@ -36,6 +43,11 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   confirmDangerous: true,
   sidebarWidth: 280
 })
+
+// Settings saved before accentVersion existed still carry the old lime default
+if (!readPersisted('dbms.settings.v1')?.includes('accentVersion') && settingsStore.get().accent === PREVIOUS_DEFAULT_ACCENT) {
+  settingsStore.set((s) => ({ ...s, accent: DEFAULT_ACCENT, accentVersion: 2 }))
+}
 
 function luminance(hex: string): number {
   const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
@@ -63,5 +75,5 @@ export function applyAccent(accent: string): void {
   const root = document.documentElement.style
   root.setProperty('--accent', hex)
   root.setProperty('--accent-hover', mix(hex, 255, 0.25))
-  root.setProperty('--accent-fg', luminance(hex) > 0.45 ? '#11160a' : '#f4f6fa')
+  root.setProperty('--accent-fg', luminance(hex) > 0.45 ? '#0b0e14' : '#f4f6fa')
 }

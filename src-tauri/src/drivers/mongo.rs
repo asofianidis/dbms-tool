@@ -23,12 +23,22 @@ pub fn describe_error(e: &mongodb::error::Error) -> String {
         ErrorKind::Write(mongodb::error::WriteFailure::WriteError(w)) => {
             format!("Write error {}: {}", w.code, w.message)
         }
-        ErrorKind::ServerSelection { message, .. } => format!(
-            "Could not reach the server: {}",
-            message.lines().next().unwrap_or(message)
-        ),
+        ErrorKind::ServerSelection { message, .. } => {
+            format!("Could not reach the server: {}", server_selection_cause(message))
+        }
         _ => e.to_string(),
     }
+}
+
+/// The driver's server-selection message dumps the whole topology; keep the first server's cause.
+fn server_selection_cause(message: &str) -> &str {
+    message
+        .split("Error: ")
+        .nth(1)
+        .map(|rest| rest.split(", labels:").next().unwrap_or(rest))
+        .map(|rest| rest.trim_start_matches("Kind: ").trim_start_matches("I/O error: "))
+        .map(|rest| rest.split(" (os error").next().unwrap_or(rest).trim_end_matches('.'))
+        .unwrap_or("no server responded")
 }
 
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<Client> {
@@ -777,6 +787,13 @@ pub async fn list_collections(client: &Client, database: &str) -> AppResult<Vec<
 mod tests {
     use super::*;
     use mongodb::bson;
+
+    #[test]
+    fn shortens_server_selection_errors() {
+        let message = "Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: localhost:57017, Type: Unknown, Error: Kind: I/O error: No connection could be made because the target machine actively refused it. (os error 10061), labels: {\"RetryableError\"}, source: None } ] }";
+        let cause = server_selection_cause(message);
+        assert_eq!(cause, "No connection could be made because the target machine actively refused it");
+    }
 
     #[test]
     fn round_trips_numeric_types() {

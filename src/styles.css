@@ -1,8 +1,8 @@
 @import 'tailwindcss';
 
 /*
- * Graphite surfaces with an electric-lime accent (shared with the password manager),
- * laid out as a dense IDE workbench (shared with ytmd-lite).
+ * Graphite surfaces from the password manager; the soft blue accent and dense IDE
+ * workbench layout from ytmd-lite.
  */
 @theme {
   --font-sans:
@@ -23,9 +23,9 @@
   --color-muted: #858c81;
   --color-faint: #50564d;
 
-  --color-accent: var(--accent, #c4f042);
-  --color-accent-hover: var(--accent-hover, #d4f76d);
-  --color-accent-fg: var(--accent-fg, #11160a);
+  --color-accent: var(--accent, #a8c7fa);
+  --color-accent-hover: var(--accent-hover, #bed5fb);
+  --color-accent-fg: var(--accent-fg, #0b0e14);
 
   --color-danger: #ff6e61;
   --color-warn: #f2b84b;
@@ -41,7 +41,7 @@
 
   /* Syntax */
   --color-syn-keyword: #c792ea;
-  --color-syn-string: #c4f042;
+  --color-syn-string: #98c379;
   --color-syn-number: #f2b84b;
   --color-syn-comment: #5c6459;
   --color-syn-type: #5fe0c8;
