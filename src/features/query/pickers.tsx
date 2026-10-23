@@ -14,10 +14,12 @@ export function ConnectionPicker({
   value,
   onChange,
   sql,
-  mongo
+  mongo,
+  disabled
 }: {
   value: string
   onChange: (id: string) => void
+  disabled?: boolean
   /** Only offer SQL connections */
   sql?: boolean
   /** Only offer MongoDB connections */
@@ -32,8 +34,9 @@ export function ConnectionPicker({
   return (
     <button
       type="button"
-      className={cn(pickerClass, 'max-w-60')}
+      className={cn(pickerClass, 'max-w-60 disabled:pointer-events-none disabled:opacity-60')}
       title="Connection"
+      disabled={disabled}
       onClick={(e) =>
         showMenuAt(
           e.currentTarget,
@@ -59,11 +62,13 @@ export function ConnectionPicker({
 export function DatabasePicker({
   connectionId,
   value,
-  onChange
+  onChange,
+  disabled
 }: {
   connectionId: string
   value: string
   onChange: (database: string) => void
+  disabled?: boolean
 }): React.JSX.Element {
   const statuses = statusStore.use()
   const connections = connectionsStore.use()
@@ -75,7 +80,7 @@ export function DatabasePicker({
       type="button"
       className={cn(pickerClass, 'max-w-52')}
       title={connection && ENGINES[connection.engine].hasSchemas ? 'Database' : 'Database / schema'}
-      disabled={!connected}
+      disabled={!connected || disabled}
       onClick={(e) => {
         const list = dbs.data ?? []
         showMenuAt(

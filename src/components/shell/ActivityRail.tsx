@@ -1,4 +1,4 @@
-import { Bookmark, Database, History, Plus, Settings } from 'lucide-react'
+import { Bookmark, Database, History, LayoutDashboard, Plus, Settings } from 'lucide-react'
 import { cn } from '@/lib/cn'
 import { MOD, SHIFT } from '@/lib/keys'
 import { layoutStore, openConnectionDialog, openSettings, type SidebarView } from '@/lib/workspace'
@@ -61,6 +61,13 @@ export function ActivityRail(): React.JSX.Element {
         onClick={() => toggle('saved')}
       >
         <Bookmark className="size-[18px]" strokeWidth={1.75} />
+      </RailButton>
+      <RailButton
+        label="Dashboards"
+        active={layout.sidebarOpen && layout.sidebar === 'dashboards'}
+        onClick={() => toggle('dashboards')}
+      >
+        <LayoutDashboard className="size-[18px]" strokeWidth={1.75} />
       </RailButton>
       <RailButton label="New connection" onClick={() => openConnectionDialog()}>
         <Plus className="size-[18px]" strokeWidth={1.75} />

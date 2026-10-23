@@ -7,6 +7,7 @@ import {
   FileCode2,
   FunctionSquare,
   Home,
+  LayoutDashboard,
   Leaf,
   Network,
   Plus,
@@ -16,6 +17,7 @@ import {
   X
 } from 'lucide-react'
 import { cn } from '@/lib/cn'
+import { dashboardsStore } from '@/lib/dashboards'
 import { MOD } from '@/lib/keys'
 import {
   activateTab,
@@ -51,6 +53,8 @@ export function tabTitle(tab: Tab): string {
       return 'Cloud databases'
     case 'diagram':
       return `${tab.schema ?? tab.database} diagram`
+    case 'dashboard':
+      return dashboardsStore.get().find((d) => d.id === tab.dashboardId)?.name ?? 'Dashboard'
   }
 }
 
@@ -85,12 +89,16 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       return <Cloud className={cn(c, 'text-info')} />
     case 'diagram':
       return <Network className={cn(c, 'text-syn-keyword')} />
+    case 'dashboard':
+      return <LayoutDashboard className={cn(c, 'text-accent')} />
   }
 }
 
 export function TabBar(): React.JSX.Element {
   const { tabs, active } = tabsStore.use()
   const connections = connectionsStore.use()
+  // Dashboard tabs are titled by the dashboard's current name
+  dashboardsStore.use()
   const dragId = useRef<string | null>(null)
 
   return (

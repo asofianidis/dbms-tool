@@ -19,6 +19,8 @@ import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
 import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
+import { DashboardTab } from './features/dashboard/DashboardTab'
+import { DashboardsPanel } from './features/dashboard/DashboardsPanel'
 import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { QueryTab } from './features/query/QueryTab'
@@ -66,6 +68,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <ServerTab tab={tab} />
     case 'diagram':
       return <DiagramTab tab={tab} />
+    case 'dashboard':
+      return <DashboardTab tab={tab} />
     case 'cloud':
       return <CloudTab />
   }
@@ -181,6 +185,8 @@ export function App(): React.JSX.Element {
                 <HistoryPanel />
               ) : layout.sidebar === 'saved' ? (
                 <SavedQueriesPanel />
+              ) : layout.sidebar === 'dashboards' ? (
+                <DashboardsPanel />
               ) : (
                 <Explorer />
               )}

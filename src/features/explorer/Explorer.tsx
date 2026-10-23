@@ -18,6 +18,7 @@ import {
   FunctionSquare,
   KeyRound,
   Layers,
+  LayoutDashboard,
   Leaf,
   Link2,
   ListOrdered,
@@ -69,6 +70,7 @@ import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
@@ -450,6 +452,11 @@ function DatabaseNode({
         label: isMongo ? 'New shell here' : 'New query here',
         icon: <Terminal />,
         onSelect: () => newQueryTab(connection.id, database)
+      },
+      {
+        label: 'New dashboard…',
+        icon: <LayoutDashboard />,
+        onSelect: () => void newDashboard(connection.id, database)
       },
       {
         label: 'Refresh',

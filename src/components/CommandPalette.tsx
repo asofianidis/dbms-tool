@@ -9,6 +9,7 @@ import {
   FileCode2,
   FunctionSquare,
   History,
+  LayoutDashboard,
   Leaf,
   ListOrdered,
   Plug,
@@ -21,6 +22,7 @@ import {
 } from 'lucide-react'
 import type { DbObject } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { dashboardsStore } from '@/lib/dashboards'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { MOD } from '@/lib/keys'
 import { queryClient } from '@/lib/queries'
@@ -38,6 +40,7 @@ import {
   openCloud,
   openCollection,
   openConnectionDialog,
+  openDashboard,
   openSettings,
   openTable,
   openWelcome,
@@ -51,6 +54,12 @@ import {
   showSavedQueries,
   targetLabel
 } from '@/features/saved/actions'
+import {
+  importDashboard,
+  newDashboard,
+  openExampleDashboard,
+  showDashboards
+} from '@/features/dashboard/actions'
 import { EngineMark, Kbd } from './ui'
 
 interface Item {
@@ -99,6 +108,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
   const connections = connectionsStore.use()
   const statuses = statusStore.use()
   const saved = savedQueriesStore.use()
+  const dashboards = dashboardsStore.use()
   const commandMode = query.startsWith('>')
   const term = (commandMode ? query.slice(1) : query).trim().toLowerCase()
 
@@ -154,6 +164,34 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'Show saved queries',
         icon: <Bookmark />,
         run: showSavedQueries
+      },
+      {
+        id: 'new-dashboard',
+        group: 'Commands',
+        label: 'New dashboard',
+        icon: <LayoutDashboard />,
+        run: () => void newDashboard()
+      },
+      {
+        id: 'dashboards',
+        group: 'Commands',
+        label: 'Show dashboards',
+        icon: <LayoutDashboard />,
+        run: showDashboards
+      },
+      {
+        id: 'example-dashboard',
+        group: 'Commands',
+        label: 'Open example dashboard',
+        icon: <LayoutDashboard />,
+        run: openExampleDashboard
+      },
+      {
+        id: 'import-dashboard',
+        group: 'Commands',
+        label: 'Import dashboard…',
+        icon: <LayoutDashboard />,
+        run: () => void importDashboard()
       },
       {
         id: 'save-query',
@@ -239,6 +277,15 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       weight: 1,
       run: () => runSavedQuery(q)
     }))
+    const dashboardItems: Item[] = dashboards.map((d) => ({
+      id: `dashboard:${d.id}`,
+      group: 'Dashboards',
+      label: d.name,
+      detail: `${d.widgets.length} widget${d.widgets.length === 1 ? '' : 's'}`,
+      icon: <LayoutDashboard />,
+      weight: 1,
+      run: () => openDashboard(d.id)
+    }))
     // Objects from every list the explorer has loaded
     const objectItems: Item[] = []
     if (!commandMode) {
@@ -278,7 +325,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
     }
     const pool = commandMode
       ? commands
-      : [...connectionItems, ...savedItems, ...objectItems, ...commands]
+      : [...connectionItems, ...savedItems, ...dashboardItems, ...objectItems, ...commands]
     return pool
       .map((item) => ({
         item,
@@ -293,7 +340,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       )
       .slice(0, 80)
       .map((m) => m.item)
-  }, [connections, statuses, saved, term, commandMode])
+  }, [connections, statuses, saved, dashboards, term, commandMode])
 
   useEffect(() => setIndex(0), [term])
   useEffect(() => {

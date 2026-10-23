@@ -71,6 +71,7 @@ export type Tab =
       /** null for engines browsed without schemas, where the whole database is drawn */
       schema: string | null
     }
+  | { id: string; kind: 'dashboard'; dashboardId: string }
 
 export type TabOf<K extends Tab['kind']> = Extract<Tab, { kind: K }>
 
@@ -385,6 +386,13 @@ export function openDiagram(connectionId: string, database: string, schema: stri
   )
 }
 
+export function openDashboard(dashboardId: string): void {
+  openTab(
+    { id: tabId(), kind: 'dashboard', dashboardId },
+    (t) => t.kind === 'dashboard' && t.dashboardId === dashboardId
+  )
+}
+
 export function activeTab(): Tab | undefined {
   const s = tabsStore.get()
   return s.tabs.find((t) => t.id === s.active)
@@ -472,7 +480,7 @@ export const lastRunStore = createStore<
   Record<string, { rows: number; elapsedMs: number; ok: boolean }>
 >({})
 
-export type SidebarView = 'explorer' | 'history' | 'saved'
+export type SidebarView = 'explorer' | 'history' | 'saved' | 'dashboards'
 
 export const layoutStore = createPersistentStore<{ sidebar: SidebarView; sidebarOpen: boolean }>(
   'dbms.layout.v1',
