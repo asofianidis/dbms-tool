@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  ArchiveRestore,
   Bookmark,
   BookmarkPlus,
   Cloud,
   CornerDownLeft,
   Database,
+  DatabaseBackup,
   Eye,
   FileCode2,
   FunctionSquare,
@@ -37,6 +39,7 @@ import {
   disconnect,
   layoutStore,
   newQueryTab,
+  openBackup,
   openCloud,
   openCollection,
   openConnectionDialog,
@@ -95,6 +98,38 @@ function objectIcon(kind: DbObject['kind']): ReactNode {
   return <Table2 className="text-syn-prop" />
 }
 
+/** Back up / restore for the active tab's connection and database. */
+function backupCommands(): Item[] {
+  const tab = activeTab()
+  if (!tab || !('connectionId' in tab)) return []
+  const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
+  if (!connection || connection.engine === 'babelfish') return []
+  const database = 'database' in tab ? tab.database : ''
+  const name = connectionLabel(connection)
+  return [
+    {
+      id: 'backup',
+      group: 'Commands',
+      label: `Back up ${database || 'database'}…`,
+      detail: name,
+      icon: <DatabaseBackup />,
+      run: () => openBackup(connection.id, database, 'backup')
+    },
+    ...(connection.readOnly
+      ? []
+      : [
+          {
+            id: 'restore',
+            group: 'Commands',
+            label: 'Restore backup…',
+            detail: name,
+            icon: <ArchiveRestore />,
+            run: () => openBackup(connection.id, database, 'restore')
+          }
+        ])
+  ]
+}
+
 export function CommandPalette(): React.JSX.Element | null {
   const { open, query } = paletteStore.use()
   if (!open) return null
@@ -128,6 +163,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         icon: <Cloud />,
         run: openCloud
       },
+      ...backupCommands(),
       {
         id: 'new-query',
         group: 'Commands',

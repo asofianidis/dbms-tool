@@ -36,6 +36,11 @@ impl Server {
         &self.config.database
     }
 
+    /// The password the connection was opened with, for client tools such as pg_dump.
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
     fn mongo(&self) -> AppResult<&mongodb::Client> {
         self.mongo
             .as_ref()

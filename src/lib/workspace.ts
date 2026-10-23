@@ -72,6 +72,14 @@ export type Tab =
       schema: string | null
     }
   | { id: string; kind: 'dashboard'; dashboardId: string }
+  | {
+      id: string
+      kind: 'backup'
+      connectionId: string
+      /** Database to back up or restore into; empty to choose in the wizard */
+      database: string
+      mode: 'backup' | 'restore'
+    }
 
 export type TabOf<K extends Tab['kind']> = Extract<Tab, { kind: K }>
 
@@ -383,6 +391,22 @@ export function openDiagram(connectionId: string, database: string, schema: stri
       t.connectionId === connectionId &&
       t.database === database &&
       t.schema === schema
+  )
+}
+
+/** Opens the backup or restore wizard for `database` (empty to choose one there). */
+export function openBackup(
+  connectionId: string,
+  database: string,
+  mode: 'backup' | 'restore'
+): void {
+  openTab(
+    { id: tabId(), kind: 'backup', connectionId, database, mode },
+    (t) =>
+      t.kind === 'backup' &&
+      t.connectionId === connectionId &&
+      t.database === database &&
+      t.mode === mode
   )
 }
 

@@ -17,6 +17,7 @@ import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
+import { BackupTab } from './features/backup/BackupTab'
 import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { DashboardTab } from './features/dashboard/DashboardTab'
@@ -72,6 +73,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <DashboardTab tab={tab} />
     case 'cloud':
       return <CloudTab />
+    case 'backup':
+      return <BackupTab tab={tab} />
   }
 })
 

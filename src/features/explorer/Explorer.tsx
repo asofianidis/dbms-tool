@@ -10,8 +10,10 @@ import {
   ChevronsDownUp,
   Code2,
   Columns3,
+  ArchiveRestore,
   Copy,
   Database,
+  DatabaseBackup,
   Eye,
   Folder,
   FolderOpen,
@@ -59,6 +61,7 @@ import {
   newQueryTab,
   openCollection,
   openConnectionDialog,
+  openBackup,
   openDiagram,
   openServer,
   openTable,
@@ -245,6 +248,16 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         disabled: !connected,
         onSelect: () => openServer(connection.id)
       },
+      ...(connection.engine !== 'babelfish'
+        ? [
+            {
+              label: 'Restore backup…',
+              icon: <ArchiveRestore />,
+              disabled: !connected || connection.readOnly,
+              onSelect: () => openBackup(connection.id, '', 'restore')
+            }
+          ]
+        : []),
       ...(connection.engine === 'mysql'
         ? [
             {
@@ -471,6 +484,22 @@ function DatabaseNode({
         }
       }
     ]
+    if (connection.engine !== 'babelfish') {
+      items.push(
+        'separator',
+        {
+          label: 'Back up…',
+          icon: <DatabaseBackup />,
+          onSelect: () => openBackup(connection.id, database, 'backup')
+        },
+        {
+          label: 'Restore into…',
+          icon: <ArchiveRestore />,
+          disabled: connection.readOnly,
+          onSelect: () => openBackup(connection.id, database, 'restore')
+        }
+      )
+    }
     if (isMongo) {
       items.push(
         'separator',

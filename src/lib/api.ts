@@ -47,6 +47,140 @@ export interface CloudTool {
   path: string | null
 }
 
+export type BackupToolKind =
+  'pg_dump' | 'pg_restore' | 'psql' | 'mysqldump' | 'mysql' | 'mongodump' | 'mongorestore'
+
+export interface BackupTool {
+  kind: BackupToolKind
+  /** Resolved executable, null when it isn't installed */
+  path: string | null
+  /** First line of `--version` */
+  version: string | null
+}
+
+export interface ObjectName {
+  schema: string | null
+  name: string
+}
+
+export type BackupContent = 'all' | 'schema' | 'data'
+export type PgFormat = 'custom' | 'plain' | 'directory' | 'tar'
+
+/** A backup or restore run by the engine's client tool (see backup.rs). */
+export type BackupJob =
+  | {
+      tool: 'pg_dump'
+      database: string
+      file: string
+      format: PgFormat
+      content: BackupContent
+      schemas: string[]
+      tables: ObjectName[]
+      noOwner: boolean
+      noPrivileges: boolean
+      clean: boolean
+      create: boolean
+      inserts: boolean
+      compression: number | null
+      jobs: number | null
+    }
+  | {
+      tool: 'pg_restore'
+      database: string
+      file: string
+      content: BackupContent
+      schemas: string[]
+      tables: ObjectName[]
+      clean: boolean
+      noOwner: boolean
+      noPrivileges: boolean
+      singleTransaction: boolean
+      exitOnError: boolean
+      jobs: number | null
+    }
+  | {
+      tool: 'psql'
+      database: string
+      file: string
+      singleTransaction: boolean
+      stopOnError: boolean
+    }
+  | {
+      tool: 'mysqldump'
+      database: string
+      file: string
+      content: BackupContent
+      tables: string[]
+      createDatabase: boolean
+      routines: boolean
+      triggers: boolean
+      events: boolean
+      dropTables: boolean
+      singleTransaction: boolean
+      hexBlob: boolean
+      extendedInsert: boolean
+    }
+  | { tool: 'mysql'; database: string; file: string; force: boolean }
+  | {
+      tool: 'mongodump'
+      database: string
+      path: string
+      archive: boolean
+      gzip: boolean
+      excludeCollections: string[]
+    }
+  | {
+      tool: 'mongorestore'
+      path: string
+      archive: boolean
+      gzip: boolean
+      namespaces: string[]
+      fromDatabase: string | null
+      toDatabase: string | null
+      drop: boolean
+      stopOnError: boolean
+      noIndexRestore: boolean
+    }
+
+export interface BackupEntry {
+  /** table | view | materialized_view | sequence | function | schema | collection | … */
+  kind: string
+  /** Schema (PostgreSQL) or database (MongoDB) */
+  schema: string | null
+  name: string
+}
+
+export interface BackupInspection {
+  /** custom | tar | directory | plain (PostgreSQL), sql (MySQL), archive | dump (MongoDB) */
+  format: string
+  /** Path to restore from; a MongoDB database folder resolves to its dump folder */
+  path: string
+  size: number
+  gzip: boolean
+  database: string | null
+  sourceVersion: string | null
+  toolVersion: string | null
+  /** The backup creates or switches to its own database, whatever the target */
+  createsDatabase: boolean
+  entries: BackupEntry[]
+}
+
+export interface BackupOutcome {
+  cancelled: boolean
+  elapsedMs: number
+  size: number | null
+  /** Error lines in the output of a run that still exited cleanly */
+  errors: number
+}
+
+export interface BackupProgress {
+  job: string
+  lines: string[]
+  /** Bytes of the backup fed to a restore so far */
+  bytes: number | null
+  total: number | null
+}
+
 export interface ServerInfo {
   product: string
   version: string
@@ -342,5 +476,16 @@ export const api = {
       args,
       secret: options.secret ?? null,
       timeoutSecs: options.timeoutSecs ?? null
-    })
+    }),
+  /** Backup tools for an engine; `dir` is a folder searched before PATH */
+  backupTools: (engine: Engine, dir?: string | null) =>
+    invoke<BackupTool[]>('backup_tools', { engine, dir: dir || null }),
+  backupPreview: (id: string, job: BackupJob, dir?: string | null) =>
+    invoke<string>('backup_preview', { id, job, dir: dir || null }),
+  backupInspect: (id: string, path: string, dir?: string | null) =>
+    invoke<BackupInspection>('backup_inspect', { id, path, dir: dir || null }),
+  /** Runs to completion; output arrives as `backup-progress` events tagged with `jobId` */
+  backupRun: (id: string, jobId: string, job: BackupJob, dir?: string | null) =>
+    invoke<BackupOutcome>('backup_run', { id, jobId, job, dir: dir || null }),
+  backupCancel: (jobId: string) => invoke<void>('backup_cancel', { jobId })
 }

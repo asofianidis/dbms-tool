@@ -1,3 +1,4 @@
+mod backup;
 mod cloud;
 mod commands;
 mod config;
@@ -27,6 +28,7 @@ pub fn run() {
             app.manage(AppState {
                 store: config::ConnectionStore::load(dir),
                 manager: manager::Manager::default(),
+                backups: backup::Jobs::default(),
             });
             Ok(())
         })
@@ -55,6 +57,11 @@ pub fn run() {
             commands::state_save,
             commands::cloud_tools,
             commands::cloud_cli,
+            commands::backup_tools,
+            commands::backup_preview,
+            commands::backup_inspect,
+            commands::backup_run,
+            commands::backup_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
