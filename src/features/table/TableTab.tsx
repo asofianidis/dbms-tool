@@ -29,6 +29,7 @@ import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
+import { buildOrderBy, buildWhere, emptyQuery, newCondition, type QueryState } from '@/lib/filters'
 import { formatDuration, plural } from '@/lib/format'
 import {
   addInsert,
@@ -45,7 +46,6 @@ import { settingsStore } from '@/lib/settings'
 import {
   countRows,
   editStatements,
-  literal,
   qualified,
   quoteIdent,
   scriptCreateTable,
@@ -83,6 +83,7 @@ import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
+import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { openTableDesigner } from './TableDesigner'
 
 export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
@@ -168,9 +169,8 @@ function DataView({
 }): React.JSX.Element {
   const { pageSize, confirmDangerous } = settingsStore.use()
   const info = useQuery(queries.table(tab.connectionId, tab.database, tab.schema, tab.name))
-  const [where, setWhere] = useState('')
-  const [appliedWhere, setAppliedWhere] = useState('')
-  const [sort, setSort] = useState<SortState>(null)
+  const [query, setQuery] = useState<QueryState>(emptyQuery)
+  const [builderOpen, setBuilderOpen] = useState(false)
   const [page, setPage] = useState(0)
   const [output, setOutput] = useState<ExecOutput | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -184,6 +184,23 @@ function DataView({
   const columns: ColumnMeta[] = set?.columns ?? []
   const pk = info.data?.primaryKey ?? []
   const canEdit = !readOnly && pk.length > 0 && !!info.data
+  const appliedWhere = useMemo(
+    () =>
+      buildWhere(
+        dialect,
+        query,
+        Object.fromEntries((info.data?.columns ?? []).map((c) => [c.name, c.dataType]))
+      ),
+    [dialect, query, info.data]
+  )
+  const appliedOrder = useMemo(() => buildOrderBy(dialect, query.sorts), [dialect, query.sorts])
+
+  /** Applies a new filter / sort from the builder, chips or grid header. */
+  const applyQuery = (next: QueryState): void => {
+    setQuery(next)
+    setPage(0)
+    setTotal(null)
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -192,11 +209,7 @@ function DataView({
     try {
       // Default to primary-key order so rows don't move around after an edit
       const orderBy =
-        sort && columns[sort.col]
-          ? `${quoteIdent(dialect, columns[sort.col].name)} ${sort.dir.toUpperCase()}`
-          : pk.length
-            ? pk.map((k) => quoteIdent(dialect, k)).join(', ')
-            : undefined
+        appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
       const sql = selectRows(dialect, tableRef, {
         where: appliedWhere,
         orderBy,
@@ -223,7 +236,7 @@ function DataView({
     tab.database,
     dialect,
     appliedWhere,
-    sort,
+    appliedOrder,
     page,
     pageSize,
     pk.join(',')
@@ -233,7 +246,7 @@ function DataView({
     if (info.isPending) return
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appliedWhere, sort, page, pageSize, info.isPending])
+  }, [appliedWhere, appliedOrder, page, pageSize, info.isPending])
 
   const count = async (): Promise<void> => {
     try {
@@ -379,15 +392,29 @@ function DataView({
     : undefined
 
   const filterByValue = (column: string, value: Cell): void => {
-    const clause =
+    const condition =
       value === null
-        ? `${quoteIdent(dialect, column)} IS NULL`
-        : `${quoteIdent(dialect, column)} = ${literal(dialect, value, info.data?.columns.find((c) => c.name === column)?.dataType)}`
-    const next = appliedWhere ? `(${appliedWhere}) AND ${clause}` : clause
-    setWhere(next)
-    setAppliedWhere(next)
-    setPage(0)
+        ? newCondition({ column, op: 'null' })
+        : typeof value === 'boolean'
+          ? newCondition({ column, op: value ? 'true' : 'false' })
+          : newCondition({ column, op: 'eq', value })
+    // Narrow the current filter. With "any", fold the existing conditions into one OR group first
+    const orGroup = query.match === 'any' && query.conditions.filter((c) => c.enabled).length > 1
+    applyQuery({
+      ...query,
+      match: 'all',
+      conditions: orGroup
+        ? [newCondition({ kind: 'sql', sql: appliedWhere }), condition]
+        : [...query.conditions, condition]
+    })
   }
+
+  // The grid header shows and sets the first sort column
+  const firstSort = query.sorts[0]
+  const gridSort: SortState =
+    firstSort && columns.some((c) => c.name === firstSort.column)
+      ? { col: columns.findIndex((c) => c.name === firstSort.column), dir: firstSort.dir }
+      : null
 
   const from = page * pageSize
   const hasNext = (set?.rowCount ?? 0) >= pageSize
@@ -395,38 +422,12 @@ function DataView({
   return (
     <>
       <Toolbar className="gap-2">
-        <div className="flex min-w-0 flex-1 items-center gap-0 rounded-md border border-line-strong bg-canvas focus-within:border-accent/50">
-          <span className="pl-2.5 font-mono text-[11px] font-medium text-syn-keyword">WHERE</span>
-          <input
-            value={where}
-            onChange={(e) => setWhere(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                setAppliedWhere(where)
-                setPage(0)
-              }
-            }}
-            spellCheck={false}
-            placeholder={
-              info.data?.columns[0]
-                ? `${quoteIdent(dialect, info.data.columns[0].name)} = …   (Enter to apply)`
-                : 'condition'
-            }
-            className="h-7 min-w-0 flex-1 bg-transparent px-2 font-mono text-[12px] text-bright placeholder:text-faint focus:outline-none"
-          />
-          {appliedWhere && (
-            <button
-              className="px-2 text-[11px] text-muted hover:text-bright"
-              onClick={() => {
-                setWhere('')
-                setAppliedWhere('')
-                setPage(0)
-              }}
-            >
-              Clear
-            </button>
-          )}
-        </div>
+        <QuerySummary
+          query={query}
+          open={builderOpen}
+          onToggle={() => setBuilderOpen((o) => !o)}
+          onChange={applyQuery}
+        />
         <Button
           size="icon"
           variant="ghost"
@@ -524,6 +525,15 @@ function DataView({
           </Button>
         )}
       </Toolbar>
+      {builderOpen && info.data && (
+        <QueryBuilder
+          columns={info.data.columns}
+          dialect={dialect}
+          applied={query}
+          onApply={applyQuery}
+          onClose={() => setBuilderOpen(false)}
+        />
+      )}
       <ProgressBar active={loading} />
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
@@ -536,11 +546,14 @@ function DataView({
               columns={columns}
               rows={rows}
               editing={editing}
-              sort={sort}
-              onSortChange={(s) => {
-                setSort(s)
-                setPage(0)
-              }}
+              sort={gridSort}
+              // A header click sorts by that column alone; the builder handles multi-column sorts
+              onSortChange={(s) =>
+                applyQuery({
+                  ...query,
+                  sorts: s ? [{ column: columns[s.col].name, dir: s.dir }] : []
+                })
+              }
               filter={filter}
               dialect={dialect}
               tableName={qualified(dialect, tableRef)}
