@@ -301,5 +301,9 @@ export const api = {
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),
+  writeBytes: (path: string, contents: Uint8Array) =>
+    invoke<void>('file_write_bytes', contents, {
+      headers: { 'x-path': encodeURIComponent(path) }
+    }),
   readText: (path: string) => invoke<string>('file_read_text', { path })
 }

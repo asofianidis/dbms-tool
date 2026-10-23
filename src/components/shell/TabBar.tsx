@@ -7,6 +7,7 @@ import {
   FunctionSquare,
   Home,
   Leaf,
+  Network,
   Plus,
   Server,
   Settings,
@@ -45,6 +46,8 @@ export function tabTitle(tab: Tab): string {
       return tab.collection
     case 'server':
       return 'Server'
+    case 'diagram':
+      return `${tab.schema ?? tab.database} diagram`
   }
 }
 
@@ -75,6 +78,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       )
     case 'server':
       return <Server className={c} />
+    case 'diagram':
+      return <Network className={cn(c, 'text-syn-keyword')} />
   }
 }
 

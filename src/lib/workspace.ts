@@ -59,6 +59,14 @@ export type Tab =
       view: CollectionView
     }
   | { id: string; kind: 'server'; connectionId: string }
+  | {
+      id: string
+      kind: 'diagram'
+      connectionId: string
+      database: string
+      /** null for engines browsed without schemas, where the whole database is drawn */
+      schema: string | null
+    }
 
 export type TabOf<K extends Tab['kind']> = Extract<Tab, { kind: K }>
 
@@ -339,6 +347,17 @@ export function openServer(connectionId: string): void {
   openTab(
     { id: tabId(), kind: 'server', connectionId },
     (t) => t.kind === 'server' && t.connectionId === connectionId
+  )
+}
+
+export function openDiagram(connectionId: string, database: string, schema: string | null): void {
+  openTab(
+    { id: tabId(), kind: 'diagram', connectionId, database, schema },
+    (t) =>
+      t.kind === 'diagram' &&
+      t.connectionId === connectionId &&
+      t.database === database &&
+      t.schema === schema
   )
 }
 

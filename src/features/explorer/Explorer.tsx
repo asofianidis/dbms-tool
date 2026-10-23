@@ -22,6 +22,7 @@ import {
   Link2,
   ListOrdered,
   Lock,
+  Network,
   Pencil,
   Plug,
   PlugZap,
@@ -56,6 +57,7 @@ import {
   newQueryTab,
   openCollection,
   openConnectionDialog,
+  openDiagram,
   openServer,
   openTable,
   promptText,
@@ -479,6 +481,11 @@ function DatabaseNode({
     } else if (connection.engine === 'mysql') {
       // MySQL schemas are databases
       items.push(
+        {
+          label: 'Open diagram',
+          icon: <Network />,
+          onSelect: () => openDiagram(connection.id, database, null)
+        },
         'separator',
         {
           label: 'Edit database…',
@@ -493,6 +500,14 @@ function DatabaseNode({
         }
       )
     } else {
+      // SQL Server schemas aren't tree nodes, so its diagram spans the database
+      if (connection.engine !== 'postgres') {
+        items.push({
+          label: 'Open diagram',
+          icon: <Network />,
+          onSelect: () => openDiagram(connection.id, database, null)
+        })
+      }
       items.push('separator', {
         label: 'New schema…',
         icon: <Plus />,
@@ -603,6 +618,11 @@ function SchemaNode({
               icon: <Terminal />,
               onSelect: () =>
                 newQueryTab(connection.id, database, `SET search_path TO ${schema};\n\n`)
+            },
+            {
+              label: 'Open diagram',
+              icon: <Network />,
+              onSelect: () => openDiagram(connection.id, database, schema)
             },
             {
               label: 'Edit schema…',

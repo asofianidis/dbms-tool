@@ -249,6 +249,42 @@ pub async fn file_write_text(path: String, contents: String) -> AppResult<()> {
     Ok(())
 }
 
+/// Binary contents arrive as the raw request body (no JSON number arrays), with
+/// the URI-encoded destination in the `x-path` header.
+#[tauri::command]
+pub async fn file_write_bytes(request: tauri::ipc::Request<'_>) -> AppResult<()> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(AppError::msg("Expected binary contents"));
+    };
+    let path = request
+        .headers()
+        .get("x-path")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::msg("Missing destination path"))?;
+    let path = percent_decode(path)?;
+    tokio::fs::write(&path, bytes).await?;
+    Ok(())
+}
+
+fn percent_decode(s: &str) -> AppResult<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| AppError::msg("Invalid destination path"))
+}
+
 #[tauri::command]
 pub async fn file_read_text(path: String) -> AppResult<String> {
     Ok(tokio::fs::read_to_string(&path).await?)

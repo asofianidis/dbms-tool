@@ -17,6 +17,7 @@ import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { CollectionTab } from './features/mongo/CollectionTab'
+import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { QueryTab } from './features/query/QueryTab'
 import { ServerTab } from './features/server/ServerTab'
@@ -61,6 +62,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <CollectionTab tab={tab} />
     case 'server':
       return <ServerTab tab={tab} />
+    case 'diagram':
+      return <DiagramTab tab={tab} />
   }
 })
 
