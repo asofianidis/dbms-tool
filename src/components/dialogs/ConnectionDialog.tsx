@@ -9,7 +9,14 @@ import {
   Loader2,
   XCircle
 } from 'lucide-react'
-import { api, type ConnectionConfig, type Engine, type ServerInfo } from '@/lib/api'
+import {
+  api,
+  type CloudProvider,
+  type ConnectionConfig,
+  type Engine,
+  type ServerInfo
+} from '@/lib/api'
+import { PROVIDERS, PROVIDER_ORDER, providerForHost } from '@/lib/cloud'
 import { cn } from '@/lib/cn'
 import {
   CONNECTION_COLORS,
@@ -200,6 +207,24 @@ function ConnectionDialog({
   const usesUri = config.engine === 'mongo' && mongoMode === 'uri'
   const hasSavedPassword = !!editing?.savePassword && !duplicate
   const needsUser = !(tds && config.auth === 'windows')
+  const cloudAuth = config.auth === 'cloud'
+  // Babelfish's TDS endpoint has no IAM sign-in
+  const iamCapable =
+    config.engine === 'postgres' || config.engine === 'mysql' || config.engine === 'mssql'
+  const cloudProvider: CloudProvider =
+    config.cloud?.provider ?? providerForHost(config.host) ?? 'aws'
+  const setCloud = (patchCloud: Partial<NonNullable<ConnectionConfig['cloud']>>): void =>
+    patch({
+      cloud: {
+        provider: cloudProvider,
+        context: '',
+        region: '',
+        resource: '',
+        kind: '',
+        ...config.cloud,
+        ...patchCloud
+      }
+    })
 
   const effective = (): ConnectionConfig => ({
     ...config,
@@ -363,17 +388,53 @@ function ConnectionDialog({
           </div>
         )}
 
-        {tds && (
+        {(tds || iamCapable) && (
           <Field label="Authentication">
             <Segmented
               value={config.auth}
-              onChange={(auth) => patch({ auth })}
+              onChange={(auth) => {
+                patch({ auth })
+                if (auth === 'cloud' && !config.cloud) setCloud({})
+              }}
               options={[
-                { value: 'password', label: 'SQL login' },
-                { value: 'windows', label: 'Windows' }
+                { value: 'password', label: tds ? 'SQL login' : 'Password' },
+                ...(tds ? [{ value: 'windows' as const, label: 'Windows' }] : []),
+                ...(iamCapable ? [{ value: 'cloud' as const, label: 'Cloud IAM' }] : [])
               ]}
             />
           </Field>
+        )}
+
+        {cloudAuth && (
+          <div className="space-y-3 rounded-lg border border-info/25 bg-info/5 p-3">
+            <div className="grid grid-cols-[auto_1fr] items-end gap-3">
+              <Field label="Provider">
+                <Segmented
+                  value={cloudProvider}
+                  onChange={(provider) =>
+                    setCloud({
+                      provider,
+                      context: provider === config.cloud?.provider ? config.cloud.context : ''
+                    })
+                  }
+                  options={PROVIDER_ORDER.map((p) => ({ value: p, label: PROVIDERS[p].label }))}
+                />
+              </Field>
+              <Field label={`${PROVIDERS[cloudProvider].contextLabel} (optional)`}>
+                <Input
+                  value={config.cloud?.context ?? ''}
+                  onChange={(e) => setCloud({ context: e.target.value })}
+                  placeholder={`The ${PROVIDERS[cloudProvider].cli} CLI's default`}
+                />
+              </Field>
+            </div>
+            <p className="text-xs leading-relaxed text-fg">{IAM_HINTS[cloudProvider]}</p>
+            {config.engine === 'mssql' && cloudProvider !== 'azure' && (
+              <p className="text-xs text-danger">
+                SQL Server only supports passwordless sign-in on Azure (Microsoft Entra ID).
+              </p>
+            )}
+          </div>
         )}
 
         <div className="grid grid-cols-2 gap-3">
@@ -386,7 +447,7 @@ function ConnectionDialog({
               />
             </Field>
           )}
-          {(needsUser || config.user) && (
+          {(needsUser || config.user) && !cloudAuth && (
             <Field label="Password">
               <Input
                 type="password"
@@ -447,10 +508,15 @@ function ConnectionDialog({
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-3 rounded-lg border border-line bg-raised/40 p-3">
           <Toggle
-            checked={config.savePassword}
+            checked={config.savePassword && !cloudAuth}
             onChange={(savePassword) => patch({ savePassword })}
             label="Save password"
-            description="Stored in the OS credential manager"
+            description={
+              cloudAuth
+                ? 'Not needed: a token is fetched each time'
+                : 'Stored in the OS credential manager'
+            }
+            disabled={cloudAuth}
           />
           <Toggle
             checked={config.trustServerCertificate}
@@ -514,4 +580,11 @@ function ConnectionDialog({
       </form>
     </Modal>
   )
+}
+
+const IAM_HINTS: Record<CloudProvider, string> = {
+  aws: 'Signs in with a 15-minute token from "aws rds generate-db-auth-token". The user must be a database user granted rds_iam (PostgreSQL) or created with AWSAuthenticationPlugin (MySQL), and the instance needs IAM authentication turned on.',
+  gcp: 'Signs in with a token from "gcloud sql generate-login-token". The user is your Google account added to the instance as an IAM user (for MySQL, the part before the @), with the cloudsql.iam_authentication flag on.',
+  azure:
+    'Signs in with a Microsoft Entra token from "az account get-access-token". The user is your Entra user principal name (e.g. you@contoso.com), set up as an Entra admin or database user.'
 }

@@ -8,7 +8,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Column, Conn, Opts, OptsBuilder, Row, SslOpts, Value as MyValue};
 use serde_json::Value;
 
-use crate::config::{ConnectionConfig, SslMode};
+use crate::config::{AuthMode, ConnectionConfig, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
 
@@ -33,7 +33,9 @@ fn build_opts(cfg: &ConnectionConfig, password: Option<&str>, database: &str, tl
         .pass(password.map(str::to_string))
         .db_name((!database.is_empty()).then(|| database.to_string()))
         .prefer_socket(false)
-        .wait_timeout(Some(28_800));
+        .wait_timeout(Some(28_800))
+        // IAM tokens are checked by the server's cleartext auth plugin
+        .enable_cleartext_plugin(cfg.auth == AuthMode::Cloud);
     if tls {
         let verify = cfg.ssl == SslMode::Require && !cfg.trust_server_certificate;
         builder = builder.ssl_opts(Some(

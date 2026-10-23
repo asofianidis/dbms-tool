@@ -37,6 +37,9 @@ pub enum AuthMode {
     Password,
     /// Windows integrated authentication (SQL Server only)
     Windows,
+    /// Short-lived token from the cloud provider's CLI: AWS IAM, Google Cloud
+    /// IAM or Microsoft Entra ID (see `cloud::database_token`)
+    Cloud,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

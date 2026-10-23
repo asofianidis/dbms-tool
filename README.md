@@ -26,12 +26,18 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 
 **Cloud**
 
-- Finds databases in AWS (RDS, Aurora, DocumentDB), Google Cloud (Cloud SQL) and Azure (PostgreSQL
-  and MySQL flexible servers, Azure SQL) and connects with host, user and TLS filled in, including
-  the master password when AWS keeps it in Secrets Manager.
-- Provisioning designer for new databases: engine, version, size, storage, credentials and network
-  access (just this machine, anywhere, or private), with a preview of the exact CLI commands. The
+- Finds databases in AWS (RDS, Aurora, Babelfish, DocumentDB), Google Cloud (Cloud SQL) and Azure
+  (PostgreSQL and MySQL flexible servers, Azure SQL, Cosmos DB for MongoDB) and connects with host,
+  user and TLS filled in, including the master password when AWS keeps it in Secrets Manager and
+  the connection string for Cosmos DB.
+- Passwordless sign-in ("Cloud IAM") with AWS IAM, Google Cloud IAM or Microsoft Entra ID: a
+  short-lived token is fetched from the CLI for every new session instead of storing a password.
+- Provisioning designer for new databases, including Aurora Babelfish clusters and Cosmos DB
+  accounts: engine, version, size, storage, credentials, IAM authentication and network access
+  (just this machine, anywhere, or private), with a preview of the exact CLI commands. The
   connection is saved once the database is ready.
+- Deleting cloud databases, with an optional final snapshot on AWS, after typing the name to
+  confirm.
 - Works through the official `aws`, `gcloud` and `az` CLIs, so existing profiles, SSO and MFA
   apply; passwords reach the CLI in a temporary file, never on the command line.
 

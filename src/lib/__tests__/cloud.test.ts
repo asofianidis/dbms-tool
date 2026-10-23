@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest'
 import type { ConnectionConfig } from '../api'
 import {
   connectionFor,
+  credentialsCommand,
+  deletePlan,
   findSaved,
+  iamUserFor,
+  parseCredentials,
+  providerForHost,
+  splitMongoPassword,
+  stepsScript,
   gcpVersion,
   generatePassword,
   newProvisionDraft,
@@ -10,7 +17,6 @@ import {
   parseDescribe,
   parseIdentity,
   parseList,
-  parseSecret,
   planScript,
   provisionPlan,
   provisionedConnection,
@@ -335,8 +341,12 @@ describe('discovery', () => {
     const out = JSON.stringify({
       SecretString: JSON.stringify({ username: 'postgres', password: 'p@ss' })
     })
-    expect(parseSecret(out)).toEqual({ username: 'postgres', password: 'p@ss' })
-    expect(parseSecret('{}')).toEqual({})
+    const [rds] = parseList('aws-instances', awsInstances, '', 'us-east-1')
+    expect(credentialsCommand(rds)).toEqual(
+      expect.arrayContaining(['secretsmanager', 'get-secret-value', '--secret-id', rds.secretArn])
+    )
+    expect(parseCredentials(rds, out)).toEqual({ username: 'postgres', password: 'p@ss' })
+    expect(parseCredentials(rds, '{}')).toEqual({})
   })
 })
 
@@ -604,5 +614,364 @@ describe('provisioning', () => {
       savePassword: true,
       cloud: db.ref
     })
+  })
+})
+
+describe('passwordless sign-in', () => {
+  it('reads whether each provider accepts IAM sign-in', () => {
+    const iamInstance = JSON.stringify({
+      DBInstances: [
+        {
+          DBInstanceIdentifier: 'iam-db',
+          Engine: 'postgres',
+          DBInstanceStatus: 'available',
+          Endpoint: { Address: 'iam-db.x.us-east-1.rds.amazonaws.com', Port: 5432 },
+          IAMDatabaseAuthenticationEnabled: true,
+          DeletionProtection: true
+        }
+      ]
+    })
+    expect(parseList('aws-instances', iamInstance, '', 'us-east-1')[0]).toMatchObject({
+      iamAuth: true,
+      deletionProtection: true
+    })
+    expect(parseList('aws-instances', awsInstances, '', 'us-east-1')[0].iamAuth).toBe(false)
+
+    const gcp = JSON.parse(gcpInstances)
+    gcp[0].settings.databaseFlags = [{ name: 'cloudsql.iam_authentication', value: 'on' }]
+    gcp[0].settings.deletionProtectionEnabled = true
+    expect(parseList('gcp-instances', JSON.stringify(gcp), '', '')[0]).toMatchObject({
+      iamAuth: true,
+      deletionProtection: true
+    })
+
+    const pg = JSON.parse(azurePostgres)
+    pg[0].authConfig = { activeDirectoryAuth: 'Enabled', passwordAuth: 'Enabled' }
+    expect(parseList('azure-postgres', JSON.stringify(pg), '', '')[0].iamAuth).toBe(true)
+    const sql = JSON.parse(azureSql)
+    expect(parseList('azure-sql', azureSql, '', '')[0].iamAuth).toBe(false)
+    sql[0].administrators = { login: 'dba@contoso.com', azureAdOnlyAuthentication: false }
+    expect(parseList('azure-sql', JSON.stringify(sql), '', '')[0].iamAuth).toBe(true)
+  })
+
+  it('picks the database user for the signed-in identity', () => {
+    const [pg, , mysql] = parseList('gcp-instances', gcpInstances, '', '')
+    expect(iamUserFor(pg, 'me@acme.dev')).toBe('me@acme.dev')
+    expect(iamUserFor(pg, 'svc@proj.iam.gserviceaccount.com')).toBe('svc@proj.iam')
+    expect(iamUserFor(mysql, 'me@acme.dev')).toBe('me')
+    const [azure] = parseList('azure-postgres', azurePostgres, '', '')
+    expect(iamUserFor(azure, 'me@contoso.com')).toBe('me@contoso.com')
+    // AWS users are mapped inside the database, so there's no guess to make
+    const [rds] = parseList('aws-instances', awsInstances, '', 'us-east-1')
+    expect(iamUserFor(rds, 'Admin/alex · 123')).toBeNull()
+    expect(iamUserFor(pg, null)).toBeNull()
+  })
+
+  it('guesses the provider from managed host names', () => {
+    expect(providerForHost('db.abc.eu-west-1.rds.amazonaws.com')).toBe('aws')
+    expect(providerForHost('pg.postgres.database.azure.com')).toBe('azure')
+    expect(providerForHost('srv.database.windows.net')).toBe('azure')
+    expect(providerForHost('34.1.2.3')).toBeNull()
+  })
+
+  it('turns on IAM authentication when provisioning', () => {
+    const aws = provisionPlan(draftFor('aws', { iamAuth: true, access: 'private' }))
+    expect(aws.steps[0].args({})).toContain('--enable-iam-database-authentication')
+    expect(provisionPlan(draftFor('aws', { access: 'private' })).steps[0].args({})).not.toContain(
+      '--enable-iam-database-authentication'
+    )
+
+    const gcpPg = provisionPlan(draftFor('gcp', { iamAuth: true, iamUser: 'me@acme.dev' }))
+    expect(gcpPg.steps[0].args({})).toContain('--database-flags=cloudsql.iam_authentication=on')
+    expect(gcpPg.afterReady[0].args({})).toEqual(
+      expect.arrayContaining(['users', 'create', 'me@acme.dev', '--type=cloud_iam_user'])
+    )
+    const gcpMy = provisionPlan(
+      withEngine(
+        draftFor('gcp', { iamAuth: true, iamUser: 'svc@p.iam.gserviceaccount.com' }),
+        'MYSQL'
+      )
+    )
+    expect(gcpMy.steps[0].args({})).toContain('--database-flags=cloudsql_iam_authentication=on')
+    expect(gcpMy.afterReady[0].args({})).toEqual(
+      expect.arrayContaining(['svc@p.iam.gserviceaccount.com', '--type=cloud_iam_service_account'])
+    )
+    expect(validateProvision(draftFor('gcp', { iamAuth: true, iamUser: '' }))).toMatch(/gcloud/)
+    // Engines without IAM support drop the setting
+    expect(withEngine(draftFor('aws', { iamAuth: true }), 'sqlserver-ex').iamAuth).toBe(false)
+  })
+})
+
+describe('Babelfish', () => {
+  it('recognises Babelfish clusters by their parameter group', () => {
+    const clusters = JSON.parse(awsClusters)
+    clusters.DBClusters[0].DBClusterParameterGroup = 'app-babelfish'
+    const [bf] = parseList('aws-clusters', JSON.stringify(clusters), '', 'eu-west-1')
+    expect(bf).toMatchObject({
+      engine: 'babelfish',
+      product: 'Aurora Babelfish 16.4',
+      port: 1433,
+      database: '',
+      members: ['aurora-1']
+    })
+    expect(connectionFor(bf)).toMatchObject({
+      engine: 'babelfish',
+      port: 1433,
+      trustServerCertificate: true
+    })
+  })
+
+  it('plans a Babelfish cluster with its parameter group and both ports', () => {
+    const plan = provisionPlan(withEngine(draftFor('aws'), 'babelfish'))
+    expect(plan.steps.map((s) => s.title)).toEqual([
+      'Find the default VPC',
+      'Create a security group',
+      'Allow 203.0.113.7/32 on port 1433',
+      'Allow 203.0.113.7/32 on port 5432',
+      'Look up the default Aurora PostgreSQL version',
+      'Create a Babelfish parameter group',
+      'Turn on Babelfish',
+      'Create the Aurora Babelfish cluster',
+      'Add the writer instance'
+    ])
+    const lookup = plan.steps[4]
+    expect(
+      lookup.capture!(
+        JSON.stringify({
+          DBEngineVersions: [
+            { EngineVersion: '16.4', DBParameterGroupFamily: 'aurora-postgresql16' }
+          ]
+        })
+      )
+    ).toEqual({ engineVersion: '16.4', family: 'aurora-postgresql16' })
+    expect(() => lookup.capture!('{"DBEngineVersions":[]}')).toThrow(/isn't offered/)
+    expect(plan.steps[5].args({ family: 'aurora-postgresql16' })).toEqual(
+      expect.arrayContaining(['--db-parameter-group-family', 'aurora-postgresql16'])
+    )
+    expect(plan.steps[6].args({})).toContain(
+      'ParameterName=rds.babelfish_status,ParameterValue=on,ApplyMethod=pending-reboot'
+    )
+    const cluster = plan.steps[7].args({ engineVersion: '16.4', groupId: 'sg-1' })
+    expect(cluster).toEqual(
+      expect.arrayContaining([
+        '--engine',
+        'aurora-postgresql',
+        '--engine-version',
+        '16.4',
+        '--db-cluster-parameter-group-name',
+        'app-dev-babelfish',
+        '--master-username',
+        'babelfish_user'
+      ])
+    )
+    expect(plan.steps[8].args({})).toEqual(
+      expect.arrayContaining(['--engine', 'aurora-postgresql'])
+    )
+    expect(plan.ref.kind).toBe('cluster')
+  })
+})
+
+const cosmosAccounts = JSON.stringify([
+  {
+    id: '/subscriptions/sub-1/resourceGroups/rg-docs/providers/Microsoft.DocumentDB/databaseAccounts/docs-acct',
+    name: 'docs-acct',
+    kind: 'MongoDB',
+    location: 'West Europe',
+    provisioningState: 'Succeeded',
+    apiProperties: { serverVersion: '6.0' },
+    capabilities: [{ name: 'EnableMongo' }, { name: 'EnableServerless' }],
+    publicNetworkAccess: 'Enabled'
+  },
+  { name: 'sql-acct', kind: 'GlobalDocumentDB', provisioningState: 'Succeeded' }
+])
+
+describe('Cosmos DB', () => {
+  it('lists MongoDB accounts only', () => {
+    const accounts = parseList('azure-cosmos', cosmosAccounts, '', '')
+    expect(accounts).toHaveLength(1)
+    expect(accounts[0]).toMatchObject({
+      name: 'docs-acct',
+      engine: 'mongo',
+      product: 'Cosmos DB for MongoDB 6.0',
+      host: 'docs-acct.mongo.cosmos.azure.com',
+      port: 10255,
+      status: 'ready',
+      ready: true,
+      size: 'Serverless',
+      ref: { kind: 'cosmos', resourceGroup: 'rg-docs', context: 'sub-1' }
+    })
+    const ref = accounts[0].ref
+    expect(parseDescribe(ref, JSON.stringify(JSON.parse(cosmosAccounts)[0]))?.name).toBe(
+      'docs-acct'
+    )
+  })
+
+  it('reads the primary connection string and keeps the key out of the URI', () => {
+    const [account] = parseList('azure-cosmos', cosmosAccounts, '', '')
+    expect(credentialsCommand(account)).toEqual(
+      expect.arrayContaining([
+        'cosmosdb',
+        'keys',
+        'list',
+        '--type',
+        'connection-strings',
+        '--name',
+        'docs-acct'
+      ])
+    )
+    const out = JSON.stringify({
+      connectionStrings: [
+        {
+          description: 'Primary MongoDB Connection String',
+          connectionString:
+            'mongodb://docs-acct:abc%2Bkey%3D%3D@docs-acct.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb'
+        },
+        { description: 'Secondary MongoDB Connection String', connectionString: 'mongodb://x:y@z/' }
+      ]
+    })
+    expect(parseCredentials(account, out)).toEqual({
+      uri: 'mongodb://docs-acct@docs-acct.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb',
+      username: 'docs-acct',
+      password: 'abc+key=='
+    })
+    expect(splitMongoPassword('mongodb://host/')).toEqual({ uri: 'mongodb://host/' })
+    expect(connectionFor(account).uri).toMatch(
+      /^mongodb:\/\/docs-acct@docs-acct\.mongo\.cosmos\.azure\.com:10255\/\?ssl=true&replicaSet=globaldb/
+    )
+  })
+
+  it('provisions a Cosmos DB account without an admin password', () => {
+    const draft = withEngine(
+      draftFor('azure', { password: '', user: '', database: 'app' }),
+      'cosmos'
+    )
+    expect(validateProvision(draft)).toBeNull()
+    expect(validateProvision({ ...draft, name: 'x'.repeat(45) })).toMatch(/3–44/)
+    const plan = provisionPlan(draft)
+    const create = plan.steps[1]
+    expect(create.secret).toBeUndefined()
+    expect(create.args({})).toEqual(
+      expect.arrayContaining([
+        'cosmosdb',
+        'create',
+        '--kind',
+        'MongoDB',
+        '--server-version',
+        '6.0',
+        '--capabilities',
+        'EnableServerless',
+        '--ip-range-filter',
+        '203.0.113.7/32'
+      ])
+    )
+    expect(provisionPlan({ ...draft, access: 'private', size: 'free' }).steps[1].args({})).toEqual(
+      expect.arrayContaining(['--public-network-access', 'Disabled', '--enable-free-tier', 'true'])
+    )
+    expect(plan.afterReady[0].args({})).toEqual(
+      expect.arrayContaining([
+        'mongodb',
+        'database',
+        'create',
+        '--account-name',
+        'app-dev',
+        '--name',
+        'app'
+      ])
+    )
+    expect(plan.ref.kind).toBe('cosmos')
+
+    const [account] = parseList('azure-cosmos', cosmosAccounts, '', '')
+    const saved = provisionedConnection({ ...draft, name: 'docs-acct' }, account, {
+      uri: 'mongodb://docs-acct@docs-acct.mongo.cosmos.azure.com:10255/?ssl=true',
+      password: 'k'
+    })
+    expect(saved).toMatchObject({
+      engine: 'mongo',
+      user: 'docs-acct',
+      uri: 'mongodb://docs-acct@docs-acct.mongo.cosmos.azure.com:10255/?ssl=true',
+      database: 'app'
+    })
+  })
+})
+
+describe('deleting', () => {
+  const now = new Date('2026-10-22T23:45:10Z')
+
+  it('deletes RDS instances with or without a final snapshot', () => {
+    const [rds] = parseList('aws-instances', awsInstances, 'work', 'us-east-1')
+    const [step] = deletePlan(rds, { finalSnapshot: true, disableProtection: false }, now)
+    expect(step.args({})).toEqual(
+      expect.arrayContaining([
+        'rds',
+        'delete-db-instance',
+        '--db-instance-identifier',
+        'app-dev',
+        '--final-db-snapshot-identifier',
+        'app-dev-final-202610222345',
+        '--profile',
+        'work'
+      ])
+    )
+    const plain = deletePlan(rds, { finalSnapshot: false, disableProtection: true }, now)
+    expect(plain.map((s) => s.title)).toEqual([
+      'Turn off deletion protection',
+      'Delete instance app-dev'
+    ])
+    expect(plain[0].args({})).toEqual(
+      expect.arrayContaining(['modify-db-instance', '--no-deletion-protection'])
+    )
+    expect(plain[1].args({})).toContain('--skip-final-snapshot')
+  })
+
+  it('deletes cluster members before the cluster, using the DocumentDB API for docdb', () => {
+    const [aurora, docs] = parseList('aws-clusters', awsClusters, '', 'eu-west-1')
+    const steps = deletePlan(aurora, { finalSnapshot: false, disableProtection: true }, now)
+    expect(steps.map((s) => s.title)).toEqual([
+      'Turn off deletion protection',
+      'Delete instance aurora-1',
+      'Delete cluster aurora'
+    ])
+    expect(steps[0].args({})).toEqual(expect.arrayContaining(['rds', 'modify-db-cluster']))
+    expect(steps[2].args({})).toEqual(
+      expect.arrayContaining(['delete-db-cluster', '--skip-final-snapshot'])
+    )
+    const docSteps = deletePlan(docs, { finalSnapshot: false, disableProtection: false }, now)
+    expect(docSteps).toHaveLength(1)
+    expect(docSteps[0].args({})[0]).toBe('docdb')
+  })
+
+  it('deletes Cloud SQL instances and Azure resources', () => {
+    const [pg] = parseList('gcp-instances', gcpInstances, '', '')
+    const gcp = deletePlan(pg, { finalSnapshot: false, disableProtection: true })
+    expect(gcp[0].args({})).toEqual(
+      expect.arrayContaining(['instances', 'patch', 'pg-main', '--no-deletion-protection'])
+    )
+    expect(gcp[1].args({})).toEqual(
+      expect.arrayContaining(['sql', 'instances', 'delete', 'pg-main', '--quiet'])
+    )
+
+    const [flex] = parseList('azure-postgres', azurePostgres, '', '')
+    expect(
+      deletePlan(flex, { finalSnapshot: false, disableProtection: false })[0].args({})
+    ).toEqual(
+      expect.arrayContaining([
+        'postgres',
+        'flexible-server',
+        'delete',
+        '--resource-group',
+        'rg-data',
+        '--yes'
+      ])
+    )
+    const [sql] = parseList('azure-sql', azureSql, '', '')
+    expect(
+      deletePlan(sql, { finalSnapshot: false, disableProtection: false })[0].args({}).slice(0, 3)
+    ).toEqual(['sql', 'server', 'delete'])
+    const [account] = parseList('azure-cosmos', cosmosAccounts, '', '')
+    const cosmos = deletePlan(account, { finalSnapshot: false, disableProtection: false })
+    expect(cosmos[0].title).toBe('Delete account docs-acct')
+    expect(stepsScript(cosmos, 'az')).toContain(
+      'az cosmosdb delete --resource-group rg-docs --name docs-acct --yes'
+    )
   })
 })

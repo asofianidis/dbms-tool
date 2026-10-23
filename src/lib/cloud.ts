@@ -259,6 +259,11 @@ export interface CloudDatabase {
   publicAccess: boolean | null
   /** AWS Secrets Manager secret holding the master password */
   secretArn?: string
+  /** Accepts passwordless sign-in: AWS IAM, Google Cloud IAM or Microsoft Entra ID */
+  iamAuth: boolean
+  deletionProtection: boolean
+  /** Instances in an AWS cluster, which go before the cluster can be deleted */
+  members?: string[]
   /** Why connecting from here may not work */
   note?: string
 }
@@ -272,6 +277,7 @@ export interface ListCommand {
     | 'azure-postgres'
     | 'azure-mysql'
     | 'azure-sql'
+    | 'azure-cosmos'
   label: string
   args: string[]
 }
@@ -316,7 +322,12 @@ export function listCommands(
           label: 'MySQL flexible servers',
           args: ['mysql', 'flexible-server', 'list', ...scope]
         },
-        { key: 'azure-sql', label: 'Azure SQL servers', args: ['sql', 'server', 'list', ...scope] }
+        { key: 'azure-sql', label: 'Azure SQL servers', args: ['sql', 'server', 'list', ...scope] },
+        {
+          key: 'azure-cosmos',
+          label: 'Cosmos DB accounts',
+          args: ['cosmosdb', 'list', ...scope]
+        }
       ]
   }
 }
@@ -353,6 +364,10 @@ export function parseList(
       return asRows(json).map((s) => azureServer(s, 'mysql', context))
     case 'azure-sql':
       return asRows(json).map((s) => azureServer(s, 'sql', context))
+    case 'azure-cosmos':
+      return asRows(json)
+        .map((a) => azureCosmos(a, context))
+        .filter(isDefined)
   }
 }
 
@@ -407,6 +422,8 @@ function awsInstance(i: Json, context: string, region: string): CloudDatabase | 
       .join(' · '),
     publicAccess: isPublic,
     secretArn: str((i.MasterUserSecret as Json | undefined)?.SecretArn) || undefined,
+    iamAuth: i.IAMDatabaseAuthenticationEnabled === true,
+    deletionProtection: i.DeletionProtection === true,
     note:
       isPublic === false ? 'Not publicly accessible: reachable only from inside its VPC' : undefined
   }
@@ -414,8 +431,12 @@ function awsInstance(i: Json, context: string, region: string): CloudDatabase | 
 
 function awsCluster(c: Json, context: string, region: string): CloudDatabase | null {
   const engineName = str(c.Engine)
-  const engine = awsEngine(engineName)
-  if (!engine) return null
+  const baseEngine = awsEngine(engineName)
+  if (!baseEngine) return null
+  // Babelfish has no flag of its own: the cluster parameter group turns it on,
+  // and the groups dbms-tool creates (like most) say so in their name
+  const babelfish = baseEngine === 'postgres' && /babelfish/i.test(str(c.DBClusterParameterGroup))
+  const engine: Engine = babelfish ? 'babelfish' : baseEngine
   const status = str(c.Status)
   const scaling = c.ServerlessV2ScalingConfiguration as Json | undefined
   const members = asRows(c.DBClusterMembers)
@@ -432,16 +453,21 @@ function awsCluster(c: Json, context: string, region: string): CloudDatabase | n
     },
     name: str(c.DBClusterIdentifier),
     engine,
-    product: `${AWS_ENGINES[engineName] ?? engineName} ${str(c.EngineVersion)}`.trim(),
+    product:
+      `${babelfish ? 'Aurora Babelfish' : (AWS_ENGINES[engineName] ?? engineName)} ${str(c.EngineVersion)}`.trim(),
     status,
     ready: status === 'available' && !!c.Endpoint,
     host: str(c.Endpoint),
-    port: num(c.Port),
+    // Babelfish speaks T-SQL on its TDS port; the cluster's port is PostgreSQL's
+    port: babelfish ? ENGINE_PORTS.babelfish : num(c.Port),
     user: str(c.MasterUsername),
-    database: str(c.DatabaseName),
+    database: babelfish ? '' : str(c.DatabaseName),
     size,
     publicAccess: typeof c.PubliclyAccessible === 'boolean' ? c.PubliclyAccessible : null,
     secretArn: str((c.MasterUserSecret as Json | undefined)?.SecretArn) || undefined,
+    iamAuth: c.IAMDatabaseAuthenticationEnabled === true,
+    deletionProtection: c.DeletionProtection === true,
+    members: members.map((m) => str(m.DBInstanceIdentifier)).filter(Boolean),
     note:
       engine === 'mongo'
         ? 'DocumentDB is only reachable from inside its VPC (VPN or SSH tunnel)'
@@ -480,6 +506,9 @@ function gcpInstance(i: Json, context: string): CloudDatabase | null {
   const stopped = settings.activationPolicy === 'NEVER'
   const state = str(i.state)
   const authorized = asRows(ipConfig.authorizedNetworks)
+  const iamFlag = asRows(settings.databaseFlags).some(
+    (f) => /^cloudsql[._]iam_authentication$/.test(str(f.name)) && str(f.value) === 'on'
+  )
   return {
     ref: {
       provider: 'gcp',
@@ -502,6 +531,8 @@ function gcpInstance(i: Json, context: string): CloudDatabase | null {
       .filter(Boolean)
       .join(' · '),
     publicAccess: publicIp ? true : privateIp ? false : null,
+    iamAuth: iamFlag,
+    deletionProtection: settings.deletionProtectionEnabled === true,
     note:
       !publicIp && privateIp
         ? 'Private IP only: reachable from its VPC or through the Cloud SQL Auth Proxy'
@@ -526,14 +557,16 @@ function azureServer(s: Json, kind: keyof typeof AZURE_KINDS, context: string): 
   const state = str(s.state) || 'Ready'
   const id = str(s.id)
   const version = kind === 'sql' ? '' : str(s.version)
+  const authConfig = (s.authConfig ?? {}) as Json
+  const administrators = (s.administrators ?? {}) as Json
   return {
     ref: {
       provider: 'azure',
-      context: id.match(/^\/subscriptions\/([^/]+)/i)?.[1] ?? context,
+      context: subscriptionOf(id) ?? context,
       region: str(s.location),
       resource: str(s.name),
       kind,
-      resourceGroup: str(s.resourceGroup) || id.match(/\/resourceGroups\/([^/]+)/i)?.[1] || ''
+      resourceGroup: str(s.resourceGroup) || resourceGroupOf(id)
     },
     name: str(s.name),
     engine: info.engine,
@@ -548,10 +581,68 @@ function azureServer(s: Json, kind: keyof typeof AZURE_KINDS, context: string): 
       .filter(Boolean)
       .join(' · '),
     publicAccess: access ? /enabled/i.test(access) : null,
+    // PostgreSQL reports Entra sign-in directly; Azure SQL has it once an Entra admin is set
+    iamAuth:
+      kind === 'sql'
+        ? !!administrators.login
+        : /enabled/i.test(str(authConfig.activeDirectoryAuth ?? authConfig.microsoftEntraAuth)),
+    deletionProtection: false,
     note: /disabled/i.test(access)
       ? 'Public network access is disabled: reachable only through its private endpoint'
       : undefined
   }
+}
+
+/** Cosmos DB accounts with the MongoDB API (other APIs aren't something we can open). */
+function azureCosmos(a: Json, context: string): CloudDatabase | null {
+  if (a.kind !== 'MongoDB') return null
+  const id = str(a.id)
+  const name = str(a.name)
+  const state = str(a.provisioningState)
+  const api = (a.apiProperties ?? {}) as Json
+  const access = str(a.publicNetworkAccess)
+  const serverless = asRows(a.capabilities).some((c) => c.name === 'EnableServerless')
+  return {
+    ref: {
+      provider: 'azure',
+      context: subscriptionOf(id) ?? context,
+      region: str(a.location),
+      resource: name,
+      kind: 'cosmos',
+      resourceGroup: str(a.resourceGroup) || resourceGroupOf(id)
+    },
+    name,
+    engine: 'mongo',
+    product: `Cosmos DB for MongoDB ${str(api.serverVersion)}`.trim(),
+    status: state === 'Succeeded' ? 'ready' : state.toLowerCase(),
+    ready: state === 'Succeeded',
+    host: `${name}.mongo.cosmos.azure.com`,
+    port: COSMOS_PORT,
+    user: name,
+    database: '',
+    size:
+      a.enableFreeTier === true
+        ? 'Free tier'
+        : serverless
+          ? 'Serverless'
+          : 'Provisioned throughput',
+    publicAccess: access ? /enabled/i.test(access) : null,
+    iamAuth: false,
+    deletionProtection: false,
+    note: /disabled/i.test(access)
+      ? 'Public network access is disabled: reachable only through its private endpoint'
+      : undefined
+  }
+}
+
+const COSMOS_PORT = 10255
+
+function subscriptionOf(id: string): string | undefined {
+  return id.match(/^\/subscriptions\/([^/]+)/i)?.[1]
+}
+
+function resourceGroupOf(id: string): string {
+  return id.match(/\/resourceGroups\/([^/]+)/i)?.[1] ?? ''
 }
 
 const ENGINE_PORTS: Record<Engine, number> = {
@@ -591,6 +682,8 @@ export function describeCommand(ref: CloudRef): { key: ListCommand['key']; args:
       const target = ['--resource-group', ref.resourceGroup ?? '', '--name', ref.resource, ...scope]
       if (ref.kind === 'sql')
         return { key: 'azure-sql', args: ['sql', 'server', 'show', ...target] }
+      if (ref.kind === 'cosmos')
+        return { key: 'azure-cosmos', args: ['cosmosdb', 'show', ...target] }
       return {
         key: ref.kind === 'mysql' ? 'azure-mysql' : 'azure-postgres',
         args: [ref.kind === 'mysql' ? 'mysql' : 'postgres', 'flexible-server', 'show', ...target]
@@ -626,24 +719,66 @@ export function anyInstanceAvailable(stdout: string): boolean {
   return asRows(json?.DBInstances).some((i) => i.DBInstanceStatus === 'available')
 }
 
-/** Fetches the master password AWS manages in Secrets Manager. */
-export function secretCommand(db: CloudDatabase): string[] | null {
-  if (db.ref.provider !== 'aws' || !db.secretArn) return null
-  return [
-    'secretsmanager',
-    'get-secret-value',
-    '--secret-id',
-    db.secretArn,
-    ...scopeArgs('aws', db.ref.context, db.ref.region)
-  ]
+export interface Credentials {
+  username?: string
+  password?: string
+  /** A connection string to use instead of host and port (Cosmos DB) */
+  uri?: string
 }
 
-export function parseSecret(stdout: string): { username?: string; password?: string } {
-  const outer = parseJson<Json>(stdout)
-  const inner = parseJson<Json>(str(outer?.SecretString))
+/**
+ * Fetches credentials the provider keeps for you: the master password AWS
+ * manages in Secrets Manager, or a Cosmos DB account's connection string.
+ */
+export function credentialsCommand(db: CloudDatabase): string[] | null {
+  if (db.ref.provider === 'aws' && db.secretArn) {
+    return [
+      'secretsmanager',
+      'get-secret-value',
+      '--secret-id',
+      db.secretArn,
+      ...scopeArgs('aws', db.ref.context, db.ref.region)
+    ]
+  }
+  if (db.ref.provider === 'azure' && db.ref.kind === 'cosmos') {
+    return [
+      'cosmosdb',
+      'keys',
+      'list',
+      '--type',
+      'connection-strings',
+      '--resource-group',
+      db.ref.resourceGroup ?? '',
+      '--name',
+      db.ref.resource,
+      ...scopeArgs('azure', db.ref.context)
+    ]
+  }
+  return null
+}
+
+export function parseCredentials(db: CloudDatabase, stdout: string): Credentials {
+  const json = parseJson<Json>(stdout)
+  if (db.ref.kind === 'cosmos') {
+    const strings = asRows(json?.connectionStrings)
+    const primary = strings.find((s) => /primary mongodb/i.test(str(s.description))) ?? strings[0]
+    return splitMongoPassword(str(primary?.connectionString))
+  }
+  const inner = parseJson<Json>(str(json?.SecretString))
   return {
     username: str(inner?.username) || undefined,
     password: str(inner?.password) || undefined
+  }
+}
+
+/** Moves the password out of a mongodb:// URI so it can go to the credential store. */
+export function splitMongoPassword(uri: string): Credentials {
+  const match = uri.match(/^(mongodb(?:\+srv)?:\/\/)([^:@/]+):([^@/]*)@(.*)$/)
+  if (!match) return uri ? { uri } : {}
+  return {
+    uri: `${match[1]}${match[2]}@${match[4]}`,
+    username: decodeURIComponent(match[2]),
+    password: decodeURIComponent(match[3])
   }
 }
 
@@ -665,12 +800,40 @@ export function connectionFor(db: CloudDatabase): ConnectionConfig {
     group: PROVIDERS[db.ref.provider].label,
     cloud: db.ref
   }
-  if (db.engine === 'mongo') {
+  if (db.ref.kind === 'cosmos') {
+    config.uri =
+      `mongodb://${encodeURIComponent(db.user)}@${db.host}:${db.port}/` +
+      `?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@${db.name}@`
+    config.host = ''
+  } else if (db.engine === 'mongo') {
     const user = db.user ? `${encodeURIComponent(db.user)}@` : ''
     config.uri = `mongodb://${user}${db.host}:${db.port || 27017}/?tls=true&retryWrites=false`
     config.host = ''
   }
   return config
+}
+
+/**
+ * The database user for passwordless sign-in as `identity` (what the CLI is
+ * signed in as), or null when it has to be set up in the database first.
+ */
+export function iamUserFor(db: CloudDatabase, identity: string | null | undefined): string | null {
+  if (!identity) return null
+  if (db.ref.provider === 'gcp') {
+    // PostgreSQL users are the email (service accounts without the domain
+    // suffix); MySQL truncates at the @
+    if (db.engine === 'mysql') return identity.split('@')[0]
+    return identity.replace(/\.gserviceaccount\.com$/, '')
+  }
+  // Entra users sign in with their user principal name
+  if (db.ref.provider === 'azure') return identity
+  return null
+}
+
+/** Whether a connection to `db` can use passwordless sign-in at all. */
+export function supportsIam(engine: Engine, provider: CloudProvider): boolean {
+  if (engine === 'postgres' || engine === 'mysql') return true
+  return engine === 'mssql' && provider === 'azure'
 }
 
 export function sameResource(a: CloudRef, b: CloudRef): boolean {
@@ -721,6 +884,10 @@ export interface EngineOption {
   storage: { min: number; default: number } | null
   /** Whether an initial database can be created; `required` for Azure SQL */
   initialDatabase: false | 'optional' | 'required'
+  /** IAM database authentication can be switched on when provisioning */
+  iam?: boolean
+  /** Authenticates with keys the provider generates, not an admin user */
+  noCredentials?: boolean
 }
 
 const DEFAULT_VERSION = { id: '', label: 'Latest (provider default)' }
@@ -777,7 +944,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       sizes: AWS_SIZES,
       defaultUser: 'postgres',
       storage: { min: 20, default: 20 },
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     },
     {
       id: 'mysql',
@@ -787,7 +955,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       sizes: AWS_SIZES,
       defaultUser: 'admin',
       storage: { min: 20, default: 20 },
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     },
     {
       id: 'mariadb',
@@ -797,7 +966,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       sizes: AWS_SIZES,
       defaultUser: 'admin',
       storage: { min: 20, default: 20 },
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     },
     {
       id: 'sqlserver-ex',
@@ -827,7 +997,20 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       sizes: AURORA_SIZES,
       defaultUser: 'postgres',
       storage: null,
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
+    },
+    {
+      id: 'babelfish',
+      label: 'Aurora Babelfish',
+      engine: 'babelfish',
+      // Babelfish needs a parameter group for the exact engine family, so the
+      // plan looks up the default version rather than offering a choice
+      versions: [DEFAULT_VERSION],
+      sizes: AURORA_SIZES,
+      defaultUser: 'babelfish_user',
+      storage: null,
+      initialDatabase: false
     },
     {
       id: 'aurora-mysql',
@@ -837,7 +1020,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       sizes: AURORA_SIZES,
       defaultUser: 'admin',
       storage: null,
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     }
   ],
   gcp: [
@@ -850,7 +1034,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       defaultUser: 'postgres',
       fixedUser: true,
       storage: { min: 10, default: 10 },
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     },
     {
       id: 'MYSQL',
@@ -864,7 +1049,8 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       defaultUser: 'root',
       fixedUser: true,
       storage: { min: 10, default: 10 },
-      initialDatabase: 'optional'
+      initialDatabase: 'optional',
+      iam: true
     },
     {
       id: 'SQLSERVER',
@@ -926,6 +1112,29 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       defaultUser: 'dbadmin',
       storage: null,
       initialDatabase: 'required'
+    },
+    {
+      id: 'cosmos',
+      label: 'Cosmos DB (MongoDB)',
+      engine: 'mongo',
+      versions: ['6.0', '7.0', '5.0', '4.2'].map((v) => ({ id: v, label: v })),
+      sizes: [
+        { id: 'serverless', label: 'Serverless', detail: 'Pay per request, no minimum' },
+        {
+          id: 'free',
+          label: 'Free tier',
+          detail: '1000 RU/s and 25 GB free; one account per subscription'
+        },
+        {
+          id: 'provisioned',
+          label: 'Provisioned',
+          detail: 'Reserved throughput, from 400 RU/s per database'
+        }
+      ],
+      defaultUser: '',
+      noCredentials: true,
+      storage: null,
+      initialDatabase: 'optional'
     }
   ]
 }
@@ -953,6 +1162,10 @@ export interface ProvisionDraft {
   backups: boolean
   deletionProtection: boolean
   saveConnection: boolean
+  /** Turn on IAM database authentication (engines with `iam`) */
+  iamAuth: boolean
+  /** Google Cloud: the signed-in account, added as an IAM database user */
+  iamUser: string
 }
 
 export function engineOption(provider: CloudProvider, id: string): EngineOption {
@@ -983,20 +1196,26 @@ export function newProvisionDraft(
     ip: '',
     backups: true,
     deletionProtection: false,
-    saveConnection: true
+    saveConnection: true,
+    iamAuth: false,
+    iamUser: ''
   }
 }
 
 /** Switching engine resets the fields that depend on it. */
 export function withEngine(draft: ProvisionDraft, engineId: string): ProvisionDraft {
   const option = engineOption(draft.provider, engineId)
+  // Keep a user name the user typed, but not the previous engine's default
+  const previous = engineOption(draft.provider, draft.engine)
+  const customUser = !!draft.user && draft.user !== previous.defaultUser
   return {
     ...draft,
     engine: option.id,
     version: option.versions[0].id,
     size: option.sizes[0].id,
     storageGb: option.storage?.default ?? 0,
-    user: option.fixedUser || !draft.user ? option.defaultUser : draft.user,
+    user: option.fixedUser || !customUser ? option.defaultUser : draft.user,
+    iamAuth: option.iam ? draft.iamAuth : false,
     database:
       option.initialDatabase === 'required'
         ? draft.database || 'appdb'
@@ -1058,6 +1277,9 @@ export function validateProvision(draft: ProvisionDraft): string | null {
   } else if (draft.provider === 'gcp') {
     if (!/^[a-z][a-z0-9-]{0,96}[a-z0-9]$/.test(name))
       return 'Cloud SQL names use lowercase letters, digits and hyphens, starting with a letter'
+  } else if (option.id === 'cosmos') {
+    if (!/^[a-z0-9][a-z0-9-]{1,42}[a-z0-9]$/.test(name))
+      return 'Cosmos DB account names are 3–44 lowercase letters, digits and hyphens'
   } else if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(name)) {
     return 'Azure server names are 3–63 lowercase letters, digits and hyphens'
   }
@@ -1067,7 +1289,7 @@ export function validateProvision(draft: ProvisionDraft): string | null {
   if (!draft.size.trim()) return 'Pick a size'
   if (option.storage && !(draft.storageGb >= option.storage.min))
     return `Storage must be at least ${option.storage.min} GB`
-  if (!option.fixedUser) {
+  if (!option.fixedUser && !option.noCredentials) {
     if (!/^[a-zA-Z][a-zA-Z0-9_]{0,15}$/.test(draft.user))
       return 'The admin user starts with a letter and uses letters, digits and underscores (max 16)'
     if (
@@ -1079,10 +1301,13 @@ export function validateProvision(draft: ProvisionDraft): string | null {
       return '"rdsadmin" is reserved by AWS'
   }
   const pw = draft.password
-  if (pw.length < 8) return 'The password needs at least 8 characters'
-  if (draft.provider === 'aws' && (pw.length > 41 || /[/"@\s]/.test(pw)))
+  if (option.noCredentials) {
+    // Keys are generated by the provider
+  } else if (pw.length < 8) {
+    return 'The password needs at least 8 characters'
+  } else if (draft.provider === 'aws' && (pw.length > 41 || /[/"@\s]/.test(pw))) {
     return 'AWS passwords are 8–41 characters without / " @ or spaces'
-  if (draft.provider === 'azure') {
+  } else if (draft.provider === 'azure') {
     const classes = [/[A-Z]/, /[a-z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(pw)).length
     if (classes < 3) return 'Azure passwords need three of: upper case, lower case, digits, symbols'
     if (pw.toLowerCase().includes(draft.user.toLowerCase()))
@@ -1093,6 +1318,8 @@ export function validateProvision(draft: ProvisionDraft): string | null {
   if (draft.database && !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(draft.database))
     return 'Database names use letters, digits and underscores'
   if (draft.access === 'ip' && !parseIp(draft.ip)) return 'Enter the IP address to allow in'
+  if (draft.iamAuth && draft.provider === 'gcp' && !draft.iamUser)
+    return 'Sign in to gcloud so your account can be added as an IAM user'
   return null
 }
 
@@ -1161,9 +1388,15 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
   const option = engineOption('aws', d.engine)
   const scope = scopeArgs('aws', d.context, d.region)
   const name = d.name.trim()
-  const aurora = d.engine.startsWith('aurora')
+  const babelfish = d.engine === 'babelfish'
+  const aurora = d.engine.startsWith('aurora') || babelfish
+  const engine = babelfish ? 'aurora-postgresql' : d.engine
   const isPublic = d.access !== 'private'
-  const port = ENGINE_PORTS[option.engine]
+  // Babelfish clients use the TDS port; PostgreSQL stays reachable too
+  const ports = babelfish
+    ? [ENGINE_PORTS.babelfish, ENGINE_PORTS.postgres]
+    : [ENGINE_PORTS[option.engine]]
+  const parameterGroup = `${name}-babelfish`
   const tags = ['--tags', 'Key=created-by,Value=dbms-tool']
   const secret = JSON.stringify({ MasterUserPassword: d.password })
   const steps: PlanStep[] = []
@@ -1195,7 +1428,7 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
         ],
         capture: (out) => ({ groupId: str(parseJson<Json>(out)?.GroupId) })
       },
-      {
+      ...ports.map((port): PlanStep => ({
         title: `Allow ${d.access === 'anywhere' ? 'any address' : cidr(d)} on port ${port}`,
         args: (ctx) => [
           'ec2',
@@ -1210,12 +1443,64 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
           cidr(d),
           ...scope
         ]
+      }))
+    )
+  }
+  if (babelfish) {
+    steps.push(
+      {
+        title: 'Look up the default Aurora PostgreSQL version',
+        args: () => [
+          'rds',
+          'describe-db-engine-versions',
+          '--engine',
+          'aurora-postgresql',
+          '--default-only',
+          ...scope
+        ],
+        capture: (out) => {
+          const version = asRows(parseJson<Json>(out)?.DBEngineVersions)[0]
+          if (!version?.DBParameterGroupFamily)
+            throw new Error(`Aurora PostgreSQL isn't offered in ${d.region}`)
+          return {
+            engineVersion: str(version.EngineVersion),
+            family: str(version.DBParameterGroupFamily)
+          }
+        }
+      },
+      {
+        title: 'Create a Babelfish parameter group',
+        args: (ctx) => [
+          'rds',
+          'create-db-cluster-parameter-group',
+          '--db-cluster-parameter-group-name',
+          parameterGroup,
+          '--db-parameter-group-family',
+          ctx.family,
+          '--description',
+          `Babelfish for ${name} (created by dbms-tool)`,
+          ...tags,
+          ...scope
+        ]
+      },
+      {
+        title: 'Turn on Babelfish',
+        args: () => [
+          'rds',
+          'modify-db-cluster-parameter-group',
+          '--db-cluster-parameter-group-name',
+          parameterGroup,
+          '--parameters',
+          'ParameterName=rds.babelfish_status,ParameterValue=on,ApplyMethod=pending-reboot',
+          ...scope
+        ]
       }
     )
   }
   const securityGroup = (ctx: Record<string, string>): string[] =>
     isPublic ? ['--vpc-security-group-ids', ctx.groupId] : []
   const version = d.version ? ['--engine-version', d.version] : []
+  const iam = d.iamAuth ? ['--enable-iam-database-authentication'] : []
   const deletion = d.deletionProtection ? ['--deletion-protection'] : ['--no-deletion-protection']
   const publicFlag = isPublic ? '--publicly-accessible' : '--no-publicly-accessible'
 
@@ -1231,13 +1516,21 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
           '--db-cluster-identifier',
           name,
           '--engine',
-          d.engine,
-          ...version,
+          engine,
+          ...(babelfish
+            ? [
+                '--engine-version',
+                ctx.engineVersion,
+                '--db-cluster-parameter-group-name',
+                parameterGroup
+              ]
+            : version),
           '--master-username',
           d.user,
           '--cli-input-json',
           'file://{secret}',
           ...(d.database ? ['--database-name', d.database] : []),
+          ...iam,
           // Aurora always keeps at least a day of backups
           '--backup-retention-period',
           d.backups ? '7' : '1',
@@ -1261,7 +1554,7 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
           '--db-cluster-identifier',
           name,
           '--engine',
-          d.engine,
+          engine,
           '--db-instance-class',
           serverless ? 'db.serverless' : d.size,
           publicFlag,
@@ -1294,6 +1587,7 @@ function awsPlan(d: ProvisionDraft): ProvisionPlan {
         'file://{secret}',
         ...(d.database && !sqlServer ? ['--db-name', d.database] : []),
         ...(sqlServer ? ['--license-model', 'license-included'] : []),
+        ...iam,
         '--backup-retention-period',
         d.backups ? '7' : '0',
         ...deletion,
@@ -1331,6 +1625,13 @@ function gcpPlan(d: ProvisionDraft): ProvisionPlan {
   // Without a VPC there's no private-only option; "private" means no authorized
   // networks, so only the Cloud SQL Auth Proxy gets in
   const networks = d.access === 'private' ? [] : [`--authorized-networks=${cidr(d)}`]
+  const mysql = d.engine === 'MYSQL'
+  const iamFlag = d.iamAuth
+    ? [
+        `--database-flags=${mysql ? 'cloudsql_iam_authentication' : 'cloudsql.iam_authentication'}=on`
+      ]
+    : []
+  const serviceAccount = d.iamUser.endsWith('.gserviceaccount.com')
   const steps: PlanStep[] = [
     {
       title: `Create the Cloud SQL instance (takes several minutes)`,
@@ -1350,6 +1651,7 @@ function gcpPlan(d: ProvisionDraft): ProvisionPlan {
         d.backups ? '--backup' : '--no-backup',
         d.deletionProtection ? '--deletion-protection' : '--no-deletion-protection',
         ...networks,
+        ...iamFlag,
         '--labels=created-by=dbms-tool',
         '--flags-file={secret}',
         ...scope
@@ -1358,14 +1660,28 @@ function gcpPlan(d: ProvisionDraft): ProvisionPlan {
       timeoutSecs: CREATE_TIMEOUT
     }
   ]
-  const afterReady: PlanStep[] = d.database
-    ? [
-        {
-          title: `Create database ${d.database}`,
-          args: () => ['sql', 'databases', 'create', d.database, `--instance=${name}`, ...scope]
-        }
+  const afterReady: PlanStep[] = []
+  if (d.database) {
+    afterReady.push({
+      title: `Create database ${d.database}`,
+      args: () => ['sql', 'databases', 'create', d.database, `--instance=${name}`, ...scope]
+    })
+  }
+  if (d.iamAuth && d.iamUser) {
+    afterReady.push({
+      title: `Add ${d.iamUser} as an IAM database user`,
+      args: () => [
+        'sql',
+        'users',
+        'create',
+        // PostgreSQL names service accounts without the domain suffix
+        serviceAccount && !mysql ? d.iamUser.replace(/\.gserviceaccount\.com$/, '') : d.iamUser,
+        `--instance=${name}`,
+        `--type=${serviceAccount ? 'cloud_iam_service_account' : 'cloud_iam_user'}`,
+        ...scope
       ]
-    : []
+    })
+  }
   return {
     ref: {
       provider: 'gcp',
@@ -1472,6 +1788,61 @@ function azurePlan(d: ProvisionDraft): ProvisionPlan {
       ],
       timeoutSecs: CREATE_TIMEOUT
     })
+  } else if (d.engine === 'cosmos') {
+    const sizeArgs =
+      d.size === 'serverless'
+        ? ['--capabilities', 'EnableServerless']
+        : d.size === 'free'
+          ? ['--enable-free-tier', 'true']
+          : []
+    const network =
+      d.access === 'private'
+        ? ['--public-network-access', 'Disabled']
+        : d.access === 'ip'
+          ? ['--ip-range-filter', cidr(d)]
+          : []
+    steps.push({
+      title: 'Create the Cosmos DB account (takes several minutes)',
+      args: () => [
+        'cosmosdb',
+        'create',
+        ...rg,
+        '--name',
+        name,
+        '--kind',
+        'MongoDB',
+        '--server-version',
+        d.version,
+        '--locations',
+        `regionName=${d.region}`,
+        'failoverPriority=0',
+        'isZoneRedundant=False',
+        '--default-consistency-level',
+        'Session',
+        ...sizeArgs,
+        ...network,
+        ...tags,
+        ...scope
+      ],
+      timeoutSecs: CREATE_TIMEOUT
+    })
+    if (d.database) {
+      afterReady.push({
+        title: `Create database ${d.database}`,
+        args: () => [
+          'cosmosdb',
+          'mongodb',
+          'database',
+          'create',
+          ...rg,
+          '--account-name',
+          name,
+          '--name',
+          d.database,
+          ...scope
+        ]
+      })
+    }
   } else {
     const family = d.engine === 'mysql' ? 'mysql' : 'postgres'
     const [tier, sku] = d.size.includes(':') ? d.size.split(':') : ['', d.size]
@@ -1545,15 +1916,18 @@ const PREVIEW_CTX = new Proxy({} as Record<string, string>, {
 
 /** The plan as a shell script, with the secret file shown by name. */
 export function planScript(plan: ProvisionPlan, cli: string): string {
-  const all = [...plan.steps, ...plan.afterReady]
-  return all
+  return stepsScript([...plan.steps, ...plan.afterReady], cli, plan.steps.length)
+}
+
+/** Steps as a shell script; `waitAt` marks where the script waits for the server. */
+export function stepsScript(steps: PlanStep[], cli: string, waitAt = -1): string {
+  return steps
     .map((step, i) => {
       const args = step
         .args(PREVIEW_CTX)
         .map((a) => a.replace('{secret}', 'password-file'))
         .map(shellQuote)
-      const waits =
-        i === plan.steps.length && plan.afterReady.length ? '# …once the server is ready\n' : ''
+      const waits = i === waitAt && i > 0 ? '# …once the server is ready\n' : ''
       return `${waits}# ${step.title}\n${cli} ${args.join(' ')}`
     })
     .join('\n\n')
@@ -1569,13 +1943,182 @@ export function commandLine(cli: string, args: string[]): string {
 }
 
 /** The connection to save once a provisioned database is ready. */
-export function provisionedConnection(draft: ProvisionDraft, db: CloudDatabase): ConnectionConfig {
+export function provisionedConnection(
+  draft: ProvisionDraft,
+  db: CloudDatabase,
+  credentials: Credentials = {}
+): ConnectionConfig {
+  const base = connectionFor(db)
+  const option = engineOption(draft.provider, draft.engine)
   return {
-    ...connectionFor(db),
+    ...base,
     name: draft.name.trim(),
-    user: engineOption(draft.provider, draft.engine).fixedUser ? db.user : draft.user,
-    database: draft.database || connectionFor(db).database,
+    user: option.fixedUser || option.noCredentials ? base.user : draft.user,
+    database: draft.database || base.database,
+    ...(credentials.uri ? { uri: credentials.uri } : {}),
     savePassword: true
+  }
+}
+
+/* ---------- Deleting ---------- */
+
+export interface DeleteOptions {
+  /** AWS: keep a final snapshot to restore from */
+  finalSnapshot: boolean
+  /** Turn deletion protection off first */
+  disableProtection: boolean
+}
+
+/** Only AWS takes a final snapshot as part of the delete call. */
+export function canSnapshot(db: CloudDatabase): boolean {
+  return db.ref.provider === 'aws'
+}
+
+/** Leftovers dbms-tool can't remove until the database is gone. */
+export function deleteLeftovers(db: CloudDatabase): string | null {
+  if (db.ref.provider !== 'aws') return null
+  return db.engine === 'babelfish'
+    ? 'A security group and the Babelfish parameter group created with it stay behind; delete them in the AWS console once the cluster is gone.'
+    : 'A security group created for it by dbms-tool stays behind; delete it in the AWS console once the database is gone.'
+}
+
+const DELETE_TIMEOUT = 30 * 60
+
+export function deletePlan(
+  db: CloudDatabase,
+  options: DeleteOptions,
+  now = new Date()
+): PlanStep[] {
+  const { ref } = db
+  const name = ref.resource
+  const scope = scopeArgs(ref.provider, ref.context, ref.region)
+  switch (ref.provider) {
+    case 'aws': {
+      // DocumentDB clusters have their own API with the same shape
+      const service = db.engine === 'mongo' ? 'docdb' : 'rds'
+      const stamp = now.toISOString().slice(0, 16).replace(/[-:T]/g, '')
+      const snapshot = options.finalSnapshot
+        ? ['--final-db-snapshot-identifier', `${name}-final-${stamp}`]
+        : ['--skip-final-snapshot']
+      if (ref.kind === 'cluster') {
+        return [
+          ...(options.disableProtection
+            ? [
+                {
+                  title: 'Turn off deletion protection',
+                  args: () => [
+                    service,
+                    'modify-db-cluster',
+                    '--db-cluster-identifier',
+                    name,
+                    '--no-deletion-protection',
+                    '--apply-immediately',
+                    ...scope
+                  ]
+                }
+              ]
+            : []),
+          // A cluster can't be deleted while it still has instances
+          ...(db.members ?? []).map((member): PlanStep => ({
+            title: `Delete instance ${member}`,
+            args: () => [
+              service,
+              'delete-db-instance',
+              '--db-instance-identifier',
+              member,
+              ...scope
+            ]
+          })),
+          {
+            title: `Delete cluster ${name}`,
+            args: () => [
+              service,
+              'delete-db-cluster',
+              '--db-cluster-identifier',
+              name,
+              ...snapshot,
+              ...scope
+            ]
+          }
+        ]
+      }
+      return [
+        ...(options.disableProtection
+          ? [
+              {
+                title: 'Turn off deletion protection',
+                args: () => [
+                  'rds',
+                  'modify-db-instance',
+                  '--db-instance-identifier',
+                  name,
+                  '--no-deletion-protection',
+                  '--apply-immediately',
+                  ...scope
+                ]
+              }
+            ]
+          : []),
+        {
+          title: `Delete instance ${name}`,
+          args: () => [
+            'rds',
+            'delete-db-instance',
+            '--db-instance-identifier',
+            name,
+            ...snapshot,
+            ...scope
+          ]
+        }
+      ]
+    }
+    case 'gcp':
+      return [
+        ...(options.disableProtection
+          ? [
+              {
+                title: 'Turn off deletion protection',
+                args: () => [
+                  'sql',
+                  'instances',
+                  'patch',
+                  name,
+                  '--no-deletion-protection',
+                  ...scope
+                ],
+                timeoutSecs: DELETE_TIMEOUT
+              }
+            ]
+          : []),
+        {
+          title: `Delete instance ${name}`,
+          args: () => ['sql', 'instances', 'delete', name, ...scope],
+          timeoutSecs: DELETE_TIMEOUT
+        }
+      ]
+    case 'azure': {
+      const target = [
+        '--resource-group',
+        ref.resourceGroup ?? '',
+        '--name',
+        name,
+        '--yes',
+        ...scope
+      ]
+      const command =
+        ref.kind === 'sql'
+          ? ['sql', 'server', 'delete']
+          : ref.kind === 'cosmos'
+            ? ['cosmosdb', 'delete']
+            : [ref.kind === 'mysql' ? 'mysql' : 'postgres', 'flexible-server', 'delete']
+      return [
+        {
+          title: `Delete ${ref.kind === 'cosmos' ? 'account' : 'server'} ${name}`,
+          args: () => [...command, ...target],
+          timeoutSecs: DELETE_TIMEOUT
+        }
+      ]
+    }
   }
 }
 
@@ -1604,4 +2147,12 @@ function num(value: unknown): number {
 
 function isDefined<T>(value: T | null | undefined): value is T {
   return value != null
+}
+
+/** Guesses the provider from a managed database's host name. */
+export function providerForHost(host: string): CloudProvider | null {
+  const h = host.toLowerCase()
+  if (h.endsWith('.amazonaws.com')) return 'aws'
+  if (/\.(database\.azure\.com|database\.windows\.net|cosmos\.azure\.com)$/.test(h)) return 'azure'
+  return null
 }

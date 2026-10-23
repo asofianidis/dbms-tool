@@ -19,6 +19,7 @@ fn needs_password(config: &ConnectionConfig) -> bool {
         // A URI may carry its own credentials; only ask when we built it ourselves
         return config.uri.trim().is_empty() && !config.user.is_empty();
     }
+    // Cloud tokens are fetched at connect time, and Windows auth needs none
     config.auth == AuthMode::Password && !config.user.is_empty()
 }
 

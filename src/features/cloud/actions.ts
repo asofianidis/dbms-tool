@@ -15,13 +15,17 @@ import {
   parseDescribe,
   parseIdentity,
   parseList,
-  parseSecret,
+  parseCredentials,
   provisionPlan,
   provisionedConnection,
-  secretCommand,
+  credentialsCommand,
   connectionFor,
   contextsCommand,
+  deletePlan,
+  iamUserFor,
   type CloudDatabase,
+  type Credentials,
+  type DeleteOptions,
   type PlanStep,
   type ProvisionDraft,
   type ProvisionPlan
@@ -32,6 +36,7 @@ import { errorMessage, toast } from '@/lib/toast'
 import {
   connect,
   connectionsStore,
+  disconnect,
   loadConnections,
   newQueryTab,
   openPrefilledConnection
@@ -137,18 +142,33 @@ export async function connectToCloudDatabase(db: CloudDatabase): Promise<void> {
     return
   }
   const config = connectionFor(db)
-  let password: string | undefined
-  const secretArgs = secretCommand(db)
-  if (secretArgs) {
-    try {
-      const secret = parseSecret(await runCli(db.ref.provider, secretArgs))
-      password = secret.password
-      if (secret.username) config.user = secret.username
-    } catch (e) {
-      toast(`Couldn't read the password from Secrets Manager: ${errorMessage(e)}`, 'info')
+  const credentials = await fetchCredentials(db)
+  if (credentials.uri) config.uri = credentials.uri
+  else if (credentials.username) config.user = credentials.username
+  // Databases set up for IAM sign-in connect as whoever the CLI is signed in as
+  if (db.iamAuth && !credentials.password) {
+    const identity = await queryClient
+      .fetchQuery(cloudQueries.identity(db.ref.provider, db.ref.context))
+      .catch(() => null)
+    const user = iamUserFor(db, identity)
+    if (user) {
+      config.auth = 'cloud'
+      config.user = user
     }
   }
-  openPrefilledConnection(config, password)
+  openPrefilledConnection(config, credentials.password)
+}
+
+/** Credentials the provider keeps (Secrets Manager, Cosmos DB keys); empty when there are none. */
+async function fetchCredentials(db: CloudDatabase): Promise<Credentials> {
+  const args = credentialsCommand(db)
+  if (!args) return {}
+  try {
+    return parseCredentials(db, await runCli(db.ref.provider, args))
+  } catch (e) {
+    toast(`Couldn't fetch the credentials for ${db.name}: ${errorMessage(e)}`, 'info')
+    return {}
+  }
 }
 
 /* ---------- Provisioning ---------- */
@@ -158,6 +178,7 @@ export interface ProvisionJob {
   provider: CloudProvider
   name: string
   engineLabel: string
+  action: 'create' | 'delete'
   state: 'running' | 'waiting' | 'ready' | 'failed'
   /** What's happening now, e.g. the step title */
   activity: string
@@ -259,6 +280,7 @@ export function startProvision(draft: ProvisionDraft, engineLabel: string): stri
       provider: draft.provider,
       name: draft.name.trim(),
       engineLabel,
+      action: 'create',
       state: 'running',
       activity: 'Starting',
       log: [],
@@ -274,7 +296,12 @@ export function startProvision(draft: ProvisionDraft, engineLabel: string): stri
       if (plan.afterReady.length) await runSteps(id, draft.provider, plan.afterReady, {})
       let connectionId: string | undefined
       if (draft.saveConnection) {
-        const saved = await api.connectionSave(provisionedConnection(draft, db), draft.password)
+        // Cosmos DB has no admin password; its connection string carries a key
+        const credentials = await fetchCredentials(db)
+        const saved = await api.connectionSave(
+          provisionedConnection(draft, db, credentials),
+          credentials.password ?? draft.password
+        )
         await loadConnections()
         connectionId = saved.id
         logJob(id, `Saved connection "${saved.name}"`)
@@ -288,6 +315,56 @@ export function startProvision(draft: ProvisionDraft, engineLabel: string): stri
       updateJob(id, { state: 'failed', activity: 'Failed', error: message })
       refreshCloud(draft.provider)
       toast(`Provisioning ${draft.name} failed: ${message}`, 'error')
+    }
+  })()
+  return id
+}
+
+/** Deletes a cloud database in the background, and its saved connection if given. */
+export function startDeletion(
+  db: CloudDatabase,
+  options: DeleteOptions,
+  connectionId?: string
+): string {
+  const steps = deletePlan(db, options)
+  const provider = db.ref.provider
+  const id = crypto.randomUUID().slice(0, 8)
+  jobsStore.set((jobs) => [
+    {
+      id,
+      provider,
+      name: db.name,
+      engineLabel: db.product,
+      action: 'delete',
+      state: 'running',
+      activity: 'Starting',
+      log: [],
+      startedAt: Date.now()
+    },
+    ...jobs
+  ])
+  void (async () => {
+    try {
+      await runSteps(id, provider, steps, {})
+      if (connectionId) {
+        await disconnect(connectionId)
+        await api.connectionDelete(connectionId)
+        await loadConnections()
+        logJob(id, 'Removed the saved connection')
+      }
+      // AWS returns as soon as deletion starts; gcloud and az wait for it
+      const activity =
+        provider === 'aws' ? 'Deletion started; AWS finishes in a few minutes' : 'Deleted'
+      logJob(id, activity)
+      updateJob(id, { state: 'ready', activity })
+      refreshCloud(provider)
+      toast(provider === 'aws' ? `Deleting ${db.name}` : `Deleted ${db.name}`)
+    } catch (e) {
+      const message = errorMessage(e)
+      logJob(id, message, 'error')
+      updateJob(id, { state: 'failed', activity: 'Failed', error: message })
+      refreshCloud(provider)
+      toast(`Deleting ${db.name} failed: ${message}`, 'error')
     }
   })()
   return id

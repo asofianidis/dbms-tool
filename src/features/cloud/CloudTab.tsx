@@ -9,11 +9,12 @@ import {
   Plug,
   Plus,
   RefreshCw,
+  Trash2,
   TriangleAlert,
   X,
   XCircle
 } from 'lucide-react'
-import type { CloudProvider } from '@/lib/api'
+import type { CloudProvider, ConnectionConfig } from '@/lib/api'
 import {
   PROVIDERS,
   PROVIDER_ORDER,
@@ -48,6 +49,7 @@ import {
   signIn,
   type ProvisionJob
 } from './actions'
+import { DeleteDialog } from './DeleteDialog'
 import { ProvisionDialog } from './ProvisionDialog'
 
 export function CloudTab(): React.JSX.Element {
@@ -359,7 +361,7 @@ function DatabaseList({
             <DatabaseRow
               key={`${db.ref.kind}:${db.ref.region}:${db.name}`}
               db={db}
-              saved={findSaved(connections, db)?.name}
+              saved={findSaved(connections, db)}
             />
           ))}
         </div>
@@ -387,8 +389,15 @@ function statusTone(db: CloudDatabase): 'success' | 'warning' | 'danger' | 'neut
   return 'warning'
 }
 
-function DatabaseRow({ db, saved }: { db: CloudDatabase; saved?: string }): React.JSX.Element {
+function DatabaseRow({
+  db,
+  saved
+}: {
+  db: CloudDatabase
+  saved?: ConnectionConfig
+}): React.JSX.Element {
   const [busy, setBusy] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   return (
     <div className="flex items-center gap-3 px-3 py-2.5">
       <EngineMark engine={db.engine} size="lg" />
@@ -397,8 +406,13 @@ function DatabaseRow({ db, saved }: { db: CloudDatabase; saved?: string }): Reac
           <span className="truncate font-medium text-bright">{db.name}</span>
           <Badge tone={statusTone(db)}>{db.status || 'unknown'}</Badge>
           {saved && (
-            <Badge tone="accent" title={`Saved as "${saved}"`}>
+            <Badge tone="accent" title={`Saved as "${saved.name}"`}>
               saved
+            </Badge>
+          )}
+          {db.iamAuth && (
+            <Badge tone="info" title="Accepts passwordless sign-in with your cloud identity">
+              IAM
             </Badge>
           )}
           {db.note && (
@@ -454,6 +468,17 @@ function DatabaseRow({ db, saved }: { db: CloudDatabase; saved?: string }): Reac
         {busy ? <Spinner className="text-current" /> : <Plug className="size-3.5" />}
         {saved ? 'Open' : 'Connect'}
       </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        className="hover:text-danger"
+        title={`Delete ${db.name}…`}
+        disabled={/delet/.test(db.status)}
+        onClick={() => setDeleting(true)}
+      >
+        <Trash2 className="size-3.5" />
+      </Button>
+      {deleting && <DeleteDialog db={db} saved={saved} onClose={() => setDeleting(false)} />}
     </div>
   )
 }
@@ -485,7 +510,8 @@ function JobCard({ job }: { job: ProvisionJob }): React.JSX.Element {
             <span className="font-medium">{job.name}</span>
             <span className="text-muted">
               {' '}
-              · {PROVIDERS[job.provider].label} {job.engineLabel}
+              · {job.action === 'delete' ? 'Deleting ' : ''}
+              {PROVIDERS[job.provider].label} {job.engineLabel}
             </span>
           </p>
           <p

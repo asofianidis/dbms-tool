@@ -3,7 +3,7 @@ pub mod mssql;
 pub mod mysql;
 pub mod postgres;
 
-use crate::config::{ConnectionConfig, Engine};
+use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
 
@@ -23,6 +23,20 @@ impl Session {
         password: Option<&str>,
         database: &str,
     ) -> AppResult<Session> {
+        // Fetched per connection (tokens expire); always over TLS, since MySQL
+        // sends the token in clear text
+        let token;
+        let cloud_config;
+        let (config, password) = if config.auth == AuthMode::Cloud {
+            token = crate::cloud::database_token(config).await?;
+            cloud_config = ConnectionConfig {
+                ssl: SslMode::Require,
+                ..config.clone()
+            };
+            (&cloud_config, Some(token.as_str()))
+        } else {
+            (config, password)
+        };
         Ok(match config.engine {
             Engine::Postgres => Session::Pg(postgres::connect(config, password, database).await?),
             Engine::Mysql => Session::My(mysql::connect(config, password, database).await?),

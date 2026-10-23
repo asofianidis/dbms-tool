@@ -2,13 +2,16 @@
 //! parses the JSON output; this module only finds the binaries and runs them,
 //! so whatever sign-in the user already has (SSO, MFA, profiles) just works.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::config::{ConnectionConfig, Engine};
 use crate::error::{AppError, AppResult};
 
 /// Replaced in arguments by the path of a temporary file holding the secret, so
@@ -250,9 +253,181 @@ fn describe_failure(stderr: &str, stdout: &str) -> String {
     }
 }
 
+/// The parts of a connection's `cloud` field that token generation needs.
+#[derive(Debug, Deserialize)]
+struct CloudRef {
+    provider: Provider,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    region: String,
+}
+
+/// Tokens last 15 minutes (AWS) to an hour (Google, Entra); reuse them for a
+/// while so opening tabs doesn't run the CLI every time.
+const TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
+
+static TOKENS: LazyLock<parking_lot::Mutex<HashMap<String, (String, Instant)>>> =
+    LazyLock::new(Default::default);
+
+/// `mydb.abc123.eu-west-1.rds.amazonaws.com` → `eu-west-1`
+fn region_from_host(host: &str) -> Option<&str> {
+    let mut labels = host.rsplit('.');
+    (labels.next()? == "com" && labels.next()? == "amazonaws" && labels.next()? == "rds")
+        .then(|| labels.next())
+        .flatten()
+}
+
+/// Arguments that print a database login token, and nothing else, to stdout.
+fn token_args(config: &ConnectionConfig, cloud: &CloudRef) -> AppResult<Vec<String>> {
+    let owned = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    Ok(match cloud.provider {
+        Provider::Aws => {
+            if matches!(config.engine, Engine::Mssql | Engine::Babelfish) {
+                return Err(AppError::Unsupported(
+                    "AWS IAM authentication works with PostgreSQL and MySQL, not SQL Server".into(),
+                ));
+            }
+            let region = if cloud.region.is_empty() {
+                region_from_host(&config.host).ok_or_else(|| {
+                    AppError::msg(
+                        "Can't tell the AWS region from the host; set it on the connection",
+                    )
+                })?
+            } else {
+                &cloud.region
+            };
+            let port = if config.port == 0 {
+                if config.engine == Engine::Mysql {
+                    3306
+                } else {
+                    5432
+                }
+            } else {
+                config.port
+            };
+            let mut args = owned(&["rds", "generate-db-auth-token", "--hostname", &config.host]);
+            args.extend(owned(&[
+                "--port",
+                &port.to_string(),
+                "--username",
+                &config.user,
+            ]));
+            args.extend(owned(&["--region", region, "--output", "text"]));
+            if !cloud.context.is_empty() {
+                args.extend(owned(&["--profile", &cloud.context]));
+            }
+            args
+        }
+        Provider::Gcp => owned(&["sql", "generate-login-token", "--quiet"]),
+        Provider::Azure => {
+            // Azure SQL takes a token for the database resource; PostgreSQL and
+            // MySQL flexible servers share the "oss-rdbms" resource
+            let mut args = if matches!(config.engine, Engine::Mssql | Engine::Babelfish) {
+                owned(&[
+                    "account",
+                    "get-access-token",
+                    "--resource",
+                    "https://database.windows.net/",
+                ])
+            } else {
+                owned(&[
+                    "account",
+                    "get-access-token",
+                    "--resource-type",
+                    "oss-rdbms",
+                ])
+            };
+            args.extend(owned(&["--query", "accessToken", "--output", "tsv"]));
+            if !cloud.context.is_empty() {
+                args.extend(owned(&["--subscription", &cloud.context]));
+            }
+            args
+        }
+    })
+}
+
+/// A login token for a connection that uses `AuthMode::Cloud`.
+pub async fn database_token(config: &ConnectionConfig) -> AppResult<String> {
+    let cloud: CloudRef = config
+        .cloud
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .ok_or_else(|| {
+            AppError::msg("Pick the cloud provider for IAM sign-in in the connection settings")
+        })?;
+    let args = token_args(config, &cloud)?;
+    let key = format!("{:?}|{}", cloud.provider, args.join(" "));
+    if let Some((token, at)) = TOKENS.lock().get(&key)
+        && at.elapsed() < TOKEN_TTL
+    {
+        return Ok(token.clone());
+    }
+    let token = run(cloud.provider, args, None, Some(60))
+        .await?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(AppError::msg(format!(
+            "{} returned an empty token",
+            cloud.provider.program()
+        )));
+    }
+    TOKENS.lock().insert(key, (token.clone(), Instant::now()));
+    Ok(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection(engine: Engine, host: &str, cloud: serde_json::Value) -> ConnectionConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "x", "engine": engine, "host": host, "port": 0,
+            "user": "app_user", "cloud": cloud
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn aws_token_args_use_host_region_and_profile() {
+        let cfg = connection(
+            Engine::Postgres,
+            "db.abc.eu-west-1.rds.amazonaws.com",
+            serde_json::json!({ "provider": "aws", "context": "work" }),
+        );
+        let cloud: CloudRef = serde_json::from_value(cfg.cloud.clone().unwrap()).unwrap();
+        let args = token_args(&cfg, &cloud).unwrap().join(" ");
+        assert_eq!(
+            args,
+            "rds generate-db-auth-token --hostname db.abc.eu-west-1.rds.amazonaws.com --port 5432 --username app_user --region eu-west-1 --output text --profile work"
+        );
+        let mssql = connection(Engine::Mssql, "x", serde_json::json!({ "provider": "aws" }));
+        assert!(token_args(&mssql, &cloud).is_err());
+        assert_eq!(region_from_host("example.com"), None);
+    }
+
+    #[test]
+    fn azure_token_resource_depends_on_engine() {
+        let cloud = CloudRef {
+            provider: Provider::Azure,
+            context: String::new(),
+            region: String::new(),
+        };
+        let sql = token_args(
+            &connection(Engine::Mssql, "s", serde_json::Value::Null),
+            &cloud,
+        );
+        assert!(
+            sql.unwrap()
+                .contains(&"https://database.windows.net/".to_string())
+        );
+        let pg = token_args(
+            &connection(Engine::Postgres, "s", serde_json::Value::Null),
+            &cloud,
+        );
+        assert!(pg.unwrap().contains(&"oss-rdbms".to_string()));
+    }
 
     #[test]
     fn failure_text_skips_noise() {

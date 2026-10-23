@@ -32,7 +32,7 @@ import {
   Spinner,
   Toggle
 } from '@/components/ui'
-import { cloudPrefsStore, detectPublicIp, runCli, startProvision } from './actions'
+import { cloudPrefsStore, cloudQueries, detectPublicIp, runCli, startProvision } from './actions'
 
 export function ProvisionDialog({
   provider,
@@ -52,6 +52,14 @@ export function ProvisionDialog({
   const [ipState, setIpState] = useState<'idle' | 'detecting' | 'failed'>('idle')
   const info = PROVIDERS[provider]
   const option = engineOption(provider, draft.engine)
+  // Google Cloud adds the signed-in account as the instance's IAM user
+  const identity = useQuery({
+    ...cloudQueries.identity(provider, context),
+    enabled: provider === 'gcp'
+  })
+  useEffect(() => {
+    if (provider === 'gcp') setDraft((d) => ({ ...d, iamUser: identity.data ?? '' }))
+  }, [provider, identity.data])
   const patch = (p: Partial<ProvisionDraft>): void => setDraft((d) => ({ ...d, ...p }))
 
   const detectIp = async (): Promise<void> => {
@@ -191,6 +199,12 @@ export function ProvisionDialog({
                 </Select>
               </Field>
             </div>
+            {draft.engine === 'babelfish' && (
+              <p className="mt-2 text-[11.5px] leading-snug text-muted">
+                An Aurora PostgreSQL cluster with a parameter group that turns on Babelfish. Connect
+                with T-SQL on port 1433; PostgreSQL stays available on 5432.
+              </p>
+            )}
           </Section>
 
           <Section title="Instance">
@@ -281,49 +295,63 @@ export function ProvisionDialog({
           </Section>
 
           <Section title="Credentials">
-            <div className="grid grid-cols-2 gap-3">
-              <Field
-                label="Admin user"
-                hint={option.fixedUser ? `${info.label} names this user for you` : undefined}
-              >
-                <Input
-                  value={draft.user}
-                  disabled={option.fixedUser}
-                  onChange={(e) => patch({ user: e.target.value })}
-                />
-              </Field>
-              <Field label="Password" hint="Saved to the OS credential manager with the connection">
-                <div className="flex gap-1">
+            {option.noCredentials ? (
+              <p className="text-[11.5px] leading-snug text-muted">
+                Cosmos DB generates access keys for the account. The saved connection uses its
+                primary connection string, with the key kept in the OS credential manager.
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                <Field
+                  label="Admin user"
+                  hint={option.fixedUser ? `${info.label} names this user for you` : undefined}
+                >
                   <Input
-                    mono
-                    type={showPassword ? 'text' : 'password'}
-                    value={draft.password}
-                    onChange={(e) => patch({ password: e.target.value })}
+                    value={draft.user}
+                    disabled={option.fixedUser}
+                    onChange={(e) => patch({ user: e.target.value })}
                   />
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="size-8"
-                    title={showPassword ? 'Hide' : 'Show'}
-                    onClick={() => setShowPassword((s) => !s)}
-                  >
-                    {showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="size-8"
-                    title="Generate a new password"
-                    onClick={() => {
-                      patch({ password: generatePassword() })
-                      setShowPassword(true)
-                    }}
-                  >
-                    <Dices className="size-3.5" />
-                  </Button>
-                </div>
-              </Field>
-            </div>
+                </Field>
+                <Field
+                  label="Password"
+                  hint="Saved to the OS credential manager with the connection"
+                >
+                  <div className="flex gap-1">
+                    <Input
+                      mono
+                      type={showPassword ? 'text' : 'password'}
+                      value={draft.password}
+                      onChange={(e) => patch({ password: e.target.value })}
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-8"
+                      title={showPassword ? 'Hide' : 'Show'}
+                      onClick={() => setShowPassword((s) => !s)}
+                    >
+                      {showPassword ? (
+                        <EyeOff className="size-3.5" />
+                      ) : (
+                        <Eye className="size-3.5" />
+                      )}
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-8"
+                      title="Generate a new password"
+                      onClick={() => {
+                        patch({ password: generatePassword() })
+                        setShowPassword(true)
+                      }}
+                    >
+                      <Dices className="size-3.5" />
+                    </Button>
+                  </div>
+                </Field>
+              </div>
+            )}
             {option.initialDatabase && (
               <Field
                 className="mt-3"
@@ -427,6 +455,20 @@ export function ProvisionDialog({
                   onChange={(deletionProtection) => patch({ deletionProtection })}
                   label="Deletion protection"
                   description="Block accidental deletes"
+                />
+              )}
+              {option.iam && (
+                <Toggle
+                  checked={draft.iamAuth}
+                  onChange={(iamAuth) => patch({ iamAuth })}
+                  label="IAM database authentication"
+                  description={
+                    provider === 'gcp'
+                      ? draft.iamUser
+                        ? `Adds ${draft.iamUser} as an IAM user`
+                        : 'Sign in to gcloud to add your account'
+                      : 'Allow sign-in with AWS IAM tokens'
+                  }
                 />
               )}
               <Toggle

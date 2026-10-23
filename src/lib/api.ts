@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 
 export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo'
 export type SslMode = 'disable' | 'prefer' | 'require'
-export type AuthMode = 'password' | 'windows'
+export type AuthMode = 'password' | 'windows' | 'cloud'
 
 export interface ConnectionConfig {
   id: string

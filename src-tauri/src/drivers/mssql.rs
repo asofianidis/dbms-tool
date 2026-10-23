@@ -85,6 +85,7 @@ fn build_config(
                 "Windows authentication is only available on Windows".into(),
             ));
         }
+        AuthMode::Cloud => config.authentication(AuthMethod::aad_token(password.unwrap_or(""))),
     }
     config.encryption(match cfg.ssl {
         SslMode::Disable => EncryptionLevel::NotSupported,
