@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ChevronDown,
@@ -12,11 +12,10 @@ import {
   Hash,
   KeyRound,
   Link2,
+  ListChecks,
   Lock,
   Plus,
-  RefreshCw,
-  Save,
-  Undo2
+  RefreshCw
 } from 'lucide-react'
 import {
   api,
@@ -31,6 +30,16 @@ import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
 import { formatDuration, plural } from '@/lib/format'
+import {
+  addInsert,
+  deleteRow,
+  editInsert,
+  editRow,
+  removeChange,
+  rowKeyOf,
+  toRowEdits,
+  type PendingChange
+} from '@/lib/pending'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import {
@@ -42,7 +51,6 @@ import {
   scriptCreateTable,
   selectRows,
   wrapInTransaction,
-  type RowEdit,
   type TableRef
 } from '@/lib/sql'
 import { errorMessage, toast, toastError } from '@/lib/toast'
@@ -74,15 +82,8 @@ import {
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
+import { ChangesPanel } from './ChangesPanel'
 import { openTableDesigner } from './TableDesigner'
-
-interface Edits {
-  updates: Map<number, Map<number, Cell>>
-  deleted: Set<number>
-  inserted: Cell[][]
-}
-
-const emptyEdits = (): Edits => ({ updates: new Map(), deleted: new Set(), inserted: [] })
 
 export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
   const connections = connectionsStore.use()
@@ -175,7 +176,8 @@ function DataView({
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [total, setTotal] = useState<number | null>(null)
-  const [edits, setEdits] = useState<Edits>(emptyEdits)
+  const [changes, setChanges] = useState<PendingChange[]>([])
+  const [panelOpen, setPanelOpen] = useState(false)
   const [filter, setFilter] = useState('')
 
   const set = output?.results[0]
@@ -205,11 +207,9 @@ function DataView({
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
         maxRows: pageSize
       })
+      // Pending changes are keyed by primary key, so they survive reloads and paging
       if (out.error) setError(out.error.message)
-      else {
-        setOutput(out)
-        setEdits(emptyEdits())
-      }
+      else setOutput(out)
     } catch (e) {
       setError(errorMessage(e))
     } finally {
@@ -251,18 +251,39 @@ function DataView({
   }
 
   const baseRows = set?.rows ?? []
-  const rows = useMemo(() => {
-    const merged = baseRows.map((r, i) => {
-      const changes = edits.updates.get(i)
-      if (!changes) return r
-      const copy = [...r]
-      for (const [c, v] of changes) copy[c] = v
-      return copy
-    })
-    return [...merged, ...edits.inserted]
-  }, [baseRows, edits])
+  // The loaded rows as records, with the primary key that ties them to pending changes
+  const baseRecords = useMemo(
+    () =>
+      baseRows.map((r) => {
+        const record = Object.fromEntries(columns.map((c, i) => [c.name, r[i]]))
+        return { record, key: rowKeyOf(pk, record) }
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [baseRows, columns, pk.join(',')]
+  )
+  const byKey = useMemo(
+    () => new Map(changes.filter((c) => c.rowKey).map((c) => [c.rowKey!, c])),
+    [changes]
+  )
+  const inserts = useMemo(() => changes.filter((c) => c.kind === 'insert'), [changes])
+  const rows = useMemo(
+    () => [
+      ...baseRows.map((r, i) => {
+        const change = byKey.get(baseRecords[i].key)
+        if (change?.kind !== 'update') return r
+        return columns.map((c, ci) => (c.name in change.values ? change.values[c.name] : r[ci]))
+      }),
+      ...inserts.map((c) => columns.map((col) => c.values[col.name] ?? null))
+    ],
+    [baseRows, baseRecords, byKey, inserts, columns]
+  )
 
-  const changeCount = edits.updates.size + edits.deleted.size + edits.inserted.length
+  // Open the panel when the first change is made
+  const hadChanges = useRef(false)
+  useEffect(() => {
+    if (changes.length && !hadChanges.current) setPanelOpen(true)
+    hadChanges.current = changes.length > 0
+  }, [changes.length])
 
   const generatedColumns = useMemo(() => {
     const generated = new Set<number>()
@@ -272,44 +293,22 @@ function DataView({
     return generated
   }, [columns, info.data])
 
-  const buildEdits = (): RowEdit[] => {
-    const original = (r: number): Record<string, Cell> =>
-      Object.fromEntries(columns.map((c, i) => [c.name, baseRows[r][i]]))
-    const list: RowEdit[] = []
-    for (const r of edits.deleted)
-      if (r < baseRows.length) list.push({ kind: 'delete', original: original(r) })
-    for (const [r, changes] of edits.updates) {
-      if (edits.deleted.has(r)) continue
-      list.push({
-        kind: 'update',
-        original: original(r),
-        values: Object.fromEntries([...changes].map(([c, v]) => [columns[c].name, v]))
-      })
-    }
-    edits.inserted.forEach((row, i) => {
-      if (edits.deleted.has(baseRows.length + i)) return
-      const values: Record<string, Cell> = {}
-      row.forEach((v, c) => {
-        // Leave untouched cells out so defaults and identities apply
-        if (v !== null && !generatedColumns.has(c)) values[columns[c].name] = v
-      })
-      list.push({ kind: 'insert', values })
-    })
-    return list
-  }
-
-  const saveChanges = async (): Promise<void> => {
+  /** Commits the given pending changes (all by default) in one transaction. */
+  const commit = async (ids?: string[]): Promise<void> => {
     if (!info.data) return
-    const statements = editStatements(dialect, tableRef, info.data, buildEdits())
-    if (!statements.length) return setEdits(emptyEdits())
+    const subset = ids ? changes.filter((c) => ids.includes(c.id)) : changes
+    const statements = editStatements(dialect, tableRef, info.data, toRowEdits(subset))
+    const done = new Set(subset.map((c) => c.id))
+    if (!statements.length) return setChanges((all) => all.filter((c) => !done.has(c.id)))
     const script = wrapInTransaction(dialect, statements)
-    if (confirmDangerous || edits.deleted.size > 0) {
+    const deletes = subset.some((c) => c.kind === 'delete')
+    if (confirmDangerous || deletes) {
       const ok = await confirm({
-        title: `Apply ${plural(statements.length, 'change')}?`,
+        title: `Commit ${plural(statements.length, 'change')}?`,
         message: 'These statements run in one transaction; if any fails, none are applied.',
         code: script,
-        confirmLabel: 'Apply changes',
-        danger: edits.deleted.size > 0
+        confirmLabel: 'Commit',
+        danger: deletes
       })
       if (!ok) return
     }
@@ -325,9 +324,11 @@ function DataView({
             dialect === 'tsql' ? 'IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION' : 'ROLLBACK'
           )
           .catch(() => {})
-        toast(`Changes not saved: ${out.error.message}`, 'error')
+        toast(`Changes not committed: ${out.error.message}`, 'error')
       } else {
-        toast(`Saved ${plural(statements.length, 'change')}`)
+        // Functional update keeps changes edited while the commit ran
+        setChanges((all) => all.filter((c) => !done.has(c.id)))
+        toast(`Committed ${plural(statements.length, 'change')}`)
         await load()
       }
     } catch (e) {
@@ -337,51 +338,42 @@ function DataView({
     }
   }
 
+  const insertAt = (row: number): PendingChange | undefined => inserts[row - baseRows.length]
   const editing = canEdit
     ? {
         onEdit: (row: number, col: number, value: Cell) =>
-          setEdits((e) => {
-            if (row >= baseRows.length) {
-              const inserted = e.inserted.map((r, i) =>
-                i === row - baseRows.length ? r.map((v, c) => (c === col ? value : v)) : r
-              )
-              return { ...e, inserted }
-            }
-            const updates = new Map(e.updates)
-            const changes = new Map(updates.get(row) ?? [])
-            if (value === baseRows[row][col]) changes.delete(col)
-            else changes.set(col, value)
-            if (changes.size) updates.set(row, changes)
-            else updates.delete(row)
-            return { ...e, updates }
-          }),
+          setChanges((all) =>
+            row >= baseRows.length
+              ? editInsert(all, insertAt(row)!.id, columns[col].name, value)
+              : editRow(all, pk, baseRecords[row].record, columns[col].name, value)
+          ),
         rowStatus: (row: number) =>
-          edits.deleted.has(row)
-            ? ('deleted' as const)
-            : row >= baseRows.length
-              ? ('inserted' as const)
+          row >= baseRows.length
+            ? ('inserted' as const)
+            : byKey.get(baseRecords[row].key)?.kind === 'delete'
+              ? ('deleted' as const)
               : undefined,
-        isModified: (row: number, col: number) => !!edits.updates.get(row)?.has(col),
+        isModified: (row: number, col: number) => {
+          const change = row < baseRows.length ? byKey.get(baseRecords[row].key) : undefined
+          return change?.kind === 'update' && columns[col].name in change.values
+        },
         onDeleteRows: (list: number[]) =>
-          setEdits((e) => {
-            // Deleting a new row just drops it
-            const newRows = new Set(
-              list.filter((r) => r >= baseRows.length).map((r) => r - baseRows.length)
+          setChanges((all) =>
+            list.reduce(
+              // Deleting a new row just drops it
+              (acc, row) =>
+                row >= baseRows.length
+                  ? removeChange(acc, insertAt(row)!.id)
+                  : deleteRow(acc, pk, baseRecords[row].record),
+              all
             )
-            const deleted = new Set(e.deleted)
-            for (const r of list) if (r < baseRows.length) deleted.add(r)
-            return { ...e, deleted, inserted: e.inserted.filter((_, i) => !newRows.has(i)) }
-          }),
-        onRevertRows: (list: number[]) =>
-          setEdits((e) => {
-            const updates = new Map(e.updates)
-            const deleted = new Set(e.deleted)
-            for (const r of list) {
-              updates.delete(r)
-              deleted.delete(r)
-            }
-            return { ...e, updates, deleted }
-          }),
+          ),
+        onRevertRows: (list: number[]) => {
+          const keys = new Set(
+            list.filter((r) => r < baseRows.length).map((r) => baseRecords[r].key)
+          )
+          setChanges((all) => all.filter((c) => !c.rowKey || !keys.has(c.rowKey)))
+        },
         readOnlyColumns: generatedColumns
       }
     : undefined
@@ -481,36 +473,19 @@ function DataView({
         <ToolbarDivider />
         {canEdit ? (
           <>
+            <Button size="sm" variant="ghost" onClick={() => setChanges(addInsert)} title="Add row">
+              <Plus className="size-3.5" /> Row
+            </Button>
             <Button
               size="sm"
               variant="ghost"
-              onClick={() =>
-                setEdits((e) => ({ ...e, inserted: [...e.inserted, columns.map(() => null)] }))
-              }
-              title="Add row"
+              onClick={() => setPanelOpen((o) => !o)}
+              title={panelOpen ? 'Hide pending changes' : 'Show pending changes'}
+              className={cn(panelOpen && 'bg-hover text-bright')}
             >
-              <Plus className="size-3.5" /> Row
+              <ListChecks className="size-3.5" /> Pending
+              {changes.length > 0 && <Badge tone="accent">{changes.length}</Badge>}
             </Button>
-            {changeCount > 0 && (
-              <>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setEdits(emptyEdits())}
-                  title="Discard changes"
-                >
-                  <Undo2 className="size-3.5" /> Discard
-                </Button>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  onClick={() => void saveChanges()}
-                  disabled={loading}
-                >
-                  <Save className="size-3.5" /> Save {changeCount}
-                </Button>
-              </>
-            )}
           </>
         ) : (
           !readOnly &&
@@ -550,30 +525,51 @@ function DataView({
         )}
       </Toolbar>
       <ProgressBar active={loading} />
-      <div className="min-h-0 flex-1">
-        {error ? (
-          <div className="p-4">
-            <ErrorText error={error} />
-          </div>
-        ) : set ? (
-          <ResultGrid
+      <div className="flex min-h-0 flex-1">
+        <div className="min-w-0 flex-1">
+          {error ? (
+            <div className="p-4">
+              <ErrorText error={error} />
+            </div>
+          ) : set ? (
+            <ResultGrid
+              columns={columns}
+              rows={rows}
+              editing={editing}
+              sort={sort}
+              onSortChange={(s) => {
+                setSort(s)
+                setPage(0)
+              }}
+              filter={filter}
+              dialect={dialect}
+              tableName={qualified(dialect, tableRef)}
+              onFilterByValue={filterByValue}
+              rowOffset={from}
+              onSelectionSummary={selectionSummaryStore.set}
+            />
+          ) : (
+            <EmptyState title="Loading…" icon={<Spinner className="size-5" />} />
+          )}
+        </div>
+        {canEdit && panelOpen && info.data && (
+          <ChangesPanel
+            changes={changes}
             columns={columns}
-            rows={rows}
-            editing={editing}
-            sort={sort}
-            onSortChange={(s) => {
-              setSort(s)
-              setPage(0)
-            }}
-            filter={filter}
+            primaryKey={pk}
+            info={info.data}
             dialect={dialect}
-            tableName={qualified(dialect, tableRef)}
-            onFilterByValue={filterByValue}
-            rowOffset={from}
-            onSelectionSummary={selectionSummaryStore.set}
+            tableRef={tableRef}
+            visibleKeys={new Set(baseRecords.map((r) => r.key))}
+            readOnlyColumns={
+              new Set(info.data.columns.filter((c) => c.isGenerated).map((c) => c.name))
+            }
+            busy={loading}
+            onChange={setChanges}
+            onCommit={(ids) => void commit(ids)}
+            onCancelAll={() => setChanges([])}
+            onClose={() => setPanelOpen(false)}
           />
-        ) : (
-          <EmptyState title="Loading…" icon={<Spinner className="size-5" />} />
         )}
       </div>
       {output && (
@@ -582,7 +578,8 @@ function DataView({
           <span className="text-faint">{formatDuration(output.elapsedMs)}</span>
           {canEdit && (
             <span className="text-faint">
-              Double-click or F2 to edit · Delete removes rows · changes save in one transaction
+              Double-click or F2 to edit · Delete removes rows · changes wait in Pending until
+              committed
             </span>
           )}
         </div>
