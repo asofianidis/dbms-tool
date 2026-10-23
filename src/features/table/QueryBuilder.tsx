@@ -10,7 +10,6 @@ import {
   Plus,
   X
 } from 'lucide-react'
-import type { ColumnInfo } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
 import {
@@ -28,6 +27,7 @@ import {
   type QueryState,
   type SortKey
 } from '@/lib/filters'
+import { bsonKind, describeMongoQuery } from '@/lib/mongo-filters'
 import { Button, Segmented } from '@/components/ui'
 
 const control =
@@ -49,7 +49,11 @@ const PLACEHOLDER: Record<ColumnKind, string> = {
   other: 'value'
 }
 
-/** Filter and sort builder shown under the Data view toolbar. */
+/**
+ * Filter and sort builder shown under the Data view toolbar. With the 'mongo'
+ * dialect, columns are sampled field paths whose dataType is a BSON type, and
+ * any other dotted path can be typed in.
+ */
 export function QueryBuilder({
   columns,
   dialect,
@@ -57,8 +61,8 @@ export function QueryBuilder({
   onApply,
   onClose
 }: {
-  columns: ColumnInfo[]
-  dialect: Dialect
+  columns: { name: string; dataType: string }[]
+  dialect: Dialect | 'mongo'
   applied: QueryState
   onApply: (query: QueryState) => void
   onClose: () => void
@@ -68,11 +72,15 @@ export function QueryBuilder({
   // Chips, header sorting and "filter by value" change the applied query from outside
   useEffect(() => setDraft(applied), [applied])
 
+  const mongo = dialect === 'mongo'
   const types = Object.fromEntries(columns.map((c) => [c.name, c.dataType]))
-  const kindOf = (column: string): ColumnKind => columnKind(types[column] ?? '')
+  const kindOf = (column: string): ColumnKind =>
+    mongo ? bsonKind(types[column] ?? '') : columnKind(types[column] ?? '')
   const dirty = JSON.stringify(draft) !== JSON.stringify(applied)
-  const where = buildWhere(dialect, draft, types)
-  const orderBy = buildOrderBy(dialect, draft.sorts)
+  const where = mongo ? '' : buildWhere(dialect, draft, types)
+  const orderBy = mongo ? '' : buildOrderBy(dialect, draft.sorts)
+  const rawLabel = mongo ? 'Query' : 'SQL'
+  const fieldList = mongo ? 'query-builder-fields' : undefined
   const apply = (): void => onApply(draft)
 
   const patchCondition = (id: string, patch: Partial<FilterCondition>): void =>
@@ -153,23 +161,38 @@ export function QueryBuilder({
                   <input
                     className={cn(control, 'min-w-0 flex-1 font-mono')}
                     value={c.sql}
-                    placeholder="Any SQL condition, e.g. created_at > now() - interval '1 day'"
+                    placeholder={
+                      mongo
+                        ? 'Any filter document, e.g. { tags: { $size: 3 } }'
+                        : "Any SQL condition, e.g. created_at > now() - interval '1 day'"
+                    }
                     spellCheck={false}
                     onChange={(e) => patchCondition(c.id, { sql: e.target.value })}
                   />
                 ) : (
                   <>
-                    <select
-                      className={cn(control, 'w-40 font-mono')}
-                      value={c.column}
-                      onChange={(e) => setColumn(c, e.target.value)}
-                    >
-                      {columns.map((col) => (
-                        <option key={col.name} value={col.name}>
-                          {col.name}
-                        </option>
-                      ))}
-                    </select>
+                    {mongo ? (
+                      <input
+                        className={cn(control, 'w-40 font-mono')}
+                        value={c.column}
+                        list={fieldList}
+                        placeholder="field.path"
+                        spellCheck={false}
+                        onChange={(e) => setColumn(c, e.target.value)}
+                      />
+                    ) : (
+                      <select
+                        className={cn(control, 'w-40 font-mono')}
+                        value={c.column}
+                        onChange={(e) => setColumn(c, e.target.value)}
+                      >
+                        {columns.map((col) => (
+                          <option key={col.name} value={col.name}>
+                            {col.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <select
                       className={cn(control, 'w-32')}
                       value={c.op}
@@ -230,7 +253,7 @@ export function QueryBuilder({
               <Plus className="size-3" /> Condition
             </Button>
             <Button size="xs" variant="ghost" onClick={() => addCondition('sql')}>
-              <Code2 className="size-3" /> SQL condition
+              <Code2 className="size-3" /> {rawLabel} condition
             </Button>
           </div>
         </section>
@@ -240,19 +263,31 @@ export function QueryBuilder({
             <ArrowDownWideNarrow className="size-3.5" /> Sort by
           </div>
           {draft.sorts.map((s, i) => (
-            <div key={s.column} className="flex items-center gap-1.5">
+            // Typed Mongo field paths change as you type, so key those by position
+            <div key={mongo ? i : s.column} className="flex items-center gap-1.5">
               <span className="w-4 text-right text-[11px] text-faint tabular-nums">{i + 1}</span>
-              <select
-                className={cn(control, 'min-w-0 flex-1 font-mono')}
-                value={s.column}
-                onChange={(e) => patchSort(i, { column: e.target.value })}
-              >
-                {[s.column, ...unsorted.map((c) => c.name)].map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
+              {mongo ? (
+                <input
+                  className={cn(control, 'min-w-0 flex-1 font-mono')}
+                  value={s.column}
+                  list={fieldList}
+                  placeholder="field.path"
+                  spellCheck={false}
+                  onChange={(e) => patchSort(i, { column: e.target.value })}
+                />
+              ) : (
+                <select
+                  className={cn(control, 'min-w-0 flex-1 font-mono')}
+                  value={s.column}
+                  onChange={(e) => patchSort(i, { column: e.target.value })}
+                >
+                  {[s.column, ...unsorted.map((c) => c.name)].map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              )}
               <Segmented
                 size="sm"
                 value={s.dir}
@@ -293,15 +328,19 @@ export function QueryBuilder({
               </Button>
             </div>
           ))}
-          {!draft.sorts.length && <p className="text-[11px] text-faint">Primary key order</p>}
+          {!draft.sorts.length && (
+            <p className="text-[11px] text-faint">
+              {mongo ? 'Natural order' : 'Primary key order'}
+            </p>
+          )}
           <Button
             size="xs"
             variant="ghost"
-            disabled={!unsorted.length}
+            disabled={!mongo && !unsorted.length}
             onClick={() =>
               setDraft((d) => ({
                 ...d,
-                sorts: [...d.sorts, { column: unsorted[0].name, dir: 'asc' }]
+                sorts: [...d.sorts, { column: unsorted[0]?.name ?? '', dir: 'asc' }]
               }))
             }
           >
@@ -312,9 +351,22 @@ export function QueryBuilder({
 
       {showSql && (
         <pre className="mt-2 rounded-md border border-line bg-canvas px-2.5 py-1.5 font-mono text-[11.5px] whitespace-pre-wrap text-fg select-text">
-          {where ? `WHERE ${where}` : '-- no filter'}
-          {orderBy ? `\nORDER BY ${orderBy}` : ''}
+          {mongo ? (
+            describeMongoQuery(draft, types)
+          ) : (
+            <>
+              {where ? `WHERE ${where}` : '-- no filter'}
+              {orderBy ? `\nORDER BY ${orderBy}` : ''}
+            </>
+          )}
         </pre>
+      )}
+      {fieldList && (
+        <datalist id={fieldList}>
+          {columns.map((col) => (
+            <option key={col.name} value={col.name} />
+          ))}
+        </datalist>
       )}
       <div className="mt-2 flex items-center gap-2">
         <Button
@@ -323,7 +375,7 @@ export function QueryBuilder({
           className={cn(showSql && 'bg-hover text-bright')}
           onClick={() => setShowSql((s) => !s)}
         >
-          <Code2 className="size-3" /> SQL
+          <Code2 className="size-3" /> {rawLabel}
         </Button>
         {dirty && <span className="text-[11px] text-warn">Not applied yet · Enter to apply</span>}
         <div className="flex-1" />
@@ -346,12 +398,15 @@ export function QuerySummary({
   query,
   open,
   onToggle,
-  onChange
+  onChange,
+  emptyLabel = 'All rows'
 }: {
   query: QueryState
   open: boolean
   onToggle: () => void
   onChange: (query: QueryState) => void
+  /** Shown when nothing is filtered or sorted */
+  emptyLabel?: string
 }): React.JSX.Element {
   const active = query.conditions.filter((c) => c.enabled)
   const chip =
@@ -405,8 +460,8 @@ export function QuerySummary({
           </button>
         </span>
       ))}
-      {!active.length && !query.sorts.length && !open && (
-        <span className="truncate text-[11.5px] text-faint">All rows</span>
+      {!active.length && !query.sorts.length && !open && emptyLabel && (
+        <span className="truncate text-[11.5px] text-faint">{emptyLabel}</span>
       )}
     </div>
   )
