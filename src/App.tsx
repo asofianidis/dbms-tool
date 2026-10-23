@@ -1,51 +1,209 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { memo, useEffect } from 'react'
+import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels'
+import { CommandPalette } from './components/CommandPalette'
+import { ContextMenuHost } from './components/ContextMenu'
+import { ConnectionDialogHost } from './components/dialogs/ConnectionDialog'
+import { ConfirmHost, PasswordPromptHost, PromptHost } from './components/dialogs/Dialogs'
+import { ActivityRail } from './components/shell/ActivityRail'
+import { StatusBar } from './components/shell/StatusBar'
+import { TabBar } from './components/shell/TabBar'
+import { TitleBar } from './components/shell/TitleBar'
+import { EmptyState, Toaster } from './components/ui'
+import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
+import { Explorer } from './features/explorer/Explorer'
+import { HistoryPanel } from './features/history/HistoryPanel'
+import { CollectionTab } from './features/mongo/CollectionTab'
+import { MongoShellTab } from './features/mongo/MongoShellTab'
+import { QueryTab } from './features/query/QueryTab'
+import { ServerTab } from './features/server/ServerTab'
+import { SettingsTab } from './features/settings/SettingsTab'
+import { TableTab } from './features/table/TableTab'
+import { WelcomeTab } from './features/welcome/WelcomeTab'
+import { cn } from './lib/cn'
+import { isMod } from './lib/keys'
+import { queryClient } from './lib/queries'
+import { toastError } from './lib/toast'
+import { migrateAccentSetting, startThemeSync } from './lib/themes'
+import { startUpdateChecks } from './lib/updater'
+import {
+  activateTab,
+  activeTab,
+  bindQueryClient,
+  closeTab,
+  layoutStore,
+  loadConnections,
+  newQueryTab,
+  openPalette,
+  openSettings,
+  openWelcome,
+  tabsStore,
+  type Tab
+} from './lib/workspace'
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+// Tabs are replaced immutably, so only the tab that changed re-renders on each keystroke
+const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.Element {
+  switch (tab.kind) {
+    case 'welcome':
+      return <WelcomeTab />
+    case 'settings':
+      return <SettingsTab />
+    case 'query':
+      return <QueryTab tab={tab} />
+    case 'mongo':
+      return <MongoShellTab tab={tab} />
+    case 'table':
+      return <TableTab tab={tab} />
+    case 'collection':
+      return <CollectionTab tab={tab} />
+    case 'server':
+      return <ServerTab tab={tab} />
   }
+})
 
-  return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
-  );
+function useGlobalShortcuts(): void {
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      const key = e.key.toLowerCase()
+      // Keep the webview from reloading the app
+      if (e.key === 'F5' || (isMod(e) && key === 'r')) e.preventDefault()
+      if (e.ctrlKey && e.key === 'Tab') {
+        e.preventDefault()
+        const { order, tabs } = tabsStore.get()
+        const ids = order.filter((id) => tabs.some((t) => t.id === id))
+        if (ids.length > 1) activateTab(e.shiftKey ? ids[ids.length - 1] : ids[1])
+        return
+      }
+      if (!isMod(e)) return
+      if (key === 'k' || (key === 'p' && !e.shiftKey)) {
+        e.preventDefault()
+        openPalette()
+      } else if (key === 'p' && e.shiftKey) {
+        e.preventDefault()
+        openPalette('>')
+      } else if (key === 'n' && !e.shiftKey) {
+        e.preventDefault()
+        newQueryTab()
+      } else if (key === 'w') {
+        e.preventDefault()
+        const tab = activeTab()
+        if (tab) closeTab(tab.id)
+      } else if (key === ',') {
+        e.preventDefault()
+        openSettings()
+      } else if (key === 'b' && !e.shiftKey) {
+        e.preventDefault()
+        layoutStore.set((l) => ({ ...l, sidebarOpen: !l.sidebarOpen }))
+      } else if (e.shiftKey && key === 'e') {
+        e.preventDefault()
+        layoutStore.set({ sidebar: 'explorer', sidebarOpen: true })
+      } else if (e.shiftKey && key === 'h') {
+        e.preventDefault()
+        layoutStore.set({ sidebar: 'history', sidebarOpen: true })
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 }
 
-export default App;
+export function App(): React.JSX.Element {
+  const { tabs, active } = tabsStore.use()
+  const layout = layoutStore.use()
+  const sidebar = usePanelRef()
+  const saved = useDefaultLayout({ id: 'workbench', storage: localStorage })
+  useGlobalShortcuts()
+
+  useEffect(() => {
+    bindQueryClient(queryClient)
+    migrateAccentSetting()
+    const stopThemes = startThemeSync()
+    loadConnections().catch(toastError)
+    if (!tabsStore.get().tabs.length) openWelcome()
+    // Native menus on right-click make the app feel like a web page
+    const onContextMenu = (e: MouseEvent): void => {
+      const target = e.target as HTMLElement
+      if (!target.closest('input, textarea, .cm-editor')) e.preventDefault()
+    }
+    window.addEventListener('contextmenu', onContextMenu)
+    const stopUpdates = startUpdateChecks()
+    return () => {
+      window.removeEventListener('contextmenu', onContextMenu)
+      stopUpdates()
+      stopThemes()
+    }
+  }, [])
+
+  useEffect(() => {
+    const panel = sidebar.current
+    if (!panel) return
+    if (layout.sidebarOpen && panel.isCollapsed()) panel.expand()
+    if (!layout.sidebarOpen && !panel.isCollapsed()) panel.collapse()
+  }, [layout.sidebarOpen, sidebar])
+
+  return (
+    <div className="flex h-full flex-col">
+      <TitleBar />
+      <div className="flex min-h-0 flex-1">
+        <ActivityRail />
+        <Group
+          orientation="horizontal"
+          className="min-w-0 flex-1"
+          defaultLayout={saved.defaultLayout}
+          onLayoutChanged={saved.onLayoutChanged}
+        >
+          <Panel
+            id="sidebar"
+            panelRef={sidebar}
+            defaultSize={280}
+            minSize={200}
+            maxSize="45%"
+            collapsible
+            collapsedSize={0}
+            onResize={(size) => {
+              const open = size.inPixels > 0
+              if (open !== layoutStore.get().sidebarOpen)
+                layoutStore.set((l) => ({ ...l, sidebarOpen: open }))
+            }}
+          >
+            <div className="h-full bg-panel">
+              {layout.sidebar === 'history' ? <HistoryPanel /> : <Explorer />}
+            </div>
+          </Panel>
+          <Separator />
+          <Panel id="main" minSize={400}>
+            <main className="flex h-full min-w-0 flex-col bg-canvas">
+              <TabBar />
+              <div className="relative min-h-0 flex-1">
+                {tabs.map((tab) => (
+                  <div
+                    key={tab.id}
+                    className={cn(
+                      'absolute inset-0 flex flex-col',
+                      tab.id !== active && 'invisible'
+                    )}
+                  >
+                    <TabContent tab={tab} />
+                  </div>
+                ))}
+                {!tabs.length && (
+                  <EmptyState title="No open tabs">
+                    Press Ctrl+N for a new query or Ctrl+K to search.
+                  </EmptyState>
+                )}
+              </div>
+            </main>
+          </Panel>
+        </Group>
+      </div>
+      <StatusBar />
+      <CommandPalette />
+      <ConnectionDialogHost />
+      <PasswordPromptHost />
+      <ConfirmHost />
+      <PromptHost />
+      <ExecuteRoutineHost />
+      <ContextMenuHost />
+      <Toaster />
+    </div>
+  )
+}

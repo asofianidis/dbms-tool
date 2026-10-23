@@ -12,9 +12,16 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "dbms-tool",
-        "width": 800,
-        "height": 600
+        "width": 1440,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 560,
+        "center": true,
+        "decorations": false,
+        "backgroundColor": "#0a0b0a",
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -30,6 +37,44 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "shortDescription": "Database client for PostgreSQL, MySQL, SQL Server, Babelfish and MongoDB",
+    "category": "DeveloperTool",
+    "copyright": "MIT License",
+    "createUpdaterArtifacts": true,
+    "publisher": "asofianidis",
+    "homepage": "https://github.com/asofianidis/dbms-tool",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "longDescription": "A developer-focused database workbench for PostgreSQL, MySQL, SQL Server, Babelfish for Aurora PostgreSQL and MongoDB.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "digestAlgorithm": "sha256"
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true
+    },
+    "linux": {
+      "deb": {
+        "section": "devel"
+      },
+      "rpm": {
+        "release": "1"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJDRTY4NTkxNkE5NzI4NjEKUldSaEtKZHFrWVhtdkFyVTdTREs5UlNmbXk0MklZQXpkTlVzYmlPWEVxYnVBclJJS1FGaEhiLzUK",
+      "endpoints": [
+        "https://github.com/asofianidis/dbms-tool/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

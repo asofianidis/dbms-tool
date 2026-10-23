@@ -1,0 +1,343 @@
+name: release
+
+# Builds signed installers for Windows, macOS and Linux, publishes them to a
+# GitHub release with checksums, build-provenance attestations and the
+# updater manifest (latest.json) that installed apps poll.
+#
+# Required secrets
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#     Signs update bundles; the public key is in src-tauri/tauri.conf.json.
+#
+# Optional secrets (code signing; builds are unsigned without them)
+#   macOS:   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#            APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID  (notarization needs the last three)
+#   Windows: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID,
+#            AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_CERTIFICATE_PROFILE
+#            (Azure Trusted Signing)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  prepare:
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Detect app changes
+        id: filter
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            app:
+              - 'src/**'
+              - 'src-tauri/**'
+              - 'index.html'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'vite.config.ts'
+              - 'scripts/release-version.mjs'
+              - 'scripts/updater-manifest.mjs'
+              - '.github/workflows/release.yml'
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          APP: ${{ steps.filter.outputs.app }}
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set; releases must be signed for the auto-updater."
+            exit 1
+          fi
+          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "branch" ] && [ "$APP" != "true" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "No app changes; skipping release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Version
+        id: version
+        if: steps.decide.outputs.release == 'true'
+        run: node scripts/release-version.mjs
+
+      - name: Create draft release
+        id: draft
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Re-runs reuse the existing draft
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+          if [ -z "$id" ]; then
+            id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="dbms-tool $TAG" \
+              -F draft=true -F prerelease=false -f body="Built from $GITHUB_SHA." --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            args: ''
+          - name: macos-universal
+            os: macos-latest
+            args: --target universal-apple-darwin
+          - name: linux-x64
+            os: ubuntu-22.04
+            args: ''
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            args: ''
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libdbus-1-dev patchelf
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.name }}
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Set version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs')
+            const p = 'src-tauri/tauri.conf.json'
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'))
+            c.version = process.env.VERSION
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n')
+          "
+
+      # Only export signing variables that are actually set: the bundler treats an
+      # empty APPLE_CERTIFICATE as a certificate to import and fails.
+      - name: Configure code signing
+        id: signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERTIFICATE_PROFILE: ${{ secrets.AZURE_CERTIFICATE_PROFILE }}
+        run: |
+          export_if_set() {
+            for name in "$@"; do
+              if [ -n "${!name}" ]; then
+                { echo "$name<<__SIGNING_EOF__"; echo "${!name}"; echo "__SIGNING_EOF__"; } >> "$GITHUB_ENV"
+              fi
+            done
+          }
+          extra=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if [ -n "$APPLE_CERTIFICATE" ]; then
+              export_if_set APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+              echo "Signing with Developer ID: $APPLE_SIGNING_IDENTITY" >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+                export_if_set APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+                echo "Notarizing with Apple" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::warning::macOS build is signed but not notarized (APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID missing)"
+              fi
+            else
+              echo "::warning::macOS build is not code signed (APPLE_CERTIFICATE missing)"
+            fi
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_SIGNING_ACCOUNT" ]; then
+              export_if_set AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID
+              cargo install trusted-signing-cli --locked
+              node -e "
+                const fs = require('fs')
+                const e = process.env
+                const cmd = 'trusted-signing-cli -e ' + e.AZURE_SIGNING_ENDPOINT + ' -a ' + e.AZURE_SIGNING_ACCOUNT +
+                  ' -c ' + e.AZURE_CERTIFICATE_PROFILE + ' -d dbms-tool %1'
+                fs.writeFileSync('src-tauri/tauri.signing.conf.json', JSON.stringify({ bundle: { windows: { signCommand: cmd } } }, null, 2))
+              "
+              extra="--config src-tauri/tauri.signing.conf.json"
+              echo "Signing with Azure Trusted Signing" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Windows build is not code signed (Azure Trusted Signing secrets missing)"
+            fi
+          fi
+          echo "args=$extra" >> "$GITHUB_OUTPUT"
+
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          tauriScript: pnpm tauri
+          args: ${{ matrix.args }} ${{ steps.signing.outputs.args }}
+          # latest.json is generated once all platforms have uploaded
+          uploadUpdaterJson: false
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          mkdir -p assets
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate --jq '.[] | [.id, .name] | @tsv' |
+          while IFS=$'\t' read -r id name; do
+            case "$name" in latest.json|SHA256SUMS.txt) continue ;; esac
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "assets/$name"
+          done
+          ls -la assets
+
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum -- * > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt . && cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'assets/*'
+
+      - name: Updater manifest
+        run: >-
+          node scripts/updater-manifest.mjs assets
+          "${{ needs.prepare.outputs.version }}" "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY"
+
+      - name: Upload manifest and checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets"
+          for file in latest.json SHA256SUMS.txt; do
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --jq ".[] | select(.name == \"$file\") | .id")
+            [ -n "$existing" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$existing"
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+              --data-binary "@assets/$file" "$upload_url?name=$file" > /dev/null
+          done
+
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cat > notes.md <<NOTES
+          ## Downloads
+
+          | Platform | File |
+          | --- | --- |
+          | Windows (x64) | \`*_x64-setup.exe\` (recommended) or \`*.msi\` |
+          | macOS (Apple Silicon and Intel) | \`*_universal.dmg\` |
+          | Linux (x64) | \`*_amd64.AppImage\` (self-updating), \`*_amd64.deb\`, \`*.x86_64.rpm\` |
+          | Linux (arm64) | \`*_aarch64.AppImage\` (self-updating), \`*_arm64.deb\`, \`*.aarch64.rpm\` |
+
+          Installed apps update themselves from this release.
+
+          ## Verifying
+
+          Every file is listed in \`SHA256SUMS.txt\` and has a build-provenance attestation tying it
+          to this repository and workflow run:
+
+          \`\`\`sh
+          gh attestation verify <file> --repo $GITHUB_REPOSITORY
+          \`\`\`
+
+          Update bundles are additionally signed with the key whose public half ships in the app.
+
+          Built from $GITHUB_SHA.
+          NOTES
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F body=@notes.md > /dev/null
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          # Installed apps read releases/latest, so only a newer version may become Latest
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo "v0.0.0")
+          latest=${latest#v}
+          newest=$(printf '%s\n' "$latest" "$VERSION" | sort -V | tail -n1)
+          make_latest=false
+          if [ "$VERSION" != "$latest" ] && [ "$newest" = "$VERSION" ]; then make_latest=true; fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease=false -f make_latest="$make_latest" > /dev/null
+          echo "Published v$VERSION (latest: $make_latest)" >> "$GITHUB_STEP_SUMMARY"
