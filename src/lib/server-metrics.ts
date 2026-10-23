@@ -799,7 +799,35 @@ export function dashboardFor(
       return BABELFISH
     case 'mongo':
       return MONGO
+    case 'sqlite':
+      return SQLITE
   }
+}
+
+const SQLITE: ServerDashboardSpec = {
+  probes: [
+    {
+      id: 'pages',
+      shape: 'row',
+      sql: `SELECT p.page_count * s.page_size AS size_bytes, p.page_count AS pages,
+  f.freelist_count AS free_pages
+FROM pragma_page_count() p, pragma_page_size() s, pragma_freelist_count() f`
+    }
+  ],
+  derive: (next) => ({
+    uptime: null,
+    size_bytes: num(next, 'size_bytes'),
+    pages: num(next, 'pages'),
+    free_pages: num(next, 'free_pages')
+  }),
+  tiles: [
+    { key: 'size_bytes', label: 'Database size', unit: 'bytes', hint: 'Pages in use times page size' },
+    { key: 'pages', label: 'Pages', unit: 'count', hint: 'Total pages in the database file' },
+    { key: 'free_pages', label: 'Free pages', unit: 'count', hint: 'Unused pages VACUUM would reclaim' }
+  ],
+  meters: [],
+  facts: () => [],
+  note: 'SQLite runs inside the client, so there are no server sessions or activity to show.'
 }
 
 export interface Collected {

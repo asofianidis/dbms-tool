@@ -104,6 +104,9 @@ export function securableKinds(dialect: Dialect): SecurableKind[] {
       return ['server', 'database', 'table', 'view', 'function', 'procedure']
     case 'tsql':
       return ['database', 'schema', 'table', 'view', 'function', 'procedure']
+    case 'sqlite':
+      // SQLite has no users, roles or grants
+      return []
   }
 }
 
@@ -133,6 +136,9 @@ export function needsContainer(dialect: Dialect, kind: SecurableKind): boolean {
       return kind !== 'server' && kind !== 'database'
     case 'tsql':
       return kind === 'schema'
+    case 'sqlite':
+      // SQLite has no users, roles or grants
+      return false
   }
 }
 
@@ -370,6 +376,9 @@ export function principalQueries(dialect: Dialect): string[] {
          WHERE type IN ('S', 'U', 'G', 'R', 'E', 'X', 'A') AND name NOT IN ('sys', 'INFORMATION_SCHEMA') \
          ORDER BY name"
       ]
+    case 'sqlite':
+      // SQLite has no users, roles or grants
+      return []
   }
 }
 
@@ -591,6 +600,9 @@ export function membershipQueries(dialect: Dialect, grantee: Principal): string[
          JOIN sys.database_principals r ON r.principal_id = m.role_principal_id \
          WHERE m.member_principal_id = DATABASE_PRINCIPAL_ID(${lit(grantee.name)})`
       ]
+    case 'sqlite':
+      // SQLite has no users, roles or grants
+      return []
   }
 }
 

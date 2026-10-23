@@ -1,22 +1,19 @@
 import { useMemo, useState } from 'react'
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   ClipboardPaste,
   Cloud,
+  FilePlus2,
+  FolderOpen,
   Info,
   Loader2,
   XCircle
 } from 'lucide-react'
-import {
-  api,
-  type CloudProvider,
-  type ConnectionConfig,
-  type Engine,
-  type ServerInfo
-} from '@/lib/api'
-import { PROVIDERS, PROVIDER_ORDER, providerForHost } from '@/lib/cloud'
+import { api, type ConnectionConfig, type Engine, type ServerInfo } from '@/lib/api'
+import { PROVIDERS, isMajorCloud, providerForHost, type MajorCloud } from '@/lib/cloud'
 import { cn } from '@/lib/cn'
 import {
   CONNECTION_COLORS,
@@ -137,7 +134,10 @@ function ConnectionDialog({
                 onClick={() => pickEngine(engine)}
                 className={cn(
                   'flex items-start gap-3 rounded-lg border border-line-strong bg-raised/60 p-3 text-left transition-colors hover:border-accent/50 hover:bg-hover',
-                  engine === 'mongo' && 'col-span-2'
+                  // An odd engine out spans the last row
+                  ENGINE_ORDER.length % 2 === 1 &&
+                    engine === ENGINE_ORDER[ENGINE_ORDER.length - 1] &&
+                    'col-span-2'
                 )}
               >
                 <EngineMark engine={engine} size="lg" />
@@ -207,12 +207,36 @@ function ConnectionDialog({
   const usesUri = config.engine === 'mongo' && mongoMode === 'uri'
   const hasSavedPassword = !!editing?.savePassword && !duplicate
   const needsUser = !(tds && config.auth === 'windows')
+  const sqlite = config.engine === 'sqlite'
+  // A SQLite connection is either a local file (host) or a D1 database (cloud ref)
+  const d1 = sqlite && config.cloud?.provider === 'cloudflare'
+  const SQLITE_FILES = [
+    { name: 'SQLite databases', extensions: ['db', 'sqlite', 'sqlite3', 'db3'] },
+    { name: 'All files', extensions: ['*'] }
+  ]
+  const useFile = (path: string): void =>
+    patch({ host: path, name: config.name || (path.split(/[\\/]/).pop() ?? '') })
+  const browseSqlite = async (): Promise<void> => {
+    const path = await openDialog({ multiple: false, filters: SQLITE_FILES })
+    if (typeof path === 'string') useFile(path)
+  }
+  const newSqliteFile = async (): Promise<void> => {
+    const path = await saveDialog({ defaultPath: 'database.db', filters: SQLITE_FILES })
+    if (!path) return
+    try {
+      // SQLite treats an empty file as an empty database
+      await api.writeText(path, '')
+      useFile(path)
+    } catch (e) {
+      toastError(e)
+    }
+  }
   const cloudAuth = config.auth === 'cloud'
   // Babelfish's TDS endpoint has no IAM sign-in
   const iamCapable =
     config.engine === 'postgres' || config.engine === 'mysql' || config.engine === 'mssql'
-  const cloudProvider: CloudProvider =
-    config.cloud?.provider ?? providerForHost(config.host) ?? 'aws'
+  const guessed = config.cloud?.provider ?? providerForHost(config.host)
+  const cloudProvider: MajorCloud = guessed && isMajorCloud(guessed) ? guessed : 'aws'
   const setCloud = (patchCloud: Partial<NonNullable<ConnectionConfig['cloud']>>): void =>
     patch({
       cloud: {
@@ -350,7 +374,89 @@ function ConnectionDialog({
           />
         )}
 
-        {usesUri ? (
+        {sqlite ? (
+          <div className="space-y-3">
+            <Segmented
+              value={d1 ? 'd1' : 'file'}
+              onChange={(source) =>
+                patch(
+                  source === 'd1'
+                    ? {
+                        host: '',
+                        cloud: {
+                          provider: 'cloudflare',
+                          context: '',
+                          region: '',
+                          resource: '',
+                          kind: 'd1'
+                        }
+                      }
+                    : { cloud: null }
+                )
+              }
+              options={[
+                { value: 'file', label: 'Database file' },
+                { value: 'd1', label: 'Cloudflare D1' }
+              ]}
+            />
+            {d1 ? (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Account ID">
+                    <Input
+                      mono
+                      value={config.cloud?.context ?? ''}
+                      onChange={(e) => setCloud({ context: e.target.value.trim() })}
+                      placeholder="From the Cloudflare dashboard URL"
+                    />
+                  </Field>
+                  <Field label="Database ID">
+                    <Input
+                      mono
+                      value={config.cloud?.resource ?? ''}
+                      onChange={(e) => setCloud({ resource: e.target.value.trim() })}
+                      placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    />
+                  </Field>
+                </div>
+                <Field
+                  label="API token (optional)"
+                  hint="Needs the D1 Read or D1 Edit permission. Leave it empty to use the token saved in the Cloud databases tab."
+                >
+                  <Input
+                    type="password"
+                    value={password}
+                    onChange={(e) => {
+                      setPassword(e.target.value)
+                      setTest({ state: 'idle' })
+                    }}
+                    placeholder={hasSavedPassword ? '•••••••• (saved)' : 'Cloud databases token'}
+                  />
+                </Field>
+              </>
+            ) : (
+              <Field
+                label="Database file"
+                hint="A .db, .sqlite or .sqlite3 file. New file creates an empty database."
+              >
+                <div className="flex gap-2">
+                  <Input
+                    mono
+                    value={config.host}
+                    onChange={(e) => patch({ host: e.target.value })}
+                    placeholder="/path/to/app.db"
+                  />
+                  <Button variant="secondary" onClick={() => void browseSqlite()}>
+                    <FolderOpen className="size-3.5" /> Browse
+                  </Button>
+                  <Button variant="secondary" onClick={() => void newSqliteFile()}>
+                    <FilePlus2 className="size-3.5" /> New file
+                  </Button>
+                </div>
+              </Field>
+            )}
+          </div>
+        ) : usesUri ? (
           <Field
             label="Connection string"
             hint="Credentials in the string are stored with the connection. Leave the password out to be asked each time, or type it below."
@@ -417,7 +523,7 @@ function ConnectionDialog({
                       context: provider === config.cloud?.provider ? config.cloud.context : ''
                     })
                   }
-                  options={PROVIDER_ORDER.map((p) => ({ value: p, label: PROVIDERS[p].label }))}
+                  options={IAM_PROVIDERS.map((p) => ({ value: p, label: PROVIDERS[p].label }))}
                 />
               </Field>
               <Field label={`${PROVIDERS[cloudProvider].contextLabel} (optional)`}>
@@ -437,35 +543,39 @@ function ConnectionDialog({
           </div>
         )}
 
-        <div className="grid grid-cols-2 gap-3">
-          {(needsUser || config.auth === 'windows') && !usesUri && (
-            <Field label={config.auth === 'windows' ? 'Domain user (optional)' : 'User'}>
-              <Input
-                value={config.user}
-                onChange={(e) => patch({ user: e.target.value })}
-                placeholder={config.auth === 'windows' ? 'Current Windows user' : info.defaultUser}
-              />
-            </Field>
-          )}
-          {(needsUser || config.user) && !cloudAuth && (
-            <Field label="Password">
-              <Input
-                type="password"
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value)
-                  setTest({ state: 'idle' })
-                }}
-                placeholder={
-                  hasSavedPassword ? '•••••••• (saved)' : usesUri ? 'If not in the string' : ''
-                }
-              />
-            </Field>
-          )}
-        </div>
+        {!sqlite && (
+          <div className="grid grid-cols-2 gap-3">
+            {(needsUser || config.auth === 'windows') && !usesUri && (
+              <Field label={config.auth === 'windows' ? 'Domain user (optional)' : 'User'}>
+                <Input
+                  value={config.user}
+                  onChange={(e) => patch({ user: e.target.value })}
+                  placeholder={
+                    config.auth === 'windows' ? 'Current Windows user' : info.defaultUser
+                  }
+                />
+              </Field>
+            )}
+            {(needsUser || config.user) && !cloudAuth && (
+              <Field label="Password">
+                <Input
+                  type="password"
+                  value={password}
+                  onChange={(e) => {
+                    setPassword(e.target.value)
+                    setTest({ state: 'idle' })
+                  }}
+                  placeholder={
+                    hasSavedPassword ? '•••••••• (saved)' : usesUri ? 'If not in the string' : ''
+                  }
+                />
+              </Field>
+            )}
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
-          {config.engine !== 'mongo' && (
+          {config.engine !== 'mongo' && !sqlite && (
             <Field
               label="Database"
               hint={
@@ -490,7 +600,7 @@ function ConnectionDialog({
               />
             </Field>
           )}
-          {!usesUri && (
+          {!usesUri && !sqlite && (
             <Field label={tds ? 'Encryption' : 'SSL / TLS'}>
               <Select
                 value={config.ssl}
@@ -508,22 +618,26 @@ function ConnectionDialog({
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-3 rounded-lg border border-line bg-raised/40 p-3">
           <Toggle
-            checked={config.savePassword && !cloudAuth}
+            checked={config.savePassword && !cloudAuth && (!sqlite || d1)}
             onChange={(savePassword) => patch({ savePassword })}
-            label="Save password"
+            label={d1 ? 'Save token' : 'Save password'}
             description={
               cloudAuth
                 ? 'Not needed: a token is fetched each time'
-                : 'Stored in the OS credential manager'
+                : sqlite && !d1
+                  ? 'SQLite files have no password'
+                  : 'Stored in the OS credential manager'
             }
-            disabled={cloudAuth}
+            disabled={cloudAuth || (sqlite && !d1)}
           />
-          <Toggle
-            checked={config.trustServerCertificate}
-            onChange={(trustServerCertificate) => patch({ trustServerCertificate })}
-            label="Trust server certificate"
-            description="Accept self-signed TLS certificates"
-          />
+          {!sqlite && (
+            <Toggle
+              checked={config.trustServerCertificate}
+              onChange={(trustServerCertificate) => patch({ trustServerCertificate })}
+              label="Trust server certificate"
+              description="Accept self-signed TLS certificates"
+            />
+          )}
           <Toggle
             checked={config.readOnly}
             onChange={(readOnly) => patch({ readOnly })}
@@ -582,7 +696,10 @@ function ConnectionDialog({
   )
 }
 
-const IAM_HINTS: Record<CloudProvider, string> = {
+/** The clouds that offer passwordless database sign-in. */
+const IAM_PROVIDERS: MajorCloud[] = ['aws', 'gcp', 'azure']
+
+const IAM_HINTS: Record<MajorCloud, string> = {
   aws: 'Signs in with a 15-minute token from "aws rds generate-db-auth-token". The user must be a database user granted rds_iam (PostgreSQL) or created with AWSAuthenticationPlugin (MySQL), and the instance needs IAM authentication turned on.',
   gcp: 'Signs in with a token from "gcloud sql generate-login-token". The user is your Google account added to the instance as an IAM user (for MySQL, the part before the @), with the cloudsql.iam_authentication flag on.',
   azure:

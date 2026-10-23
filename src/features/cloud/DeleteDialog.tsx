@@ -5,10 +5,10 @@ import {
   PROVIDERS,
   canSnapshot,
   deleteLeftovers,
-  deletePlan,
   stepsScript,
   type CloudDatabase
 } from '@/lib/cloud'
+import { planDelete } from '@/lib/cloud-platforms'
 import { Button, Field, Input, Modal, Toggle } from '@/components/ui'
 import { startDeletion } from './actions'
 
@@ -28,7 +28,7 @@ export function DeleteDialog({
   const [typed, setTyped] = useState('')
   const options = { finalSnapshot, disableProtection }
   const script = useMemo(
-    () => stepsScript(deletePlan(db, { finalSnapshot, disableProtection }), info.cli),
+    () => stepsScript(planDelete(db, { finalSnapshot, disableProtection }), info.cli),
     [db, finalSnapshot, disableProtection, info.cli]
   )
   const leftovers = deleteLeftovers(db)
@@ -96,7 +96,9 @@ export function DeleteDialog({
         </div>
         {leftovers && <p className="text-[11.5px] leading-snug text-muted">{leftovers}</p>}
         <div>
-          <p className="mb-1.5 text-[11px] font-medium text-muted">Commands ({info.cli} CLI)</p>
+          <p className="mb-1.5 text-[11px] font-medium text-muted">
+            {info.auth === 'token' ? `Requests (${info.cli})` : `Commands (${info.cli} CLI)`}
+          </p>
           <pre className="max-h-40 overflow-auto rounded-lg border border-line bg-canvas p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-fg select-text">
             {script}
           </pre>

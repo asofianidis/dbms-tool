@@ -16,6 +16,10 @@ pub struct AppState {
 
 /// Whether connecting needs a password the user hasn't given us.
 fn needs_password(config: &ConnectionConfig) -> bool {
+    // SQLite files have no password; D1 falls back to the saved Cloudflare token
+    if config.engine == Engine::Sqlite {
+        return false;
+    }
     if config.engine == Engine::Mongo {
         // A URI may carry its own credentials; only ask when we built it ourselves
         return config.uri.trim().is_empty() && !config.user.is_empty();
@@ -350,15 +354,17 @@ pub fn cloud_tools() -> Vec<crate::cloud::CloudTool> {
 }
 
 /// Runs a cloud CLI; `{secret}` in `args` becomes the path of a temporary file
-/// holding `secret`.
+/// holding `secret`. `workdir` names an app-managed folder to run in, for CLIs
+/// that act on the current directory.
 #[tauri::command]
 pub async fn cloud_cli(
     provider: crate::cloud::Provider,
     args: Vec<String>,
     secret: Option<String>,
     timeout_secs: Option<u64>,
+    workdir: Option<String>,
 ) -> AppResult<String> {
-    crate::cloud::run(provider, args, secret, timeout_secs).await
+    crate::cloud::run(provider, args, secret, timeout_secs, workdir.as_deref()).await
 }
 
 /// Backup and restore tools for an engine; `dir` is a folder to search first.
@@ -431,4 +437,31 @@ pub async fn backup_run(
 #[tauri::command]
 pub fn backup_cancel(state: State<'_, AppState>, job_id: String) {
     state.backups.cancel(&job_id);
+}
+
+/// Whether an API token is saved for a provider driven over REST.
+#[tauri::command]
+pub fn cloud_token_status(provider: crate::cloud::Provider) -> bool {
+    crate::cloud::stored_token(provider).is_some()
+}
+
+#[tauri::command]
+pub fn cloud_token_set(provider: crate::cloud::Provider, token: String) -> AppResult<()> {
+    crate::cloud::store_token(provider, &token)
+}
+
+#[tauri::command]
+pub fn cloud_token_delete(provider: crate::cloud::Provider) {
+    crate::cloud::delete_token(provider);
+}
+
+/// Calls a provider's REST API with its saved token (or flyctl's).
+#[tauri::command]
+pub async fn cloud_api(
+    provider: crate::cloud::Provider,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> AppResult<serde_json::Value> {
+    crate::cloud::api(provider, &method, &path, body, None).await
 }

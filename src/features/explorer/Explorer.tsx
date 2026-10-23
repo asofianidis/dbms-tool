@@ -45,7 +45,7 @@ import {
 import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { ENGINES, connectionLabel, connectionSubtitle } from '@/lib/engines'
+import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
@@ -250,7 +250,7 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         disabled: !connected,
         onSelect: () => openServer(connection.id)
       },
-      ...(connection.engine !== 'babelfish'
+      ...(connection.engine !== 'babelfish' && supports(connection.engine, 'databases')
         ? [
             {
               label: 'Restore backup…',
@@ -486,7 +486,7 @@ function DatabaseNode({
         }
       }
     ]
-    if (connection.engine !== 'babelfish') {
+    if (connection.engine !== 'babelfish' && supports(connection.engine, 'databases')) {
       items.push(
         'separator',
         {
@@ -545,6 +545,12 @@ function DatabaseNode({
           onSelect: () => openSchemaDesigner(connection.id, database, database, true)
         }
       )
+    } else if (connection.engine === 'sqlite') {
+      items.push({
+        label: 'Open diagram',
+        icon: <Network />,
+        onSelect: () => openDiagram(connection.id, database, null)
+      })
     } else {
       // SQL Server schemas aren't tree nodes, so its diagram spans the database
       if (connection.engine !== 'postgres') {
@@ -569,11 +575,12 @@ function DatabaseNode({
       }
     }
     if (!isMongo) {
-      items.push({
-        label: 'Permissions…',
-        icon: <ShieldCheck />,
-        onSelect: () => openPermissionsDesigner(connection.id, database)
-      })
+      if (supports(connection.engine, 'permissions'))
+        items.push({
+          label: 'Permissions…',
+          icon: <ShieldCheck />,
+          onSelect: () => openPermissionsDesigner(connection.id, database)
+        })
       items.push({
         label: 'Compare with…',
         icon: <GitCompareArrows />,
@@ -769,6 +776,7 @@ function ObjectFolders({
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
         if (!objects.length && !folder.always) return null
+        if (folder.routine && !supports(connection.engine, 'routines')) return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
           <ObjectFolder
@@ -839,7 +847,7 @@ function ObjectFolder({
                   }
                 ]
               : []),
-            ...(newTable
+            ...(newTable && supports(connection.engine, 'designers')
               ? [
                   {
                     label: 'New table…',
@@ -1009,7 +1017,9 @@ function TableChildren({
   const [indexesOpen, setIndexesOpen] = useExpanded(`${base}/indexes`)
   const [keysOpen, setKeysOpen] = useExpanded(`${base}/keys`)
   const [triggersOpen, setTriggersOpen] = useExpanded(`${base}/triggers`)
-  const editTriggers = canHaveTriggers(ENGINES[connection.engine].dialect ?? 'postgres', obj.kind)
+  const editTriggers =
+    supports(connection.engine, 'designers') &&
+    canHaveTriggers(ENGINES[connection.engine].dialect ?? 'postgres', obj.kind)
   const designTrigger = (trigger: string | null, drop = false): void =>
     openTriggerDesigner(
       connection.id,

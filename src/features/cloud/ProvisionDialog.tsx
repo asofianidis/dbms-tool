@@ -9,15 +9,16 @@ import {
   REGIONS,
   engineOption,
   generatePassword,
+  isMajorCloud,
   newProvisionDraft,
   planScript,
-  provisionPlan,
   scopeArgs,
   validateProvision,
   withEngine,
   type NetworkAccess,
   type ProvisionDraft
 } from '@/lib/cloud'
+import { planProvision } from '@/lib/cloud-platforms'
 import { cn } from '@/lib/cn'
 import { toast } from '@/lib/toast'
 import { confirm } from '@/lib/workspace'
@@ -62,6 +63,30 @@ export function ProvisionDialog({
   }, [provider, identity.data])
   const patch = (p: Partial<ProvisionDraft>): void => setDraft((d) => ({ ...d, ...p }))
 
+  // Railway projects, Render workspaces, Fly.io orgs and Cloudflare accounts
+  const pickContext = !isMajorCloud(provider)
+  const contexts = useQuery({ ...cloudQueries.contexts(provider), enabled: pickContext })
+  const contextList = contexts.data?.contexts ?? []
+  const project = contextList.find((c) => c.id === draft.context)
+  useEffect(() => {
+    // Render and Cloudflare need an account picked; start with the first
+    if ((provider === 'render' || provider === 'cloudflare') && !draft.context && contextList[0])
+      setDraft((d) => ({ ...d, context: contextList[0].id }))
+    // Opened on a Railway project: start in its production environment
+    if (provider === 'railway' && draft.context && !draft.region) {
+      const environments = contextList.find((c) => c.id === draft.context)?.children ?? []
+      const environment = environments.find((e) => e.label === 'production') ?? environments[0]
+      if (environment) setDraft((d) => ({ ...d, region: environment.id }))
+    }
+  }, [provider, draft.context, draft.region, contextList])
+  const pickProject = (id: string): void => {
+    const environments = contextList.find((c) => c.id === id)?.children ?? []
+    patch({
+      context: id,
+      region: (environments.find((e) => e.label === 'production') ?? environments[0])?.id ?? ''
+    })
+  }
+
   const detectIp = async (): Promise<void> => {
     setIpState('detecting')
     try {
@@ -74,7 +99,7 @@ export function ProvisionDialog({
   }
 
   useEffect(() => {
-    void detectIp()
+    if (info.designer.network) void detectIp()
   }, [])
 
   // Azure needs a resource group; offer the existing ones
@@ -92,15 +117,18 @@ export function ProvisionDialog({
 
   const problem = validateProvision(draft)
   const script = useMemo(
-    () => (problem ? '' : planScript(provisionPlan(draft), info.cli)),
+    () => (problem ? '' : planScript(planProvision(draft), info.cli)),
     [draft, problem, info.cli]
   )
 
   const create = async (): Promise<void> => {
     if (problem) return
-    const where = context ? `${info.contextLabel.toLowerCase()} ${context}` : 'your default account'
+    const target = draft.context || context
+    const where = target
+      ? `${info.contextLabel.toLowerCase()} ${contextList.find((c) => c.id === target)?.label ?? target}`
+      : 'your default account'
     const ok = await confirm({
-      title: `Create ${draft.name} on ${info.label}?`,
+      title: `Create ${draft.name.trim() || option.label} on ${info.label}?`,
       message: (
         <>
           This creates billable resources in {where}. Charges start as soon as the database exists
@@ -118,7 +146,10 @@ export function ProvisionDialog({
     if (!ok) return
     startProvision(draft, option.label)
     cloudPrefsStore.set((p) => ({ ...p, region: { ...p.region, [provider]: draft.region } }))
-    toast(`Provisioning ${draft.name}. Progress shows in the Cloud tab.`, 'info')
+    toast(
+      `Provisioning ${draft.name.trim() || option.label}. Progress shows in the Cloud tab.`,
+      'info'
+    )
     onClose()
   }
 
@@ -127,9 +158,11 @@ export function ProvisionDialog({
       width="2xl"
       title={`New ${info.label} database`}
       description={
-        context
-          ? `${info.contextLabel}: ${context}`
-          : `Uses the ${info.cli} CLI's default ${info.contextLabel.toLowerCase()}`
+        pickContext
+          ? `Through the ${info.cli}${info.auth === 'cli' ? ' CLI' : ''}`
+          : context
+            ? `${info.contextLabel}: ${context}`
+            : `Uses the ${info.cli} CLI's default ${info.contextLabel.toLowerCase()}`
       }
       icon={
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-info/15 text-info">
@@ -160,6 +193,43 @@ export function ProvisionDialog({
     >
       <div className="grid grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] gap-6">
         <div className="space-y-5">
+          {pickContext && (
+            <Section title={info.contextLabel}>
+              <div className="grid grid-cols-2 gap-3">
+                <Select
+                  value={draft.context}
+                  onChange={(e) =>
+                    provider === 'railway'
+                      ? pickProject(e.target.value)
+                      : patch({ context: e.target.value })
+                  }
+                >
+                  {provider === 'railway' && <option value="">New project…</option>}
+                  {provider === 'fly' && <option value="">Personal</option>}
+                  {contexts.isLoading && <option disabled>Loading…</option>}
+                  {contextList
+                    .filter((c) => !(provider === 'fly' && c.id === 'personal'))
+                    .map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label}
+                      </option>
+                    ))}
+                </Select>
+                {provider === 'railway' && project && (
+                  <Select value={draft.region} onChange={(e) => patch({ region: e.target.value })}>
+                    {project.children?.map((env) => (
+                      <option key={env.id} value={env.id}>
+                        {env.label}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </div>
+              {contexts.error ? (
+                <p className="mt-1.5 text-[11.5px] text-danger">{String(contexts.error)}</p>
+              ) : null}
+            </Section>
+          )}
           <Section title="Engine">
             <div className="grid grid-cols-3 gap-2">
               {PROVISION_ENGINES[provider].map((e) => (
@@ -180,24 +250,31 @@ export function ProvisionDialog({
               ))}
             </div>
             <div className="mt-3 grid grid-cols-2 gap-3">
-              <Field label="Version">
-                <Select value={draft.version} onChange={(e) => patch({ version: e.target.value })}>
-                  {option.versions.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.label}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-              <Field label="Region">
-                <Select value={draft.region} onChange={(e) => patch({ region: e.target.value })}>
-                  {REGIONS[provider].map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.label}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
+              {option.versions.length > 1 && (
+                <Field label="Version">
+                  <Select
+                    value={draft.version}
+                    onChange={(e) => patch({ version: e.target.value })}
+                  >
+                    {option.versions.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.label}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
+              {info.designer.region && (
+                <Field label={provider === 'cloudflare' ? 'Location' : 'Region'}>
+                  <Select value={draft.region} onChange={(e) => patch({ region: e.target.value })}>
+                    {REGIONS[provider].map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.label}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
             </div>
             {draft.engine === 'babelfish' && (
               <p className="mt-2 text-[11.5px] leading-snug text-muted">
@@ -209,17 +286,26 @@ export function ProvisionDialog({
 
           <Section title="Instance">
             <div className="grid grid-cols-2 gap-3">
-              <Field
-                label={provider === 'azure' ? 'Server name' : 'Name'}
-                hint={provider === 'azure' ? 'Becomes part of the host name' : undefined}
-              >
-                <Input
-                  value={draft.name}
-                  onChange={(e) => patch({ name: e.target.value })}
-                  placeholder="e.g. app-dev"
-                  autoFocus
-                />
-              </Field>
+              {/* Railway names the service itself; only a new project needs a name */}
+              {!(provider === 'railway' && draft.context) && (
+                <Field
+                  label={
+                    provider === 'azure'
+                      ? 'Server name'
+                      : provider === 'railway'
+                        ? 'Project name'
+                        : 'Name'
+                  }
+                  hint={provider === 'azure' ? 'Becomes part of the host name' : undefined}
+                >
+                  <Input
+                    value={draft.name}
+                    onChange={(e) => patch({ name: e.target.value })}
+                    placeholder="e.g. app-dev"
+                    autoFocus
+                  />
+                </Field>
+              )}
               {option.storage && (
                 <Field label="Storage (GB)">
                   <Input
@@ -233,27 +319,29 @@ export function ProvisionDialog({
                 </Field>
               )}
             </div>
-            <div className="mt-3 space-y-1.5">
-              <span className="text-xs font-medium text-muted">Size</span>
-              <div className="grid grid-cols-2 gap-2">
-                {option.sizes.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => patch({ size: s.id })}
-                    className={cn(
-                      'rounded-lg border px-2.5 py-2 text-left transition-colors',
-                      draft.size === s.id
-                        ? 'border-accent/60 bg-accent/5'
-                        : 'border-line-strong bg-raised/60 hover:bg-hover'
-                    )}
-                  >
-                    <span className="block font-mono text-[11.5px] text-bright">{s.label}</span>
-                    <span className="block text-[11px] text-muted">{s.detail}</span>
-                  </button>
-                ))}
+            {option.sizes.length > 1 && (
+              <div className="mt-3 space-y-1.5">
+                <span className="text-xs font-medium text-muted">Size</span>
+                <div className="grid grid-cols-2 gap-2">
+                  {option.sizes.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => patch({ size: s.id })}
+                      className={cn(
+                        'rounded-lg border px-2.5 py-2 text-left transition-colors',
+                        draft.size === s.id
+                          ? 'border-accent/60 bg-accent/5'
+                          : 'border-line-strong bg-raised/60 hover:bg-hover'
+                      )}
+                    >
+                      <span className="block font-mono text-[11.5px] text-bright">{s.label}</span>
+                      <span className="block text-[11px] text-muted">{s.detail}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
             {provider === 'azure' && (
               <div className="mt-3 grid grid-cols-[auto_1fr] items-end gap-3">
                 <Field label="Resource group">
@@ -297,8 +385,11 @@ export function ProvisionDialog({
           <Section title="Credentials">
             {option.noCredentials ? (
               <p className="text-[11.5px] leading-snug text-muted">
-                Cosmos DB generates access keys for the account. The saved connection uses its
-                primary connection string, with the key kept in the OS credential manager.
+                {option.id === 'cosmos'
+                  ? 'Cosmos DB generates access keys for the account. The saved connection uses its primary connection string, with the key kept in the OS credential manager.'
+                  : option.engine === 'sqlite'
+                    ? 'D1 has no users or passwords; the connection signs in with your Cloudflare API token.'
+                    : `${info.label} generates the user and password. The saved connection gets them once the database is ready, with the password kept in the OS credential manager.`}
               </p>
             ) : (
               <div className="grid grid-cols-2 gap-3">
@@ -368,80 +459,82 @@ export function ProvisionDialog({
             )}
           </Section>
 
-          <Section title="Network access">
-            <div className="grid grid-cols-3 gap-2">
-              {(
-                [
-                  ['ip', ShieldCheck, 'This machine', 'Only your IP address'],
-                  ['anywhere', Globe, 'Anywhere', 'Any IP; password only'],
+          {info.designer.network && (
+            <Section title="Network access">
+              <div className="grid grid-cols-3 gap-2">
+                {(
                   [
-                    'private',
-                    Lock,
-                    'Private',
-                    provider === 'gcp' ? 'Auth Proxy only' : 'Inside the cloud network'
-                  ]
-                ] as const
-              ).map(([value, Icon, label, detail]) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => patch({ access: value as NetworkAccess })}
-                  className={cn(
-                    'rounded-lg border px-2.5 py-2 text-left transition-colors',
-                    draft.access === value
-                      ? 'border-accent/60 bg-accent/5'
-                      : 'border-line-strong bg-raised/60 hover:bg-hover'
-                  )}
-                >
-                  <span className="flex items-center gap-1.5 text-xs text-bright">
-                    <Icon className="size-3.5" /> {label}
-                  </span>
-                  <span className="block text-[11px] text-muted">{detail}</span>
-                </button>
-              ))}
-            </div>
-            {draft.access === 'ip' && (
-              <Field
-                className="mt-3"
-                label="Allowed IP address"
-                hint={
-                  ipState === 'failed'
-                    ? "Couldn't detect your public IP; enter it (or a CIDR range) yourself"
-                    : 'Detected automatically; a CIDR range such as 203.0.113.0/24 also works'
-                }
-              >
-                <div className="flex gap-2">
-                  <Input
-                    mono
-                    value={draft.ip}
-                    onChange={(e) => patch({ ip: e.target.value })}
-                    placeholder="203.0.113.7"
-                  />
-                  <Button
-                    variant="secondary"
-                    disabled={ipState === 'detecting'}
-                    onClick={() => {
-                      patch({ ip: '' })
-                      void detectIp()
-                    }}
+                    ['ip', ShieldCheck, 'This machine', 'Only your IP address'],
+                    ['anywhere', Globe, 'Anywhere', 'Any IP; password only'],
+                    [
+                      'private',
+                      Lock,
+                      'Private',
+                      provider === 'gcp' ? 'Auth Proxy only' : 'Inside the cloud network'
+                    ]
+                  ] as const
+                ).map(([value, Icon, label, detail]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => patch({ access: value as NetworkAccess })}
+                    className={cn(
+                      'rounded-lg border px-2.5 py-2 text-left transition-colors',
+                      draft.access === value
+                        ? 'border-accent/60 bg-accent/5'
+                        : 'border-line-strong bg-raised/60 hover:bg-hover'
+                    )}
                   >
-                    {ipState === 'detecting' && <Spinner className="text-current" />} Detect
-                  </Button>
-                </div>
-              </Field>
-            )}
-            {draft.access === 'private' && (
-              <p className="mt-2 text-[11.5px] leading-snug text-muted">
-                {provider === 'gcp'
-                  ? 'The instance gets no authorized networks; connect through the Cloud SQL Auth Proxy.'
-                  : "You won't be able to connect from this machine without a VPN, bastion or tunnel."}
-              </p>
-            )}
-          </Section>
+                    <span className="flex items-center gap-1.5 text-xs text-bright">
+                      <Icon className="size-3.5" /> {label}
+                    </span>
+                    <span className="block text-[11px] text-muted">{detail}</span>
+                  </button>
+                ))}
+              </div>
+              {draft.access === 'ip' && (
+                <Field
+                  className="mt-3"
+                  label="Allowed IP address"
+                  hint={
+                    ipState === 'failed'
+                      ? "Couldn't detect your public IP; enter it (or a CIDR range) yourself"
+                      : 'Detected automatically; a CIDR range such as 203.0.113.0/24 also works'
+                  }
+                >
+                  <div className="flex gap-2">
+                    <Input
+                      mono
+                      value={draft.ip}
+                      onChange={(e) => patch({ ip: e.target.value })}
+                      placeholder="203.0.113.7"
+                    />
+                    <Button
+                      variant="secondary"
+                      disabled={ipState === 'detecting'}
+                      onClick={() => {
+                        patch({ ip: '' })
+                        void detectIp()
+                      }}
+                    >
+                      {ipState === 'detecting' && <Spinner className="text-current" />} Detect
+                    </Button>
+                  </div>
+                </Field>
+              )}
+              {draft.access === 'private' && (
+                <p className="mt-2 text-[11.5px] leading-snug text-muted">
+                  {provider === 'gcp'
+                    ? 'The instance gets no authorized networks; connect through the Cloud SQL Auth Proxy.'
+                    : "You won't be able to connect from this machine without a VPN, bastion or tunnel."}
+                </p>
+              )}
+            </Section>
+          )}
 
           <Section title="Options">
             <div className="grid grid-cols-2 gap-3">
-              {provider !== 'azure' && (
+              {info.designer.backups && (
                 <Toggle
                   checked={draft.backups}
                   onChange={(backups) => patch({ backups })}
@@ -449,7 +542,7 @@ export function ProvisionDialog({
                   description={provider === 'aws' ? 'Kept for 7 days' : 'Daily'}
                 />
               )}
-              {provider !== 'azure' && (
+              {info.designer.deletionProtection && (
                 <Toggle
                   checked={draft.deletionProtection}
                   onChange={(deletionProtection) => patch({ deletionProtection })}
@@ -502,14 +595,18 @@ export function ProvisionDialog({
             </p>
           </div>
           <div className="flex min-h-0 flex-1 flex-col">
-            <p className="mb-1.5 text-[11px] font-medium text-muted">Commands ({info.cli} CLI)</p>
+            <p className="mb-1.5 text-[11px] font-medium text-muted">
+              {info.auth === 'token' ? `Requests (${info.cli})` : `Commands (${info.cli} CLI)`}
+            </p>
             <pre className="min-h-64 flex-1 overflow-auto rounded-lg border border-line bg-canvas p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-fg select-text">
               {script || '# Fill in the form to see the commands'}
             </pre>
-            <p className="mt-1.5 text-[11px] leading-snug text-faint">
-              The password goes to the CLI in a temporary file that is deleted afterwards, never on
-              the command line.
-            </p>
+            {!option.noCredentials && (
+              <p className="mt-1.5 text-[11px] leading-snug text-faint">
+                The password goes to the CLI in a temporary file that is deleted afterwards, never
+                on the command line.
+              </p>
+            )}
           </div>
         </div>
       </div>

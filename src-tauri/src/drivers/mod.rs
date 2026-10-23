@@ -2,6 +2,7 @@ pub mod mongo;
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
+pub mod sqlite;
 
 use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::error::{AppError, AppResult};
@@ -15,6 +16,7 @@ pub enum Session {
     Pg(postgres::PgSession),
     My(mysql::MySession),
     Ms(mssql::MsSession),
+    Sq(sqlite::SqSession),
 }
 
 impl Session {
@@ -43,6 +45,7 @@ impl Session {
             Engine::Mssql | Engine::Babelfish => {
                 Session::Ms(mssql::connect(config, password, database).await?)
             }
+            Engine::Sqlite => Session::Sq(sqlite::connect(config, password).await?),
             Engine::Mongo => {
                 return Err(AppError::Unsupported(
                     "MongoDB doesn't use SQL sessions".into(),
@@ -56,6 +59,7 @@ impl Session {
             Session::Pg(s) => &s.database,
             Session::My(s) => &s.database,
             Session::Ms(s) => &s.database,
+            Session::Sq(s) => &s.database,
         }
     }
 
@@ -65,6 +69,7 @@ impl Session {
             Session::Pg(s) => s.is_closed(),
             Session::My(_) => false,
             Session::Ms(s) => s.broken,
+            Session::Sq(_) => false,
         }
     }
 
@@ -73,6 +78,7 @@ impl Session {
             Session::Pg(s) => !s.is_closed(),
             Session::My(s) => s.ping().await,
             Session::Ms(s) => s.ping().await,
+            Session::Sq(_) => true,
         }
     }
 
@@ -81,6 +87,7 @@ impl Session {
             Session::Pg(s) => s.server_info().await,
             Session::My(s) => s.server_info().await,
             Session::Ms(s) => s.server_info().await,
+            Session::Sq(s) => s.server_info().await,
         }
     }
 
@@ -94,6 +101,7 @@ impl Session {
             Session::Pg(s) => s.execute(sql, opts, cancel).await,
             Session::My(s) => s.execute(sql, opts, cancel).await,
             Session::Ms(s) => s.execute(sql, opts, cancel).await,
+            Session::Sq(s) => s.execute(sql, opts, cancel).await,
         }
     }
 }

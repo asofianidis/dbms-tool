@@ -9,6 +9,7 @@ mod guard;
 mod integration_tests;
 mod manager;
 mod model;
+mod tunnel;
 
 use tauri::Manager as _;
 
@@ -57,6 +58,10 @@ pub fn run() {
             commands::state_save,
             commands::cloud_tools,
             commands::cloud_cli,
+            commands::cloud_token_status,
+            commands::cloud_token_set,
+            commands::cloud_token_delete,
+            commands::cloud_api,
             commands::backup_tools,
             commands::backup_preview,
             commands::backup_inspect,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-const KEYRING_SERVICE: &str = "dbms-tool";
+pub(crate) const KEYRING_SERVICE: &str = "dbms-tool";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +18,8 @@ pub enum Engine {
     Mssql,
     Babelfish,
     Mongo,
+    /// Local database files and Cloudflare D1
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

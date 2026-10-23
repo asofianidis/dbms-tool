@@ -33,6 +33,7 @@ import {
   EngineMark,
   ErrorText,
   Eyebrow,
+  Input,
   Segmented,
   Select,
   Spinner,
@@ -45,7 +46,9 @@ import {
   connectToCloudDatabase,
   dismissJob,
   jobsStore,
+  forgetToken,
   refreshCloud,
+  saveToken,
   signIn,
   type ProvisionJob
 } from './actions'
@@ -57,11 +60,16 @@ export function CloudTab(): React.JSX.Element {
   const provider = prefs.provider
   const info = PROVIDERS[provider]
   const tools = useQuery(cloudQueries.tools())
-  const installed = !!tools.data?.find((t) => t.provider === provider)?.path
+  // Token providers need no CLI; the others need theirs installed
+  const installed =
+    info.auth === 'token' || !!tools.data?.find((t) => t.provider === provider)?.path
   const context = prefs.context[provider] ?? ''
-  const contexts = useQuery({ ...cloudQueries.contexts(provider), enabled: installed })
   const identity = useQuery({ ...cloudQueries.identity(provider, context), enabled: installed })
   const signedIn = !!identity.data
+  const contexts = useQuery({
+    ...cloudQueries.contexts(provider),
+    enabled: installed && (info.auth === 'cli' || signedIn)
+  })
   const defaultRegion = useQuery({
     ...cloudQueries.defaultRegion(provider, context),
     enabled: installed && info.regionScoped
@@ -79,22 +87,32 @@ export function CloudTab(): React.JSX.Element {
   const setPref = (key: 'context' | 'region', value: string): void =>
     cloudPrefsStore.set((p) => ({ ...p, [key]: { ...p[key], [provider]: value } }))
 
+  const firstAccount = contexts.data?.contexts[0]?.label
   const defaultLabel =
     provider === 'gcp' && contexts.data?.defaultContext
       ? `Default (${contexts.data.defaultContext})`
       : provider === 'azure'
         ? `Default (${contexts.data?.contexts.find((c) => c.isDefault)?.label ?? 'current'})`
-        : 'Default'
+        : provider === 'railway'
+          ? 'All projects'
+          : provider === 'render'
+            ? 'All workspaces'
+            : provider === 'fly'
+              ? 'Personal'
+              : provider === 'cloudflare'
+                ? (firstAccount ?? 'First account')
+                : 'Default'
 
   return (
     <div className="flex h-full flex-col">
       <Toolbar>
         <Segmented
+          size="sm"
           value={provider}
           onChange={(p: CloudProvider) => cloudPrefsStore.set((s) => ({ ...s, provider: p }))}
           options={PROVIDER_ORDER.map((p) => ({ value: p, label: PROVIDERS[p].label }))}
         />
-        {installed && (
+        {installed && (info.auth === 'cli' || signedIn) && (
           <>
             <ToolbarDivider />
             <span className="text-xs text-muted">{info.contextLabel}</span>
@@ -105,7 +123,13 @@ export function CloudTab(): React.JSX.Element {
             >
               <option value="">{defaultLabel}</option>
               {contexts.data?.contexts
-                .filter((c) => !(provider === 'aws' && c.id === 'default'))
+                // The empty choice already stands for these
+                .filter(
+                  (c) =>
+                    !(provider === 'aws' && c.id === 'default') &&
+                    !(provider === 'fly' && c.id === 'personal') &&
+                    !(provider === 'cloudflare' && c.id === contexts.data?.contexts[0]?.id)
+                )
                 .map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.label}
@@ -151,6 +175,16 @@ export function CloudTab(): React.JSX.Element {
           <span className="truncate text-[11px] text-faint" title={identity.data}>
             {identity.data}
           </span>
+        )}
+        {info.auth === 'token' && signedIn && (
+          <Button
+            size="sm"
+            variant="ghost"
+            title={`Remove the saved ${info.label} API token`}
+            onClick={() => void forgetToken(provider).catch(toastError)}
+          >
+            Forget token
+          </Button>
         )}
         <Button
           variant="primary"
@@ -199,6 +233,8 @@ export function CloudTab(): React.JSX.Element {
             </SetupCard>
           ) : identity.isLoading ? (
             <Spinner />
+          ) : !signedIn && info.auth === 'token' ? (
+            <TokenCard provider={provider} error={identity.error} />
           ) : !signedIn ? (
             <SignInCard provider={provider} context={context} error={identity.error} />
           ) : (
@@ -268,23 +304,25 @@ function SignInCard({
       title={`Sign in to ${info.label}`}
       actions={
         <>
-          <Button
-            variant="primary"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true)
-              try {
-                await signIn(provider, context)
-              } catch (e) {
-                toastError(e)
-              } finally {
-                setBusy(false)
-              }
-            }}
-          >
-            {busy ? <Spinner className="text-current" /> : <LogIn className="size-3.5" />}
-            {busy ? 'Waiting for the browser…' : 'Sign in'}
-          </Button>
+          {info.signIn && (
+            <Button
+              variant="primary"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true)
+                try {
+                  await signIn(provider, context)
+                } catch (e) {
+                  toastError(e)
+                } finally {
+                  setBusy(false)
+                }
+              }}
+            >
+              {busy ? <Spinner className="text-current" /> : <LogIn className="size-3.5" />}
+              {busy ? 'Waiting for the browser…' : 'Sign in'}
+            </Button>
+          )}
           <Button variant="secondary" onClick={() => refreshCloud(provider)}>
             Check again
           </Button>
@@ -424,7 +462,9 @@ function DatabaseRow({
         <div className="mt-0.5 flex items-center gap-2 text-[11.5px] text-muted">
           <span className="shrink-0">{db.product}</span>
           {db.size && <span className="shrink-0 text-faint">· {db.size}</span>}
-          {db.ref.region && <span className="shrink-0 text-faint">· {db.ref.region}</span>}
+          {(db.location ?? db.ref.region) && (
+            <span className="shrink-0 text-faint">· {db.location ?? db.ref.region}</span>
+          )}
           {db.ref.resourceGroup && (
             <span className="truncate text-faint">· {db.ref.resourceGroup}</span>
           )}
@@ -452,8 +492,8 @@ function DatabaseRow({
       <Button
         variant={saved ? 'secondary' : 'primary'}
         size="sm"
-        disabled={!db.host || busy}
-        title={db.host ? undefined : 'No endpoint yet'}
+        disabled={(!db.host && !db.endpointOnConnect) || busy}
+        title={db.host || db.endpointOnConnect ? undefined : 'No endpoint yet'}
         onClick={async () => {
           setBusy(true)
           try {
@@ -566,5 +606,71 @@ function Elapsed({ since }: { since: number }): React.JSX.Element {
       {' '}
       · {Math.floor(secs / 60)}m {String(secs % 60).padStart(2, '0')}s
     </span>
+  )
+}
+
+/** Render and Cloudflare: paste an API token, kept in the OS credential manager. */
+function TokenCard({
+  provider,
+  error
+}: {
+  provider: CloudProvider
+  error: unknown
+}): React.JSX.Element {
+  const info = PROVIDERS[provider]
+  const [token, setToken] = useState('')
+  const [busy, setBusy] = useState(false)
+  const save = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      await saveToken(provider, token)
+      setToken('')
+      toast(`Connected to ${info.label}`)
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <SetupCard
+      tone="info"
+      title={`Connect your ${info.label} account`}
+      actions={
+        <>
+          <Button variant="primary" disabled={!token.trim() || busy} onClick={() => void save()}>
+            {busy ? <Spinner className="text-current" /> : <LogIn className="size-3.5" />} Save
+            token
+          </Button>
+          {info.tokenUrl && (
+            <Button variant="secondary" onClick={() => void openUrl(info.tokenUrl!)}>
+              Create a token
+            </Button>
+          )}
+        </>
+      }
+    >
+      <p>{info.signInHint}</p>
+      <div className="mt-3 max-w-md">
+        <Input
+          mono
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && token.trim()) void save()
+          }}
+          placeholder="API token"
+        />
+      </div>
+      <p className="mt-2 text-[11.5px] text-muted">
+        The token is kept in the OS credential manager and only ever sent to {info.label}.
+      </p>
+      {!!error && (
+        <p className="mt-2 font-mono text-[11.5px] break-words whitespace-pre-wrap text-muted select-text">
+          {errorMessage(error)}
+        </p>
+      )}
+    </SetupCard>
   )
 }

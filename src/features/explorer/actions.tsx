@@ -20,7 +20,7 @@ import {
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
 import { modifyScript, routineTemplate } from '@/lib/routines'
-import { ENGINES, type Dialect } from '@/lib/engines'
+import { ENGINES, supports, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
 import { securableFor } from '@/lib/grants'
 import { shellCollection } from '@/lib/mongo-shell'
@@ -151,6 +151,9 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   const isView = obj.kind === 'view' || obj.kind === 'materialized_view'
   const isRoutine = obj.kind === 'function' || obj.kind === 'procedure'
   const dialect = dialectOf(connectionId)
+  const engine = getConnection(connectionId)?.engine
+  // SQLite browses and edits data, but has no table or trigger designer
+  const designers = !engine || supports(engine, 'designers')
   const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
   const items: MenuItem[] = [{ heading: label }]
   if (isTable || isView) {
@@ -168,11 +171,15 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
       },
       ...(obj.kind === 'table'
         ? [
-            {
-              label: 'Design table…',
-              icon: <Pencil />,
-              onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
-            },
+            ...(designers
+              ? [
+                  {
+                    label: 'Design table…',
+                    icon: <Pencil />,
+                    onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
+                  }
+                ]
+              : []),
             {
               label: 'Compare with…',
               icon: <GitCompareArrows />,
@@ -180,7 +187,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
             }
           ]
         : []),
-      ...(canHaveTriggers(dialect, obj.kind)
+      ...(designers && canHaveTriggers(dialect, obj.kind)
         ? [
             {
               label: 'New trigger…',

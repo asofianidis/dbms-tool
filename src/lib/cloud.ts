@@ -2,27 +2,44 @@ import type { CloudProvider, CloudRef, ConnectionConfig, Engine } from './api'
 import { newConnection } from './engines'
 
 /*
- * Cloud databases on AWS, Google Cloud and Azure, driven through each provider's
- * own CLI (aws, gcloud, az) so existing sign-ins, SSO and MFA just work. This
- * module is pure: it builds CLI arguments and parses their JSON output. Running
- * them lives in features/cloud/actions.ts.
+ * Cloud databases. AWS, Google Cloud, Azure, Railway and Fly.io are driven
+ * through each provider's own CLI so existing sign-ins, SSO and MFA just work;
+ * Render and Cloudflare go through their REST APIs with a saved API token. This
+ * module is pure: it builds CLI arguments and parses their JSON output, and
+ * covers the three big clouds (cloud-platforms.ts has the rest). Running them
+ * lives in features/cloud/actions.ts.
  */
+
+/** The providers whose databases this module's CLI builders cover. */
+export type MajorCloud = 'aws' | 'gcp' | 'azure'
+
+export function isMajorCloud(provider: CloudProvider): provider is MajorCloud {
+  return provider === 'aws' || provider === 'gcp' || provider === 'azure'
+}
 
 export interface ProviderInfo {
   id: CloudProvider
   label: string
-  /** Executable name, shown in messages */
+  /** Executable name, or the API's name for token providers; shown in messages */
   cli: string
-  /** What a "context" is: profile, project or subscription */
+  /** `cli`: the provider's CLI must be installed and signed in; `token`: a saved API token */
+  auth: 'cli' | 'token'
+  /** What a "context" is: profile, project, subscription, workspace, org or account */
   contextLabel: string
   installUrl: string
   pricingUrl: string
   /** Arguments that start an interactive (browser) sign-in */
-  signIn: (context: string) => string[]
+  signIn?: (context: string) => string[]
   signInHint: string
+  /** Where to create an API token (token providers) */
+  tokenUrl?: string
   /** AWS lists databases one region at a time; the others list every region at once */
   regionScoped: boolean
+  /** Options the provisioning designer offers */
+  designer: { backups: boolean; deletionProtection: boolean; network: boolean; region: boolean }
 }
+
+const ALL_OPTIONS = { backups: true, deletionProtection: true, network: true, region: true }
 
 export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
   aws: {
@@ -35,7 +52,9 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     signIn: (context) => ['sso', 'login', ...(context ? ['--profile', context] : [])],
     signInHint:
       'Run "aws configure" for access keys, or "aws configure sso" once and then sign in here.',
-    regionScoped: true
+    regionScoped: true,
+    auth: 'cli',
+    designer: ALL_OPTIONS
   },
   gcp: {
     id: 'gcp',
@@ -46,7 +65,9 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://cloud.google.com/sql/pricing',
     signIn: () => ['auth', 'login', '--brief'],
     signInHint: 'Sign in opens your browser, the same as "gcloud auth login".',
-    regionScoped: false
+    regionScoped: false,
+    auth: 'cli',
+    designer: ALL_OPTIONS
   },
   azure: {
     id: 'azure',
@@ -57,11 +78,73 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://azure.microsoft.com/pricing/details/azure-sql-database/',
     signIn: () => ['login', '--output', 'none', '--only-show-errors'],
     signInHint: 'Sign in opens your browser, the same as "az login".',
-    regionScoped: false
+    regionScoped: false,
+    auth: 'cli',
+    designer: { ...ALL_OPTIONS, backups: false, deletionProtection: false }
+  },
+  railway: {
+    id: 'railway',
+    label: 'Railway',
+    cli: 'railway',
+    auth: 'cli',
+    contextLabel: 'Project',
+    installUrl: 'https://docs.railway.com/guides/cli',
+    pricingUrl: 'https://railway.com/pricing',
+    signInHint: 'Run "railway login" in a terminal, then check again.',
+    regionScoped: false,
+    designer: { backups: false, deletionProtection: false, network: false, region: false }
+  },
+  render: {
+    id: 'render',
+    label: 'Render',
+    cli: 'Render API',
+    auth: 'token',
+    contextLabel: 'Workspace',
+    installUrl: 'https://render.com/docs/api',
+    pricingUrl: 'https://render.com/pricing#postgresql',
+    signInHint: 'Create an API key under Account Settings → API Keys and paste it here.',
+    tokenUrl: 'https://dashboard.render.com/u/settings#api-keys',
+    regionScoped: false,
+    designer: { backups: false, deletionProtection: false, network: true, region: true }
+  },
+  fly: {
+    id: 'fly',
+    label: 'Fly.io',
+    cli: 'flyctl',
+    auth: 'cli',
+    contextLabel: 'Organization',
+    installUrl: 'https://fly.io/docs/flyctl/install/',
+    pricingUrl: 'https://fly.io/docs/mpg/#pricing',
+    signIn: () => ['auth', 'login'],
+    signInHint: 'Sign in opens your browser, the same as "fly auth login".',
+    regionScoped: false,
+    designer: { backups: false, deletionProtection: false, network: false, region: true }
+  },
+  cloudflare: {
+    id: 'cloudflare',
+    label: 'Cloudflare',
+    cli: 'Cloudflare API',
+    auth: 'token',
+    contextLabel: 'Account',
+    installUrl: 'https://developers.cloudflare.com/d1/',
+    pricingUrl: 'https://developers.cloudflare.com/d1/platform/pricing/',
+    signInHint:
+      'Create an API token with the "D1 Edit" and "Account Settings Read" permissions and paste it here.',
+    tokenUrl: 'https://dash.cloudflare.com/profile/api-tokens',
+    regionScoped: false,
+    designer: { backups: false, deletionProtection: false, network: false, region: true }
   }
 }
 
-export const PROVIDER_ORDER: CloudProvider[] = ['aws', 'gcp', 'azure']
+export const PROVIDER_ORDER: CloudProvider[] = [
+  'aws',
+  'gcp',
+  'azure',
+  'railway',
+  'render',
+  'fly',
+  'cloudflare'
+]
 
 export const REGIONS: Record<CloudProvider, { id: string; label: string }[]> = {
   aws: [
@@ -115,6 +198,39 @@ export const REGIONS: Record<CloudProvider, { id: string; label: string }[]> = {
     { id: 'southeastasia', label: 'Southeast Asia' },
     { id: 'japaneast', label: 'Japan East' },
     { id: 'australiaeast', label: 'Australia East' }
+  ],
+  // Railway picks the region per service in its dashboard
+  railway: [],
+  render: [
+    { id: 'oregon', label: 'Oregon (US West)' },
+    { id: 'ohio', label: 'Ohio (US East)' },
+    { id: 'virginia', label: 'Virginia (US East)' },
+    { id: 'frankfurt', label: 'Frankfurt (EU Central)' },
+    { id: 'singapore', label: 'Singapore (Southeast Asia)' }
+  ],
+  fly: [
+    { id: 'iad', label: 'Ashburn, Virginia (iad)' },
+    { id: 'ord', label: 'Chicago (ord)' },
+    { id: 'sjc', label: 'San Jose (sjc)' },
+    { id: 'lax', label: 'Los Angeles (lax)' },
+    { id: 'yyz', label: 'Toronto (yyz)' },
+    { id: 'gru', label: 'São Paulo (gru)' },
+    { id: 'lhr', label: 'London (lhr)' },
+    { id: 'ams', label: 'Amsterdam (ams)' },
+    { id: 'fra', label: 'Frankfurt (fra)' },
+    { id: 'sin', label: 'Singapore (sin)' },
+    { id: 'nrt', label: 'Tokyo (nrt)' },
+    { id: 'syd', label: 'Sydney (syd)' }
+  ],
+  // D1 takes a location hint rather than a region
+  cloudflare: [
+    { id: '', label: 'Automatic (nearest to you)' },
+    { id: 'wnam', label: 'Western North America' },
+    { id: 'enam', label: 'Eastern North America' },
+    { id: 'weur', label: 'Western Europe' },
+    { id: 'eeur', label: 'Eastern Europe' },
+    { id: 'apac', label: 'Asia Pacific' },
+    { id: 'oc', label: 'Oceania' }
   ]
 }
 
@@ -123,7 +239,7 @@ export function regionLabel(provider: CloudProvider, region: string): string {
 }
 
 /** Global flags that pick the account, region and JSON output. */
-export function scopeArgs(provider: CloudProvider, context: string, region?: string): string[] {
+export function scopeArgs(provider: MajorCloud, context: string, region?: string): string[] {
   switch (provider) {
     case 'aws':
       return [
@@ -150,10 +266,12 @@ export interface CloudContext {
   id: string
   label: string
   isDefault: boolean
+  /** Railway: the project's environments */
+  children?: { id: string; label: string }[]
 }
 
 /** Command listing profiles / projects / subscriptions. */
-export function contextsCommand(provider: CloudProvider): string[] {
+export function contextsCommand(provider: MajorCloud): string[] {
   switch (provider) {
     case 'aws':
       return ['configure', 'list-profiles']
@@ -164,7 +282,7 @@ export function contextsCommand(provider: CloudProvider): string[] {
   }
 }
 
-export function parseContexts(provider: CloudProvider, stdout: string): CloudContext[] {
+export function parseContexts(provider: MajorCloud, stdout: string): CloudContext[] {
   if (provider === 'aws') {
     // Plain text, one profile per line
     return stdout
@@ -197,7 +315,7 @@ export function parseContexts(provider: CloudProvider, stdout: string): CloudCon
 }
 
 /** Who the CLI is signed in as; the command fails (or lists nobody) when signed out. */
-export function identityCommand(provider: CloudProvider, context: string): string[] {
+export function identityCommand(provider: MajorCloud, context: string): string[] {
   switch (provider) {
     case 'aws':
       return ['sts', 'get-caller-identity', ...scopeArgs('aws', context)]
@@ -209,7 +327,7 @@ export function identityCommand(provider: CloudProvider, context: string): strin
 }
 
 /** The signed-in identity, or null when nobody is signed in. */
-export function parseIdentity(provider: CloudProvider, stdout: string): string | null {
+export function parseIdentity(provider: MajorCloud, stdout: string): string | null {
   const json = parseJson<Record<string, unknown> | Record<string, unknown>[]>(stdout)
   if (!json) return null
   if (provider === 'aws' && !Array.isArray(json)) {
@@ -266,6 +384,10 @@ export interface CloudDatabase {
   members?: string[]
   /** Why connecting from here may not work */
   note?: string
+  /** Shown in place of the region, e.g. Railway's project and environment */
+  location?: string
+  /** The endpoint is looked up when connecting rather than listed (Render, Railway, Fly.io, D1) */
+  endpointOnConnect?: boolean
 }
 
 export interface ListCommand {
@@ -282,11 +404,7 @@ export interface ListCommand {
   args: string[]
 }
 
-export function listCommands(
-  provider: CloudProvider,
-  context: string,
-  region: string
-): ListCommand[] {
+export function listCommands(provider: MajorCloud, context: string, region: string): ListCommand[] {
   const scope = scopeArgs(provider, context, region)
   switch (provider) {
     case 'aws':
@@ -650,13 +768,16 @@ const ENGINE_PORTS: Record<Engine, number> = {
   mysql: 3306,
   mssql: 1433,
   babelfish: 1433,
-  mongo: 27017
+  mongo: 27017,
+  sqlite: 0
 }
 
 /** Command that looks up one database again (for refreshes and provisioning progress). */
 export function describeCommand(ref: CloudRef): { key: ListCommand['key']; args: string[] } {
-  const scope = scopeArgs(ref.provider, ref.context, ref.region)
-  switch (ref.provider) {
+  const provider = ref.provider
+  if (!isMajorCloud(provider)) throw new Error(`No describe command for ${provider}`)
+  const scope = scopeArgs(provider, ref.context, ref.region)
+  switch (provider) {
     case 'aws':
       return ref.kind === 'cluster'
         ? {
@@ -722,8 +843,20 @@ export function anyInstanceAvailable(stdout: string): boolean {
 export interface Credentials {
   username?: string
   password?: string
-  /** A connection string to use instead of host and port (Cosmos DB) */
+  /** A connection string to use instead of host and port (Cosmos DB, MongoDB) */
   uri?: string
+  host?: string
+  port?: number
+  database?: string
+}
+
+/** Fills a connection in from credentials fetched when connecting. */
+export function applyCredentials(config: ConnectionConfig, credentials: Credentials): void {
+  if (credentials.uri) config.uri = credentials.uri
+  if (credentials.host) config.host = credentials.host
+  if (credentials.port) config.port = credentials.port
+  if (credentials.username) config.user = credentials.username
+  if (credentials.database) config.database = credentials.database
 }
 
 /**
@@ -784,6 +917,19 @@ export function splitMongoPassword(uri: string): Credentials {
 
 /* ---------- Connections ---------- */
 
+/** TLS per provider: Azure and Render use public CAs; RDS, Cloud SQL and Railway sign their own. */
+const TLS: Record<CloudProvider, Pick<ConnectionConfig, 'ssl' | 'trustServerCertificate'>> = {
+  aws: { ssl: 'require', trustServerCertificate: true },
+  gcp: { ssl: 'require', trustServerCertificate: true },
+  azure: { ssl: 'require', trustServerCertificate: false },
+  render: { ssl: 'require', trustServerCertificate: false },
+  // Railway's MySQL and MongoDB templates don't all offer TLS
+  railway: { ssl: 'prefer', trustServerCertificate: true },
+  // Reached through a local tunnel, which rewrites these when connecting
+  fly: { ssl: 'prefer', trustServerCertificate: true },
+  cloudflare: { ssl: 'prefer', trustServerCertificate: false }
+}
+
 /** A new (unsaved) connection for a discovered database. */
 export function connectionFor(db: CloudDatabase): ConnectionConfig {
   const base = newConnection(db.engine)
@@ -794,9 +940,7 @@ export function connectionFor(db: CloudDatabase): ConnectionConfig {
     port: db.port || base.port,
     user: db.user || base.user,
     database: db.database || base.database,
-    ssl: 'require',
-    // RDS and Cloud SQL sign with their own CAs, which aren't in the OS trust store
-    trustServerCertificate: db.ref.provider !== 'azure',
+    ...TLS[db.ref.provider],
     group: PROVIDERS[db.ref.provider].label,
     cloud: db.ref
   }
@@ -1136,6 +1280,82 @@ export const PROVISION_ENGINES: Record<CloudProvider, EngineOption[]> = {
       storage: null,
       initialDatabase: 'optional'
     }
+  ],
+  // Railway deploys its database templates with generated credentials
+  railway: (
+    [
+      ['postgres', 'PostgreSQL', 'postgres'],
+      ['mysql', 'MySQL', 'mysql'],
+      ['mongo', 'MongoDB', 'mongo']
+    ] as const
+  ).map(([id, label, engine]) => ({
+    id,
+    label,
+    engine,
+    versions: [DEFAULT_VERSION],
+    sizes: [
+      { id: 'usage', label: 'Usage-based', detail: 'Billed for the CPU, memory and storage used' }
+    ],
+    defaultUser: '',
+    noCredentials: true,
+    storage: null,
+    initialDatabase: false
+  })),
+  render: [
+    {
+      id: 'postgres',
+      label: 'PostgreSQL',
+      engine: 'postgres',
+      versions: ['17', '18', '16', '15'].map((v) => ({ id: v, label: v })),
+      sizes: [
+        { id: 'free', label: 'Free', detail: '256 MB · expires after 30 days; one per workspace' },
+        { id: 'basic_256mb', label: 'Basic 256 MB', detail: '0.1 CPU · 256 MB RAM' },
+        { id: 'basic_1gb', label: 'Basic 1 GB', detail: '0.5 CPU · 1 GB RAM' },
+        { id: 'basic_4gb', label: 'Basic 4 GB', detail: '2 CPU · 4 GB RAM' },
+        { id: 'pro_4gb', label: 'Pro 4 GB', detail: '1 CPU · 4 GB RAM' }
+      ],
+      defaultUser: '',
+      noCredentials: true,
+      storage: null,
+      initialDatabase: 'optional'
+    }
+  ],
+  fly: [
+    {
+      id: 'mpg',
+      label: 'Managed Postgres',
+      engine: 'postgres',
+      versions: ['16', '17'].map((v) => ({ id: v, label: v })),
+      sizes: [
+        { id: 'basic', label: 'Basic', detail: 'Shared 2x · 1 GB' },
+        { id: 'starter', label: 'Starter', detail: 'Shared 2x · 2 GB' },
+        { id: 'launch', label: 'Launch', detail: 'Performance 2x · 8 GB' },
+        { id: 'scale', label: 'Scale', detail: 'Performance 4x · 32 GB' }
+      ],
+      defaultUser: '',
+      noCredentials: true,
+      storage: { min: 10, default: 10 },
+      initialDatabase: false
+    }
+  ],
+  cloudflare: [
+    {
+      id: 'd1',
+      label: 'D1 (SQLite)',
+      engine: 'sqlite',
+      versions: [DEFAULT_VERSION],
+      sizes: [
+        {
+          id: 'serverless',
+          label: 'Serverless',
+          detail: 'Billed per row read and written, with a free allowance'
+        }
+      ],
+      defaultUser: '',
+      noCredentials: true,
+      storage: null,
+      initialDatabase: false
+    }
   ]
 }
 
@@ -1181,7 +1401,7 @@ export function newProvisionDraft(
   return {
     provider,
     context,
-    region: region || REGIONS[provider][0].id,
+    region: region || (REGIONS[provider][0]?.id ?? ''),
     resourceGroup: 'dbms-tool',
     newResourceGroup: true,
     engine: option.id,
@@ -1270,8 +1490,24 @@ const RESERVED_USERS = new Set([
 export function validateProvision(draft: ProvisionDraft): string | null {
   const option = engineOption(draft.provider, draft.engine)
   const name = draft.name.trim()
+  const info = PROVIDERS[draft.provider]
+  // Railway adds the database to a project: a new one needs a name, an existing one an environment
+  if (draft.provider === 'railway') {
+    if (!draft.context) return /^[\w .-]{1,64}$/.test(name) ? null : 'Enter a project name'
+    return draft.region ? null : 'Pick an environment'
+  }
   if (!name) return 'Enter a name'
-  if (draft.provider === 'aws') {
+  if (draft.provider === 'render') {
+    if (name.length > 64) return 'Render names are at most 64 characters'
+    if (!draft.context) return 'Pick a workspace'
+  } else if (draft.provider === 'fly') {
+    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name))
+      return 'Fly.io names use lowercase letters, digits and hyphens'
+  } else if (draft.provider === 'cloudflare') {
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name))
+      return 'D1 names use lowercase letters, digits, hyphens and underscores'
+    if (!draft.context) return 'Pick an account'
+  } else if (draft.provider === 'aws') {
     if (!/^[a-zA-Z][a-zA-Z0-9-]{0,62}$/.test(name) || /--|-$/.test(name))
       return 'AWS names start with a letter and use letters, digits and single hyphens (max 63)'
   } else if (draft.provider === 'gcp') {
@@ -1283,7 +1519,9 @@ export function validateProvision(draft: ProvisionDraft): string | null {
   } else if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(name)) {
     return 'Azure server names are 3–63 lowercase letters, digits and hyphens'
   }
-  if (!draft.region) return 'Pick a region'
+  // D1's location hint may be left to Cloudflare
+  if (info.designer.region && !draft.region && draft.provider !== 'cloudflare')
+    return 'Pick a region'
   if (draft.provider === 'azure' && !/^[\w.()-]{1,90}$/.test(draft.resourceGroup.trim()))
     return 'Enter a resource group name'
   if (!draft.size.trim()) return 'Pick a size'
@@ -1317,7 +1555,8 @@ export function validateProvision(draft: ProvisionDraft): string | null {
     return 'Enter a database name'
   if (draft.database && !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(draft.database))
     return 'Database names use letters, digits and underscores'
-  if (draft.access === 'ip' && !parseIp(draft.ip)) return 'Enter the IP address to allow in'
+  if (info.designer.network && draft.access === 'ip' && !parseIp(draft.ip))
+    return 'Enter the IP address to allow in'
   if (draft.iamAuth && draft.provider === 'gcp' && !draft.iamUser)
     return 'Sign in to gcloud so your account can be added as an IAM user'
   return null
@@ -1331,7 +1570,7 @@ function parseIp(text: string): { address: string; prefix: number } | null {
   return prefix <= 32 ? { address: match[1], prefix } : null
 }
 
-function cidr(draft: ProvisionDraft): string {
+export function cidr(draft: ProvisionDraft): string {
   if (draft.access === 'anywhere') return '0.0.0.0/0'
   const ip = parseIp(draft.ip)
   return ip ? `${ip.address}/${ip.prefix}` : ''
@@ -1351,14 +1590,25 @@ function ipRange(draft: ProvisionDraft): [string, string] {
   return [dotted(start), dotted(end)]
 }
 
+export interface ApiRequest {
+  method: 'GET' | 'POST' | 'DELETE' | 'PATCH'
+  /** Relative to the provider's API base URL */
+  path: string
+  body?: unknown
+}
+
 export interface PlanStep {
   title: string
   /** `ctx` holds values captured from earlier steps; previews pass `<name>` placeholders */
   args: (ctx: Record<string, string>) => string[]
+  /** A REST call instead of a CLI command (token providers, Fly.io lookups) */
+  api?: (ctx: Record<string, string>) => ApiRequest
+  /** App-managed folder to run the CLI in, for CLIs that act on the current directory */
+  workdir?: string
   /** Contents of the temporary file `{secret}` refers to */
   secret?: string
-  /** Pulls values out of the step's JSON output for later steps */
-  capture?: (stdout: string) => Record<string, string>
+  /** Pulls values out of the step's output (JSON text for API calls) for later steps */
+  capture?: (stdout: string, ctx: Record<string, string>) => Record<string, string>
   timeoutSecs?: number
 }
 
@@ -1368,12 +1618,15 @@ export interface ProvisionPlan {
   steps: PlanStep[]
   /** Run once the database reports ready, e.g. creating the initial database */
   afterReady: PlanStep[]
+  /** The created resource, once its id is known from captured values */
+  resolveRef?: (ctx: Record<string, string>) => CloudRef
 }
 
 /** Long enough for the CLIs that wait for the server to come up (gcloud, az). */
 const CREATE_TIMEOUT = 45 * 60
 
-export function provisionPlan(draft: ProvisionDraft): ProvisionPlan {
+/** Plans for AWS, Google Cloud and Azure; see cloud-platforms.ts for the others. */
+export function provisionPlan(draft: ProvisionDraft & { provider: MajorCloud }): ProvisionPlan {
   switch (draft.provider) {
     case 'aws':
       return awsPlan(draft)
@@ -1923,12 +2176,18 @@ export function planScript(plan: ProvisionPlan, cli: string): string {
 export function stepsScript(steps: PlanStep[], cli: string, waitAt = -1): string {
   return steps
     .map((step, i) => {
+      const waits = i === waitAt && i > 0 ? '# …once the server is ready\n' : ''
+      if (step.api) {
+        const request = step.api(PREVIEW_CTX)
+        const body = request.body === undefined ? '' : `\n${JSON.stringify(request.body, null, 2)}`
+        return `${waits}# ${step.title}\n${request.method} ${request.path}${body}`
+      }
       const args = step
         .args(PREVIEW_CTX)
         .map((a) => a.replace('{secret}', 'password-file'))
         .map(shellQuote)
-      const waits = i === waitAt && i > 0 ? '# …once the server is ready\n' : ''
-      return `${waits}# ${step.title}\n${cli} ${args.join(' ')}`
+      const where = step.workdir ? `(in a ${cli} working folder) ` : ''
+      return `${waits}# ${step.title}\n${where}${cli} ${args.join(' ')}`
     })
     .join('\n\n')
 }
@@ -1949,13 +2208,13 @@ export function provisionedConnection(
   credentials: Credentials = {}
 ): ConnectionConfig {
   const base = connectionFor(db)
+  applyCredentials(base, credentials)
   const option = engineOption(draft.provider, draft.engine)
   return {
     ...base,
-    name: draft.name.trim(),
+    name: draft.name.trim() || db.name,
     user: option.fixedUser || option.noCredentials ? base.user : draft.user,
     database: draft.database || base.database,
-    ...(credentials.uri ? { uri: credentials.uri } : {}),
     savePassword: true
   }
 }
@@ -1991,8 +2250,10 @@ export function deletePlan(
 ): PlanStep[] {
   const { ref } = db
   const name = ref.resource
-  const scope = scopeArgs(ref.provider, ref.context, ref.region)
-  switch (ref.provider) {
+  const provider = ref.provider
+  if (!isMajorCloud(provider)) throw new Error(`No delete plan for ${provider} here`)
+  const scope = scopeArgs(provider, ref.context, ref.region)
+  switch (provider) {
     case 'aws': {
       // DocumentDB clusters have their own API with the same shape
       const service = db.engine === 'mongo' ? 'docdb' : 'rds'

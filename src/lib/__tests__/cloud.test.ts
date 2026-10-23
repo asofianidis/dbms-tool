@@ -18,12 +18,12 @@ import {
   parseIdentity,
   parseList,
   planScript,
-  provisionPlan,
   provisionedConnection,
   validateProvision,
   withEngine,
   type ProvisionDraft
 } from '../cloud'
+import { planProvision } from '../cloud-platforms'
 import { newConnection } from '../engines'
 
 const awsInstances = JSON.stringify({
@@ -444,17 +444,17 @@ describe('provisioning', () => {
   })
 
   it('plans a public RDS instance with its own security group', () => {
-    const plan = provisionPlan(draftFor('aws', { region: 'eu-west-1', database: 'app' }))
+    const plan = planProvision(draftFor('aws', { region: 'eu-west-1', database: 'app' }))
     expect(plan.steps.map((s) => s.title)).toEqual([
       'Find the default VPC',
       'Create a security group',
       'Allow 203.0.113.7/32 on port 5432',
       'Create the PostgreSQL instance'
     ])
-    expect(plan.steps[0].capture!(JSON.stringify({ Vpcs: [{ VpcId: 'vpc-1' }] }))).toEqual({
+    expect(plan.steps[0].capture!(JSON.stringify({ Vpcs: [{ VpcId: 'vpc-1' }] }), {})).toEqual({
       vpcId: 'vpc-1'
     })
-    expect(() => plan.steps[0].capture!(JSON.stringify({ Vpcs: [] }))).toThrow(/default VPC/)
+    expect(() => plan.steps[0].capture!(JSON.stringify({ Vpcs: [] }), {})).toThrow(/default VPC/)
     const create = plan.steps[3]
     const args = create.args({ groupId: 'sg-9' })
     expect(args).toEqual(
@@ -482,7 +482,7 @@ describe('provisioning', () => {
   })
 
   it('plans private and SQL Server RDS instances', () => {
-    const plan = provisionPlan(
+    const plan = planProvision(
       withEngine(draftFor('aws', { access: 'private', database: 'x' }), 'sqlserver-ex')
     )
     expect(plan.steps).toHaveLength(1)
@@ -495,7 +495,7 @@ describe('provisioning', () => {
   })
 
   it('plans an Aurora Serverless v2 cluster and its writer', () => {
-    const plan = provisionPlan(
+    const plan = planProvision(
       withEngine(draftFor('aws', { access: 'private' }), 'aurora-postgresql')
     )
     expect(plan.ref.kind).toBe('cluster')
@@ -520,7 +520,7 @@ describe('provisioning', () => {
   })
 
   it('plans a Cloud SQL instance with the password in a flags file', () => {
-    const plan = provisionPlan(draftFor('gcp', { region: 'us-central1', database: 'app' }))
+    const plan = planProvision(draftFor('gcp', { region: 'us-central1', database: 'app' }))
     const [create] = plan.steps
     expect(create.args({})).toEqual(
       expect.arrayContaining([
@@ -540,14 +540,14 @@ describe('provisioning', () => {
       expect.arrayContaining(['databases', 'create', 'app', '--instance=app-dev'])
     )
     expect(
-      provisionPlan(draftFor('gcp', { access: 'private' }))
+      planProvision(draftFor('gcp', { access: 'private' }))
         .steps[0].args({})
         .join(' ')
     ).not.toContain('authorized-networks')
   })
 
   it('plans Azure flexible servers and SQL databases', () => {
-    const pg = provisionPlan(
+    const pg = planProvision(
       draftFor('azure', { region: 'westeurope', user: 'dbadmin', database: 'app' })
     )
     expect(pg.steps.map((s) => s.title)[0]).toBe('Create resource group dbms-tool')
@@ -573,7 +573,7 @@ describe('provisioning', () => {
     expect(pg.afterReady).toHaveLength(1)
     expect(pg.ref).toMatchObject({ kind: 'postgres', resourceGroup: 'dbms-tool' })
 
-    const sql = provisionPlan(
+    const sql = planProvision(
       withEngine(draftFor('azure', { newResourceGroup: false, ip: '203.0.113.0/24' }), 'sql')
     )
     expect(sql.steps.map((s) => s.title)).toEqual([
@@ -593,13 +593,13 @@ describe('provisioning', () => {
   })
 
   it('renders a script without the password', () => {
-    const script = planScript(provisionPlan(draftFor('aws')), 'aws')
+    const script = planScript(planProvision(draftFor('aws')), 'aws')
     expect(script).toContain('# Create a security group')
     expect(script).toContain('--vpc-id <vpcId>')
     expect(script).toContain('file://password-file')
     expect(script).toContain("--description 'Database access for app-dev (created by dbms-tool)'")
     expect(script).not.toContain('Str0ng')
-    expect(planScript(provisionPlan(draftFor('gcp', { database: 'app' })), 'gcloud')).toContain(
+    expect(planScript(planProvision(draftFor('gcp', { database: 'app' })), 'gcloud')).toContain(
       '# …once the server is ready'
     )
   })
@@ -675,18 +675,18 @@ describe('passwordless sign-in', () => {
   })
 
   it('turns on IAM authentication when provisioning', () => {
-    const aws = provisionPlan(draftFor('aws', { iamAuth: true, access: 'private' }))
+    const aws = planProvision(draftFor('aws', { iamAuth: true, access: 'private' }))
     expect(aws.steps[0].args({})).toContain('--enable-iam-database-authentication')
-    expect(provisionPlan(draftFor('aws', { access: 'private' })).steps[0].args({})).not.toContain(
+    expect(planProvision(draftFor('aws', { access: 'private' })).steps[0].args({})).not.toContain(
       '--enable-iam-database-authentication'
     )
 
-    const gcpPg = provisionPlan(draftFor('gcp', { iamAuth: true, iamUser: 'me@acme.dev' }))
+    const gcpPg = planProvision(draftFor('gcp', { iamAuth: true, iamUser: 'me@acme.dev' }))
     expect(gcpPg.steps[0].args({})).toContain('--database-flags=cloudsql.iam_authentication=on')
     expect(gcpPg.afterReady[0].args({})).toEqual(
       expect.arrayContaining(['users', 'create', 'me@acme.dev', '--type=cloud_iam_user'])
     )
-    const gcpMy = provisionPlan(
+    const gcpMy = planProvision(
       withEngine(
         draftFor('gcp', { iamAuth: true, iamUser: 'svc@p.iam.gserviceaccount.com' }),
         'MYSQL'
@@ -722,7 +722,7 @@ describe('Babelfish', () => {
   })
 
   it('plans a Babelfish cluster with its parameter group and both ports', () => {
-    const plan = provisionPlan(withEngine(draftFor('aws'), 'babelfish'))
+    const plan = planProvision(withEngine(draftFor('aws'), 'babelfish'))
     expect(plan.steps.map((s) => s.title)).toEqual([
       'Find the default VPC',
       'Create a security group',
@@ -741,10 +741,11 @@ describe('Babelfish', () => {
           DBEngineVersions: [
             { EngineVersion: '16.4', DBParameterGroupFamily: 'aurora-postgresql16' }
           ]
-        })
+        }),
+        {}
       )
     ).toEqual({ engineVersion: '16.4', family: 'aurora-postgresql16' })
-    expect(() => lookup.capture!('{"DBEngineVersions":[]}')).toThrow(/isn't offered/)
+    expect(() => lookup.capture!('{"DBEngineVersions":[]}', {})).toThrow(/isn't offered/)
     expect(plan.steps[5].args({ family: 'aurora-postgresql16' })).toEqual(
       expect.arrayContaining(['--db-parameter-group-family', 'aurora-postgresql16'])
     )
@@ -847,7 +848,7 @@ describe('Cosmos DB', () => {
     )
     expect(validateProvision(draft)).toBeNull()
     expect(validateProvision({ ...draft, name: 'x'.repeat(45) })).toMatch(/3–44/)
-    const plan = provisionPlan(draft)
+    const plan = planProvision(draft)
     const create = plan.steps[1]
     expect(create.secret).toBeUndefined()
     expect(create.args({})).toEqual(
@@ -864,7 +865,7 @@ describe('Cosmos DB', () => {
         '203.0.113.7/32'
       ])
     )
-    expect(provisionPlan({ ...draft, access: 'private', size: 'free' }).steps[1].args({})).toEqual(
+    expect(planProvision({ ...draft, access: 'private', size: 'free' }).steps[1].args({})).toEqual(
       expect.arrayContaining(['--public-network-access', 'Disabled', '--enable-free-tier', 'true'])
     )
     expect(plan.afterReady[0].args({})).toEqual(

@@ -15,7 +15,7 @@ import {
 } from '@codemirror/commands'
 import { javascript } from '@codemirror/lang-javascript'
 import { json } from '@codemirror/lang-json'
-import { MSSQL, MySQL, PostgreSQL, sql, type SQLNamespace } from '@codemirror/lang-sql'
+import { MSSQL, MySQL, PostgreSQL, sql, type SQLNamespace, SQLite } from '@codemirror/lang-sql'
 import {
   bracketMatching,
   foldGutter,
@@ -190,7 +190,7 @@ const theme = EditorView.theme(
   { dark: true }
 )
 
-const DIALECTS = { postgres: PostgreSQL, mysql: MySQL, tsql: MSSQL }
+const DIALECTS = { postgres: PostgreSQL, mysql: MySQL, tsql: MSSQL, sqlite: SQLite }
 
 function languageExtension(
   language: EditorLanguage,

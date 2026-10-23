@@ -11,6 +11,12 @@ export function quoteIdent(dialect: Dialect, name: string): string {
       return `\`${name.replace(/`/g, '``')}\``
     case 'tsql':
       return `[${name.replace(/]/g, ']]')}]`
+    case 'sqlite':
+      // SQLite folds unquoted names to no case at all, so quoting only matters
+      // for unusual characters and keywords
+      return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !PG_RESERVED.has(name.toLowerCase())
+        ? name
+        : `"${name.replace(/"/g, '""')}"`
   }
 }
 
@@ -133,6 +139,9 @@ export function literal(dialect: Dialect, value: Cell, dataType = ''): string {
   }
   if (dialect === 'postgres' && /^0x[0-9a-f]*$/i.test(value) && /bytea/i.test(dataType)) {
     return `'\\x${value.slice(2)}'`
+  }
+  if (dialect === 'sqlite' && /^0x[0-9a-f]*$/i.test(value) && /blob/i.test(dataType)) {
+    return `X'${value.slice(2)}'`
   }
   const escaped =
     dialect === 'mysql'
@@ -327,6 +336,8 @@ export function wrapInTransaction(dialect: Dialect, statements: string[]): strin
       return `START TRANSACTION;\n${body}\nCOMMIT;`
     case 'tsql':
       return `SET XACT_ABORT ON;\nBEGIN TRANSACTION;\n${body}\nCOMMIT TRANSACTION;`
+    case 'sqlite':
+      return `BEGIN;\n${body}\nCOMMIT;`
   }
 }
 
@@ -452,7 +463,14 @@ export function lineCol(text: string, offset: number): { line: number; col: numb
 export async function formatSql(sql: string, dialect: Dialect): Promise<string> {
   const { format } = await import('sql-formatter')
   return format(sql, {
-    language: dialect === 'postgres' ? 'postgresql' : dialect === 'mysql' ? 'mysql' : 'transactsql',
+    language:
+      dialect === 'postgres'
+        ? 'postgresql'
+        : dialect === 'mysql'
+          ? 'mysql'
+          : dialect === 'sqlite'
+            ? 'sqlite'
+            : 'transactsql',
     keywordCase: 'upper',
     tabWidth: 2,
     linesBetweenQueries: 1
@@ -508,6 +526,9 @@ export function explainSql(
       return analyze
         ? `SET STATISTICS XML ON;\nGO\n${body}\nGO\nSET STATISTICS XML OFF;`
         : `SET SHOWPLAN_XML ON;\nGO\n${body}\nGO\nSET SHOWPLAN_XML OFF;`
+    case 'sqlite':
+      // SQLite has no ANALYZE variant of EXPLAIN
+      return `EXPLAIN QUERY PLAN\n${body}`
   }
 }
 

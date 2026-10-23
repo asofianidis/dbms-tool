@@ -1,35 +1,21 @@
 import { queryOptions } from '@tanstack/react-query'
-import { api, type CloudProvider } from '@/lib/api'
+import { api, type CloudProvider, type CloudRef } from '@/lib/api'
 import {
   PROVIDERS,
-  anyInstanceAvailable,
-  clusterInstancesCommand,
+  applyCredentials,
   commandLine,
-  defaultContextCommand,
-  defaultRegionCommand,
-  describeCommand,
-  findSaved,
-  identityCommand,
-  listCommands,
-  parseContexts,
-  parseDescribe,
-  parseIdentity,
-  parseList,
-  parseCredentials,
-  provisionPlan,
-  provisionedConnection,
-  credentialsCommand,
   connectionFor,
-  contextsCommand,
-  deletePlan,
+  findSaved,
   iamUserFor,
+  isMajorCloud,
+  provisionedConnection,
   type CloudDatabase,
   type Credentials,
   type DeleteOptions,
   type PlanStep,
-  type ProvisionDraft,
-  type ProvisionPlan
+  type ProvisionDraft
 } from '@/lib/cloud'
+import { planDelete, planProvision } from '@/lib/cloud-platforms'
 import { queryClient } from '@/lib/queries'
 import { createPersistentStore, createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
@@ -41,6 +27,9 @@ import {
   newQueryTab,
   openPrefilledConnection
 } from '@/lib/workspace'
+import { adapterFor, callApi, runCli, type ListResult } from './adapters'
+
+export { runCli, type ListResult }
 
 /** Which account and region the cloud tab shows, per provider. */
 export const cloudPrefsStore = createPersistentStore<{
@@ -49,73 +38,28 @@ export const cloudPrefsStore = createPersistentStore<{
   region: Partial<Record<CloudProvider, string>>
 }>('dbms.cloud.v1', { provider: 'aws', context: {}, region: {} })
 
-export function runCli(
-  provider: CloudProvider,
-  args: string[],
-  options?: { secret?: string; timeoutSecs?: number }
-): Promise<string> {
-  return api.cloudCli(provider, args, options)
-}
-
-/** Runs a CLI command and returns null instead of failing (for optional lookups). */
-async function tryCli(provider: CloudProvider, args: string[] | null): Promise<string | null> {
-  if (!args) return null
-  return runCli(provider, args).then(
-    (out) => out.trim() || null,
-    () => null
-  )
-}
-
-export interface ListResult {
-  databases: CloudDatabase[]
-  /** Listings that failed, e.g. a missing permission, while others worked */
-  errors: { label: string; message: string }[]
-}
-
 export const cloudQueries = {
   tools: () =>
     queryOptions({ queryKey: ['cloud', 'tools'], queryFn: api.cloudTools, staleTime: 60_000 }),
   identity: (provider: CloudProvider, context: string) =>
     queryOptions({
       queryKey: ['cloud', provider, 'identity', context],
-      queryFn: async () =>
-        parseIdentity(provider, await runCli(provider, identityCommand(provider, context)))
+      queryFn: () => adapterFor(provider).identity(context)
     }),
   contexts: (provider: CloudProvider) =>
     queryOptions({
       queryKey: ['cloud', provider, 'contexts'],
-      queryFn: async () => ({
-        contexts: parseContexts(provider, await runCli(provider, contextsCommand(provider))),
-        defaultContext: await tryCli(provider, defaultContextCommand(provider))
-      })
+      queryFn: () => adapterFor(provider).contexts()
     }),
   defaultRegion: (provider: CloudProvider, context: string) =>
     queryOptions({
       queryKey: ['cloud', provider, 'region', context],
-      queryFn: () => tryCli(provider, defaultRegionCommand(provider, context))
+      queryFn: () => adapterFor(provider).defaultRegion(context)
     }),
   databases: (provider: CloudProvider, context: string, region: string) =>
     queryOptions({
       queryKey: ['cloud', provider, 'databases', context, region],
-      queryFn: async (): Promise<ListResult> => {
-        const commands = listCommands(provider, context, region)
-        const results = await Promise.allSettled(
-          commands.map(async (c) =>
-            parseList(c.key, await runCli(provider, c.args), context, region)
-          )
-        )
-        const errors = results.flatMap((r, i) =>
-          r.status === 'rejected'
-            ? [{ label: commands[i].label, message: errorMessage(r.reason) }]
-            : []
-        )
-        // When every listing fails it's the account, not one service
-        if (errors.length === commands.length) throw new Error(errors[0].message)
-        const databases = results
-          .flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
-          .sort((a, b) => a.name.localeCompare(b.name))
-        return { databases, errors }
-      },
+      queryFn: (): Promise<ListResult> => adapterFor(provider).list(context, region),
       staleTime: 60_000
     })
 }
@@ -126,14 +70,34 @@ export function refreshCloud(provider?: CloudProvider): void {
 
 /** Opens the browser sign-in for the provider's CLI and waits for it to finish. */
 export async function signIn(provider: CloudProvider, context: string): Promise<void> {
-  await runCli(provider, PROVIDERS[provider].signIn(context), { timeoutSecs: 10 * 60 })
+  const args = PROVIDERS[provider].signIn?.(context)
+  if (!args) return
+  await runCli(provider, args, { timeoutSecs: 10 * 60 })
+  refreshCloud(provider)
+}
+
+/** Saves an API token (Render, Cloudflare) after checking it works. */
+export async function saveToken(provider: CloudProvider, token: string): Promise<void> {
+  await api.cloudTokenSet(provider, token)
+  try {
+    if (!(await adapterFor(provider).identity(''))) throw new Error('The token has no access')
+  } catch (e) {
+    await api.cloudTokenDelete(provider)
+    throw e
+  }
+  refreshCloud(provider)
+}
+
+export async function forgetToken(provider: CloudProvider): Promise<void> {
+  await api.cloudTokenDelete(provider)
+  queryClient.removeQueries({ queryKey: ['cloud', provider] })
   refreshCloud(provider)
 }
 
 /**
  * Connects to a discovered database: straight away when it's already saved,
- * otherwise through the connection dialog with everything filled in (including
- * the password, when AWS manages it in Secrets Manager).
+ * otherwise through the connection dialog with everything filled in, including
+ * passwords the provider keeps (Secrets Manager, Render, Railway, Fly.io).
  */
 export async function connectToCloudDatabase(db: CloudDatabase): Promise<void> {
   const saved = findSaved(connectionsStore.get(), db)
@@ -143,10 +107,9 @@ export async function connectToCloudDatabase(db: CloudDatabase): Promise<void> {
   }
   const config = connectionFor(db)
   const credentials = await fetchCredentials(db)
-  if (credentials.uri) config.uri = credentials.uri
-  else if (credentials.username) config.user = credentials.username
+  applyCredentials(config, credentials)
   // Databases set up for IAM sign-in connect as whoever the CLI is signed in as
-  if (db.iamAuth && !credentials.password) {
+  if (db.iamAuth && !credentials.password && isMajorCloud(db.ref.provider)) {
     const identity = await queryClient
       .fetchQuery(cloudQueries.identity(db.ref.provider, db.ref.context))
       .catch(() => null)
@@ -159,12 +122,10 @@ export async function connectToCloudDatabase(db: CloudDatabase): Promise<void> {
   openPrefilledConnection(config, credentials.password)
 }
 
-/** Credentials the provider keeps (Secrets Manager, Cosmos DB keys); empty when there are none. */
+/** Credentials the provider keeps; empty (with a note) when they can't be fetched. */
 async function fetchCredentials(db: CloudDatabase): Promise<Credentials> {
-  const args = credentialsCommand(db)
-  if (!args) return {}
   try {
-    return parseCredentials(db, await runCli(db.ref.provider, args))
+    return await adapterFor(db.ref.provider).credentials(db)
   } catch (e) {
     toast(`Couldn't fetch the credentials for ${db.name}: ${errorMessage(e)}`, 'info')
     return {}
@@ -216,6 +177,7 @@ export function dismissJob(id: string): void {
 const POLL_MS = 20_000
 const MAX_WAIT_MS = 75 * 60_000
 
+/** Runs CLI and REST steps in order, passing captured values along in `ctx`. */
 async function runSteps(
   job: string,
   provider: CloudProvider,
@@ -224,41 +186,47 @@ async function runSteps(
 ): Promise<void> {
   for (const step of steps) {
     updateJob(job, { activity: step.title })
-    const args = step.args(ctx)
     logJob(job, step.title)
-    logJob(
-      job,
-      commandLine(
-        PROVIDERS[provider].cli,
-        args.map((a) => a.replace('{secret}', 'password-file'))
-      ),
-      'command'
-    )
-    const out = await runCli(provider, args, { secret: step.secret, timeoutSecs: step.timeoutSecs })
-    if (step.capture) Object.assign(ctx, step.capture(out))
+    let out: string
+    if (step.api) {
+      const request = step.api(ctx)
+      logJob(job, `${request.method} ${request.path}`, 'command')
+      out = JSON.stringify(await callApi(provider, request.method, request.path, request.body))
+    } else {
+      const args = step.args(ctx)
+      logJob(
+        job,
+        commandLine(
+          PROVIDERS[provider].cli,
+          args.map((a) => a.replace('{secret}', 'password-file'))
+        ),
+        'command'
+      )
+      out = await runCli(provider, args, {
+        secret: step.secret,
+        timeoutSecs: step.timeoutSecs,
+        workdir: step.workdir
+      })
+    }
+    if (step.capture) Object.assign(ctx, step.capture(out, ctx))
   }
 }
 
-async function waitUntilReady(job: string, plan: ProvisionPlan): Promise<CloudDatabase> {
-  const { ref } = plan
-  const describe = describeCommand(ref)
+async function waitUntilReady(job: string, ref: CloudRef): Promise<CloudDatabase> {
+  const adapter = adapterFor(ref.provider)
   const started = Date.now()
   updateJob(job, { state: 'waiting', activity: 'Waiting for the database to come up' })
   logJob(job, 'Waiting for the database to report ready…')
   let lastStatus = ''
   for (;;) {
     try {
-      const db = parseDescribe(ref, await runCli(ref.provider, describe.args))
-      const membersReady =
-        ref.provider !== 'aws' || ref.kind !== 'cluster'
-          ? true
-          : anyInstanceAvailable(await runCli(ref.provider, clusterInstancesCommand(ref)))
+      const db = await adapter.describe(ref)
       if (db && db.status !== lastStatus) {
         lastStatus = db.status
         logJob(job, `Status: ${db.status}`)
         updateJob(job, { activity: `Status: ${db.status}` })
       }
-      if (db?.ready && membersReady) return db
+      if (db?.ready) return db
     } catch (e) {
       // Right after creation some APIs briefly report the resource as missing
       if (Date.now() - started > 5 * 60_000) throw e
@@ -272,13 +240,14 @@ async function waitUntilReady(job: string, plan: ProvisionPlan): Promise<CloudDa
 
 /** Creates the database in the background, then saves (and returns) its connection. */
 export function startProvision(draft: ProvisionDraft, engineLabel: string): string {
-  const plan = provisionPlan(draft)
+  const plan = planProvision(draft)
   const id = crypto.randomUUID().slice(0, 8)
+  const name = draft.name.trim() || engineLabel
   jobsStore.set((jobs) => [
     {
       id,
       provider: draft.provider,
-      name: draft.name.trim(),
+      name,
       engineLabel,
       action: 'create',
       state: 'running',
@@ -290,17 +259,19 @@ export function startProvision(draft: ProvisionDraft, engineLabel: string): stri
   ])
   void (async () => {
     try {
-      await runSteps(id, draft.provider, plan.steps, {})
+      const ctx: Record<string, string> = {}
+      await runSteps(id, draft.provider, plan.steps, ctx)
       refreshCloud(draft.provider)
-      const db = await waitUntilReady(id, plan)
-      if (plan.afterReady.length) await runSteps(id, draft.provider, plan.afterReady, {})
+      const ref = plan.resolveRef ? plan.resolveRef(ctx) : plan.ref
+      const db = await waitUntilReady(id, ref)
+      if (plan.afterReady.length) await runSteps(id, draft.provider, plan.afterReady, ctx)
       let connectionId: string | undefined
       if (draft.saveConnection) {
-        // Cosmos DB has no admin password; its connection string carries a key
+        // Providers that generate credentials (Cosmos DB, Render, Railway, Fly.io) hand them over now
         const credentials = await fetchCredentials(db)
         const saved = await api.connectionSave(
           provisionedConnection(draft, db, credentials),
-          credentials.password ?? draft.password
+          credentials.password ?? (engineHasPassword(draft) ? draft.password : null)
         )
         await loadConnections()
         connectionId = saved.id
@@ -308,16 +279,21 @@ export function startProvision(draft: ProvisionDraft, engineLabel: string): stri
       }
       updateJob(id, { state: 'ready', activity: 'Ready', connectionId })
       refreshCloud(draft.provider)
-      toast(`${draft.name} is ready${connectionId ? ' and saved as a connection' : ''}`)
+      toast(`${name} is ready${connectionId ? ' and saved as a connection' : ''}`)
     } catch (e) {
       const message = errorMessage(e)
       logJob(id, message, 'error')
       updateJob(id, { state: 'failed', activity: 'Failed', error: message })
       refreshCloud(draft.provider)
-      toast(`Provisioning ${draft.name} failed: ${message}`, 'error')
+      toast(`Provisioning ${name} failed: ${message}`, 'error')
     }
   })()
   return id
+}
+
+/** Whether the draft's password is the database's (rather than one the provider generates). */
+function engineHasPassword(draft: ProvisionDraft): boolean {
+  return PROVIDERS[draft.provider].auth === 'cli' && isMajorCloud(draft.provider)
 }
 
 /** Deletes a cloud database in the background, and its saved connection if given. */
@@ -326,7 +302,7 @@ export function startDeletion(
   options: DeleteOptions,
   connectionId?: string
 ): string {
-  const steps = deletePlan(db, options)
+  const steps = planDelete(db, options)
   const provider = db.ref.provider
   const id = crypto.randomUUID().slice(0, 8)
   jobsStore.set((jobs) => [
@@ -352,7 +328,7 @@ export function startDeletion(
         await loadConnections()
         logJob(id, 'Removed the saved connection')
       }
-      // AWS returns as soon as deletion starts; gcloud and az wait for it
+      // AWS returns as soon as deletion starts; the others wait for it
       const activity =
         provider === 'aws' ? 'Deletion started; AWS finishes in a few minutes' : 'Deleted'
       logJob(id, activity)

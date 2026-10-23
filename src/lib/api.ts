@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
-export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo'
+export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo' | 'sqlite'
 export type SslMode = 'disable' | 'prefer' | 'require'
 export type AuthMode = 'password' | 'windows' | 'cloud'
 
@@ -26,7 +26,7 @@ export interface ConnectionConfig {
   cloud?: CloudRef | null
 }
 
-export type CloudProvider = 'aws' | 'gcp' | 'azure'
+export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'railway' | 'render' | 'fly' | 'cloudflare'
 
 /** Where a database lives in a cloud account, enough to look it up again. */
 export interface CloudRef {
@@ -469,14 +469,23 @@ export const api = {
   cloudCli: (
     provider: CloudProvider,
     args: string[],
-    options: { secret?: string; timeoutSecs?: number } = {}
+    options: { secret?: string; timeoutSecs?: number; workdir?: string } = {}
   ) =>
     invoke<string>('cloud_cli', {
       provider,
       args,
       secret: options.secret ?? null,
-      timeoutSecs: options.timeoutSecs ?? null
+      timeoutSecs: options.timeoutSecs ?? null,
+      workdir: options.workdir ?? null
     }),
+  /** Calls a provider's REST API (Render, Fly.io, Cloudflare) with its saved token */
+  cloudApi: (provider: CloudProvider, method: string, path: string, body?: unknown) =>
+    invoke<unknown>('cloud_api', { provider, method, path, body: body ?? null }),
+  cloudTokenStatus: (provider: CloudProvider) => invoke<boolean>('cloud_token_status', { provider }),
+  cloudTokenSet: (provider: CloudProvider, token: string) =>
+    invoke<void>('cloud_token_set', { provider, token }),
+  cloudTokenDelete: (provider: CloudProvider) => invoke<void>('cloud_token_delete', { provider }),
+
   /** Backup tools for an engine; `dir` is a folder searched before PATH */
   backupTools: (engine: Engine, dir?: string | null) =>
     invoke<BackupTool[]>('backup_tools', { engine, dir: dir || null }),

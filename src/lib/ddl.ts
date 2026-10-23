@@ -78,6 +78,8 @@ export function foreignKeyActions(dialect: Dialect): ForeignKeyAction[] {
       return ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL']
     case 'tsql':
       return ['NO ACTION', 'CASCADE', 'SET NULL', 'SET DEFAULT']
+    case 'sqlite':
+      return ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL', 'SET DEFAULT']
   }
 }
 

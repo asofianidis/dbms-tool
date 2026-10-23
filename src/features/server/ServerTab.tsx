@@ -176,7 +176,9 @@ function useActivity(
   connection: ConnectionConfig,
   engineKey: string
 ): ReturnType<typeof useSqlPanel> {
-  const sql = connection.engine === 'mongo' ? null : ACTIVITY_SQL[engineKey]
+  // SQLite runs in-process, so there are no sessions to list
+  const sql =
+    connection.engine === 'mongo' || connection.engine === 'sqlite' ? null : ACTIVITY_SQL[engineKey]
   const sqlPanel = useSqlPanel(connection, sql)
   const [mongo, setMongo] = useState<ResultSet | null>(null)
   const [error, setError] = useState<string | null>(null)

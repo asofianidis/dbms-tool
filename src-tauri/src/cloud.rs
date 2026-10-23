@@ -26,16 +26,51 @@ pub enum Provider {
     Aws,
     Gcp,
     Azure,
+    Railway,
+    Render,
+    Fly,
+    Cloudflare,
 }
 
 impl Provider {
-    const ALL: [Provider; 3] = [Provider::Aws, Provider::Gcp, Provider::Azure];
+    const ALL: [Provider; 7] = [
+        Provider::Aws,
+        Provider::Gcp,
+        Provider::Azure,
+        Provider::Railway,
+        Provider::Render,
+        Provider::Fly,
+        Provider::Cloudflare,
+    ];
+
+    /// Executable names to look for, first match wins. Render and Cloudflare
+    /// are driven through their REST APIs instead.
+    fn programs(self) -> &'static [&'static str] {
+        match self {
+            Provider::Aws => &["aws"],
+            Provider::Gcp => &["gcloud"],
+            Provider::Azure => &["az"],
+            Provider::Railway => &["railway"],
+            Provider::Fly => &["flyctl", "fly"],
+            Provider::Render | Provider::Cloudflare => &[],
+        }
+    }
 
     fn program(self) -> &'static str {
         match self {
-            Provider::Aws => "aws",
-            Provider::Gcp => "gcloud",
-            Provider::Azure => "az",
+            Provider::Render => "render",
+            Provider::Cloudflare => "cloudflare",
+            _ => self.programs()[0],
+        }
+    }
+
+    /// REST API base URL, for providers driven over HTTP.
+    fn api_base(self) -> Option<&'static str> {
+        match self {
+            Provider::Render => Some("https://api.render.com/v1"),
+            Provider::Fly => Some("https://api.machines.dev/v1"),
+            Provider::Cloudflare => Some("https://api.cloudflare.com/client/v4"),
+            _ => None,
         }
     }
 }
@@ -90,28 +125,42 @@ fn extra_dirs() -> Vec<PathBuf> {
                     .join("bin"),
             );
         }
+        // npm global installs (railway) and the flyctl installer
+        if let Ok(roaming) = std::env::var("APPDATA") {
+            dirs.push(PathBuf::from(roaming).join("npm"));
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            dirs.push(PathBuf::from(profile).join(".fly").join("bin"));
+        }
     } else {
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/snap/bin"].map(PathBuf::from));
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
             dirs.push(home.join("google-cloud-sdk").join("bin"));
             dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join(".fly").join("bin"));
+            dirs.push(home.join(".railway").join("bin"));
         }
     }
     dirs
 }
 
 fn locate(provider: Provider) -> Option<PathBuf> {
-    let program = provider.program();
     // az and gcloud ship as .cmd wrappers on Windows, which Command won't find on its own
-    let names: Vec<String> = if cfg!(windows) {
-        ["exe", "cmd", "bat"]
-            .iter()
-            .map(|ext| format!("{program}.{ext}"))
-            .collect()
-    } else {
-        vec![program.to_string()]
-    };
+    let names: Vec<String> = provider
+        .programs()
+        .iter()
+        .flat_map(|program| {
+            if cfg!(windows) {
+                ["exe", "cmd", "bat"]
+                    .iter()
+                    .map(|ext| format!("{program}.{ext}"))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![program.to_string()]
+            }
+        })
+        .collect();
     let path_dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
@@ -162,19 +211,61 @@ impl Drop for SecretFile {
     }
 }
 
-/// Runs the provider's CLI and returns its standard output.
-pub async fn run(
-    provider: Provider,
-    args: Vec<String>,
-    secret: Option<String>,
-    timeout_secs: Option<u64>,
-) -> AppResult<String> {
+/// A command for the provider's CLI that never pages, prompts or opens a
+/// console window. Callers add arguments and stdio.
+pub fn command(provider: Provider) -> AppResult<Command> {
     let program = locate(provider).ok_or_else(|| {
         AppError::msg(format!(
             "The {} CLI isn't installed or isn't on PATH",
             provider.program()
         ))
     })?;
+    let mut command = Command::new(&program);
+    command
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        // Never page, prompt or colour output: there's no terminal to answer
+        .env("AWS_PAGER", "")
+        .env("AWS_CLI_AUTO_PROMPT", "off")
+        .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
+        .env("AZURE_CORE_NO_COLOR", "1")
+        .env("AZURE_CORE_COLLECT_TELEMETRY", "0")
+        .env("NO_COLOR", "1");
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    Ok(command)
+}
+
+/// A folder for CLIs that work on "the current directory" (`railway link`),
+/// keyed by what it's for so repeated runs reuse it.
+fn workdir(key: &str) -> AppResult<PathBuf> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::msg("Invalid working directory key"));
+    }
+    let dir = std::env::temp_dir().join("dbms-tool-cloud").join(key);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Runs the provider's CLI and returns its standard output.
+pub async fn run(
+    provider: Provider,
+    args: Vec<String>,
+    secret: Option<String>,
+    timeout_secs: Option<u64>,
+    workdir_key: Option<&str>,
+) -> AppResult<String> {
+    let mut command = command(provider)?;
+    if let Some(key) = workdir_key {
+        command.current_dir(workdir(key)?);
+    }
     let secret = secret.as_deref().map(SecretFile::create).transpose()?;
     let args: Vec<String> = match &secret {
         Some(file) => {
@@ -186,24 +277,10 @@ pub async fn run(
         None => args,
     };
 
-    let mut command = Command::new(&program);
     command
         .args(&args)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // Never page, prompt or colour output: there's no terminal to answer
-        .env("AWS_PAGER", "")
-        .env("AWS_CLI_AUTO_PROMPT", "off")
-        .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
-        .env("AZURE_CORE_NO_COLOR", "1")
-        .env("AZURE_CORE_COLLECT_TELEMETRY", "0");
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+        .stderr(Stdio::piped());
 
     let timeout = timeout_secs.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     let output = tokio::time::timeout(timeout, command.output())
@@ -320,6 +397,12 @@ fn token_args(config: &ConnectionConfig, cloud: &CloudRef) -> AppResult<Vec<Stri
             args
         }
         Provider::Gcp => owned(&["sql", "generate-login-token", "--quiet"]),
+        Provider::Railway | Provider::Render | Provider::Fly | Provider::Cloudflare => {
+            return Err(AppError::Unsupported(format!(
+                "{} doesn't offer passwordless database sign-in",
+                cloud.provider.program()
+            )));
+        }
         Provider::Azure => {
             // Azure SQL takes a token for the database resource; PostgreSQL and
             // MySQL flexible servers share the "oss-rdbms" resource
@@ -363,7 +446,7 @@ pub async fn database_token(config: &ConnectionConfig) -> AppResult<String> {
     {
         return Ok(token.clone());
     }
-    let token = run(cloud.provider, args, None, Some(60))
+    let token = run(cloud.provider, args, None, Some(60), None)
         .await?
         .trim()
         .to_string();
@@ -375,6 +458,144 @@ pub async fn database_token(config: &ConnectionConfig) -> AppResult<String> {
     }
     TOKENS.lock().insert(key, (token.clone(), Instant::now()));
     Ok(token)
+}
+
+/* ---------- API tokens and REST calls ---------- */
+
+fn token_entry(provider: Provider) -> AppResult<keyring::Entry> {
+    keyring::Entry::new(
+        crate::config::KEYRING_SERVICE,
+        &format!("cloud-token:{}", provider.program()),
+    )
+    .map_err(|e| AppError::msg(format!("Credential store unavailable: {e}")))
+}
+
+/// API token saved for a provider driven over REST (Render, Cloudflare).
+pub fn stored_token(provider: Provider) -> Option<String> {
+    token_entry(provider).ok()?.get_password().ok()
+}
+
+pub fn store_token(provider: Provider, token: &str) -> AppResult<()> {
+    token_entry(provider)?
+        .set_password(token.trim())
+        .map_err(|e| AppError::msg(format!("Could not save the token: {e}")))
+}
+
+pub fn delete_token(provider: Provider) {
+    if let Ok(entry) = token_entry(provider) {
+        let _ = entry.delete_credential();
+    }
+}
+
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(concat!("dbms-tool/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("HTTP client")
+});
+
+/// The bearer token for a REST call: the saved API token, or flyctl's own.
+async fn api_token(provider: Provider) -> AppResult<String> {
+    if provider == Provider::Fly {
+        let key = "fly|auth token".to_string();
+        if let Some((token, at)) = TOKENS.lock().get(&key)
+            && at.elapsed() < TOKEN_TTL
+        {
+            return Ok(token.clone());
+        }
+        let out = run(
+            provider,
+            vec!["auth".into(), "token".into()],
+            None,
+            Some(30),
+            None,
+        )
+        .await?;
+        // Newer flyctl versions print a deprecation note before the token
+        let token = out
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty() && !l.contains(' '))
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            return Err(AppError::msg(
+                "flyctl isn't signed in; run \"fly auth login\"",
+            ));
+        }
+        TOKENS.lock().insert(key, (token.clone(), Instant::now()));
+        return Ok(token);
+    }
+    stored_token(provider).ok_or_else(|| {
+        AppError::msg(format!(
+            "Add a {} API token in the Cloud databases tab first",
+            provider.program()
+        ))
+    })
+}
+
+/// The error message out of a provider's JSON error body.
+fn api_error(status: reqwest::StatusCode, body: &str) -> String {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let message = json["errors"][0]["message"]
+        .as_str()
+        .or_else(|| json["message"].as_str())
+        .or_else(|| json["error"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| body.trim().chars().take(300).collect());
+    let reason = status.canonical_reason().unwrap_or("error");
+    if message.is_empty() {
+        format!("HTTP {} {reason}", status.as_u16())
+    } else {
+        format!("{message} (HTTP {})", status.as_u16())
+    }
+}
+
+/// Calls a provider's REST API. `path` is relative to the provider's base
+/// URL, so requests (and the token) can only ever go to that provider.
+pub async fn api(
+    provider: Provider,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+    token: Option<&str>,
+) -> AppResult<serde_json::Value> {
+    let base = provider
+        .api_base()
+        .ok_or_else(|| AppError::msg(format!("{} has no REST API here", provider.program())))?;
+    if !path.starts_with('/') || path.contains("://") || path.contains("..") {
+        return Err(AppError::msg("Invalid API path"));
+    }
+    let method = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+        .map_err(|_| AppError::msg("Invalid HTTP method"))?;
+    let token = match token {
+        Some(t) => t.to_string(),
+        None => api_token(provider).await?,
+    };
+    let mut request = HTTP
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(token)
+        .header("Accept", "application/json");
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::msg(format!("Couldn't reach {}: {e}", provider.program())))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AppError::msg(e.to_string()))?;
+    if !status.is_success() {
+        return Err(AppError::msg(api_error(status, &text)));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 #[cfg(test)]
@@ -427,6 +648,47 @@ mod tests {
             &cloud,
         );
         assert!(pg.unwrap().contains(&"oss-rdbms".to_string()));
+    }
+
+    #[test]
+    fn api_errors_read_each_providers_shape() {
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        assert_eq!(
+            api_error(
+                bad,
+                r#"{"success":false,"errors":[{"code":7500,"message":"no such table: x"}]}"#
+            ),
+            "no such table: x (HTTP 400)"
+        );
+        assert_eq!(
+            api_error(bad, r#"{"id":"x","message":"plan is invalid"}"#),
+            "plan is invalid (HTTP 400)"
+        );
+        assert_eq!(
+            api_error(bad, r#"{"error":"not found"}"#),
+            "not found (HTTP 400)"
+        );
+        assert_eq!(api_error(bad, ""), "HTTP 400 Bad Request");
+    }
+
+    #[tokio::test]
+    async fn api_paths_stay_on_the_providers_host() {
+        for path in ["https://evil.example/x", "../x", "x"] {
+            let err = api(Provider::Render, "GET", path, None, Some("t")).await;
+            assert!(err.is_err(), "{path} should be rejected");
+        }
+        assert!(
+            api(Provider::Aws, "GET", "/x", None, Some("t"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workdir_keys_are_restricted() {
+        assert!(workdir("railway-abc_1").is_ok());
+        assert!(workdir("../etc").is_err());
+        assert!(workdir("").is_err());
     }
 
     #[test]

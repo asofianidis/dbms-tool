@@ -1,6 +1,6 @@
 import type { ConnectionConfig, Engine } from './api'
 
-export type Dialect = 'postgres' | 'mysql' | 'tsql'
+export type Dialect = 'postgres' | 'mysql' | 'tsql' | 'sqlite'
 
 export interface EngineInfo {
   id: Engine
@@ -16,6 +16,24 @@ export interface EngineInfo {
   tone: string
   /** Whether databases contain schemas the user browses (pgAdmin / SSMS style) */
   hasSchemas: boolean
+  /** Designers and management features the engine supports */
+  features?: Partial<EngineFeatures>
+}
+
+export interface EngineFeatures {
+  /** Table, schema and trigger designers */
+  designers: boolean
+  /** Users, roles and grants */
+  permissions: boolean
+  /** Stored procedures and functions */
+  routines: boolean
+  /** Creating, editing, dropping, backing up and restoring databases */
+  databases: boolean
+}
+
+/** Whether `engine` supports `feature` (everything does unless it says otherwise). */
+export function supports(engine: Engine, feature: keyof EngineFeatures): boolean {
+  return ENGINES[engine].features?.[feature] ?? true
 }
 
 export const ENGINES: Record<Engine, EngineInfo> = {
@@ -78,10 +96,23 @@ export const ENGINES: Record<Engine, EngineInfo> = {
     dialect: null,
     tone: 'bg-mongo/15 text-mongo',
     hasSchemas: false
+  },
+  sqlite: {
+    id: 'sqlite',
+    label: 'SQLite',
+    mark: 'SQ',
+    description: 'A local SQLite database file, or Cloudflare D1 over its HTTP API',
+    defaultPort: 0,
+    defaultUser: '',
+    defaultDatabase: '',
+    dialect: 'sqlite',
+    tone: 'bg-sqlite/15 text-sqlite',
+    hasSchemas: false,
+    features: { designers: false, permissions: false, routines: false, databases: false }
   }
 }
 
-export const ENGINE_ORDER: Engine[] = ['postgres', 'mysql', 'mssql', 'babelfish', 'mongo']
+export const ENGINE_ORDER: Engine[] = ['postgres', 'mysql', 'mssql', 'babelfish', 'mongo', 'sqlite']
 
 export const CONNECTION_COLORS = [
   { value: '', label: 'None' },
@@ -100,7 +131,8 @@ export function newConnection(engine: Engine): ConnectionConfig {
     id: '',
     name: '',
     engine,
-    host: 'localhost',
+    // A SQLite connection's "host" is the database file
+    host: engine === 'sqlite' ? '' : 'localhost',
     port: info.defaultPort,
     user: info.defaultUser,
     database: info.defaultDatabase,
@@ -119,6 +151,9 @@ export function newConnection(engine: Engine): ConnectionConfig {
 
 export function connectionLabel(c: ConnectionConfig): string {
   if (c.name) return c.name
+  if (c.engine === 'sqlite') {
+    return c.host ? (c.host.split(/[\\/]/).pop() ?? c.host) : 'Cloudflare D1'
+  }
   if (c.engine === 'mongo' && c.uri) return hostFromUri(c.uri) ?? 'MongoDB'
   return c.host
     ? `${c.host}${c.port && c.port !== ENGINES[c.engine].defaultPort ? `:${c.port}` : ''}`
@@ -126,6 +161,7 @@ export function connectionLabel(c: ConnectionConfig): string {
 }
 
 export function connectionSubtitle(c: ConnectionConfig): string {
+  if (c.engine === 'sqlite') return c.host || (c.cloud ? `D1 · ${c.cloud.resource}` : '')
   if (c.engine === 'mongo' && c.uri) return redactUri(c.uri)
   const user = c.auth === 'windows' ? 'Windows auth' : c.user
   return [user && `${user}@`, c.host, c.port ? `:${c.port}` : '', c.database && `/${c.database}`]

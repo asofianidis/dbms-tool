@@ -95,6 +95,8 @@ export function TableDesignerHost(): React.JSX.Element | null {
 }
 
 const TYPES: Record<Dialect, string[]> = {
+  // SQLite only has storage classes; any type name maps onto one of them
+  sqlite: ['INTEGER', 'REAL', 'TEXT', 'BLOB', 'NUMERIC', 'BOOLEAN', 'DATETIME'],
   postgres: [
     'integer',
     'bigint',

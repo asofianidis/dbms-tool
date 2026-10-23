@@ -76,6 +76,8 @@ function bodyTemplate(dialect: Dialect, timing: TriggerTiming): string {
       return 'BEGIN\n  -- NEW and OLD hold the affected row\nEND'
     case 'tsql':
       return 'BEGIN\n  SET NOCOUNT ON;\n  -- inserted and deleted hold the affected rows\nEND'
+    case 'sqlite':
+      return 'BEGIN\n  -- NEW and OLD hold the affected row\n  SELECT 1;\nEND'
   }
 }
 
@@ -367,5 +369,8 @@ export function dropTriggerStatement(
       return `DROP TRIGGER ${q(name)}`
     case 'tsql':
       return `DROP TRIGGER ${q(target.schema ?? 'dbo')}.${q(name)}`
+    case 'sqlite':
+      // Trigger names are unique per database in SQLite
+      return `DROP TRIGGER ${q(name)}`
   }
 }

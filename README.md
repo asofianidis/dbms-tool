@@ -1,8 +1,8 @@
 # dbms-tool
 
 A free, open-source, developer-focused database client for **PostgreSQL**, **MySQL / MariaDB**,
-**SQL Server**, **Babelfish for Aurora PostgreSQL** and **MongoDB**. Built with Tauri 2, Rust and
-React.
+**SQL Server**, **Babelfish for Aurora PostgreSQL**, **MongoDB** and **SQLite** (local files and
+Cloudflare D1). Built with Tauri 2, Rust and React.
 
 The aim is the directness of SSMS and pgAdmin, with MongoDB treated as a first-class citizen
 rather than a plugin, in a fast native app that doesn't get in your way.
@@ -26,10 +26,13 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 
 **Cloud**
 
-- Finds databases in AWS (RDS, Aurora, Babelfish, DocumentDB), Google Cloud (Cloud SQL) and Azure
-  (PostgreSQL and MySQL flexible servers, Azure SQL, Cosmos DB for MongoDB) and connects with host,
-  user and TLS filled in, including the master password when AWS keeps it in Secrets Manager and
-  the connection string for Cosmos DB.
+- Finds databases in AWS (RDS, Aurora, Babelfish, DocumentDB), Google Cloud (Cloud SQL), Azure
+  (PostgreSQL and MySQL flexible servers, Azure SQL, Cosmos DB for MongoDB), Railway (PostgreSQL,
+  MySQL, MongoDB), Render (PostgreSQL), Fly.io (Managed Postgres) and Cloudflare (D1), and connects
+  with host, user and TLS filled in, including passwords the provider keeps (AWS Secrets Manager,
+  Cosmos DB keys, Render, Railway and Fly.io credentials).
+- Fly.io Managed Postgres lives on Fly's private network, so connections run through a
+  `fly mpg proxy` tunnel that starts and stops with the connection.
 - Passwordless sign-in ("Cloud IAM") with AWS IAM, Google Cloud IAM or Microsoft Entra ID: a
   short-lived token is fetched from the CLI for every new session instead of storing a password.
 - Provisioning designer for new databases, including Aurora Babelfish clusters and Cosmos DB
@@ -38,8 +41,17 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   connection is saved once the database is ready.
 - Deleting cloud databases, with an optional final snapshot on AWS, after typing the name to
   confirm.
-- Works through the official `aws`, `gcloud` and `az` CLIs, so existing profiles, SSO and MFA
-  apply; passwords reach the CLI in a temporary file, never on the command line.
+- Works through the official `aws`, `gcloud`, `az`, `railway` and `flyctl` CLIs, so existing
+  profiles, SSO and MFA apply; passwords reach the CLI in a temporary file, never on the command
+  line. Render and Cloudflare use an API token kept in the OS credential manager and only ever
+  sent to that provider's API.
+
+**SQLite**
+
+- Open a local `.db` / `.sqlite` file (or create an empty one), or a Cloudflare D1 database over
+  its REST API. Tables, views, columns, indexes, foreign keys and triggers in the explorer, data
+  editing, diagrams and the query editor work as for the other engines; there are no designers,
+  users or stored routines, because SQLite has none of its own.
 
 **SQL**
 
@@ -150,10 +162,13 @@ src/                     React frontend
   lib/                   API bindings, SQL and Mongo helpers, stores
 src-tauri/src/
   drivers/               postgres (tokio-postgres), mysql (mysql_async),
-                         mssql (tiberius; SQL Server + Babelfish), mongo (official driver)
+                         mssql (tiberius; SQL Server + Babelfish), mongo (official driver),
+                         sqlite (rusqlite for files, REST for Cloudflare D1)
   manager.rs             open connections and per-tab sessions, cancellation
   commands.rs            Tauri command surface
-  cloud.rs               runs the aws / gcloud / az CLIs for cloud discovery and provisioning
+  cloud.rs               cloud CLIs (aws, gcloud, az, railway, flyctl) and REST APIs (Render,
+                         Fly.io, Cloudflare) for discovery, provisioning and IAM tokens
+  tunnel.rs              local tunnels for private-network databases (fly mpg proxy)
 src-tauri/vendor/tiberius  tiberius 0.13 with small patches (see PATCHES.md)
 ```
 
