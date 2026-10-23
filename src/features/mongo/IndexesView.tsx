@@ -15,6 +15,7 @@ import {
   ProgressBar,
   Toggle
 } from '@/components/ui'
+import { SearchIndexes } from './SearchIndexes'
 
 type IndexDoc = Record<string, unknown> & { name: string; key: Record<string, unknown> }
 
@@ -30,6 +31,7 @@ export function IndexesView({
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -104,7 +106,15 @@ export function IndexesView({
             <Plus className="size-3.5" /> Create index
           </Button>
         )}
-        <Button size="icon" variant="ghost" title="Refresh" onClick={() => void load()}>
+        <Button
+          size="icon"
+          variant="ghost"
+          title="Refresh"
+          onClick={() => {
+            void load()
+            setReloadKey((k) => k + 1)
+          }}
+        >
           <RefreshCw className="size-3.5" />
         </Button>
       </div>
@@ -187,6 +197,7 @@ export function IndexesView({
             </tbody>
           </table>
         )}
+        <SearchIndexes tab={tab} readOnly={readOnly} reloadKey={reloadKey} />
       </div>
       {creating && (
         <CreateIndexDialog
