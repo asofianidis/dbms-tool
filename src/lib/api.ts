@@ -97,11 +97,24 @@ export interface ForeignKeyInfo {
   onDelete: string | null
 }
 
+export interface TriggerInfo {
+  name: string
+  /** BEFORE | AFTER | INSTEAD OF */
+  timing: string
+  /** INSERT | UPDATE | DELETE | TRUNCATE */
+  events: string[]
+  /** FOR EACH ROW, as opposed to once per statement */
+  rowLevel: boolean
+  enabled: boolean
+  definition: string | null
+}
+
 export interface TableInfo {
   columns: ColumnInfo[]
   primaryKey: string[]
   indexes: IndexInfo[]
   foreignKeys: ForeignKeyInfo[]
+  triggers: TriggerInfo[]
 }
 
 export interface RoutineParam {

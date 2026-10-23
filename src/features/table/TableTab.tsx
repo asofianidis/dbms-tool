@@ -15,7 +15,8 @@ import {
   ListChecks,
   Lock,
   Plus,
-  RefreshCw
+  RefreshCw,
+  Zap
 } from 'lucide-react'
 import {
   api,
@@ -23,7 +24,8 @@ import {
   type ColumnMeta,
   type DbObject,
   type ExecOutput,
-  type TableInfo
+  type TableInfo,
+  type TriggerInfo
 } from '@/lib/api'
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
@@ -42,6 +44,7 @@ import {
   type PendingChange
 } from '@/lib/pending'
 import { queries } from '@/lib/queries'
+import { canHaveTriggers } from '@/lib/triggers'
 import { settingsStore } from '@/lib/settings'
 import {
   countRows,
@@ -85,6 +88,7 @@ import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { openTableDesigner } from './TableDesigner'
+import { openTriggerDesigner } from './TriggerDesigner'
 
 export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
   const connections = connectionsStore.use()
@@ -148,7 +152,7 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
           readOnly={connection.readOnly || tab.objectKind !== 'table'}
         />
       ) : tab.view === 'structure' && browsable ? (
-        <StructureView tab={tab} />
+        <StructureView tab={tab} dialect={dialect} />
       ) : (
         <DefinitionView tab={tab} dialect={dialect} tableRef={ref} />
       )}
@@ -601,7 +605,13 @@ function DataView({
   )
 }
 
-function StructureView({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
+function StructureView({
+  tab,
+  dialect
+}: {
+  tab: TabOf<'table'>
+  dialect: Dialect
+}): React.JSX.Element {
   const q = useQuery(queries.table(tab.connectionId, tab.database, tab.schema, tab.name))
   if (q.isPending) return <EmptyState title="Loading…" icon={<Spinner className="size-5" />} />
   if (q.isError)
@@ -611,17 +621,34 @@ function StructureView({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
       </div>
     )
   const info: TableInfo = q.data
+  const triggers = canHaveTriggers(dialect, tab.objectKind)
+  const isView = tab.objectKind === 'view'
   return (
     <>
-      {tab.objectKind === 'table' && (
+      {(tab.objectKind === 'table' || triggers) && (
         <Toolbar>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => openTableDesigner(tab.connectionId, tab.database, tab.schema, tab.name)}
-          >
-            <Pencil className="size-3.5" /> Design table…
-          </Button>
+          {tab.objectKind === 'table' && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                openTableDesigner(tab.connectionId, tab.database, tab.schema, tab.name)
+              }
+            >
+              <Pencil className="size-3.5" /> Design table…
+            </Button>
+          )}
+          {triggers && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                openTriggerDesigner(tab.connectionId, tab.database, tab.schema, tab.name, isView)
+              }
+            >
+              <Zap className="size-3.5" /> New trigger…
+            </Button>
+          )}
         </Toolbar>
       )}
       <div className="min-h-0 flex-1 overflow-auto p-4">
@@ -740,8 +767,86 @@ function StructureView({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
             <p className="text-xs text-faint">No foreign keys</p>
           )}
         </Section>
+        <Section title="Triggers" count={info.triggers.length}>
+          {info.triggers.length ? (
+            <div className="space-y-1.5">
+              {info.triggers.map((t) => (
+                <TriggerRow key={t.name} tab={tab} trigger={t} editable={triggers} />
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-faint">No triggers</p>
+          )}
+        </Section>
       </div>
     </>
+  )
+}
+
+function TriggerRow({
+  tab,
+  trigger,
+  editable
+}: {
+  tab: TabOf<'table'>
+  trigger: TriggerInfo
+  editable: boolean
+}): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const Chevron = open ? ChevronDown : ChevronRight
+  return (
+    <div>
+      <div className="flex items-center gap-2 font-mono text-[12px]">
+        <button
+          className="flex min-w-0 items-center gap-2 text-left disabled:cursor-default"
+          disabled={!trigger.definition}
+          onClick={() => setOpen((o) => !o)}
+        >
+          <Chevron
+            className={cn('size-3.5 shrink-0 text-faint', !trigger.definition && 'invisible')}
+          />
+          <Zap className="size-3.5 shrink-0 text-syn-fn" />
+          <span className="truncate text-bright select-text">{trigger.name}</span>
+        </button>
+        <span className="text-muted">
+          {trigger.timing.toLowerCase()} {trigger.events.join(' or ').toLowerCase()}
+        </span>
+        <span className="text-faint">{trigger.rowLevel ? 'for each row' : 'per statement'}</span>
+        {!trigger.enabled && <Badge tone="warning">disabled</Badge>}
+        <span className="ml-auto flex gap-3 text-[11px]">
+          {editable && (
+            <button
+              className="text-info hover:underline"
+              onClick={() =>
+                openTriggerDesigner(
+                  tab.connectionId,
+                  tab.database,
+                  tab.schema,
+                  tab.name,
+                  tab.objectKind === 'view',
+                  trigger.name
+                )
+              }
+            >
+              Edit…
+            </button>
+          )}
+          {trigger.definition && (
+            <button
+              className="text-info hover:underline"
+              onClick={() => newQueryTab(tab.connectionId, tab.database, trigger.definition ?? '')}
+            >
+              Open in editor
+            </button>
+          )}
+        </span>
+      </div>
+      {open && trigger.definition && (
+        <pre className="mt-1.5 mb-2 ml-11 overflow-x-auto rounded border border-line bg-canvas p-2 font-mono text-[11.5px] text-fg select-text">
+          {trigger.definition}
+        </pre>
+      )}
+    </div>
   )
 }
 

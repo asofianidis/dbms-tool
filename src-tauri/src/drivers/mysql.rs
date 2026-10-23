@@ -481,6 +481,14 @@ impl MySession {
                 vec![database.into(), table.into()],
             )
             .await?;
+        let trigger_rows = self
+            .rows(
+                "SELECT trigger_name, action_timing, event_manipulation, action_statement \
+                 FROM information_schema.triggers WHERE event_object_schema = ? AND event_object_table = ? \
+                 ORDER BY action_timing, event_manipulation, action_order",
+                vec![database.into(), table.into()],
+            )
+            .await?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for r in &stats {
@@ -548,6 +556,32 @@ impl MySession {
             primary_key,
             indexes,
             foreign_keys,
+            triggers: trigger_rows
+                .iter()
+                .map(|r| {
+                    let name = text(r, 0).unwrap_or_default();
+                    let timing = text(r, 1).unwrap_or_default();
+                    let event = text(r, 2).unwrap_or_default();
+                    // information_schema only has the body, so restate the header
+                    let definition = text(r, 3).map(|body| {
+                        format!(
+                            "CREATE TRIGGER {} {timing} {event} ON {}.{} FOR EACH ROW\n{body}",
+                            quote_ident(&name),
+                            quote_ident(database),
+                            quote_ident(table),
+                        )
+                    });
+                    TriggerInfo {
+                        name,
+                        timing,
+                        events: vec![event],
+                        // MySQL only has row-level triggers
+                        row_level: true,
+                        enabled: true,
+                        definition,
+                    }
+                })
+                .collect(),
         })
     }
 

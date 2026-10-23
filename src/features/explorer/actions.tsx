@@ -13,7 +13,8 @@ import {
   RefreshCw,
   ScrollText,
   Table2,
-  Trash2
+  Trash2,
+  Zap
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
 import { modifyScript, routineTemplate } from '@/lib/routines'
@@ -33,6 +34,7 @@ import {
   type TableRef
 } from '@/lib/sql'
 import { toast, toastError } from '@/lib/toast'
+import { canHaveTriggers } from '@/lib/triggers'
 import {
   confirm,
   getConnection,
@@ -43,6 +45,7 @@ import {
 } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
 import { openTableDesigner } from '../table/TableDesigner'
+import { openTriggerDesigner } from '../table/TriggerDesigner'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -164,6 +167,16 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
               label: 'Design table…',
               icon: <Pencil />,
               onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
+            }
+          ]
+        : []),
+      ...(canHaveTriggers(dialect, obj.kind)
+        ? [
+            {
+              label: 'New trigger…',
+              icon: <Zap />,
+              onSelect: () =>
+                openTriggerDesigner(connectionId, database, obj.schema, obj.name, isView)
             }
           ]
         : []),

@@ -15,6 +15,7 @@ import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
 import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
+import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { QueryTab } from './features/query/QueryTab'
@@ -213,6 +214,7 @@ export function App(): React.JSX.Element {
       <ExecuteRoutineHost />
       <TableDesignerHost />
       <SchemaDesignerHost />
+      <TriggerDesignerHost />
       <ContextMenuHost />
       <Toaster />
     </div>

@@ -107,7 +107,8 @@ describe('literals and identifiers', () => {
       ],
       primaryKey: ['id'],
       indexes: [],
-      foreignKeys: []
+      foreignKeys: [],
+      triggers: []
     }
     const statements = editStatements('postgres', { schema: 'public', name: 't' }, info, [
       { kind: 'update', original: { id: '1', name: 'a' }, values: { name: 'b' } },

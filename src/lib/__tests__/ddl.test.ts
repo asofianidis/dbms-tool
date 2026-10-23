@@ -73,7 +73,8 @@ const usersTable = (dialect: Dialect): TableInfo => ({
       definition: null
     }
   ],
-  foreignKeys: []
+  foreignKeys: [],
+  triggers: []
 })
 
 const load = (dialect: Dialect): TableDraft =>
@@ -258,7 +259,8 @@ describe('alter table', () => {
       ],
       primaryKey: ['id'],
       indexes: [],
-      foreignKeys: []
+      foreignKeys: [],
+      triggers: []
     }
     const d = draftFromTable('mysql', 'app', 't', info)
     expect(col(d, 'updated').computed).toBe(false)
@@ -318,7 +320,8 @@ describe('alter table', () => {
       columns: [column({ name: 'total', isGenerated: true, default: '(price * qty)' })],
       primaryKey: [],
       indexes: [],
-      foreignKeys: []
+      foreignKeys: [],
+      triggers: []
     }
     const d = draftFromTable('tsql', 'dbo', 't', info)
     expect(d.columns[0].computed).toBe(true)

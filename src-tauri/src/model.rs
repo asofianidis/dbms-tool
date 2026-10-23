@@ -90,6 +90,20 @@ pub struct ForeignKeyInfo {
     pub on_delete: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerInfo {
+    pub name: String,
+    /// BEFORE | AFTER | INSTEAD OF
+    pub timing: String,
+    /// INSERT | UPDATE | DELETE | TRUNCATE
+    pub events: Vec<String>,
+    /// FOR EACH ROW, as opposed to once per statement
+    pub row_level: bool,
+    pub enabled: bool,
+    pub definition: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
@@ -97,6 +111,7 @@ pub struct TableInfo {
     pub primary_key: Vec<String>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub triggers: Vec<TriggerInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]

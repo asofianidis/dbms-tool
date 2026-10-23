@@ -33,7 +33,8 @@ import {
   Terminal,
   Trash2,
   Unplug,
-  X
+  X,
+  Zap
 } from 'lucide-react'
 import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
@@ -44,6 +45,7 @@ import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
+import { canHaveTriggers } from '@/lib/triggers'
 import { toast, toastError, errorMessage } from '@/lib/toast'
 import {
   confirm,
@@ -65,6 +67,7 @@ import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { openTableDesigner } from '../table/TableDesigner'
+import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -911,6 +914,18 @@ function TableChildren({
   const q = useQuery(queries.table(connection.id, database, obj.schema, obj.name))
   const [indexesOpen, setIndexesOpen] = useExpanded(`${base}/indexes`)
   const [keysOpen, setKeysOpen] = useExpanded(`${base}/keys`)
+  const [triggersOpen, setTriggersOpen] = useExpanded(`${base}/triggers`)
+  const editTriggers = canHaveTriggers(ENGINES[connection.engine].dialect ?? 'postgres', obj.kind)
+  const designTrigger = (trigger: string | null, drop = false): void =>
+    openTriggerDesigner(
+      connection.id,
+      database,
+      obj.schema,
+      obj.name,
+      obj.kind === 'view',
+      trigger,
+      drop
+    )
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   const info = q.data
@@ -1014,6 +1029,82 @@ function TableChildren({
                 detail={`${fk.columns.join(', ')} → ${fk.refTable}(${fk.refColumns.join(', ')})`}
                 onOpen={() =>
                   openTable(connection.id, database, fk.refSchema, fk.refTable, 'table')
+                }
+              />
+            ))}
+        </>
+      )}
+      {info.triggers.length > 0 && (
+        <>
+          <Row
+            id={`${base}/triggers`}
+            depth={depth}
+            expandable
+            open={triggersOpen}
+            onToggle={() => setTriggersOpen()}
+            muted
+            icon={<Zap className="text-faint" />}
+            label="Triggers"
+            detail={info.triggers.length}
+            onMenu={
+              editTriggers
+                ? (e) =>
+                    showContextMenu(e, [
+                      { label: 'New trigger…', icon: <Plus />, onSelect: () => designTrigger(null) }
+                    ])
+                : undefined
+            }
+          />
+          {triggersOpen &&
+            info.triggers.map((t) => (
+              <Row
+                key={t.name}
+                id={`${base}/tr:${t.name}`}
+                depth={depth + 1}
+                icon={<Zap className={t.enabled ? 'text-syn-fn' : 'text-faint'} />}
+                label={t.name}
+                title={t.definition ?? undefined}
+                detail={`${t.timing} ${t.events.join(' OR ')}`.toLowerCase()}
+                onOpen={
+                  editTriggers
+                    ? () => designTrigger(t.name)
+                    : t.definition
+                      ? () => newQueryTab(connection.id, database, t.definition ?? '')
+                      : undefined
+                }
+                onMenu={(e) =>
+                  showContextMenu(e, [
+                    { heading: t.name },
+                    ...(editTriggers
+                      ? [
+                          {
+                            label: 'Edit trigger…',
+                            icon: <Pencil />,
+                            onSelect: () => designTrigger(t.name)
+                          }
+                        ]
+                      : []),
+                    ...(t.definition
+                      ? [
+                          {
+                            label: 'Open definition in editor',
+                            icon: <Code2 />,
+                            onSelect: () => newQueryTab(connection.id, database, t.definition ?? '')
+                          }
+                        ]
+                      : []),
+                    ...(editTriggers
+                      ? [
+                          'separator' as const,
+                          {
+                            label: 'Drop trigger…',
+                            icon: <Trash2 />,
+                            danger: true,
+                            onSelect: () => designTrigger(t.name, true)
+                          }
+                        ]
+                      : [])
+                  ])
                 }
               />
             ))}
