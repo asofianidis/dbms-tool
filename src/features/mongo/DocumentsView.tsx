@@ -5,6 +5,7 @@ import { cn } from '@/lib/cn'
 import { copyText } from '@/lib/export'
 import { bsonType, isContainer, scalarText, toShell } from '@/lib/ejson'
 import { CodeEditor } from '@/components/editor/CodeEditor'
+import type { SortKey } from '@/lib/filters'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Button, EmptyState, Segmented } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
@@ -67,6 +68,11 @@ export function DocumentsView({
   onClone,
   onDelete,
   toolbarExtra,
+  toolbarStart,
+  panel,
+  sort,
+  onSortChange,
+  onFilterByValue,
   className
 }: {
   documents: Doc[]
@@ -76,6 +82,14 @@ export function DocumentsView({
   onClone?: (doc: Doc) => void
   onDelete?: (doc: Doc) => void
   toolbarExtra?: React.ReactNode
+  /** Fills the toolbar between the view switcher and toolbarExtra */
+  toolbarStart?: React.ReactNode
+  /** Shown under the toolbar, e.g. a filter builder */
+  panel?: React.ReactNode
+  /** Table header sorting by field, delegated (e.g. to the find sort) instead of done in memory */
+  sort?: SortKey | null
+  onSortChange?: (sort: SortKey | null) => void
+  onFilterByValue?: (column: string, value: Cell) => void
   className?: string
 }): React.JSX.Element {
   const grid = useMemo(
@@ -115,9 +129,10 @@ export function DocumentsView({
             {expandAll ? 'Collapse all' : 'Expand all'}
           </button>
         )}
-        <div className="flex-1" />
+        {toolbarStart ?? <div className="flex-1" />}
         {toolbarExtra}
       </div>
+      {panel}
       <div className="min-h-0 flex-1">
         {!documents.length ? (
           <EmptyState title="No documents" />
@@ -125,6 +140,16 @@ export function DocumentsView({
           <ResultGrid
             columns={grid.columns}
             rows={grid.rows}
+            sort={
+              sort && grid.columns.some((c) => c.name === sort.column)
+                ? { col: grid.columns.findIndex((c) => c.name === sort.column), dir: sort.dir }
+                : null
+            }
+            onSortChange={
+              onSortChange &&
+              ((s) => onSortChange(s ? { column: grid.columns[s.col].name, dir: s.dir } : null))
+            }
+            onFilterByValue={onFilterByValue}
             onSelectionSummary={selectionSummaryStore.set}
           />
         ) : mode === 'json' ? (

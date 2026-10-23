@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ChevronLeft,
   ChevronRight,
@@ -12,10 +12,12 @@ import {
   Search,
   SlidersHorizontal
 } from 'lucide-react'
-import { api, type MongoOutput } from '@/lib/api'
+import { api, type Cell, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { exportRows } from '@/lib/export'
 import { parseShellValue, scalarText, toShell } from '@/lib/ejson'
+import { emptyQuery, newCondition, type QueryState } from '@/lib/filters'
+import { andFilters, buildMongoFilter, buildMongoSort, sampleFields } from '@/lib/mongo-filters'
 import { shellCollection } from '@/lib/mongo-shell'
 import { formatDuration, plural } from '@/lib/format'
 import { settingsStore } from '@/lib/settings'
@@ -44,6 +46,7 @@ import { DocumentsView, documentsToGrid, type DocumentsMode } from './DocumentsV
 import { AggregationView } from './AggregationView'
 import { SchemaView } from './SchemaView'
 import { IndexesView } from './IndexesView'
+import { QueryBuilder, QuerySummary } from '../table/QueryBuilder'
 
 export function CollectionTab({ tab }: { tab: TabOf<'collection'> }): React.JSX.Element {
   const connection = connectionsStore.use().find((c) => c.id === tab.connectionId)
@@ -129,6 +132,8 @@ function QueryField({
   )
 }
 
+type Doc = Record<string, unknown>
+
 function DocumentsBrowser({
   tab,
   readOnly
@@ -148,6 +153,12 @@ function DocumentsBrowser({
   const [loading, setLoading] = useState(false)
   const [mode, setMode] = useState<DocumentsMode>('list')
   const [editor, setEditor] = useState<DocumentEditorRequest | null>(null)
+  const [query, setQuery] = useState<QueryState>(emptyQuery)
+  const [builderOpen, setBuilderOpen] = useState(false)
+  // Field paths and types sampled from every page loaded so far, for the builder
+  const [fields, setFields] = useState<Record<string, string>>({})
+  const fieldsRef = useRef(fields)
+  fieldsRef.current = fields
 
   const parse = (text: string, what: string): unknown => {
     if (!text.trim()) return undefined
@@ -158,28 +169,46 @@ function DocumentsBrowser({
     }
   }
 
+  /** The typed filter and the builder's conditions both apply; builder sorts come first. */
+  const findQuery = useCallback((): { filter: Doc; sort: Doc | undefined } => {
+    const filter = andFilters(
+      parse(applied.filter, 'Filter') as Doc | undefined,
+      buildMongoFilter(query, fieldsRef.current)
+    )
+    const built = buildMongoSort(query.sorts)
+    const typed = parse(applied.sort, 'Sort') as Doc | undefined
+    const sort =
+      built && typed
+        ? { ...built, ...Object.fromEntries(Object.entries(typed).filter(([k]) => !(k in built))) }
+        : (built ?? typed)
+    return { filter, sort }
+  }, [applied, query])
+
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
+      const { filter, sort } = findQuery()
       const out = await api.mongo(tab.connectionId, tab.id, {
         op: 'find',
         database: tab.database,
         collection: tab.collection,
-        filter: parse(applied.filter, 'Filter') ?? {},
+        filter,
         projection: parse(applied.projection, 'Project'),
-        sort: parse(applied.sort, 'Sort'),
+        sort,
         skip: page * pageSize,
         limit: pageSize,
         count: true
       })
       setOutput(out)
+      // Keep known types stable; only add newly seen fields
+      setFields((known) => ({ ...sampleFields(out.documents), ...known }))
     } catch (e) {
       setError(errorMessage(e))
     } finally {
       setLoading(false)
     }
-  }, [tab.connectionId, tab.id, tab.database, tab.collection, applied, page, pageSize])
+  }, [tab.connectionId, tab.id, tab.database, tab.collection, applied, findQuery, page, pageSize])
 
   useEffect(() => {
     void load()
@@ -190,21 +219,49 @@ function DocumentsBrowser({
     setPage(0)
   }
 
+  /** Applies a new filter / sort from the builder, chips or grid header. */
+  const applyQuery = (next: QueryState): void => {
+    setQuery(next)
+    setPage(0)
+  }
+
   const reset = (): void => {
     setFilter('')
     setProjection('')
     setSort('')
     setApplied({ filter: '', projection: '', sort: '' })
+    setQuery(emptyQuery())
     setPage(0)
+  }
+
+  const filterByValue = (column: string, value: Cell): void => {
+    const condition =
+      value === null
+        ? newCondition({ column, op: 'null' })
+        : typeof value === 'boolean'
+          ? newCondition({ column, op: value ? 'true' : 'false' })
+          : newCondition({ column, op: 'eq', value: String(value) })
+    // Narrow the current filter. With "any", fold the existing conditions into one OR group first
+    const orGroup = query.match === 'any' && query.conditions.filter((c) => c.enabled).length > 1
+    try {
+      const folded = orGroup ? buildMongoFilter(query, fields) : null
+      applyQuery({
+        ...query,
+        match: 'all',
+        conditions: folded
+          ? [newCondition({ kind: 'sql', sql: toShell(folded, 0) }), condition]
+          : [...query.conditions, condition]
+      })
+    } catch (e) {
+      toastError(e)
+    }
   }
 
   const explain = async (): Promise<void> => {
     try {
-      const find: Record<string, unknown> = {
-        find: tab.collection,
-        filter: parse(applied.filter, 'Filter') ?? {}
-      }
-      if (applied.sort) find.sort = parse(applied.sort, 'Sort')
+      const { filter, sort } = findQuery()
+      const find: Record<string, unknown> = { find: tab.collection, filter }
+      if (sort) find.sort = sort
       const out = await api.mongo(tab.connectionId, tab.id, {
         op: 'runCommand',
         database: tab.database,
@@ -336,6 +393,30 @@ function DocumentsBrowser({
                 : (doc) => setEditor({ ...editorBase, mode: 'insert', document: doc })
             }
             onDelete={readOnly ? undefined : (doc) => void remove(doc)}
+            toolbarStart={
+              <QuerySummary
+                query={query}
+                open={builderOpen}
+                onToggle={() => setBuilderOpen((o) => !o)}
+                onChange={applyQuery}
+                emptyLabel={applied.filter ? '' : 'All documents'}
+              />
+            }
+            panel={
+              builderOpen && (
+                <QueryBuilder
+                  columns={Object.entries(fields).map(([name, dataType]) => ({ name, dataType }))}
+                  dialect="mongo"
+                  applied={query}
+                  onApply={applyQuery}
+                  onClose={() => setBuilderOpen(false)}
+                />
+              )
+            }
+            // A header click sorts by that field alone; the builder handles multi-field sorts
+            sort={query.sorts[0] ?? null}
+            onSortChange={(s) => applyQuery({ ...query, sorts: s ? [s] : [] })}
+            onFilterByValue={filterByValue}
             toolbarExtra={
               <div className="flex items-center gap-1 text-[11.5px] text-muted">
                 {!readOnly && (
@@ -351,13 +432,18 @@ function DocumentsBrowser({
                   size="xs"
                   variant="ghost"
                   title="Open this query in a shell tab"
-                  onClick={() =>
-                    newQueryTab(
-                      tab.connectionId,
-                      tab.database,
-                      `${shellCollection(tab.collection)}.find(${applied.filter || '{}'}${applied.projection ? `, ${applied.projection}` : ''})${applied.sort ? `\n  .sort(${applied.sort})` : ''}\n  .limit(${pageSize})`
-                    )
-                  }
+                  onClick={() => {
+                    try {
+                      const { filter, sort } = findQuery()
+                      newQueryTab(
+                        tab.connectionId,
+                        tab.database,
+                        `${shellCollection(tab.collection)}.find(${toShell(filter, 0)}${applied.projection ? `, ${applied.projection}` : ''})${sort ? `\n  .sort(${toShell(sort, 0)})` : ''}\n  .limit(${pageSize})`
+                      )
+                    } catch (e) {
+                      toastError(e)
+                    }
+                  }}
                 >
                   <Code2 className="size-3.5" /> Shell
                 </Button>
