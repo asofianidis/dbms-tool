@@ -24,6 +24,7 @@ import {
   newRestoreDraft,
   restoreJob,
   restoresAsNamed,
+  builtinCanRun,
   toolVersionProblem,
   validateBackup,
   validateRestore,
@@ -199,6 +200,11 @@ export function ToolBackupWizard({
   const dumpKind: BackupToolKind = isPg ? 'pg_dump' : isMongo ? 'mongodump' : 'mysqldump'
   const dumpTool = tools?.find((t) => t.kind === dumpKind)
   const versionProblem = dumpTool ? toolVersionProblem(dumpTool, serverVersion) : null
+  // Without the tool the built-in engine backs up, as plain SQL for PostgreSQL
+  const builtin = !toolsLoading && !dumpTool?.path
+  useEffect(() => {
+    if (builtin && isPg && draft.pgFormat !== 'plain') setFormat({ pgFormat: 'plain' })
+  }, [builtin])
 
   const stepProblem = (): string | null => {
     switch (steps.step) {
@@ -213,7 +219,9 @@ export function ToolBackupWizard({
       case 3:
         if (!path.trim()) return 'Choose where to save the backup'
         if (toolsLoading) return 'Looking for the backup tool…'
-        if (!dumpTool?.path) return `${dumpKind} wasn't found`
+        if (builtin && !builtinCanRun(backupJob(engine, full, collections))) {
+          return `${dumpKind} wasn't found; without it, backups are plain SQL`
+        }
         return versionProblem ?? validateBackup(engine, full)
       default:
         return null
@@ -367,23 +375,34 @@ export function ToolBackupWizard({
                 {
                   value: 'custom',
                   label: 'Custom archive',
-                  badge: 'Recommended',
-                  description: 'Compressed. pg_restore can restore all of it or chosen parts.'
+                  badge: builtin ? undefined : 'Recommended',
+                  description: builtin
+                    ? 'Needs pg_dump, which isn’t installed.'
+                    : 'Compressed. pg_restore can restore all of it or chosen parts.',
+                  disabled: builtin
                 },
                 {
                   value: 'plain',
                   label: 'Plain SQL script',
-                  description: 'Readable and editable. Restores by running it with psql.'
+                  description: builtin
+                    ? 'Readable and editable. Written by the built-in engine; restores here or with psql.'
+                    : 'Readable and editable. Restores by running it with psql.'
                 },
                 {
                   value: 'directory',
                   label: 'Directory',
-                  description: 'A folder with one file per table. Backs up in parallel.'
+                  description: builtin
+                    ? 'Needs pg_dump, which isn’t installed.'
+                    : 'A folder with one file per table. Backs up in parallel.',
+                  disabled: builtin
                 },
                 {
                   value: 'tar',
                   label: 'Tar archive',
-                  description: 'Uncompressed archive for pg_restore.'
+                  description: builtin
+                    ? 'Needs pg_dump, which isn’t installed.'
+                    : 'Uncompressed archive for pg_restore.',
+                  disabled: builtin
                 }
               ]}
             />
@@ -575,6 +594,7 @@ export function ToolBackupWizard({
               tools={tools}
               loading={toolsLoading}
               problem={versionProblem}
+              builtin={builtin}
             />
           </Section>
         </>
@@ -608,8 +628,10 @@ export function ToolBackupWizard({
             />
           </Section>
           <Section
-            title="Command"
-            description="The password is passed privately, never on the command line."
+            title={builtin ? 'How it runs' : 'Command'}
+            description={
+              builtin ? undefined : 'The password is passed privately, never on the command line.'
+            }
           >
             {preview.isError ? (
               <ErrorText error={preview.error} />
@@ -717,6 +739,8 @@ export function ToolRestoreWizard({ tabId, connection, database }: Props): React
       ? 'mongorestore'
       : 'mysql'
   const restoreTool = tools?.find((t) => t.kind === restoreKind)
+  // Without the tool the built-in engine restores, except pg_dump's archives
+  const builtin = !toolsLoading && !restoreTool?.path && restoreKind !== 'pg_restore'
   const target = draft.database.trim()
   const existingTarget = !asNamed && draft.target === 'existing'
   const destructive =
@@ -759,7 +783,7 @@ export function ToolRestoreWizard({ tabId, connection, database }: Props): React
       case 2:
       case 3:
         if (toolsLoading) return 'Looking for the restore tool…'
-        if (!restoreTool?.path) return `${restoreKind} wasn't found`
+        if (!restoreTool?.path && !builtin) return `${restoreKind} wasn't found`
         return validateRestore(engine, draft, inspection, databases)
       default:
         return null
@@ -1119,7 +1143,7 @@ export function ToolRestoreWizard({ tabId, connection, database }: Props): React
             )}
           </Section>
           <Section title="Restore tool">
-            <ToolStatus kind={restoreKind} tools={tools} loading={toolsLoading} />
+            <ToolStatus kind={restoreKind} tools={tools} loading={toolsLoading} builtin={builtin} />
           </Section>
         </>
       )}
@@ -1156,8 +1180,10 @@ export function ToolRestoreWizard({ tabId, connection, database }: Props): React
             </Callout>
           )}
           <Section
-            title="Command"
-            description="The password is passed privately, never on the command line."
+            title={builtin ? 'How it runs' : 'Command'}
+            description={
+              builtin ? undefined : 'The password is passed privately, never on the command line.'
+            }
           >
             {preview.isError ? (
               <ErrorText error={preview.error} />

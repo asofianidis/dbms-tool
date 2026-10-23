@@ -232,6 +232,11 @@ impl MySession {
         self.conn.ping().await.is_ok()
     }
 
+    /// The underlying connection, for the built-in backup's streaming reads.
+    pub fn conn(&mut self) -> &mut Conn {
+        &mut self.conn
+    }
+
     pub async fn use_database(&mut self, database: &str) -> AppResult<()> {
         if database.is_empty() || database == self.database {
             return Ok(());

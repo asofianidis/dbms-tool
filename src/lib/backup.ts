@@ -327,6 +327,15 @@ export function createDatabaseSql(engine: Engine, name: string): string | null {
   return null
 }
 
+/**
+ * Whether the app's built-in engine can run `job` when its client tool isn't
+ * installed. It writes and reads everything but pg_dump's archive formats.
+ */
+export function builtinCanRun(job: BackupJob): boolean {
+  if (job.tool === 'pg_restore') return false
+  return job.tool !== 'pg_dump' || job.format === 'plain'
+}
+
 /** Warns when pg_dump is older than the server, which it refuses to dump. */
 export function toolVersionProblem(tool: BackupTool, serverVersion: string): string | null {
   if (!tool.path || !tool.kind.startsWith('pg') || !tool.version) return null

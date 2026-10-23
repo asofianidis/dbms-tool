@@ -146,6 +146,11 @@ impl PgSession {
         self.client.is_closed()
     }
 
+    /// The underlying client, for the built-in backup's COPY streams.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub async fn server_info(&self) -> AppResult<ServerInfo> {
         let row = self
             .client

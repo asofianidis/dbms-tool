@@ -582,13 +582,16 @@ export function ToolStatus({
   kind,
   tools,
   loading,
-  problem
+  problem,
+  builtin
 }: {
   kind: BackupToolKind
   tools: BackupTool[] | undefined
   loading: boolean
   /** e.g. pg_dump older than the server */
   problem?: string | null
+  /** The app's built-in engine runs the job when the tool is missing */
+  builtin?: boolean
 }): React.JSX.Element {
   const { toolsDir } = backupPrefsStore.use()
   const tool = tools?.find((t) => t.kind === kind)
@@ -596,7 +599,7 @@ export function ToolStatus({
     const picked = await openDialog({ directory: true, defaultPath: toolsDir || undefined })
     if (typeof picked === 'string') backupPrefsStore.set({ toolsDir: picked })
   }
-  const missing = !loading && !tool?.path
+  const missing = !loading && !tool?.path && !builtin
   return (
     <div
       className={cn(
@@ -617,6 +620,14 @@ export function ToolStatus({
               {tool.path}
             </span>
             {problem && <span className="mt-1 block text-warn">{problem}</span>}
+          </>
+        ) : builtin ? (
+          <>
+            <span className="text-bright">Built-in engine</span>
+            <span className="block text-muted">
+              {kind} isn&apos;t installed, so dbms-tool does this itself, reading and writing the
+              same format {kind} uses.
+            </span>
           </>
         ) : (
           <>

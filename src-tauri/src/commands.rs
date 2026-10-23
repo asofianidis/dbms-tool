@@ -399,6 +399,11 @@ pub async fn backup_preview(
     let server = state.manager.get(&id)?;
     let tool = crate::backup::resolve(job.kind(), dir.as_deref()).await;
     let plan = job.plan(&server.config, server.password(), &tool)?;
+    // Without the tool, the built-in engine runs the job
+    if tool.path.is_none() {
+        crate::backup::builtin::supports(&job)?;
+        return Ok(crate::backup::builtin::describe(&job));
+    }
     Ok(crate::backup::command_line(&tool, &plan))
 }
 
@@ -440,6 +445,9 @@ pub async fn backup_run(
     }
     let tool = crate::backup::resolve(job.kind(), dir.as_deref()).await;
     let plan = job.plan(&server.config, server.password(), &tool)?;
+    if tool.path.is_none() {
+        return crate::backup::builtin::run(&app, &state.backups, &job_id, &server, &job).await;
+    }
     crate::backup::run(&app, &state.backups, &job_id, &tool, plan).await
 }
 

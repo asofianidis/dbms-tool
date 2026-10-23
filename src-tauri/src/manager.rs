@@ -42,6 +42,11 @@ impl Server {
         self.password.as_deref()
     }
 
+    /// The MongoDB client, for the built-in backup.
+    pub fn mongo_client(&self) -> AppResult<&mongodb::Client> {
+        self.mongo()
+    }
+
     fn mongo(&self) -> AppResult<&mongodb::Client> {
         self.mongo
             .as_ref()

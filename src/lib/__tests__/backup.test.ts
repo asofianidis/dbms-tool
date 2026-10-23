@@ -3,6 +3,7 @@ import type { BackupInspection, ResultSet } from '../api'
 import {
   backupJob,
   backupIsFolder,
+  builtinCanRun,
   defaultBackupName,
   defaultMoves,
   defaultMssqlBackupPath,
@@ -129,6 +130,21 @@ describe('tool backups', () => {
       toolVersionProblem({ ...tool, version: 'pg_dump (PostgreSQL) 17.0' }, 'PostgreSQL 17.2')
     ).toBeNull()
     expect(toolVersionProblem({ ...tool, path: null }, 'PostgreSQL 17.2')).toBeNull()
+  })
+
+  it('runs everything but pg_dump archives without the tools', () => {
+    const draft = { ...newBackupDraft('shop'), path: '/b/shop' }
+    expect(builtinCanRun(backupJob('postgres', { ...draft, pgFormat: 'plain' }))).toBe(true)
+    expect(builtinCanRun(backupJob('postgres', draft))).toBe(false)
+    expect(builtinCanRun(backupJob('mysql', draft))).toBe(true)
+    expect(builtinCanRun(backupJob('mongo', draft))).toBe(true)
+    const restore = { ...newRestoreDraft('copy') }
+    expect(builtinCanRun(restoreJob('postgres', restore, inspection({ format: 'plain' })))).toBe(
+      true
+    )
+    expect(builtinCanRun(restoreJob('postgres', restore, inspection({ format: 'custom' })))).toBe(
+      false
+    )
   })
 })
 

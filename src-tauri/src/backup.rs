@@ -20,6 +20,8 @@ use crate::config::{ConnectionConfig, Engine, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::CancelSignal;
 
+pub mod builtin;
+
 /// Replaced in arguments by the path of a private temporary file holding the
 /// password (a MySQL option file or a MongoDB tools config file), so it never
 /// appears in the process list.
@@ -1159,6 +1161,8 @@ pub fn parse_plain_pg(text: &str, out: &mut Inspection) {
             out.source_version = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("-- Dumped by pg_dump version ") {
             out.tool_version = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("-- Dumped by dbms-tool version ") {
+            out.tool_version = Some(format!("dbms-tool {}", v.trim()));
         }
     }
     if let Some(at) = text.find("\nCREATE DATABASE ") {
@@ -1325,6 +1329,13 @@ pub async fn inspect(
                 }
             }
             let tool = resolve(ToolKind::PgRestore, custom).await;
+            if tool.path.is_none() {
+                return Err(AppError::msg(format!(
+                    "This is a pg_dump {} archive, which needs pg_restore to read and restore. \
+                     Install the PostgreSQL client tools, or choose the folder they're in.",
+                    out.format
+                )));
+            }
             let plan = Plan {
                 args: vec!["--list".into(), out.path.clone()],
                 ..Default::default()
@@ -1355,6 +1366,29 @@ pub async fn inspect(
                 }
                 out.format = "archive".into();
                 let tool = resolve(ToolKind::Mongorestore, custom).await;
+                if tool.path.is_none() {
+                    // The built-in engine reads the archive's own table of contents
+                    for (db, name, kind) in builtin::mongo_archive_contents(p)? {
+                        out.entries.push(Entry {
+                            kind: if kind == "view" {
+                                "view".into()
+                            } else {
+                                "collection".into()
+                            },
+                            schema: Some(db),
+                            name,
+                        });
+                    }
+                    let dbs: HashSet<&str> = out
+                        .entries
+                        .iter()
+                        .filter_map(|e| e.schema.as_deref())
+                        .collect();
+                    if dbs.len() == 1 {
+                        out.database = dbs.into_iter().next().map(String::from);
+                    }
+                    return Ok(out);
+                }
                 let mut plan = Plan::default();
                 mongo_connection(&mut plan, cfg, password);
                 plan.args.extend([
@@ -1565,6 +1599,17 @@ impl Jobs {
         if let Some(signal) = self.0.lock().get(id) {
             signal.fire();
         }
+    }
+
+    /// Tracks a job run without a client tool (the built-in engine).
+    pub(crate) fn register(&self, id: &str) -> Arc<CancelSignal> {
+        let signal = Arc::new(CancelSignal::default());
+        self.0.lock().insert(id.to_string(), signal.clone());
+        signal
+    }
+
+    pub(crate) fn unregister(&self, id: &str) {
+        self.0.lock().remove(id);
     }
 }
 
