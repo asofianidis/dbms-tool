@@ -57,6 +57,8 @@ struct CloudRef {
     context: String,
     #[serde(default)]
     resource: String,
+    #[serde(default)]
+    account: String,
 }
 
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<SqSession> {
@@ -73,7 +75,7 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
             let token = password
                 .filter(|p| !p.is_empty())
                 .map(str::to_string)
-                .or_else(|| cloud::stored_token(Provider::Cloudflare))
+                .or_else(|| cloud::stored_token(Provider::Cloudflare, &cloud.account))
                 .ok_or_else(|| {
                     AppError::msg("Add a Cloudflare API token, here or in the Cloud databases tab")
                 })?;

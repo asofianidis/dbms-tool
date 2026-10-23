@@ -14,6 +14,7 @@ import {
   generatePassword,
   newProvisionDraft,
   parseContexts,
+  parseGcpAccounts,
   parseDescribe,
   parseIdentity,
   parseList,
@@ -335,6 +336,31 @@ describe('discovery', () => {
     expect(
       parseIdentity('azure', JSON.stringify({ name: 'Dev', user: { name: 'me@x.dev' } }))
     ).toBe('me@x.dev')
+  })
+
+  it('tells several signed-in accounts apart', () => {
+    expect(
+      parseGcpAccounts(
+        JSON.stringify([
+          { account: 'a@x.dev', status: '' },
+          { account: 'b@x.dev', status: 'ACTIVE' }
+        ])
+      )
+    ).toEqual([
+      { id: 'a@x.dev', label: 'a@x.dev', isDefault: false },
+      { id: 'b@x.dev', label: 'b@x.dev', isDefault: true }
+    ])
+    expect(parseGcpAccounts('')).toEqual([])
+    // Azure subscriptions name their user once more than one is signed in
+    expect(
+      parseContexts(
+        'azure',
+        JSON.stringify([
+          { id: 's1', name: 'Dev', isDefault: true, user: { name: 'me@x.dev' } },
+          { id: 's2', name: 'Prod', isDefault: false, user: { name: 'ops@y.dev' } }
+        ])
+      ).map((c) => c.label)
+    ).toEqual(['Dev · me@x.dev', 'Prod · ops@y.dev'])
   })
 
   it('reads Secrets Manager passwords', () => {
