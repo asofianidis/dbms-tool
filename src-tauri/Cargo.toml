@@ -29,7 +29,7 @@ tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-serd
 postgres-native-tls = "0.5.3"
 native-tls = "0.2.18"
 mysql_async = { version = "0.37.1", features = ["native-tls-tls"] }
-tiberius = { version = "0.13.0", default-features = false, features = ["chrono", "rust_decimal", "tds73", "winauth", "native-tls", "sql-browser-tokio"] }
+tiberius = { version = "0.13.0", default-features = false, features = ["chrono", "rust_decimal", "tds73", "winauth", "sql-browser-tokio"] }
 mongodb = "3.9.1"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 thiserror = "2.0.21"
@@ -59,6 +59,18 @@ strip = true
 # surfaced through QueryItem (see vendor/tiberius/PATCHES.md)
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+
+# tiberius's TLS backend: SChannel on Windows; rustls elsewhere, because macOS
+# Secure Transport fails some SQL Server handshakes even with certificate checks off
+[target.'cfg(windows)'.dependencies.tiberius]
+version = "0.13.0"
+default-features = false
+features = ["native-tls"]
+
+[target.'cfg(not(windows))'.dependencies.tiberius]
+version = "0.13.0"
+default-features = false
+features = ["rustls"]
 
 # Resolves mongodb+srv ourselves; see drivers/mongo_srv.rs
 [target.'cfg(windows)'.dependencies]

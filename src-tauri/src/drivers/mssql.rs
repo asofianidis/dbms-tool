@@ -123,7 +123,24 @@ pub async fn connect(
     database: &str,
 ) -> AppResult<MsSession> {
     let config = build_config(cfg, password, database)?;
-    let client = open(config).await?;
+    let client = match open(config).await {
+        // Certificate checks are already off, so the handshake itself failed: usually a
+        // server that only speaks TLS 1.0/1.1, which neither rustls nor current Windows allows
+        Err(AppError::Message(m))
+            if cfg.trust_server_certificate && m.starts_with("TLS error:") =>
+        {
+            let reason = m
+                .split_once(". If the server")
+                .map_or(m.as_str(), |(r, _)| r);
+            return Err(AppError::msg(format!(
+                "{reason}. Certificate validation is already off, so the TLS handshake itself failed. \
+                 This usually means the server only supports TLS 1.0/1.1 (SQL Server 2014 and older \
+                 without the TLS 1.2 update), which this app can't use. Update the server, or \
+                 set Encryption to Off if the server doesn't force encryption."
+            )));
+        }
+        r => r?,
+    };
     let mut session = MsSession {
         client,
         database: database.to_string(),
