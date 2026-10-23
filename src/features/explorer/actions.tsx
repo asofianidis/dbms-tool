@@ -12,6 +12,7 @@ import {
   Play,
   RefreshCw,
   ScrollText,
+  ShieldCheck,
   Table2,
   Trash2,
   Zap
@@ -20,6 +21,7 @@ import { api, type DbObject } from '@/lib/api'
 import { modifyScript, routineTemplate } from '@/lib/routines'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
+import { securableFor } from '@/lib/grants'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import {
@@ -46,6 +48,7 @@ import {
 import type { MenuItem } from '@/components/ContextMenu'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPermissionsDesigner } from './PermissionsDesigner'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -270,6 +273,14 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
       label: 'Script as CREATE',
       icon: <FileCode2 />,
       onSelect: () => void scriptTo(connectionId, database, obj, 'definition')
+    })
+  }
+  const securable = securableFor(dialect, database, obj)
+  if (securable) {
+    items.push({
+      label: 'Permissions…',
+      icon: <ShieldCheck />,
+      onSelect: () => openPermissionsDesigner(connectionId, database, securable)
     })
   }
   items.push(

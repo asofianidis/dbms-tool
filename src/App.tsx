@@ -16,6 +16,7 @@ import { HistoryPanel } from './features/history/HistoryPanel'
 import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
+import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
 import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { DiagramTab } from './features/diagram/DiagramTab'
@@ -221,6 +222,7 @@ export function App(): React.JSX.Element {
       <TableDesignerHost />
       <SchemaDesignerHost />
       <TriggerDesignerHost />
+      <PermissionsDesignerHost />
       <ContextMenuHost />
       <Toaster />
     </div>

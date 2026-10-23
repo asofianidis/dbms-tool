@@ -30,6 +30,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   Table2,
   Terminal,
   Trash2,
@@ -70,6 +71,7 @@ import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu 
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -248,6 +250,12 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <Plus />,
               disabled: !connected,
               onSelect: () => openSchemaDesigner(connection.id, '')
+            },
+            {
+              label: 'Permissions…',
+              icon: <ShieldCheck />,
+              disabled: !connected,
+              onSelect: () => openPermissionsDesigner(connection.id, '')
             }
           ]
         : []),
@@ -522,6 +530,13 @@ function DatabaseNode({
         })
       }
     }
+    if (!isMongo) {
+      items.push({
+        label: 'Permissions…',
+        icon: <ShieldCheck />,
+        onSelect: () => openPermissionsDesigner(connection.id, database)
+      })
+    }
     showContextMenu(e, items)
   }
 
@@ -634,6 +649,17 @@ function SchemaNode({
               icon: <Trash2 />,
               danger: true,
               onSelect: () => openSchemaDesigner(connection.id, database, schema, true)
+            },
+            {
+              label: 'Permissions…',
+              icon: <ShieldCheck />,
+              onSelect: () =>
+                openPermissionsDesigner(connection.id, database, {
+                  kind: 'schema',
+                  schema,
+                  name: null,
+                  args: null
+                })
             },
             {
               label: 'Refresh',
