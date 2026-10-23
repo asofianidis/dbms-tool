@@ -65,6 +65,7 @@ import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { openTableDesigner } from '../table/TableDesigner'
+import { openSchemaDesigner } from './SchemaDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -235,6 +236,16 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         disabled: !connected,
         onSelect: () => openServer(connection.id)
       },
+      ...(connection.engine === 'mysql'
+        ? [
+            {
+              label: 'New database…',
+              icon: <Plus />,
+              disabled: !connected,
+              onSelect: () => openSchemaDesigner(connection.id, '')
+            }
+          ]
+        : []),
       {
         label: 'Refresh',
         icon: <RefreshCw />,
@@ -462,6 +473,36 @@ function DatabaseNode({
           onSelect: () => void dropDatabase(connection.id, database)
         }
       )
+    } else if (connection.engine === 'mysql') {
+      // MySQL schemas are databases
+      items.push(
+        'separator',
+        {
+          label: 'Edit database…',
+          icon: <Pencil />,
+          onSelect: () => openSchemaDesigner(connection.id, database, database)
+        },
+        {
+          label: 'Drop database…',
+          icon: <Trash2 />,
+          danger: true,
+          onSelect: () => openSchemaDesigner(connection.id, database, database, true)
+        }
+      )
+    } else {
+      items.push('separator', {
+        label: 'New schema…',
+        icon: <Plus />,
+        onSelect: () => openSchemaDesigner(connection.id, database)
+      })
+      // SQL Server schemas aren't tree nodes; the dialog picks which one to edit
+      if (connection.engine !== 'postgres') {
+        items.push({
+          label: 'Edit schemas…',
+          icon: <Layers />,
+          onSelect: () => openSchemaDesigner(connection.id, database, 'dbo')
+        })
+      }
     }
     showContextMenu(e, items)
   }
@@ -559,6 +600,17 @@ function SchemaNode({
               icon: <Terminal />,
               onSelect: () =>
                 newQueryTab(connection.id, database, `SET search_path TO ${schema};\n\n`)
+            },
+            {
+              label: 'Edit schema…',
+              icon: <Pencil />,
+              onSelect: () => openSchemaDesigner(connection.id, database, schema)
+            },
+            {
+              label: 'Drop schema…',
+              icon: <Trash2 />,
+              danger: true,
+              onSelect: () => openSchemaDesigner(connection.id, database, schema, true)
             },
             {
               label: 'Refresh',

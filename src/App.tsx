@@ -11,6 +11,7 @@ import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { Explorer } from './features/explorer/Explorer'
+import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { CollectionTab } from './features/mongo/CollectionTab'
@@ -204,6 +205,7 @@ export function App(): React.JSX.Element {
       <PromptHost />
       <ExecuteRoutineHost />
       <TableDesignerHost />
+      <SchemaDesignerHost />
       <ContextMenuHost />
       <Toaster />
     </div>

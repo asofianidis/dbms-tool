@@ -5,11 +5,17 @@ import {
   ddlScript,
   draftFromTable,
   draftWarnings,
+  dropSchemaStatement,
   mysqlDefaultExpr,
   newColumn,
+  newSchemaDraft,
   newTableDraft,
+  schemaDraftFrom,
+  schemaStatements,
   tableStatements,
   validateDraft,
+  validateSchema,
+  type SchemaState,
   type TableDraft
 } from '../ddl'
 import type { Dialect } from '../engines'
@@ -363,5 +369,69 @@ describe('mysqlDefaultExpr', () => {
     expect(mysqlDefaultExpr('uuid()', 'char(36)')).toBe('(uuid())')
     expect(mysqlDefaultExpr("lower(_latin1\\'A\\')", 'char(36)')).toBe("(lower(_latin1'A'))")
     expect(mysqlDefaultExpr('', 'varchar(10)')).toBe("''")
+  })
+})
+
+describe('schema designer', () => {
+  const sales: SchemaState = {
+    name: 'sales',
+    owner: 'postgres',
+    comment: '',
+    charset: '',
+    collation: ''
+  }
+
+  it('creates schemas with an owner and comment', () => {
+    const draft = { ...newSchemaDraft(), name: 'sales', owner: 'app', comment: "team's data" }
+    expect(schemaStatements('postgres', draft)).toEqual([
+      'CREATE SCHEMA sales AUTHORIZATION app',
+      "COMMENT ON SCHEMA sales IS 'team''s data'"
+    ])
+    expect(schemaStatements('tsql', draft)).toEqual(['CREATE SCHEMA [sales] AUTHORIZATION [app]'])
+  })
+
+  it('creates MySQL databases with a character set', () => {
+    const draft = { ...newSchemaDraft(), name: 'shop', charset: 'utf8mb4' }
+    expect(schemaStatements('mysql', draft)).toEqual([
+      'CREATE DATABASE `shop` CHARACTER SET utf8mb4'
+    ])
+  })
+
+  it('renames, re-owns and comments a PostgreSQL schema', () => {
+    const draft = { ...schemaDraftFrom(sales), name: 'Sales', owner: 'app', comment: 'x' }
+    expect(schemaStatements('postgres', draft)).toEqual([
+      'ALTER SCHEMA sales RENAME TO "Sales"',
+      'ALTER SCHEMA "Sales" OWNER TO app',
+      `COMMENT ON SCHEMA "Sales" IS 'x'`
+    ])
+    expect(schemaStatements('postgres', schemaDraftFrom(sales))).toEqual([])
+  })
+
+  it('changes SQL Server owners but not on Babelfish', () => {
+    const draft = { ...schemaDraftFrom({ ...sales, owner: 'dbo' }), owner: 'guest' }
+    expect(schemaStatements('tsql', draft)).toEqual([
+      'ALTER AUTHORIZATION ON SCHEMA::[sales] TO [guest]'
+    ])
+    expect(schemaStatements('tsql', draft, { babelfish: true })).toEqual([])
+  })
+
+  it('alters MySQL database defaults', () => {
+    const shop = { ...sales, name: 'shop', charset: 'latin1', collation: 'latin1_swedish_ci' }
+    const draft = { ...schemaDraftFrom(shop), charset: 'utf8mb4', collation: 'utf8mb4_bin' }
+    expect(schemaStatements('mysql', draft)).toEqual([
+      'ALTER DATABASE `shop` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin'
+    ])
+  })
+
+  it('drops schemas, cascading only on PostgreSQL', () => {
+    expect(dropSchemaStatement('postgres', 'sales', true)).toBe('DROP SCHEMA sales CASCADE')
+    expect(dropSchemaStatement('tsql', 'sales', true)).toBe('DROP SCHEMA [sales]')
+    expect(dropSchemaStatement('mysql', 'shop', false)).toBe('DROP DATABASE `shop`')
+  })
+
+  it('rejects collation names that would need quoting', () => {
+    expect(validateSchema({ ...newSchemaDraft(), name: 'x', collation: 'a; DROP' })).toBe(
+      'Invalid character set or collation'
+    )
   })
 })

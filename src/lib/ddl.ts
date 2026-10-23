@@ -622,3 +622,98 @@ export function ddlScript(dialect: Dialect, statements: string[]): string {
   }
   return statements.map((s) => `${s};`).join('\n\n')
 }
+
+/* ---------- Schema designer ---------- */
+
+/** A schema (PostgreSQL / SQL Server) or database (MySQL). */
+export interface SchemaState {
+  name: string
+  /** Owning role or principal (PostgreSQL / SQL Server) */
+  owner: string
+  /** PostgreSQL only */
+  comment: string
+  /** MySQL default character set and collation, '' for the server default */
+  charset: string
+  collation: string
+}
+
+export interface SchemaDraft extends SchemaState {
+  /** The schema as loaded; null when creating one */
+  original: SchemaState | null
+}
+
+export function newSchemaDraft(): SchemaDraft {
+  return { name: '', owner: '', comment: '', charset: '', collation: '', original: null }
+}
+
+export function schemaDraftFrom(state: SchemaState): SchemaDraft {
+  return { ...state, original: state }
+}
+
+/** Only PostgreSQL can rename a schema; SQL Server and MySQL can't rename schemas or databases. */
+export const canRenameSchema = (dialect: Dialect): boolean => dialect === 'postgres'
+
+/** Whether an existing schema's owner can change (Babelfish rejects ALTER AUTHORIZATION). */
+export const canChangeSchemaOwner = (dialect: Dialect, options: DdlOptions = {}): boolean =>
+  dialect === 'postgres' || (dialect === 'tsql' && !options.babelfish)
+
+export function validateSchema(draft: SchemaDraft): string | null {
+  if (!draft.name.trim()) return 'Enter a name'
+  // Character sets and collations are spliced in unquoted
+  if (!/^\w*$/.test(draft.charset) || !/^\w*$/.test(draft.collation))
+    return 'Invalid character set or collation'
+  return null
+}
+
+/** Statements (without trailing semicolons) that create or alter the schema to match the draft. */
+export function schemaStatements(
+  dialect: Dialect,
+  draft: SchemaDraft,
+  options: DdlOptions = {}
+): string[] {
+  const q = (name: string): string => quoteIdent(dialect, name)
+  const name = draft.name.trim()
+  const owner = draft.owner.trim()
+  const comment = draft.comment.trim()
+  const was = draft.original
+
+  if (dialect === 'mysql') {
+    const defaults = [
+      draft.charset && `CHARACTER SET ${draft.charset}`,
+      draft.collation && `COLLATE ${draft.collation}`
+    ].filter(Boolean)
+    if (!was) return [[`CREATE DATABASE ${q(name)}`, ...defaults].join(' ')]
+    const changed = draft.charset !== was.charset || draft.collation !== was.collation
+    return changed && defaults.length
+      ? [[`ALTER DATABASE ${q(was.name)}`, ...defaults].join(' ')]
+      : []
+  }
+
+  if (!was) {
+    const statements = [`CREATE SCHEMA ${q(name)}${owner ? ` AUTHORIZATION ${q(owner)}` : ''}`]
+    if (dialect === 'postgres' && comment)
+      statements.push(`COMMENT ON SCHEMA ${q(name)} IS ${literal(dialect, comment)}`)
+    return statements
+  }
+
+  const statements: string[] = []
+  if (dialect === 'postgres') {
+    if (name !== was.name) statements.push(`ALTER SCHEMA ${q(was.name)} RENAME TO ${q(name)}`)
+    if (owner && owner !== was.owner)
+      statements.push(`ALTER SCHEMA ${q(name)} OWNER TO ${q(owner)}`)
+    if (comment !== was.comment.trim())
+      statements.push(
+        `COMMENT ON SCHEMA ${q(name)} IS ${comment ? literal(dialect, comment) : 'NULL'}`
+      )
+  } else if (owner && owner !== was.owner && canChangeSchemaOwner(dialect, options)) {
+    statements.push(`ALTER AUTHORIZATION ON SCHEMA::${q(was.name)} TO ${q(owner)}`)
+  }
+  return statements
+}
+
+/** DROP SCHEMA (DROP DATABASE on MySQL); only PostgreSQL can cascade to the contents. */
+export function dropSchemaStatement(dialect: Dialect, name: string, cascade: boolean): string {
+  const target = quoteIdent(dialect, name)
+  if (dialect === 'mysql') return `DROP DATABASE ${target}`
+  return `DROP SCHEMA ${target}${dialect === 'postgres' && cascade ? ' CASCADE' : ''}`
+}
