@@ -93,6 +93,14 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         {
             cred.password = Some(p.to_string());
         }
+        // Prefer leaves TLS to the string (on for mongodb+srv); the others override it
+        match cfg.ssl {
+            SslMode::Disable => opts.tls = Some(Tls::Disabled),
+            SslMode::Require if !matches!(opts.tls, Some(Tls::Enabled(_))) => {
+                opts.tls = Some(Tls::Enabled(TlsOptions::default()))
+            }
+            _ => {}
+        }
         if cfg.trust_server_certificate
             && let Some(Tls::Enabled(tls)) = opts.tls.as_mut()
         {

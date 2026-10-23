@@ -600,15 +600,27 @@ function ConnectionDialog({
               />
             </Field>
           )}
-          {!usesUri && !sqlite && (
-            <Field label={tds ? 'Encryption' : 'SSL / TLS'}>
+          {!sqlite && (
+            <Field
+              label={tds ? 'Encryption' : 'SSL / TLS'}
+              hint={
+                cloudAuth ? 'Always on: the access token must not travel in clear text' : undefined
+              }
+            >
               <Select
-                value={config.ssl}
+                value={cloudAuth ? 'require' : config.ssl}
+                disabled={cloudAuth}
                 onChange={(e) => patch({ ssl: e.target.value as ConnectionConfig['ssl'] })}
               >
                 <option value="disable">{tds ? 'Off' : 'Disable'}</option>
                 <option value="prefer">
-                  {tds ? 'Login only (default)' : config.engine === 'mongo' ? 'Off' : 'Prefer'}
+                  {tds
+                    ? 'Login only (default)'
+                    : usesUri
+                      ? 'As in the connection string'
+                      : config.engine === 'mongo'
+                        ? 'Off'
+                        : 'Prefer'}
                 </option>
                 <option value="require">{tds ? 'Mandatory' : 'Require'}</option>
               </Select>
