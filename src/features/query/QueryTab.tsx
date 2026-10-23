@@ -20,6 +20,7 @@ import { api, type CompletionTable } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
+import { parsePlan, planFormat } from '@/lib/plan'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
@@ -86,7 +87,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const defaultSchema = dialect === 'postgres' ? 'public' : dialect === 'tsql' ? 'dbo' : undefined
 
   const execute = useCallback(
-    async (mode: 'auto' | 'all' | 'statement', transform?: (sql: string) => string) => {
+    async (
+      mode: 'auto' | 'all' | 'statement',
+      transform?: (sql: string) => string,
+      explain?: boolean
+    ) => {
       const ed = editor.current
       if (!ed || !connection) return
       if (runsStore.get()[tab.id]?.running) return
@@ -136,7 +141,14 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         const output = await api.execute(tab.connectionId, tab.id, tab.database, toRun, {
           maxRows: settings.maxRows
         })
-        sqlResultsStore.set((r) => ({ ...r, [tab.id]: { output, offset: runOffset, sql: toRun } }))
+        const plan =
+          explain && !output.error
+            ? (parsePlan(output, planFormat(dialect, babelfish)) ?? undefined)
+            : undefined
+        sqlResultsStore.set((r) => ({
+          ...r,
+          [tab.id]: { output, offset: runOffset, sql: toRun, plan }
+        }))
         if (output.database && output.database !== tab.database)
           updateTab(tab.id, { database: output.database })
         const rows = output.results.reduce((n, s) => n + s.rowCount, 0)
@@ -171,6 +183,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       tab.connectionId,
       tab.database,
       dialect,
+      babelfish,
       settings.maxRows,
       settings.confirmDangerous
     ]
@@ -258,7 +271,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       {
         key: 'Mod-l',
         run: () => (
-          void execute('statement', (s) => explainSql(s, dialect, false, babelfish)),
+          void execute('statement', (s) => explainSql(s, dialect, false, babelfish), true),
           true
         )
       },
@@ -333,15 +346,15 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
                 label: 'Explain',
                 shortcut: `${MOD}L`,
                 onSelect: () =>
-                  void execute('statement', (s) => explainSql(s, dialect, false, babelfish))
+                  void execute('statement', (s) => explainSql(s, dialect, false, babelfish), true)
               },
               {
                 label:
                   dialect === 'tsql'
-                    ? 'Run with statistics profile'
+                    ? 'Actual execution plan (runs the query)'
                     : 'Explain analyze (runs the query)',
                 onSelect: () =>
-                  void execute('statement', (s) => explainSql(s, dialect, true, babelfish))
+                  void execute('statement', (s) => explainSql(s, dialect, true, babelfish), true)
               }
             ])
           }

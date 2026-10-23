@@ -496,7 +496,7 @@ export function explainSql(
   const body = sql.trim().replace(/;\s*$/, '')
   switch (dialect) {
     case 'postgres':
-      return `EXPLAIN (${analyze ? 'ANALYZE, BUFFERS, ' : ''}VERBOSE, FORMAT TEXT)\n${body}`
+      return `EXPLAIN (${analyze ? 'ANALYZE, BUFFERS, ' : ''}VERBOSE, FORMAT JSON)\n${body}`
     case 'mysql':
       return analyze ? `EXPLAIN ANALYZE\n${body}` : `EXPLAIN FORMAT=TREE\n${body}`
     case 'tsql':
@@ -506,8 +506,8 @@ export function explainSql(
         return `SET ${option} ON;\nGO\n${body}\nGO\nSET ${option} OFF;`
       }
       return analyze
-        ? `SET STATISTICS PROFILE ON;\nGO\n${body}\nGO\nSET STATISTICS PROFILE OFF;`
-        : `SET SHOWPLAN_TEXT ON;\nGO\n${body}\nGO\nSET SHOWPLAN_TEXT OFF;`
+        ? `SET STATISTICS XML ON;\nGO\n${body}\nGO\nSET STATISTICS XML OFF;`
+        : `SET SHOWPLAN_XML ON;\nGO\n${body}\nGO\nSET SHOWPLAN_XML OFF;`
   }
 }
 
