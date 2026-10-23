@@ -11,8 +11,19 @@ import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { Explorer } from './features/explorer/Explorer'
+import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
+import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
+import { TableDesignerHost } from './features/table/TableDesigner'
+import { TriggerDesignerHost } from './features/table/TriggerDesigner'
+import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
+import { BackupTab } from './features/backup/BackupTab'
+import { CompareTab } from './features/compare/CompareTab'
+import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
+import { DashboardTab } from './features/dashboard/DashboardTab'
+import { DashboardsPanel } from './features/dashboard/DashboardsPanel'
+import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { QueryTab } from './features/query/QueryTab'
 import { ServerTab } from './features/server/ServerTab'
@@ -57,6 +68,16 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <CollectionTab tab={tab} />
     case 'server':
       return <ServerTab tab={tab} />
+    case 'diagram':
+      return <DiagramTab tab={tab} />
+    case 'dashboard':
+      return <DashboardTab tab={tab} />
+    case 'cloud':
+      return <CloudTab />
+    case 'backup':
+      return <BackupTab tab={tab} />
+    case 'compare':
+      return <CompareTab tab={tab} />
   }
 })
 
@@ -166,7 +187,15 @@ export function App(): React.JSX.Element {
             }}
           >
             <div className="h-full bg-panel">
-              {layout.sidebar === 'history' ? <HistoryPanel /> : <Explorer />}
+              {layout.sidebar === 'history' ? (
+                <HistoryPanel />
+              ) : layout.sidebar === 'saved' ? (
+                <SavedQueriesPanel />
+              ) : layout.sidebar === 'dashboards' ? (
+                <DashboardsPanel />
+              ) : (
+                <Explorer />
+              )}
             </div>
           </Panel>
           <Separator />
@@ -202,6 +231,10 @@ export function App(): React.JSX.Element {
       <ConfirmHost />
       <PromptHost />
       <ExecuteRoutineHost />
+      <TableDesignerHost />
+      <SchemaDesignerHost />
+      <TriggerDesignerHost />
+      <PermissionsDesignerHost />
       <ContextMenuHost />
       <Toaster />
     </div>

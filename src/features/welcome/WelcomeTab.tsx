@@ -1,4 +1,4 @@
-import { FileCode2, FolderOpen, Plus, Search } from 'lucide-react'
+import { Cloud, FileCode2, FolderOpen, Plus, Search } from 'lucide-react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { api } from '@/lib/api'
 import { ENGINES, ENGINE_ORDER, connectionLabel, connectionSubtitle } from '@/lib/engines'
@@ -9,6 +9,7 @@ import {
   connect,
   connectionsStore,
   newQueryTab,
+  openCloud,
   openConnectionDialog,
   openPalette,
   statusStore,
@@ -87,6 +88,9 @@ export function WelcomeTab(): React.JSX.Element {
                   disabled={!connections.length}
                 >
                   <FileCode2 className="size-3.5" /> New query
+                </Button>
+                <Button variant="secondary" onClick={openCloud}>
+                  <Cloud className="size-3.5" /> Cloud databases
                 </Button>
                 <Button variant="secondary" onClick={() => void openFile()}>
                   <FolderOpen className="size-3.5" /> Open file

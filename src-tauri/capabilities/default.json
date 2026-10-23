@@ -18,6 +18,7 @@
     "updater:default",
     "process:allow-restart",
     "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir",
     "core:window:allow-set-background-color"
   ]
 }

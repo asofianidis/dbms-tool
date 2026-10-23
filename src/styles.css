@@ -38,6 +38,7 @@
   --color-mssql: #e8675c;
   --color-babelfish: #4fc9c0;
   --color-mongo: #5fd38a;
+  --color-sqlite: #6cb4e8;
 
   /* Syntax */
   --color-syn-keyword: #c792ea;
@@ -61,16 +62,33 @@
     overflow: clip;
   }
 
+  /* Dashboard chart series, in fixed order; each mode is stepped and validated for its surface */
   html {
     color-scheme: dark;
     --backdrop: rgb(0 0 0 / 0.6);
     --shadow: rgb(0 0 0 / 0.55);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
   }
 
   html[data-theme='light'] {
     color-scheme: light;
     --backdrop: rgb(20 24 28 / 0.28);
     --shadow: rgb(20 24 28 / 0.16);
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+    --series-6: #008300;
+    --series-7: #6250d6;
+    --series-8: #e34948;
   }
 
   body {

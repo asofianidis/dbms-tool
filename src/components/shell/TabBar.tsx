@@ -1,12 +1,18 @@
 import { useRef } from 'react'
 import {
+  ArchiveRestore,
   Braces,
+  Cloud,
   Code2,
+  DatabaseBackup,
   Eye,
   FileCode2,
   FunctionSquare,
+  GitCompareArrows,
   Home,
+  LayoutDashboard,
   Leaf,
+  Network,
   Plus,
   Server,
   Settings,
@@ -14,6 +20,7 @@ import {
   X
 } from 'lucide-react'
 import { cn } from '@/lib/cn'
+import { dashboardsStore } from '@/lib/dashboards'
 import { MOD } from '@/lib/keys'
 import {
   activateTab,
@@ -45,6 +52,18 @@ export function tabTitle(tab: Tab): string {
       return tab.collection
     case 'server':
       return 'Server'
+    case 'cloud':
+      return 'Cloud databases'
+    case 'diagram':
+      return `${tab.schema ?? tab.database} diagram`
+    case 'dashboard':
+      return dashboardsStore.get().find((d) => d.id === tab.dashboardId)?.name ?? 'Dashboard'
+    case 'backup':
+      return tab.mode === 'backup'
+        ? `Back up ${tab.database || 'database'}`
+        : `Restore${tab.database ? ` ${tab.database}` : ''}`
+    case 'compare':
+      return `Compare ${tab.table ?? tab.schema ?? tab.database}`
   }
 }
 
@@ -75,12 +94,28 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       )
     case 'server':
       return <Server className={c} />
+    case 'cloud':
+      return <Cloud className={cn(c, 'text-info')} />
+    case 'diagram':
+      return <Network className={cn(c, 'text-syn-keyword')} />
+    case 'dashboard':
+      return <LayoutDashboard className={cn(c, 'text-accent')} />
+    case 'backup':
+      return tab.mode === 'backup' ? (
+        <DatabaseBackup className={cn(c, 'text-ok')} />
+      ) : (
+        <ArchiveRestore className={cn(c, 'text-warn')} />
+      )
+    case 'compare':
+      return <GitCompareArrows className={cn(c, 'text-info')} />
   }
 }
 
 export function TabBar(): React.JSX.Element {
   const { tabs, active } = tabsStore.use()
   const connections = connectionsStore.use()
+  // Dashboard tabs are titled by the dashboard's current name
+  dashboardsStore.use()
   const dragId = useRef<string | null>(null)
 
   return (

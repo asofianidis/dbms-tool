@@ -1,7 +1,9 @@
 import type { QueryClient } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { api, isAppError, type ConnectionConfig, type ObjectKind, type ServerInfo } from './api'
+import type { CompareScope } from './compare'
 import { ENGINES } from './engines'
+import type { QueryState } from './filters'
 import { createPersistentStore, createStore } from './store'
 import { errorMessage, toast } from './toast'
 
@@ -22,8 +24,10 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
-      /** Run the whole script once when the tab first opens */
+      /** Run the whole script once, as soon as the editor has the text */
       autorun?: boolean
+      /** The saved query this tab was opened from or saved as */
+      savedQueryId?: string
     }
   | {
       id: string
@@ -34,6 +38,8 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
+      autorun?: boolean
+      savedQueryId?: string
     }
   | {
       id: string
@@ -45,6 +51,8 @@ export type Tab =
       objectKind: ObjectKind
       detail?: string | null
       view: TableView
+      /** A filter for the data view to apply, e.g. when following a foreign key */
+      query?: QueryState
     }
   | {
       id: string
@@ -55,6 +63,43 @@ export type Tab =
       view: CollectionView
     }
   | { id: string; kind: 'server'; connectionId: string }
+  | { id: string; kind: 'cloud' }
+  | {
+      id: string
+      kind: 'diagram'
+      connectionId: string
+      database: string
+      /** null for engines browsed without schemas, where the whole database is drawn */
+      schema: string | null
+    }
+  | { id: string; kind: 'dashboard'; dashboardId: string }
+  | {
+      id: string
+      kind: 'backup'
+      connectionId: string
+      /** Database to back up or restore into; empty to choose in the wizard */
+      database: string
+      mode: 'backup' | 'restore'
+    }
+  | {
+      id: string
+      kind: 'compare'
+      /** The source: the side the target is changed to match */
+      connectionId: string
+      database: string
+      schema: string | null
+      table: string | null
+      scope: CompareScope
+      target: CompareTarget | null
+    }
+
+/** The side of a comparison the migration script runs against. */
+export interface CompareTarget {
+  connectionId: string
+  database: string
+  schema: string | null
+  table: string | null
+}
 
 export type TabOf<K extends Tab['kind']> = Extract<Tab, { kind: K }>
 
@@ -264,7 +309,7 @@ export function newQueryTab(
   connectionId?: string,
   database?: string,
   text = '',
-  options: { autorun?: boolean; title?: string } = {}
+  options: { autorun?: boolean; title?: string; savedQueryId?: string } = {}
 ): void {
   const fallback = connectionId ?? activeConnectionId() ?? connectionsStore.get()[0]?.id
   if (!fallback) {
@@ -281,7 +326,8 @@ export function newQueryTab(
     database: database ?? defaultDatabase(fallback),
     title: options.title ?? `${kind === 'mongo' ? 'shell' : 'query'}-${untitled}`,
     text,
-    ...(options.autorun && kind === 'query' ? { autorun: true } : {})
+    ...(options.autorun ? { autorun: true } : {}),
+    ...(options.savedQueryId ? { savedQueryId: options.savedQueryId } : {})
   } as Tab)
 }
 
@@ -292,17 +338,33 @@ export function openTable(
   name: string,
   objectKind: ObjectKind,
   view: TableView = 'data',
-  detail?: string | null
+  detail?: string | null,
+  query?: QueryState
 ): void {
+  const sameAs = (t: Tab): boolean =>
+    t.kind === 'table' &&
+    t.connectionId === connectionId &&
+    t.database === database &&
+    t.schema === schema &&
+    t.name === name &&
+    (t.detail ?? null) === (detail ?? null)
+  const existing = tabsStore.get().tabs.find(sameAs)
+  // An already open tab picks up the new filter
+  if (existing && query) updateTab(existing.id, { query } as Partial<Tab>)
   openTab(
-    { id: tabId(), kind: 'table', connectionId, database, schema, name, objectKind, view, detail },
-    (t) =>
-      t.kind === 'table' &&
-      t.connectionId === connectionId &&
-      t.database === database &&
-      t.schema === schema &&
-      t.name === name &&
-      (t.detail ?? null) === (detail ?? null)
+    {
+      id: tabId(),
+      kind: 'table',
+      connectionId,
+      database,
+      schema,
+      name,
+      objectKind,
+      view,
+      detail,
+      ...(query ? { query } : {})
+    },
+    sameAs
   )
 }
 
@@ -337,6 +399,64 @@ export function openServer(connectionId: string): void {
   )
 }
 
+export function openCloud(): void {
+  openTab({ id: 'cloud', kind: 'cloud' }, (t) => t.kind === 'cloud')
+}
+
+export function openDiagram(connectionId: string, database: string, schema: string | null): void {
+  openTab(
+    { id: tabId(), kind: 'diagram', connectionId, database, schema },
+    (t) =>
+      t.kind === 'diagram' &&
+      t.connectionId === connectionId &&
+      t.database === database &&
+      t.schema === schema
+  )
+}
+
+/** Opens the backup or restore wizard for `database` (empty to choose one there). */
+export function openBackup(
+  connectionId: string,
+  database: string,
+  mode: 'backup' | 'restore'
+): void {
+  openTab(
+    { id: tabId(), kind: 'backup', connectionId, database, mode },
+    (t) =>
+      t.kind === 'backup' &&
+      t.connectionId === connectionId &&
+      t.database === database &&
+      t.mode === mode
+  )
+}
+
+/** Opens a comparison of a database, schema or table (`table` set) against one chosen in the tab. */
+export function openCompare(
+  connectionId: string,
+  database: string,
+  schema: string | null,
+  table: string | null = null
+): void {
+  const scope: CompareScope = table ? 'table' : schema ? 'schema' : 'database'
+  openTab({
+    id: tabId(),
+    kind: 'compare',
+    connectionId,
+    database,
+    schema,
+    table,
+    scope,
+    target: null
+  })
+}
+
+export function openDashboard(dashboardId: string): void {
+  openTab(
+    { id: tabId(), kind: 'dashboard', dashboardId },
+    (t) => t.kind === 'dashboard' && t.dashboardId === dashboardId
+  )
+}
+
 export function activeTab(): Tab | undefined {
   const s = tabsStore.get()
   return s.tabs.find((t) => t.id === s.active)
@@ -353,12 +473,18 @@ export const connectionDialogStore = createStore<{
   open: boolean
   editing?: ConnectionConfig
   duplicate?: boolean
+  /** A new connection with fields already filled in, e.g. from a cloud database */
+  prefill?: { config: ConnectionConfig; password?: string }
 }>({
   open: false
 })
 
 export function openConnectionDialog(editing?: ConnectionConfig, duplicate = false): void {
   connectionDialogStore.set({ open: true, editing, duplicate })
+}
+
+export function openPrefilledConnection(config: ConnectionConfig, password?: string): void {
+  connectionDialogStore.set({ open: true, prefill: { config, password } })
 }
 
 export function closeConnectionDialog(): void {
@@ -418,7 +544,7 @@ export const lastRunStore = createStore<
   Record<string, { rows: number; elapsedMs: number; ok: boolean }>
 >({})
 
-export type SidebarView = 'explorer' | 'history'
+export type SidebarView = 'explorer' | 'history' | 'saved' | 'dashboards'
 
 export const layoutStore = createPersistentStore<{ sidebar: SidebarView; sidebarOpen: boolean }>(
   'dbms.layout.v1',

@@ -11,6 +11,7 @@ use crate::drivers::{Session, mongo};
 use crate::error::{AppError, AppResult};
 use crate::guard;
 use crate::model::*;
+use crate::tunnel;
 
 /// Session key used by the object explorer and other background metadata calls.
 pub const META: &str = "__meta";
@@ -34,6 +35,11 @@ pub struct Server {
 impl Server {
     fn default_database(&self) -> &str {
         &self.config.database
+    }
+
+    /// The password the connection was opened with, for client tools such as pg_dump.
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
     }
 
     fn mongo(&self) -> AppResult<&mongodb::Client> {
@@ -71,6 +77,8 @@ impl Server {
                     match &mut guard.session {
                         Session::My(s) => s.use_database(database).await?,
                         Session::Ms(s) => s.use_database(database).await?,
+                        // One database per SQLite connection
+                        Session::Sq(_) => {}
                         Session::Pg(_) => {}
                     }
                 }
@@ -177,6 +185,7 @@ impl Server {
             Session::Pg(s) => s.list_databases().await,
             Session::My(s) => s.list_databases().await,
             Session::Ms(s) => s.list_databases().await,
+            Session::Sq(s) => s.list_databases().await,
         }
     }
 
@@ -186,7 +195,7 @@ impl Server {
         match &mut guard.session {
             Session::Pg(s) => s.list_schemas().await,
             Session::Ms(s) => s.list_schemas(database).await,
-            Session::My(_) => Ok(Vec::new()),
+            Session::My(_) | Session::Sq(_) => Ok(Vec::new()),
         }
     }
 
@@ -210,6 +219,7 @@ impl Server {
                 }
                 Ok(objects)
             }
+            Session::Sq(s) => s.list_objects().await,
         }
     }
 
@@ -228,6 +238,7 @@ impl Server {
                 s.describe_table(database, schema.unwrap_or("dbo"), table)
                     .await
             }
+            Session::Sq(s) => s.describe_table(table).await,
         }
     }
 
@@ -251,6 +262,7 @@ impl Server {
                 s.object_definition(database, schema.unwrap_or("dbo"), name)
                     .await
             }
+            Session::Sq(s) => s.object_definition(name).await,
         }
     }
 
@@ -274,6 +286,9 @@ impl Server {
                 s.describe_routine(database, schema.unwrap_or("dbo"), name, kind)
                     .await
             }
+            Session::Sq(_) => Err(AppError::Unsupported(
+                "SQLite has no stored procedures or functions".into(),
+            )),
         }
     }
 
@@ -284,6 +299,7 @@ impl Server {
             Session::Pg(s) => s.completion().await,
             Session::My(s) => s.completion(database).await,
             Session::Ms(s) => s.completion(database).await,
+            Session::Sq(s) => s.completion().await,
         }
     }
 }
@@ -293,11 +309,22 @@ pub struct Manager {
     servers: parking_lot::Mutex<HashMap<String, Arc<Server>>>,
 }
 
-/// Connects without registering anything; used by "Test connection" and `open`.
-pub async fn probe(
-    config: &ConnectionConfig,
-    password: Option<&str>,
-) -> AppResult<(ServerInfo, Option<mongodb::Client>, Option<Session>)> {
+type Probed = (ServerInfo, Option<mongodb::Client>, Option<Session>);
+
+/// Connects without registering anything; used by "Test connection". A tunnel
+/// the connection needs only lives for the test.
+pub async fn probe(config: &ConnectionConfig, password: Option<&str>) -> AppResult<Probed> {
+    let key = format!("probe:{}", uuid::Uuid::new_v4());
+    let result = async {
+        let config = tunnel::prepare(&key, config.clone()).await?;
+        probe_direct(&config, password).await
+    }
+    .await;
+    tunnel::close(&key).await;
+    result
+}
+
+async fn probe_direct(config: &ConnectionConfig, password: Option<&str>) -> AppResult<Probed> {
     if config.engine == Engine::Mongo {
         let client = mongo::connect(config, password).await?;
         let info = mongo::server_info(&client).await?;
@@ -314,7 +341,16 @@ impl Manager {
         config: ConnectionConfig,
         password: Option<String>,
     ) -> AppResult<ServerInfo> {
-        let (info, mongo, session) = probe(&config, password.as_deref()).await?;
+        // A tunnel (Fly.io) stays up while the connection is open
+        let id = config.id.clone();
+        let config = tunnel::prepare(&id, config).await?;
+        let (info, mongo, session) = match probe_direct(&config, password.as_deref()).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                tunnel::close(&id).await;
+                return Err(e);
+            }
+        };
         let mut sessions = HashMap::new();
         if let Some(session) = session {
             let key = if config.engine == Engine::Postgres {
@@ -361,5 +397,7 @@ impl Manager {
                 signal.fire();
             }
         }
+        let id = id.to_string();
+        tauri::async_runtime::spawn(async move { tunnel::close(&id).await });
     }
 }

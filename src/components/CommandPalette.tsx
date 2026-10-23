@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  ArchiveRestore,
+  Bookmark,
+  BookmarkPlus,
+  Cloud,
   CornerDownLeft,
   Database,
+  DatabaseBackup,
+  GitCompareArrows,
   Eye,
   FileCode2,
   FunctionSquare,
   History,
+  LayoutDashboard,
   Leaf,
   ListOrdered,
   Plug,
@@ -18,9 +25,11 @@ import {
 } from 'lucide-react'
 import type { DbObject } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { dashboardsStore } from '@/lib/dashboards'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { MOD } from '@/lib/keys'
 import { queryClient } from '@/lib/queries'
+import { savedQueriesStore } from '@/lib/saved'
 import { settingsStore } from '@/lib/settings'
 import {
   activeTab,
@@ -31,14 +40,31 @@ import {
   disconnect,
   layoutStore,
   newQueryTab,
+  openBackup,
+  openCompare,
+  openCloud,
   openCollection,
   openConnectionDialog,
+  openDashboard,
   openSettings,
   openTable,
   openWelcome,
   paletteStore,
   statusStore
 } from '@/lib/workspace'
+import {
+  defaultTarget,
+  runSavedQuery,
+  saveTabQuery,
+  showSavedQueries,
+  targetLabel
+} from '@/features/saved/actions'
+import {
+  importDashboard,
+  newDashboard,
+  openExampleDashboard,
+  showDashboards
+} from '@/features/dashboard/actions'
 import { EngineMark, Kbd } from './ui'
 
 interface Item {
@@ -74,6 +100,59 @@ function objectIcon(kind: DbObject['kind']): ReactNode {
   return <Table2 className="text-syn-prop" />
 }
 
+/** Back up / restore for the active tab's connection and database. */
+function backupCommands(): Item[] {
+  const tab = activeTab()
+  if (!tab || !('connectionId' in tab)) return []
+  const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
+  if (!connection || connection.engine === 'babelfish') return []
+  const database = 'database' in tab ? tab.database : ''
+  const name = connectionLabel(connection)
+  return [
+    {
+      id: 'backup',
+      group: 'Commands',
+      label: `Back up ${database || 'database'}…`,
+      detail: name,
+      icon: <DatabaseBackup />,
+      run: () => openBackup(connection.id, database, 'backup')
+    },
+    ...(connection.readOnly
+      ? []
+      : [
+          {
+            id: 'restore',
+            group: 'Commands',
+            label: 'Restore backup…',
+            detail: name,
+            icon: <ArchiveRestore />,
+            run: () => openBackup(connection.id, database, 'restore')
+          }
+        ])
+  ]
+}
+
+/** Schema comparison from the active tab's connection and database. */
+function compareCommands(): Item[] {
+  const tab = activeTab()
+  if (!tab || !('connectionId' in tab) || tab.kind === 'compare') return []
+  const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
+  if (!connection || connection.engine === 'mongo') return []
+  const database = 'database' in tab ? tab.database : ''
+  const schema = 'schema' in tab ? tab.schema : null
+  const table = tab.kind === 'table' && tab.objectKind === 'table' ? tab.name : null
+  return [
+    {
+      id: 'compare',
+      group: 'Commands',
+      label: `Compare ${table ?? schema ?? (database || 'database')} with…`,
+      detail: connectionLabel(connection),
+      icon: <GitCompareArrows />,
+      run: () => openCompare(connection.id, database, schema, table)
+    }
+  ]
+}
+
 export function CommandPalette(): React.JSX.Element | null {
   const { open, query } = paletteStore.use()
   if (!open) return null
@@ -86,6 +165,8 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
   const listRef = useRef<HTMLDivElement>(null)
   const connections = connectionsStore.use()
   const statuses = statusStore.use()
+  const saved = savedQueriesStore.use()
+  const dashboards = dashboardsStore.use()
   const commandMode = query.startsWith('>')
   const term = (commandMode ? query.slice(1) : query).trim().toLowerCase()
 
@@ -98,6 +179,15 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         icon: <Plus />,
         run: () => openConnectionDialog()
       },
+      {
+        id: 'cloud',
+        group: 'Commands',
+        label: 'Cloud databases (AWS, Google Cloud, Azure)',
+        icon: <Cloud />,
+        run: openCloud
+      },
+      ...backupCommands(),
+      ...compareCommands(),
       {
         id: 'new-query',
         group: 'Commands',
@@ -127,6 +217,51 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'Show query history',
         icon: <History />,
         run: () => layoutStore.set({ sidebar: 'history', sidebarOpen: true })
+      },
+      {
+        id: 'saved',
+        group: 'Commands',
+        label: 'Show saved queries',
+        icon: <Bookmark />,
+        run: showSavedQueries
+      },
+      {
+        id: 'new-dashboard',
+        group: 'Commands',
+        label: 'New dashboard',
+        icon: <LayoutDashboard />,
+        run: () => void newDashboard()
+      },
+      {
+        id: 'dashboards',
+        group: 'Commands',
+        label: 'Show dashboards',
+        icon: <LayoutDashboard />,
+        run: showDashboards
+      },
+      {
+        id: 'example-dashboard',
+        group: 'Commands',
+        label: 'Open example dashboard',
+        icon: <LayoutDashboard />,
+        run: openExampleDashboard
+      },
+      {
+        id: 'import-dashboard',
+        group: 'Commands',
+        label: 'Import dashboard…',
+        icon: <LayoutDashboard />,
+        run: () => void importDashboard()
+      },
+      {
+        id: 'save-query',
+        group: 'Commands',
+        label: 'Save current query',
+        icon: <BookmarkPlus />,
+        run: () => {
+          const tab = activeTab()
+          if (tab?.kind === 'query' || tab?.kind === 'mongo') void saveTabQuery(tab, tab.text)
+        }
       },
       {
         id: 'explorer',
@@ -193,6 +328,24 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
             }
       ]
     })
+    const savedItems: Item[] = saved.map((q) => ({
+      id: `saved:${q.id}`,
+      group: 'Saved queries',
+      label: q.name,
+      detail: `Run on ${targetLabel(defaultTarget(q))}`,
+      icon: <Bookmark />,
+      weight: 1,
+      run: () => runSavedQuery(q)
+    }))
+    const dashboardItems: Item[] = dashboards.map((d) => ({
+      id: `dashboard:${d.id}`,
+      group: 'Dashboards',
+      label: d.name,
+      detail: `${d.widgets.length} widget${d.widgets.length === 1 ? '' : 's'}`,
+      icon: <LayoutDashboard />,
+      weight: 1,
+      run: () => openDashboard(d.id)
+    }))
     // Objects from every list the explorer has loaded
     const objectItems: Item[] = []
     if (!commandMode) {
@@ -230,7 +383,9 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         }
       }
     }
-    const pool = commandMode ? commands : [...connectionItems, ...objectItems, ...commands]
+    const pool = commandMode
+      ? commands
+      : [...connectionItems, ...savedItems, ...dashboardItems, ...objectItems, ...commands]
     return pool
       .map((item) => ({
         item,
@@ -245,7 +400,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       )
       .slice(0, 80)
       .map((m) => m.item)
-  }, [connections, statuses, term, commandMode])
+  }, [connections, statuses, saved, dashboards, term, commandMode])
 
   useEffect(() => setIndex(0), [term])
   useEffect(() => {

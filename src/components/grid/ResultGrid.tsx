@@ -59,6 +59,8 @@ interface Props {
   tableName?: string
   /** "Filter by this value" in the context menu */
   onFilterByValue?: (column: string, value: Cell) => void
+  /** Extra context menu items for a cell, by data row and column */
+  cellMenuItems?: (row: number, col: number) => MenuItem[]
   /** Row numbers start here (for paged views) */
   rowOffset?: number
   className?: string
@@ -99,6 +101,7 @@ export const ResultGrid = memo(function ResultGrid({
   dialect,
   tableName,
   onFilterByValue,
+  cellMenuItems,
   rowOffset = 0,
   className,
   onSelectionSummary
@@ -477,6 +480,7 @@ export const ResultGrid = memo(function ResultGrid({
         onSelect: () => onFilterByValue(columns[p.c].name, value)
       })
     }
+    if (cellMenuItems) items.push(...cellMenuItems(row, p.c))
     if (editing) {
       const sel = selection ?? { r1: p.r, r2: p.r, c1: p.c, c2: p.c }
       const dataRows = order.slice(sel.r1, sel.r2 + 1)

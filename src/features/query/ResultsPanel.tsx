@@ -7,6 +7,7 @@ import {
   MessageSquareText,
   Search,
   TableProperties,
+  Workflow,
   X
 } from 'lucide-react'
 import type { ExecOutput, ResultSet } from '@/lib/api'
@@ -14,10 +15,12 @@ import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
 import { copyText, exportRows, serialize, type ExportFormat } from '@/lib/export'
 import { formatDuration, plural } from '@/lib/format'
+import type { Plan } from '@/lib/plan'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Button, EmptyState, ProgressBar } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
+import { PlanView } from './PlanView'
 
 export interface RunResult {
   output?: ExecOutput
@@ -26,6 +29,8 @@ export interface RunResult {
   /** Offset of the executed text within the editor, for error positions */
   offset: number
   sql: string
+  /** Set when the run was an Explain whose output could be read as a plan */
+  plan?: Plan
 }
 
 export function exportMenu(
@@ -75,7 +80,7 @@ export function ResultsPanel({
 }): React.JSX.Element {
   const output = result?.output
   const sets = output?.results ?? []
-  const [active, setActive] = useState<number | 'messages'>(0)
+  const [active, setActive] = useState<number | 'messages' | 'plan'>(0)
   const [filter, setFilter] = useState('')
   const [showFilter, setShowFilter] = useState(false)
   const [elapsed, setElapsed] = useState(0)
@@ -83,7 +88,9 @@ export function ResultsPanel({
   // Jump to messages when a run produced no grids or failed outright
   useEffect(() => {
     if (!result) return
-    setActive(sets.length && !(output?.error && !sets.length) ? 0 : 'messages')
+    setActive(
+      result.plan ? 'plan' : sets.length && !(output?.error && !sets.length) ? 0 : 'messages'
+    )
     setFilter('')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [result])
@@ -104,6 +111,25 @@ export function ResultsPanel({
     <div className="flex h-full min-h-0 flex-col bg-canvas">
       <div className="flex h-8 shrink-0 items-stretch border-b border-line bg-panel">
         <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto [&::-webkit-scrollbar]:h-0">
+          {result?.plan && (
+            <button
+              type="button"
+              onClick={() => setActive('plan')}
+              className={cn(
+                'relative flex shrink-0 items-center gap-1.5 px-3 text-[12px]',
+                active === 'plan' ? 'text-bright' : 'text-muted hover:text-fg'
+              )}
+            >
+              {active === 'plan' && (
+                <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-accent" />
+              )}
+              <Workflow className="size-3.5" />
+              Plan
+              {result.plan.hints.length > 0 && (
+                <span className="text-warn tabular-nums">{result.plan.hints.length}</span>
+              )}
+            </button>
+          )}
           {sets.map((s, i) => (
             <button
               key={i}
@@ -230,7 +256,9 @@ export function ResultsPanel({
           }
         }}
       >
-        {active === 'messages' ? (
+        {active === 'plan' && result?.plan ? (
+          <PlanView plan={result.plan} />
+        ) : active === 'messages' ? (
           <Messages result={result} onJumpToError={onJumpToError} />
         ) : set ? (
           set.columns.length ? (

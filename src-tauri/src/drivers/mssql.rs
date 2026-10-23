@@ -85,6 +85,7 @@ fn build_config(
                 "Windows authentication is only available on Windows".into(),
             ));
         }
+        AuthMode::Cloud => config.authentication(AuthMethod::aad_token(password.unwrap_or(""))),
     }
     config.encryption(match cfg.ssl {
         SslMode::Disable => EncryptionLevel::NotSupported,
@@ -615,14 +616,15 @@ impl MsSession {
                      WHEN c.DATA_TYPE IN ('decimal', 'numeric') THEN '(' + CAST(c.NUMERIC_PRECISION AS varchar(10)) + ',' + CAST(c.NUMERIC_SCALE AS varchar(10)) + ')' \
                      ELSE '' END, \
                    CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, c.COLUMN_DEFAULT, \
-                   CAST(ISNULL(sc.is_identity, 0) | ISNULL(sc.is_computed, 0) AS int) \
+                   CAST(ISNULL(sc.is_identity, 0) | ISNULL(sc.is_computed, 0) AS int), \
+                   CAST(ISNULL(sc.is_identity, 0) AS int) \
                  FROM INFORMATION_SCHEMA.COLUMNS c \
                  LEFT JOIN sys.columns sc ON sc.object_id = OBJECT_ID(@P1) AND sc.name = c.COLUMN_NAME \
                  WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 \
                  ORDER BY c.ORDINAL_POSITION",
                 Some(
                     "SELECT c.COLUMN_NAME, c.DATA_TYPE, CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, \
-                       c.COLUMN_DEFAULT, 0, @P1 \
+                       c.COLUMN_DEFAULT, 0, 0, @P1 \
                      FROM INFORMATION_SCHEMA.COLUMNS c \
                      WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 ORDER BY c.ORDINAL_POSITION",
                 ),
@@ -675,6 +677,18 @@ impl MsSession {
             )
             .await
             .unwrap_or_default();
+        let trigger_rows = self
+            .rows(
+                "SELECT tr.name, CASE tr.is_instead_of_trigger WHEN 1 THEN 'INSTEAD OF' ELSE 'AFTER' END, \
+                   te.type_desc, CAST(tr.is_disabled AS int), OBJECT_DEFINITION(tr.object_id) \
+                 FROM sys.triggers tr \
+                 JOIN sys.trigger_events te ON te.object_id = tr.object_id \
+                 WHERE tr.parent_id = OBJECT_ID(@P1) \
+                 ORDER BY tr.name, te.type",
+                &[&qualified.as_str()],
+            )
+            .await
+            .unwrap_or_default();
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for r in &index_rows {
@@ -722,6 +736,24 @@ impl MsSession {
             }
         }
 
+        let mut triggers: Vec<TriggerInfo> = Vec::new();
+        for r in &trigger_rows {
+            let name = text(r, 0).unwrap_or_default();
+            let event = text(r, 2).unwrap_or_default();
+            match triggers.iter_mut().find(|t| t.name == name) {
+                Some(trigger) => trigger.events.push(event),
+                None => triggers.push(TriggerInfo {
+                    name,
+                    timing: text(r, 1).unwrap_or_default(),
+                    events: vec![event],
+                    // T-SQL triggers fire once per statement
+                    row_level: false,
+                    enabled: !flag(r, 3),
+                    definition: text(r, 4),
+                }),
+            }
+        }
+
         Ok(TableInfo {
             columns: columns
                 .iter()
@@ -734,13 +766,16 @@ impl MsSession {
                         nullable: flag(r, 2),
                         default: text(r, 3),
                         is_generated: flag(r, 4),
+                        is_identity: flag(r, 5),
                         comment: None,
+                        extra: None,
                     }
                 })
                 .collect(),
             primary_key,
             indexes,
             foreign_keys,
+            triggers,
         })
     }
 

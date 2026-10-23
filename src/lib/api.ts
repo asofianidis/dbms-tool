@@ -1,8 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 
-export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo'
+export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo' | 'sqlite'
 export type SslMode = 'disable' | 'prefer' | 'require'
-export type AuthMode = 'password' | 'windows'
+export type AuthMode = 'password' | 'windows' | 'cloud'
 
 export interface ConnectionConfig {
   id: string
@@ -22,6 +22,163 @@ export interface ConnectionConfig {
   color: string
   group: string
   lastUsed?: number | null
+  /** The cloud resource this connection was found in or provisioned as */
+  cloud?: CloudRef | null
+}
+
+export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'railway' | 'render' | 'fly' | 'cloudflare'
+
+/** Where a database lives in a cloud account, enough to look it up again. */
+export interface CloudRef {
+  provider: CloudProvider
+  /** AWS profile, GCP project or Azure subscription; empty for the CLI default */
+  context: string
+  region: string
+  /** Instance / cluster / server name */
+  resource: string
+  /** aws: instance | cluster; azure: postgres | mysql | sql */
+  kind: string
+  resourceGroup?: string
+}
+
+export interface CloudTool {
+  provider: CloudProvider
+  /** Resolved executable, null when the CLI isn't installed */
+  path: string | null
+}
+
+export type BackupToolKind =
+  'pg_dump' | 'pg_restore' | 'psql' | 'mysqldump' | 'mysql' | 'mongodump' | 'mongorestore'
+
+export interface BackupTool {
+  kind: BackupToolKind
+  /** Resolved executable, null when it isn't installed */
+  path: string | null
+  /** First line of `--version` */
+  version: string | null
+}
+
+export interface ObjectName {
+  schema: string | null
+  name: string
+}
+
+export type BackupContent = 'all' | 'schema' | 'data'
+export type PgFormat = 'custom' | 'plain' | 'directory' | 'tar'
+
+/** A backup or restore run by the engine's client tool (see backup.rs). */
+export type BackupJob =
+  | {
+      tool: 'pg_dump'
+      database: string
+      file: string
+      format: PgFormat
+      content: BackupContent
+      schemas: string[]
+      tables: ObjectName[]
+      noOwner: boolean
+      noPrivileges: boolean
+      clean: boolean
+      create: boolean
+      inserts: boolean
+      compression: number | null
+      jobs: number | null
+    }
+  | {
+      tool: 'pg_restore'
+      database: string
+      file: string
+      content: BackupContent
+      schemas: string[]
+      tables: ObjectName[]
+      clean: boolean
+      noOwner: boolean
+      noPrivileges: boolean
+      singleTransaction: boolean
+      exitOnError: boolean
+      jobs: number | null
+    }
+  | {
+      tool: 'psql'
+      database: string
+      file: string
+      singleTransaction: boolean
+      stopOnError: boolean
+    }
+  | {
+      tool: 'mysqldump'
+      database: string
+      file: string
+      content: BackupContent
+      tables: string[]
+      createDatabase: boolean
+      routines: boolean
+      triggers: boolean
+      events: boolean
+      dropTables: boolean
+      singleTransaction: boolean
+      hexBlob: boolean
+      extendedInsert: boolean
+    }
+  | { tool: 'mysql'; database: string; file: string; force: boolean }
+  | {
+      tool: 'mongodump'
+      database: string
+      path: string
+      archive: boolean
+      gzip: boolean
+      excludeCollections: string[]
+    }
+  | {
+      tool: 'mongorestore'
+      path: string
+      archive: boolean
+      gzip: boolean
+      namespaces: string[]
+      fromDatabase: string | null
+      toDatabase: string | null
+      drop: boolean
+      stopOnError: boolean
+      noIndexRestore: boolean
+    }
+
+export interface BackupEntry {
+  /** table | view | materialized_view | sequence | function | schema | collection | … */
+  kind: string
+  /** Schema (PostgreSQL) or database (MongoDB) */
+  schema: string | null
+  name: string
+}
+
+export interface BackupInspection {
+  /** custom | tar | directory | plain (PostgreSQL), sql (MySQL), archive | dump (MongoDB) */
+  format: string
+  /** Path to restore from; a MongoDB database folder resolves to its dump folder */
+  path: string
+  size: number
+  gzip: boolean
+  database: string | null
+  sourceVersion: string | null
+  toolVersion: string | null
+  /** The backup creates or switches to its own database, whatever the target */
+  createsDatabase: boolean
+  entries: BackupEntry[]
+}
+
+export interface BackupOutcome {
+  cancelled: boolean
+  elapsedMs: number
+  size: number | null
+  /** Error lines in the output of a run that still exited cleanly */
+  errors: number
+}
+
+export interface BackupProgress {
+  job: string
+  lines: string[]
+  /** Bytes of the backup fed to a restore so far */
+  bytes: number | null
+  total: number | null
 }
 
 export interface ServerInfo {
@@ -71,7 +228,11 @@ export interface ColumnInfo {
   default: string | null
   isPrimaryKey: boolean
   isGenerated: boolean
+  /** Identity / auto_increment only (not serial defaults or computed columns) */
+  isIdentity: boolean
   comment: string | null
+  /** MySQL column attributes such as `on update CURRENT_TIMESTAMP` */
+  extra: string | null
 }
 
 export interface IndexInfo {
@@ -93,11 +254,24 @@ export interface ForeignKeyInfo {
   onDelete: string | null
 }
 
+export interface TriggerInfo {
+  name: string
+  /** BEFORE | AFTER | INSTEAD OF */
+  timing: string
+  /** INSERT | UPDATE | DELETE | TRUNCATE */
+  events: string[]
+  /** FOR EACH ROW, as opposed to once per statement */
+  rowLevel: boolean
+  enabled: boolean
+  definition: string | null
+}
+
 export interface TableInfo {
   columns: ColumnInfo[]
   primaryKey: string[]
   indexes: IndexInfo[]
   foreignKeys: ForeignKeyInfo[]
+  triggers: TriggerInfo[]
 }
 
 export interface RoutineParam {
@@ -284,5 +458,43 @@ export const api = {
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),
-  readText: (path: string) => invoke<string>('file_read_text', { path })
+  writeBytes: (path: string, contents: Uint8Array) =>
+    invoke<void>('file_write_bytes', contents, {
+      headers: { 'x-path': encodeURIComponent(path) }
+    }),
+  readText: (path: string) => invoke<string>('file_read_text', { path }),
+
+  cloudTools: () => invoke<CloudTool[]>('cloud_tools'),
+  /** Runs a cloud CLI and returns stdout; `{secret}` in `args` becomes a temp file holding `secret` */
+  cloudCli: (
+    provider: CloudProvider,
+    args: string[],
+    options: { secret?: string; timeoutSecs?: number; workdir?: string } = {}
+  ) =>
+    invoke<string>('cloud_cli', {
+      provider,
+      args,
+      secret: options.secret ?? null,
+      timeoutSecs: options.timeoutSecs ?? null,
+      workdir: options.workdir ?? null
+    }),
+  /** Calls a provider's REST API (Render, Fly.io, Cloudflare) with its saved token */
+  cloudApi: (provider: CloudProvider, method: string, path: string, body?: unknown) =>
+    invoke<unknown>('cloud_api', { provider, method, path, body: body ?? null }),
+  cloudTokenStatus: (provider: CloudProvider) => invoke<boolean>('cloud_token_status', { provider }),
+  cloudTokenSet: (provider: CloudProvider, token: string) =>
+    invoke<void>('cloud_token_set', { provider, token }),
+  cloudTokenDelete: (provider: CloudProvider) => invoke<void>('cloud_token_delete', { provider }),
+
+  /** Backup tools for an engine; `dir` is a folder searched before PATH */
+  backupTools: (engine: Engine, dir?: string | null) =>
+    invoke<BackupTool[]>('backup_tools', { engine, dir: dir || null }),
+  backupPreview: (id: string, job: BackupJob, dir?: string | null) =>
+    invoke<string>('backup_preview', { id, job, dir: dir || null }),
+  backupInspect: (id: string, path: string, dir?: string | null) =>
+    invoke<BackupInspection>('backup_inspect', { id, path, dir: dir || null }),
+  /** Runs to completion; output arrives as `backup-progress` events tagged with `jobId` */
+  backupRun: (id: string, jobId: string, job: BackupJob, dir?: string | null) =>
+    invoke<BackupOutcome>('backup_run', { id, jobId, job, dir: dir || null }),
+  backupCancel: (jobId: string) => invoke<void>('backup_cancel', { jobId })
 }

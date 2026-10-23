@@ -363,7 +363,8 @@ impl PgSession {
             .strings(
                 "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
                    pg_get_expr(d.adbin, d.adrelid), col_description(a.attrelid, a.attnum), \
-                   a.attidentity <> '' OR a.attgenerated <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%' \
+                   a.attidentity <> '' OR a.attgenerated <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%', \
+                   a.attidentity <> '' \
                  FROM pg_attribute a \
                  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
                  WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass \
@@ -400,6 +401,24 @@ impl PgSession {
                  JOIN pg_namespace nf ON nf.oid = cf.relnamespace \
                  WHERE con.conrelid = format('%I.%I', $1::text, $2::text)::regclass AND con.contype = 'f' \
                  ORDER BY con.conname",
+                &[&schema, &table],
+            )
+            .await?;
+        // tgtype bits: 1 row, 2 before, 4 insert, 8 delete, 16 update, 32 truncate, 64 instead
+        let triggers = self
+            .strings(
+                "SELECT t.tgname::text, \
+                   CASE WHEN t.tgtype::int & 2 <> 0 THEN 'BEFORE' \
+                        WHEN t.tgtype::int & 64 <> 0 THEN 'INSTEAD OF' ELSE 'AFTER' END, \
+                   array_remove(ARRAY[ \
+                     CASE WHEN t.tgtype::int & 4 <> 0 THEN 'INSERT' END, \
+                     CASE WHEN t.tgtype::int & 16 <> 0 THEN 'UPDATE' END, \
+                     CASE WHEN t.tgtype::int & 8 <> 0 THEN 'DELETE' END, \
+                     CASE WHEN t.tgtype::int & 32 <> 0 THEN 'TRUNCATE' END], NULL)::text[], \
+                   t.tgtype::int & 1 <> 0, t.tgenabled <> 'D', pg_get_triggerdef(t.oid, true) \
+                 FROM pg_trigger t \
+                 WHERE t.tgrelid = format('%I.%I', $1::text, $2::text)::regclass AND NOT t.tgisinternal \
+                 ORDER BY t.tgname",
                 &[&schema, &table],
             )
             .await?;
@@ -446,6 +465,8 @@ impl PgSession {
                         default: r.get(3),
                         comment: r.get(4),
                         is_generated: r.get(5),
+                        is_identity: r.get(6),
+                        extra: None,
                     }
                 })
                 .collect(),
@@ -461,6 +482,17 @@ impl PgSession {
                     ref_columns: r.get(4),
                     on_update: action(r.get(5)),
                     on_delete: action(r.get(6)),
+                })
+                .collect(),
+            triggers: triggers
+                .iter()
+                .map(|r| TriggerInfo {
+                    name: r.get(0),
+                    timing: r.get(1),
+                    events: r.get(2),
+                    row_level: r.get(3),
+                    enabled: r.get(4),
+                    definition: r.get(5),
                 })
                 .collect(),
         })

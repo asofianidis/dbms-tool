@@ -4,20 +4,25 @@ import {
   Code2,
   FileCode2,
   FilePlus2,
+  GitCompareArrows,
   Hash,
   KeyRound,
   Leaf,
   ListTree,
+  Pencil,
   Play,
   RefreshCw,
   ScrollText,
+  ShieldCheck,
   Table2,
-  Trash2
+  Trash2,
+  Zap
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
 import { modifyScript, routineTemplate } from '@/lib/routines'
-import { ENGINES, type Dialect } from '@/lib/engines'
+import { ENGINES, supports, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
+import { securableFor } from '@/lib/grants'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import {
@@ -32,15 +37,20 @@ import {
   type TableRef
 } from '@/lib/sql'
 import { toast, toastError } from '@/lib/toast'
+import { canHaveTriggers } from '@/lib/triggers'
 import {
   confirm,
   getConnection,
   newQueryTab,
   openCollection,
+  openCompare,
   openTable,
   refreshConnection
 } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
+import { openTableDesigner } from '../table/TableDesigner'
+import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPermissionsDesigner } from './PermissionsDesigner'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -141,6 +151,9 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   const isView = obj.kind === 'view' || obj.kind === 'materialized_view'
   const isRoutine = obj.kind === 'function' || obj.kind === 'procedure'
   const dialect = dialectOf(connectionId)
+  const engine = getConnection(connectionId)?.engine
+  // SQLite browses and edits data, but has no table or trigger designer
+  const designers = !engine || supports(engine, 'designers')
   const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
   const items: MenuItem[] = [{ heading: label }]
   if (isTable || isView) {
@@ -156,6 +169,34 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         onSelect: () =>
           openTable(connectionId, database, obj.schema, obj.name, obj.kind, 'structure')
       },
+      ...(obj.kind === 'table'
+        ? [
+            ...(designers
+              ? [
+                  {
+                    label: 'Design table…',
+                    icon: <Pencil />,
+                    onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
+                  }
+                ]
+              : []),
+            {
+              label: 'Compare with…',
+              icon: <GitCompareArrows />,
+              onSelect: () => openCompare(connectionId, database, obj.schema, obj.name)
+            }
+          ]
+        : []),
+      ...(designers && canHaveTriggers(dialect, obj.kind)
+        ? [
+            {
+              label: 'New trigger…',
+              icon: <Zap />,
+              onSelect: () =>
+                openTriggerDesigner(connectionId, database, obj.schema, obj.name, isView)
+            }
+          ]
+        : []),
       {
         label: isView ? 'Definition' : 'DDL',
         icon: <ScrollText />,
@@ -246,6 +287,14 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
       label: 'Script as CREATE',
       icon: <FileCode2 />,
       onSelect: () => void scriptTo(connectionId, database, obj, 'definition')
+    })
+  }
+  const securable = securableFor(dialect, database, obj)
+  if (securable) {
+    items.push({
+      label: 'Permissions…',
+      icon: <ShieldCheck />,
+      onSelect: () => openPermissionsDesigner(connectionId, database, securable)
     })
   }
   items.push(

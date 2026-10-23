@@ -40,6 +40,7 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         color: String::new(),
         group: String::new(),
         last_used: None,
+        cloud: None,
     };
     if engine == Engine::Mongo {
         c.uri = raw;
@@ -144,6 +145,8 @@ async fn postgres_end_to_end() {
         .unwrap();
     assert_eq!(info.primary_key, vec!["id"]);
     assert!(info.columns[0].is_generated);
+    // serial is a nextval() default, not an identity
+    assert!(!info.columns[0].is_identity);
     assert!(!info.columns[1].nullable);
     let completion = s.completion("").await.unwrap();
     assert!(
@@ -212,6 +215,8 @@ async fn mysql_end_to_end() {
     assert!(objects.iter().any(|o| o.name == "t" && o.kind == "table"));
     let info = s.describe_table("dbms_test", None, "t").await.unwrap();
     assert_eq!(info.primary_key, vec!["id"]);
+    assert!(info.columns[0].is_identity);
+    assert_eq!(info.columns[0].extra.as_deref(), Some("auto_increment"));
     assert!(info.indexes.iter().any(|i| i.name == "ix_name"));
     let ddl = s
         .object_definition("dbms_test", None, "t", "table", None)
@@ -318,6 +323,8 @@ async fn tds_suite(engine: Engine, var: &str) {
         .unwrap();
     assert_eq!(info.primary_key, vec!["id"]);
     assert!(info.columns[0].is_generated, "{:?}", info.columns[0]);
+    assert!(info.columns[0].is_identity, "{:?}", info.columns[0]);
+    assert!(!info.columns[1].is_identity);
     assert_eq!(info.columns[1].data_type, "nvarchar(50)");
     let completion = s.completion("dbms_test").await.unwrap();
     assert!(completion.iter().any(|t| t.name == "t"));

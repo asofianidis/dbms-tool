@@ -5,11 +5,13 @@ import { api, type ConnectionConfig, type ResultSet } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { formatBytes } from '@/lib/format'
 import { queries } from '@/lib/queries'
+import { dashboardFor } from '@/lib/server-metrics'
 import { errorMessage } from '@/lib/toast'
-import { connect, connectionsStore, statusStore, type TabOf } from '@/lib/workspace'
+import { connect, connectionsStore, statusStore, tabsStore, type TabOf } from '@/lib/workspace'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { documentsToGrid } from '../mongo/DocumentsView'
+import { LiveMetrics } from './LiveMetrics'
 
 const ACTIVITY_SQL: Record<string, string> = {
   postgres: `SELECT pid, usename AS "user", datname AS "database", application_name AS app, client_addr AS client,
@@ -64,22 +66,32 @@ function useSqlPanel(
 export function ServerTab({ tab }: { tab: TabOf<'server'> }): React.JSX.Element {
   const connection = connectionsStore.use().find((c) => c.id === tab.connectionId)
   const status = statusStore.use()[tab.connectionId]
+  const active = tabsStore.use().active === tab.id
   useEffect(() => {
     if (connection && status?.state !== 'connected') void connect(connection.id)
   }, [connection, status?.state])
   if (!connection) return <EmptyState title="This connection no longer exists" />
   if (status?.state !== 'connected')
     return <EmptyState title="Connecting…" icon={<Spinner className="size-5" />} />
-  return <ServerDashboard connection={connection} />
+  return <ServerDashboard connection={connection} session={tab.id} active={active} />
 }
 
-function ServerDashboard({ connection }: { connection: ConnectionConfig }): React.JSX.Element {
+function ServerDashboard({
+  connection,
+  session,
+  active
+}: {
+  connection: ConnectionConfig
+  session: string
+  active: boolean
+}): React.JSX.Element {
   const status = statusStore.use()[connection.id]
   const info = status?.state === 'connected' ? status.info : null
   const dbs = useQuery(queries.databases(connection.id))
   const babelfish = connection.engine === 'babelfish' || !!info?.babelfishVersion
   const engineKey = babelfish ? 'babelfish' : connection.engine
   const activity = useActivity(connection, engineKey)
+  const spec = dashboardFor(connection.engine, babelfish)
 
   return (
     <div className="h-full overflow-y-auto bg-canvas">
@@ -110,6 +122,8 @@ function ServerDashboard({ connection }: { connection: ConnectionConfig }): Reac
             </div>
           ))}
         </div>
+
+        <LiveMetrics connectionId={connection.id} session={session} spec={spec} active={active} />
 
         {babelfish && (
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
@@ -162,7 +176,9 @@ function useActivity(
   connection: ConnectionConfig,
   engineKey: string
 ): ReturnType<typeof useSqlPanel> {
-  const sql = connection.engine === 'mongo' ? null : ACTIVITY_SQL[engineKey]
+  // SQLite runs in-process, so there are no sessions to list
+  const sql =
+    connection.engine === 'mongo' || connection.engine === 'sqlite' ? null : ACTIVITY_SQL[engineKey]
   const sqlPanel = useSqlPanel(connection, sql)
   const [mongo, setMongo] = useState<ResultSet | null>(null)
   const [error, setError] = useState<string | null>(null)

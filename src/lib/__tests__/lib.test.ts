@@ -89,7 +89,9 @@ describe('literals and identifiers', () => {
           default: null,
           isPrimaryKey: true,
           isGenerated: true,
-          comment: null
+          isIdentity: true,
+          comment: null,
+          extra: null
         },
         {
           name: 'name',
@@ -98,12 +100,15 @@ describe('literals and identifiers', () => {
           default: null,
           isPrimaryKey: false,
           isGenerated: false,
-          comment: null
+          isIdentity: false,
+          comment: null,
+          extra: null
         }
       ],
       primaryKey: ['id'],
       indexes: [],
-      foreignKeys: []
+      foreignKeys: [],
+      triggers: []
     }
     const statements = editStatements('postgres', { schema: 'public', name: 't' }, info, [
       { kind: 'update', original: { id: '1', name: 'a' }, values: { name: 'b' } },

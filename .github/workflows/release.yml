@@ -252,6 +252,9 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          # setup-node v5 enables pnpm caching from package.json's packageManager field, but this
+          # job only runs dependency-free scripts and never installs pnpm
+          package-manager-cache: false
 
       - name: Download release assets
         env:
@@ -310,6 +313,15 @@ jobs:
           | Linux (arm64) | \`*_aarch64.AppImage\` (self-updating), \`*_arm64.deb\`, \`*.aarch64.rpm\` |
 
           Installed apps update themselves from this release.
+
+          ## Install on macOS
+
+          Install or update without the Gatekeeper prompt a browser download triggers on builds that
+          aren't notarized:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-mac.sh | bash
+          \`\`\`
 
           ## Verifying
 

@@ -10,18 +10,22 @@ import {
   ChevronsDownUp,
   Code2,
   Columns3,
+  ArchiveRestore,
   Copy,
   Database,
+  DatabaseBackup,
   Eye,
   Folder,
   FolderOpen,
   FunctionSquare,
   KeyRound,
   Layers,
+  LayoutDashboard,
   Leaf,
   Link2,
   ListOrdered,
   Lock,
+  Network,
   Pencil,
   Plug,
   PlugZap,
@@ -29,21 +33,25 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   Table2,
   Terminal,
   Trash2,
   Unplug,
-  X
+  X,
+  Zap,
+  GitCompareArrows
 } from 'lucide-react'
 import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { ENGINES, connectionLabel, connectionSubtitle } from '@/lib/engines'
+import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
+import { canHaveTriggers } from '@/lib/triggers'
 import { toast, toastError, errorMessage } from '@/lib/toast'
 import {
   confirm,
@@ -54,6 +62,9 @@ import {
   newQueryTab,
   openCollection,
   openConnectionDialog,
+  openBackup,
+  openCompare,
+  openDiagram,
   openServer,
   openTable,
   promptText,
@@ -64,6 +75,11 @@ import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { newDashboard } from '../dashboard/actions'
+import { openTableDesigner } from '../table/TableDesigner'
+import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPermissionsDesigner } from './PermissionsDesigner'
+import { openSchemaDesigner } from './SchemaDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -234,6 +250,32 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         disabled: !connected,
         onSelect: () => openServer(connection.id)
       },
+      ...(connection.engine !== 'babelfish' && supports(connection.engine, 'databases')
+        ? [
+            {
+              label: 'Restore backup…',
+              icon: <ArchiveRestore />,
+              disabled: !connected || connection.readOnly,
+              onSelect: () => openBackup(connection.id, '', 'restore')
+            }
+          ]
+        : []),
+      ...(connection.engine === 'mysql'
+        ? [
+            {
+              label: 'New database…',
+              icon: <Plus />,
+              disabled: !connected,
+              onSelect: () => openSchemaDesigner(connection.id, '')
+            },
+            {
+              label: 'Permissions…',
+              icon: <ShieldCheck />,
+              disabled: !connected,
+              onSelect: () => openPermissionsDesigner(connection.id, '')
+            }
+          ]
+        : []),
       {
         label: 'Refresh',
         icon: <RefreshCw />,
@@ -427,6 +469,11 @@ function DatabaseNode({
         onSelect: () => newQueryTab(connection.id, database)
       },
       {
+        label: 'New dashboard…',
+        icon: <LayoutDashboard />,
+        onSelect: () => void newDashboard(connection.id, database)
+      },
+      {
         label: 'Refresh',
         icon: <RefreshCw />,
         onSelect: () => {
@@ -439,6 +486,22 @@ function DatabaseNode({
         }
       }
     ]
+    if (connection.engine !== 'babelfish' && supports(connection.engine, 'databases')) {
+      items.push(
+        'separator',
+        {
+          label: 'Back up…',
+          icon: <DatabaseBackup />,
+          onSelect: () => openBackup(connection.id, database, 'backup')
+        },
+        {
+          label: 'Restore into…',
+          icon: <ArchiveRestore />,
+          disabled: connection.readOnly,
+          onSelect: () => openBackup(connection.id, database, 'restore')
+        }
+      )
+    }
     if (isMongo) {
       items.push(
         'separator',
@@ -461,6 +524,68 @@ function DatabaseNode({
           onSelect: () => void dropDatabase(connection.id, database)
         }
       )
+    } else if (connection.engine === 'mysql') {
+      // MySQL schemas are databases
+      items.push(
+        {
+          label: 'Open diagram',
+          icon: <Network />,
+          onSelect: () => openDiagram(connection.id, database, null)
+        },
+        'separator',
+        {
+          label: 'Edit database…',
+          icon: <Pencil />,
+          onSelect: () => openSchemaDesigner(connection.id, database, database)
+        },
+        {
+          label: 'Drop database…',
+          icon: <Trash2 />,
+          danger: true,
+          onSelect: () => openSchemaDesigner(connection.id, database, database, true)
+        }
+      )
+    } else if (connection.engine === 'sqlite') {
+      items.push({
+        label: 'Open diagram',
+        icon: <Network />,
+        onSelect: () => openDiagram(connection.id, database, null)
+      })
+    } else {
+      // SQL Server schemas aren't tree nodes, so its diagram spans the database
+      if (connection.engine !== 'postgres') {
+        items.push({
+          label: 'Open diagram',
+          icon: <Network />,
+          onSelect: () => openDiagram(connection.id, database, null)
+        })
+      }
+      items.push('separator', {
+        label: 'New schema…',
+        icon: <Plus />,
+        onSelect: () => openSchemaDesigner(connection.id, database)
+      })
+      // SQL Server schemas aren't tree nodes; the dialog picks which one to edit
+      if (connection.engine !== 'postgres') {
+        items.push({
+          label: 'Edit schemas…',
+          icon: <Layers />,
+          onSelect: () => openSchemaDesigner(connection.id, database, 'dbo')
+        })
+      }
+    }
+    if (!isMongo) {
+      if (supports(connection.engine, 'permissions'))
+        items.push({
+          label: 'Permissions…',
+          icon: <ShieldCheck />,
+          onSelect: () => openPermissionsDesigner(connection.id, database)
+        })
+      items.push({
+        label: 'Compare with…',
+        icon: <GitCompareArrows />,
+        onSelect: () => openCompare(connection.id, database, null)
+      })
     }
     showContextMenu(e, items)
   }
@@ -560,6 +685,38 @@ function SchemaNode({
                 newQueryTab(connection.id, database, `SET search_path TO ${schema};\n\n`)
             },
             {
+              label: 'Open diagram',
+              icon: <Network />,
+              onSelect: () => openDiagram(connection.id, database, schema)
+            },
+            {
+              label: 'Compare with…',
+              icon: <GitCompareArrows />,
+              onSelect: () => openCompare(connection.id, database, schema)
+            },
+            {
+              label: 'Edit schema…',
+              icon: <Pencil />,
+              onSelect: () => openSchemaDesigner(connection.id, database, schema)
+            },
+            {
+              label: 'Drop schema…',
+              icon: <Trash2 />,
+              danger: true,
+              onSelect: () => openSchemaDesigner(connection.id, database, schema, true)
+            },
+            {
+              label: 'Permissions…',
+              icon: <ShieldCheck />,
+              onSelect: () =>
+                openPermissionsDesigner(connection.id, database, {
+                  kind: 'schema',
+                  schema,
+                  name: null,
+                  args: null
+                })
+            },
+            {
               label: 'Refresh',
               icon: <RefreshCw />,
               onSelect: () =>
@@ -589,8 +746,9 @@ const FOLDERS: {
   label: string
   always?: boolean
   routine?: 'procedure' | 'function'
+  newTable?: boolean
 }[] = [
-  { kinds: ['table', 'foreign_table'], label: 'Tables', always: true },
+  { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
@@ -618,6 +776,7 @@ function ObjectFolders({
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
         if (!objects.length && !folder.always) return null
+        if (folder.routine && !supports(connection.engine, 'routines')) return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
           <ObjectFolder
@@ -628,6 +787,7 @@ function ObjectFolders({
             schema={schema}
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
+            newTable={folder.newTable}
             objects={objects}
             depth={depth}
           />
@@ -644,6 +804,7 @@ function ObjectFolder({
   schema,
   label,
   routine,
+  newTable,
   objects,
   depth
 }: {
@@ -653,6 +814,7 @@ function ObjectFolder({
   schema: string | null
   label: string
   routine?: 'procedure' | 'function'
+  newTable?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -685,6 +847,15 @@ function ObjectFolder({
                   }
                 ]
               : []),
+            ...(newTable && supports(connection.engine, 'designers')
+              ? [
+                  {
+                    label: 'New table…',
+                    icon: <Plus />,
+                    onSelect: () => openTableDesigner(connection.id, database, schema)
+                  }
+                ]
+              : []),
             {
               label: 'Refresh',
               icon: <RefreshCw />,
@@ -696,7 +867,7 @@ function ObjectFolder({
           ])
         }
         actions={
-          routine && (
+          routine ? (
             <Button
               size="icon-sm"
               variant="ghost"
@@ -705,6 +876,17 @@ function ObjectFolder({
             >
               <Plus className="size-3.5" />
             </Button>
+          ) : (
+            newTable && (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                title="New table"
+                onClick={() => openTableDesigner(connection.id, database, schema)}
+              >
+                <Plus className="size-3.5" />
+              </Button>
+            )
           )
         }
       />
@@ -834,6 +1016,20 @@ function TableChildren({
   const q = useQuery(queries.table(connection.id, database, obj.schema, obj.name))
   const [indexesOpen, setIndexesOpen] = useExpanded(`${base}/indexes`)
   const [keysOpen, setKeysOpen] = useExpanded(`${base}/keys`)
+  const [triggersOpen, setTriggersOpen] = useExpanded(`${base}/triggers`)
+  const editTriggers =
+    supports(connection.engine, 'designers') &&
+    canHaveTriggers(ENGINES[connection.engine].dialect ?? 'postgres', obj.kind)
+  const designTrigger = (trigger: string | null, drop = false): void =>
+    openTriggerDesigner(
+      connection.id,
+      database,
+      obj.schema,
+      obj.name,
+      obj.kind === 'view',
+      trigger,
+      drop
+    )
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   const info = q.data
@@ -937,6 +1133,82 @@ function TableChildren({
                 detail={`${fk.columns.join(', ')} → ${fk.refTable}(${fk.refColumns.join(', ')})`}
                 onOpen={() =>
                   openTable(connection.id, database, fk.refSchema, fk.refTable, 'table')
+                }
+              />
+            ))}
+        </>
+      )}
+      {info.triggers.length > 0 && (
+        <>
+          <Row
+            id={`${base}/triggers`}
+            depth={depth}
+            expandable
+            open={triggersOpen}
+            onToggle={() => setTriggersOpen()}
+            muted
+            icon={<Zap className="text-faint" />}
+            label="Triggers"
+            detail={info.triggers.length}
+            onMenu={
+              editTriggers
+                ? (e) =>
+                    showContextMenu(e, [
+                      { label: 'New trigger…', icon: <Plus />, onSelect: () => designTrigger(null) }
+                    ])
+                : undefined
+            }
+          />
+          {triggersOpen &&
+            info.triggers.map((t) => (
+              <Row
+                key={t.name}
+                id={`${base}/tr:${t.name}`}
+                depth={depth + 1}
+                icon={<Zap className={t.enabled ? 'text-syn-fn' : 'text-faint'} />}
+                label={t.name}
+                title={t.definition ?? undefined}
+                detail={`${t.timing} ${t.events.join(' OR ')}`.toLowerCase()}
+                onOpen={
+                  editTriggers
+                    ? () => designTrigger(t.name)
+                    : t.definition
+                      ? () => newQueryTab(connection.id, database, t.definition ?? '')
+                      : undefined
+                }
+                onMenu={(e) =>
+                  showContextMenu(e, [
+                    { heading: t.name },
+                    ...(editTriggers
+                      ? [
+                          {
+                            label: 'Edit trigger…',
+                            icon: <Pencil />,
+                            onSelect: () => designTrigger(t.name)
+                          }
+                        ]
+                      : []),
+                    ...(t.definition
+                      ? [
+                          {
+                            label: 'Open definition in editor',
+                            icon: <Code2 />,
+                            onSelect: () => newQueryTab(connection.id, database, t.definition ?? '')
+                          }
+                        ]
+                      : []),
+                    ...(editTriggers
+                      ? [
+                          'separator' as const,
+                          {
+                            label: 'Drop trigger…',
+                            icon: <Trash2 />,
+                            danger: true,
+                            onSelect: () => designTrigger(t.name, true)
+                          }
+                        ]
+                      : [])
+                  ])
                 }
               />
             ))}

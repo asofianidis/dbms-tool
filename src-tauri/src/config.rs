@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-const KEYRING_SERVICE: &str = "dbms-tool";
+pub(crate) const KEYRING_SERVICE: &str = "dbms-tool";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +18,8 @@ pub enum Engine {
     Mssql,
     Babelfish,
     Mongo,
+    /// Local database files and Cloudflare D1
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -37,6 +39,9 @@ pub enum AuthMode {
     Password,
     /// Windows integrated authentication (SQL Server only)
     Windows,
+    /// Short-lived token from the cloud provider's CLI: AWS IAM, Google Cloud
+    /// IAM or Microsoft Entra ID (see `cloud::database_token`)
+    Cloud,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +83,10 @@ pub struct ConnectionConfig {
     /// Opaque to the backend; the frontend sorts by it
     #[serde(default)]
     pub last_used: Option<i64>,
+    /// Opaque to the backend; the cloud resource this connection was found in
+    /// or provisioned as
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<serde_json::Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]

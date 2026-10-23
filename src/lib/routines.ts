@@ -183,6 +183,8 @@ BEGIN
 END
 GO`
     }
+    case 'sqlite':
+      return '-- SQLite has no stored procedures or functions'
   }
 }
 

@@ -8,7 +8,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Column, Conn, Opts, OptsBuilder, Row, SslOpts, Value as MyValue};
 use serde_json::Value;
 
-use crate::config::{ConnectionConfig, SslMode};
+use crate::config::{AuthMode, ConnectionConfig, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
 
@@ -33,7 +33,9 @@ fn build_opts(cfg: &ConnectionConfig, password: Option<&str>, database: &str, tl
         .pass(password.map(str::to_string))
         .db_name((!database.is_empty()).then(|| database.to_string()))
         .prefer_socket(false)
-        .wait_timeout(Some(28_800));
+        .wait_timeout(Some(28_800))
+        // IAM tokens are checked by the server's cleartext auth plugin
+        .enable_cleartext_plugin(cfg.auth == AuthMode::Cloud);
     if tls {
         let verify = cfg.ssl == SslMode::Require && !cfg.trust_server_certificate;
         builder = builder.ssl_opts(Some(
@@ -481,6 +483,14 @@ impl MySession {
                 vec![database.into(), table.into()],
             )
             .await?;
+        let trigger_rows = self
+            .rows(
+                "SELECT trigger_name, action_timing, event_manipulation, action_statement \
+                 FROM information_schema.triggers WHERE event_object_schema = ? AND event_object_table = ? \
+                 ORDER BY action_timing, event_manipulation, action_order",
+                vec![database.into(), table.into()],
+            )
+            .await?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for r in &stats {
@@ -539,13 +549,41 @@ impl MySession {
                         is_primary_key: text(r, 4).as_deref() == Some("PRI"),
                         is_generated: extra.contains("auto_increment")
                             || extra.contains("generated"),
+                        is_identity: extra.contains("auto_increment"),
                         comment: text(r, 6).filter(|c| !c.is_empty()),
+                        extra: text(r, 5).filter(|e| !e.is_empty()),
                     }
                 })
                 .collect(),
             primary_key,
             indexes,
             foreign_keys,
+            triggers: trigger_rows
+                .iter()
+                .map(|r| {
+                    let name = text(r, 0).unwrap_or_default();
+                    let timing = text(r, 1).unwrap_or_default();
+                    let event = text(r, 2).unwrap_or_default();
+                    // information_schema only has the body, so restate the header
+                    let definition = text(r, 3).map(|body| {
+                        format!(
+                            "CREATE TRIGGER {} {timing} {event} ON {}.{} FOR EACH ROW\n{body}",
+                            quote_ident(&name),
+                            quote_ident(database),
+                            quote_ident(table),
+                        )
+                    });
+                    TriggerInfo {
+                        name,
+                        timing,
+                        events: vec![event],
+                        // MySQL only has row-level triggers
+                        row_level: true,
+                        enabled: true,
+                        definition,
+                    }
+                })
+                .collect(),
         })
     }
 
