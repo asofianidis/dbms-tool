@@ -1039,6 +1039,7 @@ dependencies = [
  "chrono",
  "flate2",
  "futures-util",
+ "hickory-resolver",
  "keyring",
  "log",
  "mongodb",

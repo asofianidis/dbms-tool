@@ -85,7 +85,7 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         };
         opts
     } else {
-        let mut opts = ClientOptions::parse(uri).await?;
+        let mut opts = ClientOptions::parse(super::mongo_srv::expand(uri).await?).await?;
         // A password typed into the dialog fills in a URI that only names the user
         if let (Some(cred), Some(p)) = (opts.credential.as_mut(), password)
             && cred.password.is_none()

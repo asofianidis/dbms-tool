@@ -1,4 +1,5 @@
 pub mod mongo;
+pub mod mongo_srv;
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;

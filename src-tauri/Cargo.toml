@@ -31,6 +31,8 @@ native-tls = "0.2.18"
 mysql_async = { version = "0.37.1", features = ["native-tls-tls"] }
 tiberius = { version = "0.13.0", default-features = false, features = ["chrono", "rust_decimal", "tds73", "winauth", "native-tls", "sql-browser-tokio"] }
 mongodb = "3.9.1"
+# Resolves mongodb+srv ourselves; see drivers/mongo_srv.rs
+hickory-resolver = "0.26.3"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 thiserror = "2.0.21"
 chrono = { version = "0.4.45", features = ["serde"] }
