@@ -33,6 +33,12 @@ export interface ProviderInfo {
   signInHint: string
   /** Where to create an API token (token providers) */
   tokenUrl?: string
+  /**
+   * How more accounts are added next to the first one. `browser`: the CLI keeps
+   * several sign-ins, and these arguments add one; `token`: each further account
+   * is an API token. AWS has none: its profiles already are the accounts.
+   */
+  addAccount?: { kind: 'browser'; args: string[] } | { kind: 'token'; hint: string; url?: string }
   /** AWS lists databases one region at a time; the others list every region at once */
   regionScoped: boolean
   /** Options the provisioning designer offers */
@@ -65,6 +71,8 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://cloud.google.com/sql/pricing',
     signIn: () => ['auth', 'login', '--brief'],
     signInHint: 'Sign in opens your browser, the same as "gcloud auth login".',
+    // Without --no-activate the new account would replace gcloud's active one
+    addAccount: { kind: 'browser', args: ['auth', 'login', '--brief', '--no-activate'] },
     regionScoped: false,
     auth: 'cli',
     designer: ALL_OPTIONS
@@ -78,6 +86,8 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://azure.microsoft.com/pricing/details/azure-sql-database/',
     signIn: () => ['login', '--output', 'none', '--only-show-errors'],
     signInHint: 'Sign in opens your browser, the same as "az login".',
+    // az keeps every user it signs in; their subscriptions all show in the list
+    addAccount: { kind: 'browser', args: ['login', '--output', 'none', '--only-show-errors'] },
     regionScoped: false,
     auth: 'cli',
     designer: { ...ALL_OPTIONS, backups: false, deletionProtection: false }
@@ -91,6 +101,11 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     installUrl: 'https://docs.railway.com/guides/cli',
     pricingUrl: 'https://railway.com/pricing',
     signInHint: 'Run "railway login" in a terminal, then check again.',
+    addAccount: {
+      kind: 'token',
+      hint: 'Create an account token for the other account (Account Settings → Tokens, with no workspace picked) and paste it here.',
+      url: 'https://railway.com/account/tokens'
+    },
     regionScoped: false,
     designer: { backups: false, deletionProtection: false, network: false, region: false }
   },
@@ -104,6 +119,11 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://render.com/pricing#postgresql',
     signInHint: 'Create an API key under Account Settings → API Keys and paste it here.',
     tokenUrl: 'https://dashboard.render.com/u/settings#api-keys',
+    addAccount: {
+      kind: 'token',
+      hint: 'Sign in to the other Render account, create an API key under Account Settings → API Keys and paste it here.',
+      url: 'https://dashboard.render.com/u/settings#api-keys'
+    },
     regionScoped: false,
     designer: { backups: false, deletionProtection: false, network: true, region: true }
   },
@@ -117,6 +137,11 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     pricingUrl: 'https://fly.io/docs/mpg/#pricing',
     signIn: () => ['auth', 'login'],
     signInHint: 'Sign in opens your browser, the same as "fly auth login".',
+    addAccount: {
+      kind: 'token',
+      hint: 'Paste an access token for the other account: create one in its dashboard under Access Tokens, or run "fly auth token" while signed in to it.',
+      url: 'https://fly.io/user/personal_access_tokens'
+    },
     regionScoped: false,
     designer: { backups: false, deletionProtection: false, network: false, region: true }
   },
@@ -131,6 +156,11 @@ export const PROVIDERS: Record<CloudProvider, ProviderInfo> = {
     signInHint:
       'Create an API token with the "D1 Edit" and "Account Settings Read" permissions and paste it here.',
     tokenUrl: 'https://dash.cloudflare.com/profile/api-tokens',
+    addAccount: {
+      kind: 'token',
+      hint: 'Create an API token for the other account with the "D1 Edit" and "Account Settings Read" permissions and paste it here.',
+      url: 'https://dash.cloudflare.com/profile/api-tokens'
+    },
     regionScoped: false,
     designer: { backups: false, deletionProtection: false, network: false, region: true }
   }
@@ -305,13 +335,27 @@ export function parseContexts(provider: MajorCloud, stdout: string): CloudContex
       .filter((p) => p.id)
       .sort((a, b) => a.label.localeCompare(b.label))
   }
-  return rows
-    .filter((s) => !s.state || s.state === 'Enabled')
-    .map((s) => ({
+  const enabled = rows.filter((s) => !s.state || s.state === 'Enabled')
+  const userOf = (s: Record<string, unknown>): string =>
+    str((s.user as Record<string, unknown> | undefined)?.name)
+  // With more than one account signed in, say whose each subscription is
+  const severalUsers = new Set(enabled.map(userOf)).size > 1
+  return enabled.map((s) => {
+    const label = str(s.name) || str(s.id)
+    return {
       id: str(s.id),
-      label: str(s.name) || str(s.id),
+      label: severalUsers && userOf(s) ? `${label} · ${userOf(s)}` : label,
       isDefault: s.isDefault === true
-    }))
+    }
+  })
+}
+
+/** The Google accounts gcloud holds (`gcloud auth list`); the active one is the default. */
+export function parseGcpAccounts(stdout: string): CloudContext[] {
+  const rows = parseJson<Record<string, unknown>[]>(stdout) ?? []
+  return rows
+    .map((a) => ({ id: str(a.account), label: str(a.account), isDefault: a.status === 'ACTIVE' }))
+    .filter((a) => a.id)
 }
 
 /** Who the CLI is signed in as; the command fails (or lists nobody) when signed out. */
@@ -1363,6 +1407,8 @@ export type NetworkAccess = 'ip' | 'anywhere' | 'private'
 
 export interface ProvisionDraft {
   provider: CloudProvider
+  /** The account to create it in; empty for the CLI's own sign-in */
+  account: string
   context: string
   region: string
   /** Azure only */
@@ -1395,11 +1441,13 @@ export function engineOption(provider: CloudProvider, id: string): EngineOption 
 export function newProvisionDraft(
   provider: CloudProvider,
   context: string,
-  region: string
+  region: string,
+  account = ''
 ): ProvisionDraft {
   const option = PROVISION_ENGINES[provider][0]
   return {
     provider,
+    account,
     context,
     region: region || (REGIONS[provider][0]?.id ?? ''),
     resourceGroup: 'dbms-tool',

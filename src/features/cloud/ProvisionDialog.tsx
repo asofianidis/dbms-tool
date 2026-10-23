@@ -37,17 +37,20 @@ import { cloudPrefsStore, cloudQueries, detectPublicIp, runCli, startProvision }
 
 export function ProvisionDialog({
   provider,
+  account = '',
   context,
   region,
   onClose
 }: {
   provider: CloudProvider
+  /** The account picked in the Cloud tab; empty for the CLI's own sign-in */
+  account?: string
   context: string
   region: string
   onClose: () => void
 }): React.JSX.Element {
   const [draft, setDraft] = useState<ProvisionDraft>(() =>
-    newProvisionDraft(provider, context, region)
+    newProvisionDraft(provider, context, region, account)
   )
   const [showPassword, setShowPassword] = useState(false)
   const [ipState, setIpState] = useState<'idle' | 'detecting' | 'failed'>('idle')
@@ -55,7 +58,7 @@ export function ProvisionDialog({
   const option = engineOption(provider, draft.engine)
   // Google Cloud adds the signed-in account as the instance's IAM user
   const identity = useQuery({
-    ...cloudQueries.identity(provider, context),
+    ...cloudQueries.identity(provider, context, account),
     enabled: provider === 'gcp'
   })
   useEffect(() => {
@@ -65,7 +68,7 @@ export function ProvisionDialog({
 
   // Railway projects, Render workspaces, Fly.io orgs and Cloudflare accounts
   const pickContext = !isMajorCloud(provider)
-  const contexts = useQuery({ ...cloudQueries.contexts(provider), enabled: pickContext })
+  const contexts = useQuery({ ...cloudQueries.contexts(provider, account), enabled: pickContext })
   const contextList = contexts.data?.contexts ?? []
   const project = contextList.find((c) => c.id === draft.context)
   useEffect(() => {
@@ -124,9 +127,10 @@ export function ProvisionDialog({
   const create = async (): Promise<void> => {
     if (problem) return
     const target = draft.context || context
-    const where = target
-      ? `${info.contextLabel.toLowerCase()} ${contextList.find((c) => c.id === target)?.label ?? target}`
-      : 'your default account'
+    const where =
+      (target
+        ? `${info.contextLabel.toLowerCase()} ${contextList.find((c) => c.id === target)?.label ?? target}`
+        : 'your default account') + (provider === 'gcp' && account ? ` as ${account}` : '')
     const ok = await confirm({
       title: `Create ${draft.name.trim() || option.label} on ${info.label}?`,
       message: (

@@ -355,7 +355,7 @@ pub fn cloud_tools() -> Vec<crate::cloud::CloudTool> {
 
 /// Runs a cloud CLI; `{secret}` in `args` becomes the path of a temporary file
 /// holding `secret`. `workdir` names an app-managed folder to run in, for CLIs
-/// that act on the current directory.
+/// that act on the current directory. `account` picks one the user added.
 #[tauri::command]
 pub async fn cloud_cli(
     provider: crate::cloud::Provider,
@@ -363,8 +363,17 @@ pub async fn cloud_cli(
     secret: Option<String>,
     timeout_secs: Option<u64>,
     workdir: Option<String>,
+    account: Option<String>,
 ) -> AppResult<String> {
-    crate::cloud::run(provider, args, secret, timeout_secs, workdir.as_deref()).await
+    crate::cloud::run(
+        provider,
+        args,
+        secret,
+        timeout_secs,
+        workdir.as_deref(),
+        account.as_deref().unwrap_or_default(),
+    )
+    .await
 }
 
 /// Backup and restore tools for an engine; `dir` is a folder to search first.
@@ -439,29 +448,35 @@ pub fn backup_cancel(state: State<'_, AppState>, job_id: String) {
     state.backups.cancel(&job_id);
 }
 
-/// Whether an API token is saved for a provider driven over REST.
+/// Whether an API token is saved for a provider's account.
 #[tauri::command]
-pub fn cloud_token_status(provider: crate::cloud::Provider) -> bool {
-    crate::cloud::stored_token(provider).is_some()
+pub fn cloud_token_status(provider: crate::cloud::Provider, account: Option<String>) -> bool {
+    crate::cloud::stored_token(provider, account.as_deref().unwrap_or_default()).is_some()
 }
 
 #[tauri::command]
-pub fn cloud_token_set(provider: crate::cloud::Provider, token: String) -> AppResult<()> {
-    crate::cloud::store_token(provider, &token)
+pub fn cloud_token_set(
+    provider: crate::cloud::Provider,
+    token: String,
+    account: Option<String>,
+) -> AppResult<()> {
+    crate::cloud::store_token(provider, account.as_deref().unwrap_or_default(), &token)
 }
 
 #[tauri::command]
-pub fn cloud_token_delete(provider: crate::cloud::Provider) {
-    crate::cloud::delete_token(provider);
+pub fn cloud_token_delete(provider: crate::cloud::Provider, account: Option<String>) {
+    crate::cloud::delete_token(provider, account.as_deref().unwrap_or_default());
 }
 
-/// Calls a provider's REST API with its saved token (or flyctl's).
+/// Calls a provider's REST API with the account's saved token (or flyctl's).
 #[tauri::command]
 pub async fn cloud_api(
     provider: crate::cloud::Provider,
     method: String,
     path: String,
     body: Option<serde_json::Value>,
+    account: Option<String>,
 ) -> AppResult<serde_json::Value> {
-    crate::cloud::api(provider, &method, &path, body, None).await
+    let token = crate::cloud::api_token(provider, account.as_deref().unwrap_or_default()).await?;
+    crate::cloud::api(provider, &method, &path, body, Some(&token)).await
 }

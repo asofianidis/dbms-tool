@@ -34,6 +34,8 @@ struct CloudRef {
     kind: String,
     #[serde(default)]
     resource: String,
+    #[serde(default)]
+    account: String,
 }
 
 /// The cluster to tunnel to, when the connection needs one.
@@ -51,9 +53,9 @@ fn free_port() -> AppResult<u16> {
         .port())
 }
 
-async fn start(cluster: &str) -> AppResult<Tunnel> {
+async fn start(cluster: &str, account: &str) -> AppResult<Tunnel> {
     let port = free_port()?;
-    let mut child = cloud::command(Provider::Fly)?
+    let mut child = cloud::command(Provider::Fly, account)?
         .args(["mpg", "proxy", cluster, "--local-port", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -99,7 +101,10 @@ pub async fn prepare(key: &str, config: ConnectionConfig) -> AppResult<Connectio
         None => false,
     };
     if !alive {
-        tunnels.insert(key.to_string(), start(&cloud.resource).await?);
+        tunnels.insert(
+            key.to_string(),
+            start(&cloud.resource, &cloud.account).await?,
+        );
     }
     let port = tunnels[key].port;
     Ok(ConnectionConfig {

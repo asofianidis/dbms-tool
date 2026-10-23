@@ -39,6 +39,8 @@ export interface CloudRef {
   /** aws: instance | cluster; azure: postgres | mysql | sql */
   kind: string
   resourceGroup?: string
+  /** A Google account gcloud holds, or a saved token's ID; absent for the CLI's own sign-in */
+  account?: string
 }
 
 export interface CloudTool {
@@ -469,23 +471,37 @@ export const api = {
   cloudCli: (
     provider: CloudProvider,
     args: string[],
-    options: { secret?: string; timeoutSecs?: number; workdir?: string } = {}
+    options: { secret?: string; timeoutSecs?: number; workdir?: string; account?: string } = {}
   ) =>
     invoke<string>('cloud_cli', {
       provider,
       args,
       secret: options.secret ?? null,
       timeoutSecs: options.timeoutSecs ?? null,
-      workdir: options.workdir ?? null
+      workdir: options.workdir ?? null,
+      account: options.account || null
     }),
-  /** Calls a provider's REST API (Render, Fly.io, Cloudflare) with its saved token */
-  cloudApi: (provider: CloudProvider, method: string, path: string, body?: unknown) =>
-    invoke<unknown>('cloud_api', { provider, method, path, body: body ?? null }),
-  cloudTokenStatus: (provider: CloudProvider) =>
-    invoke<boolean>('cloud_token_status', { provider }),
-  cloudTokenSet: (provider: CloudProvider, token: string) =>
-    invoke<void>('cloud_token_set', { provider, token }),
-  cloudTokenDelete: (provider: CloudProvider) => invoke<void>('cloud_token_delete', { provider }),
+  /** Calls a provider's REST API (Render, Fly.io, Cloudflare) with the account's saved token */
+  cloudApi: (
+    provider: CloudProvider,
+    method: string,
+    path: string,
+    body?: unknown,
+    account?: string
+  ) =>
+    invoke<unknown>('cloud_api', {
+      provider,
+      method,
+      path,
+      body: body ?? null,
+      account: account || null
+    }),
+  cloudTokenStatus: (provider: CloudProvider, account?: string) =>
+    invoke<boolean>('cloud_token_status', { provider, account: account || null }),
+  cloudTokenSet: (provider: CloudProvider, token: string, account?: string) =>
+    invoke<void>('cloud_token_set', { provider, token, account: account || null }),
+  cloudTokenDelete: (provider: CloudProvider, account?: string) =>
+    invoke<void>('cloud_token_delete', { provider, account: account || null }),
 
   /** Backup tools for an engine; `dir` is a folder searched before PATH */
   backupTools: (engine: Engine, dir?: string | null) =>

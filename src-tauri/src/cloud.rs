@@ -1,6 +1,11 @@
 //! Cloud provider CLIs (aws, gcloud, az). The frontend builds the arguments and
 //! parses the JSON output; this module only finds the binaries and runs them,
 //! so whatever sign-in the user already has (SSO, MFA, profiles) just works.
+//!
+//! Every call takes an `account`: empty for the CLI's own sign-in (or the
+//! provider's first saved token), otherwise another account the user added. A
+//! Google account is one gcloud already holds; for the others it names a saved
+//! API token, which the CLIs that accept one get through their environment.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -61,6 +66,15 @@ impl Provider {
             Provider::Render => "render",
             Provider::Cloudflare => "cloudflare",
             _ => self.programs()[0],
+        }
+    }
+
+    /// The environment variable that signs the CLI in with an API token.
+    fn token_env(self) -> Option<&'static str> {
+        match self {
+            Provider::Fly => Some("FLY_API_TOKEN"),
+            Provider::Railway => Some("RAILWAY_API_TOKEN"),
+            _ => None,
         }
     }
 
@@ -211,9 +225,9 @@ impl Drop for SecretFile {
     }
 }
 
-/// A command for the provider's CLI that never pages, prompts or opens a
-/// console window. Callers add arguments and stdio.
-pub fn command(provider: Provider) -> AppResult<Command> {
+/// A command for the provider's CLI, signed in as `account`, that never pages,
+/// prompts or opens a console window. Callers add arguments and stdio.
+pub fn command(provider: Provider, account: &str) -> AppResult<Command> {
     let program = locate(provider).ok_or_else(|| {
         AppError::msg(format!(
             "The {} CLI isn't installed or isn't on PATH",
@@ -235,6 +249,14 @@ pub fn command(provider: Provider) -> AppResult<Command> {
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    if !account.is_empty() {
+        if provider == Provider::Gcp {
+            // A global flag, so it can go before the command group
+            command.arg(format!("--account={account}"));
+        } else if let Some(var) = provider.token_env() {
+            command.env(var, account_token(provider, account)?);
+        }
     }
     Ok(command)
 }
@@ -261,8 +283,9 @@ pub async fn run(
     secret: Option<String>,
     timeout_secs: Option<u64>,
     workdir_key: Option<&str>,
+    account: &str,
 ) -> AppResult<String> {
-    let mut command = command(provider)?;
+    let mut command = command(provider, account)?;
     if let Some(key) = workdir_key {
         command.current_dir(workdir(key)?);
     }
@@ -338,6 +361,8 @@ struct CloudRef {
     context: String,
     #[serde(default)]
     region: String,
+    #[serde(default)]
+    account: String,
 }
 
 /// Tokens last 15 minutes (AWS) to an hour (Google, Entra); reuse them for a
@@ -440,13 +465,13 @@ pub async fn database_token(config: &ConnectionConfig) -> AppResult<String> {
             AppError::msg("Pick the cloud provider for IAM sign-in in the connection settings")
         })?;
     let args = token_args(config, &cloud)?;
-    let key = format!("{:?}|{}", cloud.provider, args.join(" "));
+    let key = format!("{:?}|{}|{}", cloud.provider, cloud.account, args.join(" "));
     if let Some((token, at)) = TOKENS.lock().get(&key)
         && at.elapsed() < TOKEN_TTL
     {
         return Ok(token.clone());
     }
-    let token = run(cloud.provider, args, None, Some(60), None)
+    let token = run(cloud.provider, args, None, Some(60), None, &cloud.account)
         .await?
         .trim()
         .to_string();
@@ -462,29 +487,51 @@ pub async fn database_token(config: &ConnectionConfig) -> AppResult<String> {
 
 /* ---------- API tokens and REST calls ---------- */
 
-fn token_entry(provider: Provider) -> AppResult<keyring::Entry> {
-    keyring::Entry::new(
-        crate::config::KEYRING_SERVICE,
-        &format!("cloud-token:{}", provider.program()),
-    )
-    .map_err(|e| AppError::msg(format!("Credential store unavailable: {e}")))
+/// The credential store entry for an account's token; the first account keeps
+/// the name tokens had before there could be several.
+fn token_entry(provider: Provider, account: &str) -> AppResult<keyring::Entry> {
+    if !account
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::msg("Invalid account ID"));
+    }
+    let name = if account.is_empty() {
+        format!("cloud-token:{}", provider.program())
+    } else {
+        format!("cloud-token:{}:{account}", provider.program())
+    };
+    keyring::Entry::new(crate::config::KEYRING_SERVICE, &name)
+        .map_err(|e| AppError::msg(format!("Credential store unavailable: {e}")))
 }
 
-/// API token saved for a provider driven over REST (Render, Cloudflare).
-pub fn stored_token(provider: Provider) -> Option<String> {
-    token_entry(provider).ok()?.get_password().ok()
+/// API token saved for an account: Render and Cloudflare's, or one added for
+/// another Fly.io or Railway account.
+pub fn stored_token(provider: Provider, account: &str) -> Option<String> {
+    token_entry(provider, account).ok()?.get_password().ok()
 }
 
-pub fn store_token(provider: Provider, token: &str) -> AppResult<()> {
-    token_entry(provider)?
+pub fn store_token(provider: Provider, account: &str, token: &str) -> AppResult<()> {
+    token_entry(provider, account)?
         .set_password(token.trim())
         .map_err(|e| AppError::msg(format!("Could not save the token: {e}")))
 }
 
-pub fn delete_token(provider: Provider) {
-    if let Ok(entry) = token_entry(provider) {
+pub fn delete_token(provider: Provider, account: &str) {
+    if let Ok(entry) = token_entry(provider, account) {
         let _ = entry.delete_credential();
     }
+    let prefix = format!("{provider:?}|{account}|");
+    TOKENS.lock().retain(|key, _| !key.starts_with(&prefix));
+}
+
+fn account_token(provider: Provider, account: &str) -> AppResult<String> {
+    stored_token(provider, account).ok_or_else(|| {
+        AppError::msg(format!(
+            "The token for this {} account is missing; add the account again in the Cloud databases tab",
+            provider.program()
+        ))
+    })
 }
 
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -495,10 +542,14 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("HTTP client")
 });
 
-/// The bearer token for a REST call: the saved API token, or flyctl's own.
-async fn api_token(provider: Provider) -> AppResult<String> {
+/// The bearer token for a REST call: the account's saved API token, or flyctl's
+/// own for the account it's signed in to.
+pub async fn api_token(provider: Provider, account: &str) -> AppResult<String> {
+    if !account.is_empty() {
+        return account_token(provider, account);
+    }
     if provider == Provider::Fly {
-        let key = "fly|auth token".to_string();
+        let key = "Fly||auth token".to_string();
         if let Some((token, at)) = TOKENS.lock().get(&key)
             && at.elapsed() < TOKEN_TTL
         {
@@ -510,6 +561,7 @@ async fn api_token(provider: Provider) -> AppResult<String> {
             None,
             Some(30),
             None,
+            "",
         )
         .await?;
         // Newer flyctl versions print a deprecation note before the token
@@ -527,7 +579,7 @@ async fn api_token(provider: Provider) -> AppResult<String> {
         TOKENS.lock().insert(key, (token.clone(), Instant::now()));
         return Ok(token);
     }
-    stored_token(provider).ok_or_else(|| {
+    stored_token(provider, "").ok_or_else(|| {
         AppError::msg(format!(
             "Add a {} API token in the Cloud databases tab first",
             provider.program()
@@ -571,7 +623,7 @@ pub async fn api(
         .map_err(|_| AppError::msg("Invalid HTTP method"))?;
     let token = match token {
         Some(t) => t.to_string(),
-        None => api_token(provider).await?,
+        None => api_token(provider, "").await?,
     };
     let mut request = HTTP
         .request(method, format!("{base}{path}"))
@@ -634,6 +686,7 @@ mod tests {
             provider: Provider::Azure,
             context: String::new(),
             region: String::new(),
+            account: String::new(),
         };
         let sql = token_args(
             &connection(Engine::Mssql, "s", serde_json::Value::Null),
@@ -682,6 +735,12 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn account_ids_are_restricted() {
+        assert!(token_entry(Provider::Render, "../x").is_err());
+        assert!(token_entry(Provider::Render, "a:b").is_err());
     }
 
     #[test]

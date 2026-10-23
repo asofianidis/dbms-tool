@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Trash2,
   TriangleAlert,
+  UserPlus,
   X,
   XCircle
 } from 'lucide-react'
@@ -25,7 +26,7 @@ import {
 } from '@/lib/cloud'
 import { cn } from '@/lib/cn'
 import { errorMessage, toast, toastError } from '@/lib/toast'
-import { connectionsStore } from '@/lib/workspace'
+import { confirm, connectionsStore } from '@/lib/workspace'
 import {
   Badge,
   Button,
@@ -48,10 +49,14 @@ import {
   jobsStore,
   forgetToken,
   refreshCloud,
+  removeTokenAccount,
   saveToken,
+  selectAccount,
   signIn,
+  useAccounts,
   type ProvisionJob
 } from './actions'
+import { AccountDialog } from './AccountDialog'
 import { DeleteDialog } from './DeleteDialog'
 import { ProvisionDialog } from './ProvisionDialog'
 
@@ -63,29 +68,59 @@ export function CloudTab(): React.JSX.Element {
   // Token providers need no CLI; the others need theirs installed
   const installed =
     info.auth === 'token' || !!tools.data?.find((t) => t.provider === provider)?.path
+  // Google accounts gcloud holds, or tokens added for other accounts; Azure's
+  // subscriptions already span its accounts and AWS profiles are accounts
+  const pickAccount = provider === 'gcp' || info.addAccount?.kind === 'token'
+  const accounts = useAccounts(provider, installed && pickAccount)
+  const savedAccount = prefs.account?.[provider] ?? ''
+  const account =
+    provider === 'gcp' || accounts.some((a) => a.id === savedAccount) ? savedAccount : ''
+  const tokenAccount = !!account && info.addAccount?.kind === 'token'
   const context = prefs.context[provider] ?? ''
-  const identity = useQuery({ ...cloudQueries.identity(provider, context), enabled: installed })
+  const identity = useQuery({
+    ...cloudQueries.identity(provider, context, account),
+    enabled: installed
+  })
   const signedIn = !!identity.data
+  // Who the first account is, to name it in the account list
+  const firstIdentity = useQuery({
+    ...cloudQueries.identity(provider, '', ''),
+    enabled: installed && pickAccount && (account !== '' || context !== '')
+  })
   const contexts = useQuery({
-    ...cloudQueries.contexts(provider),
-    enabled: installed && (info.auth === 'cli' || signedIn)
+    ...cloudQueries.contexts(provider, account),
+    enabled: installed && ((info.auth === 'cli' && !tokenAccount) || signedIn)
   })
   const defaultRegion = useQuery({
-    ...cloudQueries.defaultRegion(provider, context),
+    ...cloudQueries.defaultRegion(provider, context, account),
     enabled: installed && info.regionScoped
   })
   const region = info.regionScoped
     ? prefs.region[provider] || defaultRegion.data || REGIONS[provider][0].id
     : ''
   const databases = useQuery({
-    ...cloudQueries.databases(provider, context, region),
+    ...cloudQueries.databases(provider, context, region, account),
     enabled: installed && signedIn && (!info.regionScoped || !defaultRegion.isLoading)
   })
   const [provisioning, setProvisioning] = useState(false)
+  const [addingAccount, setAddingAccount] = useState(false)
   const jobs = jobsStore.use()
 
   const setPref = (key: 'context' | 'region', value: string): void =>
     cloudPrefsStore.set((p) => ({ ...p, [key]: { ...p[key], [provider]: value } }))
+
+  const firstLabel =
+    (account || context ? firstIdentity.data : identity.data) ||
+    (info.auth === 'token' ? 'First token' : `${info.cli} sign-in`)
+  const removeAccount = async (): Promise<void> => {
+    const label = accounts.find((a) => a.id === account)?.label ?? account
+    const ok = await confirm({
+      title: `Remove ${label}?`,
+      message: `Its API token is deleted from the OS credential manager. Saved connections to its databases stop working until you add it again.`,
+      confirmLabel: 'Remove account'
+    })
+    if (ok) await removeTokenAccount(provider, account).catch(toastError)
+  }
 
   const firstAccount = contexts.data?.contexts[0]?.label
   const defaultLabel =
@@ -112,7 +147,45 @@ export function CloudTab(): React.JSX.Element {
           onChange={(p: CloudProvider) => cloudPrefsStore.set((s) => ({ ...s, provider: p }))}
           options={PROVIDER_ORDER.map((p) => ({ value: p, label: PROVIDERS[p].label }))}
         />
-        {installed && (info.auth === 'cli' || signedIn) && (
+        {installed && pickAccount && (
+          <>
+            <ToolbarDivider />
+            <span className="text-xs text-muted">Account</span>
+            <Select
+              className="h-7 w-52 text-xs"
+              value={account}
+              onChange={(e) =>
+                e.target.value === ADD_ACCOUNT
+                  ? setAddingAccount(true)
+                  : selectAccount(provider, e.target.value)
+              }
+            >
+              <option value="">{firstLabel}</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
+                </option>
+              ))}
+              {/* gcloud lists an account it lost track of; keep it pickable */}
+              {account && !accounts.some((a) => a.id === account) && (
+                <option value={account}>{account}</option>
+              )}
+              <option value={ADD_ACCOUNT}>Add account…</option>
+            </Select>
+            {tokenAccount && (
+              <Button
+                size="icon"
+                variant="ghost"
+                className="hover:text-danger"
+                title="Remove this account"
+                onClick={() => void removeAccount()}
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            )}
+          </>
+        )}
+        {installed && ((info.auth === 'cli' && !tokenAccount) || signedIn) && (
           <>
             <ToolbarDivider />
             <span className="text-xs text-muted">{info.contextLabel}</span>
@@ -176,7 +249,17 @@ export function CloudTab(): React.JSX.Element {
             {identity.data}
           </span>
         )}
-        {info.auth === 'token' && signedIn && (
+        {provider === 'azure' && signedIn && (
+          <Button
+            size="sm"
+            variant="ghost"
+            title="Sign in to another Azure account"
+            onClick={() => setAddingAccount(true)}
+          >
+            <UserPlus className="size-3.5" /> Add account
+          </Button>
+        )}
+        {info.auth === 'token' && signedIn && !account && (
           <Button
             size="sm"
             variant="ghost"
@@ -233,10 +316,15 @@ export function CloudTab(): React.JSX.Element {
             </SetupCard>
           ) : identity.isLoading ? (
             <Spinner />
-          ) : !signedIn && info.auth === 'token' ? (
-            <TokenCard provider={provider} error={identity.error} />
+          ) : !signedIn && (info.auth === 'token' || tokenAccount) ? (
+            <TokenCard provider={provider} account={account} error={identity.error} />
           ) : !signedIn ? (
-            <SignInCard provider={provider} context={context} error={identity.error} />
+            <SignInCard
+              provider={provider}
+              context={context}
+              account={account}
+              error={identity.error}
+            />
           ) : (
             <DatabaseList
               provider={provider}
@@ -253,14 +341,21 @@ export function CloudTab(): React.JSX.Element {
       {provisioning && (
         <ProvisionDialog
           provider={provider}
+          account={account}
           context={context}
           region={region || prefs.region[provider] || ''}
           onClose={() => setProvisioning(false)}
         />
       )}
+      {addingAccount && (
+        <AccountDialog provider={provider} onClose={() => setAddingAccount(false)} />
+      )}
     </div>
   )
 }
+
+/** The account list's last entry, which opens the add-account dialog. */
+const ADD_ACCOUNT = '__add-account__'
 
 function SetupCard({
   tone,
@@ -290,10 +385,12 @@ function SetupCard({
 function SignInCard({
   provider,
   context,
+  account,
   error
 }: {
   provider: CloudProvider
   context: string
+  account: string
   error: unknown
 }): React.JSX.Element {
   const info = PROVIDERS[provider]
@@ -311,7 +408,7 @@ function SignInCard({
               onClick={async () => {
                 setBusy(true)
                 try {
-                  await signIn(provider, context)
+                  await signIn(provider, context, account)
                 } catch (e) {
                   toastError(e)
                 } finally {
@@ -331,10 +428,10 @@ function SignInCard({
     >
       <p>
         The <span className="font-mono text-bright">{info.cli}</span> CLI isn&apos;t signed in
-        {context ? (
+        {account || context ? (
           <>
             {' '}
-            for <span className="font-mono text-bright">{context}</span>
+            for <span className="font-mono text-bright">{account || context}</span>
           </>
         ) : null}
         . {info.signInHint}
@@ -609,21 +706,29 @@ function Elapsed({ since }: { since: number }): React.JSX.Element {
   )
 }
 
-/** Render and Cloudflare: paste an API token, kept in the OS credential manager. */
+/**
+ * Render and Cloudflare, or an account added with a token whose token stopped
+ * working: paste an API token, kept in the OS credential manager.
+ */
 function TokenCard({
   provider,
+  account,
   error
 }: {
   provider: CloudProvider
+  account: string
   error: unknown
 }): React.JSX.Element {
   const info = PROVIDERS[provider]
+  const add = info.addAccount?.kind === 'token' ? info.addAccount : undefined
+  const hint = account && add ? add.hint : info.signInHint
+  const tokenUrl = account && add ? add.url : info.tokenUrl
   const [token, setToken] = useState('')
   const [busy, setBusy] = useState(false)
   const save = async (): Promise<void> => {
     setBusy(true)
     try {
-      await saveToken(provider, token)
+      await saveToken(provider, token, account)
       setToken('')
       toast(`Connected to ${info.label}`)
     } catch (e) {
@@ -635,22 +740,26 @@ function TokenCard({
   return (
     <SetupCard
       tone="info"
-      title={`Connect your ${info.label} account`}
+      title={
+        account
+          ? `Replace this ${info.label} account's token`
+          : `Connect your ${info.label} account`
+      }
       actions={
         <>
           <Button variant="primary" disabled={!token.trim() || busy} onClick={() => void save()}>
             {busy ? <Spinner className="text-current" /> : <LogIn className="size-3.5" />} Save
             token
           </Button>
-          {info.tokenUrl && (
-            <Button variant="secondary" onClick={() => void openUrl(info.tokenUrl!)}>
+          {tokenUrl && (
+            <Button variant="secondary" onClick={() => void openUrl(tokenUrl)}>
               Create a token
             </Button>
           )}
         </>
       }
     >
-      <p>{info.signInHint}</p>
+      <p>{hint}</p>
       <div className="mt-3 max-w-md">
         <Input
           mono
