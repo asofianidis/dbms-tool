@@ -1,9 +1,21 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App";
+import '@fontsource-variable/inter'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
+import './styles.css'
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { loadPersistedState } from './lib/persist'
+
+// Stores read persisted state when their modules load, so load it before importing the app
+await loadPersistedState()
+const [{ App }, { queryClient }] = await Promise.all([import('./App'), import('./lib/queries')])
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
+  </StrictMode>
+)

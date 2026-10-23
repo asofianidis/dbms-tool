@@ -12,9 +12,16 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "dbms-tool",
-        "width": 800,
-        "height": 600
+        "width": 1440,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 560,
+        "center": true,
+        "decorations": false,
+        "backgroundColor": "#0a0b0a",
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -30,6 +37,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "shortDescription": "Database client for PostgreSQL, MySQL, SQL Server, Babelfish and MongoDB",
+    "category": "DeveloperTool",
+    "copyright": "MIT License"
   }
 }
