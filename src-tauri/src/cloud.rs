@@ -390,8 +390,13 @@ fn token_args(config: &ConnectionConfig, cloud: &CloudRef) -> AppResult<Vec<Stri
                     "AWS IAM authentication works with PostgreSQL and MySQL, not SQL Server".into(),
                 ));
             }
+            // The token is signed for the database's own address, not a local tunnel's
+            let (host, port) = match &config.tunneled {
+                Some((host, port)) => (host.as_str(), *port),
+                None => (config.host.as_str(), config.port),
+            };
             let region = if cloud.region.is_empty() {
-                region_from_host(&config.host).ok_or_else(|| {
+                region_from_host(host).ok_or_else(|| {
                     AppError::msg(
                         "Can't tell the AWS region from the host; set it on the connection",
                     )
@@ -399,16 +404,16 @@ fn token_args(config: &ConnectionConfig, cloud: &CloudRef) -> AppResult<Vec<Stri
             } else {
                 &cloud.region
             };
-            let port = if config.port == 0 {
+            let port = if port == 0 {
                 if config.engine == Engine::Mysql {
                     3306
                 } else {
                     5432
                 }
             } else {
-                config.port
+                port
             };
-            let mut args = owned(&["rds", "generate-db-auth-token", "--hostname", &config.host]);
+            let mut args = owned(&["rds", "generate-db-auth-token", "--hostname", host]);
             args.extend(owned(&[
                 "--port",
                 &port.to_string(),

@@ -91,6 +91,7 @@ pub fn connection_save(
     state: State<'_, AppState>,
     config: ConnectionConfig,
     password: Option<String>,
+    ssh_secret: Option<String>,
 ) -> AppResult<ConnectionConfig> {
     let saved = state.store.upsert(config)?;
     if saved.save_password {
@@ -100,6 +101,14 @@ pub fn connection_save(
     } else {
         config::delete_password(&saved.id);
     }
+    // Tunnels reconnect on their own, so an SSH password or passphrase is always saved
+    let ssh_id = config::ssh_secret_id(&saved.id);
+    match (&saved.ssh, ssh_secret.filter(|s| !s.is_empty())) {
+        (None, _) => config::delete_password(&ssh_id),
+        (Some(ssh), _) if ssh.auth == config::SshAuth::Agent => config::delete_password(&ssh_id),
+        (Some(_), Some(secret)) => config::store_password(&ssh_id, &secret)?,
+        (Some(_), None) => {}
+    }
     Ok(saved)
 }
 
@@ -107,6 +116,7 @@ pub fn connection_save(
 pub fn connection_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.manager.close(&id);
     config::delete_password(&id);
+    config::delete_password(&config::ssh_secret_id(&id));
     state.store.remove(&id)
 }
 
@@ -114,9 +124,11 @@ pub fn connection_delete(state: State<'_, AppState>, id: String) -> AppResult<()
 pub async fn connection_test(
     config: ConnectionConfig,
     password: Option<String>,
+    ssh_secret: Option<String>,
 ) -> AppResult<ServerInfo> {
     let password = resolve_password(&config, password);
-    let (info, _, _) = logged(manager::probe(&config, password.as_deref()).await, || {
+    let probed = manager::probe(&config, password.as_deref(), ssh_secret.as_deref()).await;
+    let (info, _, _) = logged(probed, || {
         format!("Connection test to {} failed", describe(&config))
     })?;
     Ok(info)

@@ -7,6 +7,7 @@ import {
   DatabaseBackup,
   Eye,
   FileCode2,
+  FileUp,
   FunctionSquare,
   GitCompareArrows,
   Home,
@@ -64,6 +65,8 @@ export function tabTitle(tab: Tab): string {
         : `Restore${tab.database ? ` ${tab.database}` : ''}`
     case 'compare':
       return `Compare ${tab.table ?? tab.schema ?? tab.database}`
+    case 'import':
+      return `Import into ${tab.table ?? tab.schema ?? tab.database}`
   }
 }
 
@@ -108,6 +111,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       )
     case 'compare':
       return <GitCompareArrows className={cn(c, 'text-info')} />
+    case 'import':
+      return <FileUp className={cn(c, 'text-ok')} />
   }
 }
 

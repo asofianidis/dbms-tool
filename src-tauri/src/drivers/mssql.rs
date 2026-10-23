@@ -323,6 +323,12 @@ impl MsSession {
         self.rows("SELECT 1", &[]).await.is_ok()
     }
 
+    pub async fn in_transaction(&mut self) -> Option<bool> {
+        let rows = self.rows("SELECT @@TRANCOUNT", &[]).await.ok()?;
+        let count: i32 = rows.first()?.get(0)?;
+        Some(count > 0)
+    }
+
     pub async fn use_database(&mut self, database: &str) -> AppResult<()> {
         if database.is_empty() || database.eq_ignore_ascii_case(&self.database) {
             return Ok(());

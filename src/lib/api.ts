@@ -24,6 +24,23 @@ export interface ConnectionConfig {
   lastUsed?: number | null
   /** The cloud resource this connection was found in or provisioned as */
   cloud?: CloudRef | null
+  /** SSH server the connection is tunnelled through */
+  ssh?: SshConfig | null
+}
+
+export type SshAuth = 'agent' | 'key' | 'password'
+
+export interface SshConfig {
+  enabled: boolean
+  /** Host name or a Host alias from ~/.ssh/config */
+  host: string
+  /** 0 for ssh's default */
+  port: number
+  user: string
+  auth: SshAuth
+  keyFile: string
+  /** ssh -J destinations */
+  jumpHost: string
 }
 
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'railway' | 'render' | 'fly' | 'cloudflare'
@@ -329,6 +346,8 @@ export interface ExecOutput {
   elapsedMs: number
   cancelled: boolean
   database: string | null
+  /** Whether the session was left inside a transaction; null when unknown */
+  inTransaction: boolean | null
 }
 
 export interface ExecOptions {
@@ -407,11 +426,20 @@ export function isAppError(e: unknown, code?: AppError['code']): e is AppError {
 
 export const api = {
   connectionsList: () => invoke<ConnectionConfig[]>('connections_list'),
-  connectionSave: (config: ConnectionConfig, password?: string | null) =>
-    invoke<ConnectionConfig>('connection_save', { config, password: password ?? null }),
+  /** `sshSecret` is the SSH password or key passphrase, saved with the connection */
+  connectionSave: (config: ConnectionConfig, password?: string | null, sshSecret?: string | null) =>
+    invoke<ConnectionConfig>('connection_save', {
+      config,
+      password: password ?? null,
+      sshSecret: sshSecret || null
+    }),
   connectionDelete: (id: string) => invoke<void>('connection_delete', { id }),
-  connectionTest: (config: ConnectionConfig, password?: string | null) =>
-    invoke<ServerInfo>('connection_test', { config, password: password ?? null }),
+  connectionTest: (config: ConnectionConfig, password?: string | null, sshSecret?: string | null) =>
+    invoke<ServerInfo>('connection_test', {
+      config,
+      password: password ?? null,
+      sshSecret: sshSecret || null
+    }),
   connectionOpen: (id: string, password?: string | null, remember?: boolean) =>
     invoke<ServerInfo>('connection_open', { id, password: password ?? null, remember }),
   connectionClose: (id: string) => invoke<void>('connection_close', { id }),

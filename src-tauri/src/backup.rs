@@ -1757,6 +1757,8 @@ mod tests {
             group: String::new(),
             last_used: None,
             cloud: None,
+            ssh: None,
+            tunneled: None,
         }
     }
 

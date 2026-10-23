@@ -1,31 +1,44 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { SQLNamespace } from '@codemirror/lang-sql'
 import type { KeyBinding } from '@codemirror/view'
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
+  Check,
   ChevronDown,
   FileDown,
   FolderOpen,
   Gauge,
+  GitCommitHorizontal,
   PanelBottomClose,
   Play,
   PlugZap,
   Sparkles,
   Square,
-  TextCursorInput
+  TextCursorInput,
+  Undo2
 } from 'lucide-react'
 import { api, type CompletionTable } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
+import { paramNames, substituteParams, type ParamValue } from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast, toastError } from '@/lib/toast'
+import {
+  beginSql,
+  commitSql,
+  manualCommitStore,
+  openTransactionsStore,
+  rollbackSql,
+  setInTransaction,
+  setManualCommit
+} from '@/lib/transactions'
 import {
   confirm,
   connect,
@@ -41,8 +54,9 @@ import {
 } from '@/lib/workspace'
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { showMenuAt } from '@/components/ContextMenu'
-import { Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
+import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
 import { SavedButton } from '../saved/SavedButton'
+import { ParamsDialog } from './ParamsDialog'
 import { ResultsPanel, type RunResult } from './ResultsPanel'
 import { ConnectionPicker, DatabasePicker } from './pickers'
 
@@ -78,6 +92,19 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     connection?.engine === 'babelfish' ||
     (status?.state === 'connected' && !!status.info.babelfishVersion)
   const layout = useDefaultLayout({ id: 'query-split', storage: localStorage })
+  const inTransaction = !!openTransactionsStore.use()[tab.id]
+  const manualCommit = !!manualCommitStore.use()[tab.id]
+  const [paramPrompt, setParamPrompt] = useState<{
+    names: string[]
+    resolve: (values: Record<string, ParamValue> | null) => void
+  } | null>(null)
+  const askParams = (names: string[]): Promise<Record<string, ParamValue> | null> =>
+    new Promise((resolve) => setParamPrompt({ names, resolve }))
+
+  // A closed connection takes its transactions with it
+  useEffect(() => {
+    if (!connected) setInTransaction(tab.id, false)
+  }, [connected, tab.id])
 
   const completion = useQuery({
     ...queries.completion(tab.connectionId, tab.database),
@@ -131,16 +158,37 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           if (!ok) return
         }
       }
+      const names = paramNames(sql, dialect)
+      let filled = sql
+      if (names.length) {
+        const values = await askParams(names)
+        if (!values) return
+        filled = substituteParams(sql, dialect, values)
+      }
       if (!(await connect(tab.connectionId))) return
-      const toRun = transform ? transform(sql) : sql
-      const runOffset = transform ? -1 : offset
+      const toRun = transform ? transform(filled) : filled
+      // Error positions only map back onto the editor when the text ran unchanged
+      const runOffset = transform || names.length ? -1 : offset
       ed.clearErrors()
       setRunning(tab.id, true)
       if (resultsPanel.current?.isCollapsed()) resultsPanel.current.expand()
       try {
+        // Manual commit: the first run after a COMMIT or ROLLBACK opens a new transaction
+        if (manualCommitStore.get()[tab.id] && !explain && !openTransactionsStore.get()[tab.id]) {
+          const begin = beginSql(dialect)
+          const begun = await api.execute(tab.connectionId, tab.id, tab.database, begin)
+          if (begun.error) {
+            sqlResultsStore.set((r) => ({
+              ...r,
+              [tab.id]: { output: begun, offset: -1, sql: begin }
+            }))
+            return
+          }
+        }
         const output = await api.execute(tab.connectionId, tab.id, tab.database, toRun, {
           maxRows: settings.maxRows
         })
+        if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
         const plan =
           explain && !output.error
             ? (parsePlan(output, planFormat(dialect, babelfish)) ?? undefined)
@@ -214,6 +262,25 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   }
 
   const cancel = (): void => void api.cancel(tab.connectionId, tab.id).catch(toastError)
+
+  const endTransaction = async (commit: boolean): Promise<void> => {
+    const sql = commit ? commitSql(dialect) : rollbackSql(dialect)
+    setRunning(tab.id, true)
+    try {
+      const output = await api.execute(tab.connectionId, tab.id, tab.database, sql)
+      if (output.error) {
+        sqlResultsStore.set((r) => ({ ...r, [tab.id]: { output, offset: -1, sql } }))
+      } else {
+        toast(commit ? 'Transaction committed' : 'Transaction rolled back')
+      }
+      // Nested T-SQL transactions stay open after one COMMIT
+      setInTransaction(tab.id, output.inTransaction ?? (!!output.error && inTransaction))
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setRunning(tab.id, false)
+    }
+  }
 
   const format = async (): Promise<void> => {
     const ed = editor.current
@@ -361,11 +428,61 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         >
           <Gauge className="size-3.5" /> Explain <ChevronDown className="size-3" />
         </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setManualCommit(tab.id, !manualCommit)}
+          title={
+            manualCommit
+              ? 'Manual commit: running opens a transaction that stays open until you commit or roll back. Click for auto-commit.'
+              : 'Auto-commit: each statement is committed as it runs. Click for manual commit.'
+          }
+        >
+          <GitCommitHorizontal className="size-3.5" />
+          {manualCommit ? 'Manual commit' : 'Auto-commit'}
+        </Button>
+        {inTransaction && (
+          <>
+            <Badge tone="warning" title="This tab's session holds a transaction open">
+              Transaction open
+            </Badge>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={running}
+              onClick={() => void endTransaction(true)}
+              title={commitSql(dialect)}
+            >
+              <Check className="size-3.5" /> Commit
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={running}
+              onClick={() => void endTransaction(false)}
+              title={rollbackSql(dialect)}
+            >
+              <Undo2 className="size-3.5" /> Rollback
+            </Button>
+          </>
+        )}
         <ToolbarDivider />
         <ConnectionPicker
           value={tab.connectionId}
           sql
-          onChange={(id) => {
+          onChange={async (id) => {
+            if (
+              openTransactionsStore.get()[tab.id] &&
+              !(await confirm({
+                title: 'Switch connection with an open transaction?',
+                message:
+                  "Switching ends this tab's session, which rolls back the uncommitted changes.",
+                confirmLabel: 'Roll back and switch',
+                danger: true
+              }))
+            )
+              return
+            setInTransaction(tab.id, false)
             void api.closeSession(tab.connectionId, tab.id).catch(() => {})
             updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })
           }}
@@ -484,6 +601,16 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           />
         </Panel>
       </Group>
+      {paramPrompt && (
+        <ParamsDialog
+          names={paramPrompt.names}
+          dialect={dialect}
+          onDone={(values) => {
+            paramPrompt.resolve(values)
+            setParamPrompt(null)
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -23,7 +23,8 @@ function output(...cells: string[][]): ExecOutput {
     error: null,
     elapsedMs: 5,
     cancelled: false,
-    database: null
+    database: null,
+    inTransaction: null
   }
 }
 

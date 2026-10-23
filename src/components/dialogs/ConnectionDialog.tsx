@@ -34,6 +34,7 @@ import {
   statusOf
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
+import { SshFields } from './SshFields'
 
 export function ConnectionDialogHost(): React.JSX.Element | null {
   const state = connectionDialogStore.use()
@@ -73,6 +74,7 @@ function ConnectionDialog({
       : (prefill?.config ?? null)
   )
   const [password, setPassword] = useState(prefill?.password ?? '')
+  const [sshSecret, setSshSecret] = useState('')
   const [paste, setPaste] = useState('')
   const [test, setTest] = useState<TestState>({ state: 'idle' })
   const [saving, setSaving] = useState(false)
@@ -258,7 +260,7 @@ function ConnectionDialog({
   const runTest = async (): Promise<void> => {
     setTest({ state: 'testing' })
     try {
-      const info = await api.connectionTest(effective(), password || null)
+      const info = await api.connectionTest(effective(), password || null, sshSecret)
       setTest({ state: 'ok', info })
     } catch (e) {
       setTest({ state: 'error', error: errorMessage(e) })
@@ -268,7 +270,7 @@ function ConnectionDialog({
   const save = async (andConnect: boolean): Promise<void> => {
     setSaving(true)
     try {
-      const saved = await api.connectionSave(effective(), password || null)
+      const saved = await api.connectionSave(effective(), password || null, sshSecret)
       await loadConnections()
       closeConnectionDialog()
       toast(isNew ? `Added ${saved.name || saved.host}` : `Saved ${saved.name || saved.host}`)
@@ -627,6 +629,20 @@ function ConnectionDialog({
             </Field>
           )}
         </div>
+
+        {!sqlite && config.cloud?.provider !== 'fly' && (
+          <SshFields
+            ssh={config.ssh}
+            onChange={(ssh) => patch({ ssh })}
+            secret={sshSecret}
+            onSecret={(s) => {
+              setSshSecret(s)
+              setTest({ state: 'idle' })
+            }}
+            hasSavedSecret={!duplicate && !!editing?.ssh && editing.ssh.auth !== 'agent'}
+            uriMode={usesUri}
+          />
+        )}
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-3 rounded-lg border border-line bg-raised/40 p-3">
           <Toggle

@@ -76,6 +76,8 @@ impl Server {
                 let wrong_db = !database.is_empty()
                     && !guard.session.database().eq_ignore_ascii_case(database);
                 if stale || (wrong_db && matches!(guard.session, Session::Pg(_))) {
+                    // A dropped SSH or Fly tunnel comes back on the same port
+                    tunnel::ensure(&self.config.id).await?;
                     guard.session =
                         Session::connect(&self.config, self.password.as_deref(), database).await?;
                 } else if wrong_db {
@@ -92,6 +94,7 @@ impl Server {
             return Ok(slot);
         }
 
+        tunnel::ensure(&self.config.id).await?;
         let session = Session::connect(&self.config, self.password.as_deref(), database).await?;
         let slot = Arc::new(Mutex::new(Slot {
             session,
@@ -154,7 +157,11 @@ impl Server {
             out.finish(None)
         } else {
             let mut guard = slot.lock().await;
-            let output = guard.session.execute(sql, opts, &signal).await;
+            let mut output = guard.session.execute(sql, opts, &signal).await;
+            // Editor tabs show when they hold a transaction open
+            if !key.starts_with(META) && !guard.session.is_broken() {
+                output.in_transaction = guard.session.in_transaction().await;
+            }
             guard.last_used = Instant::now();
             output
         };
@@ -318,10 +325,14 @@ type Probed = (ServerInfo, Option<mongodb::Client>, Option<Session>);
 
 /// Connects without registering anything; used by "Test connection". A tunnel
 /// the connection needs only lives for the test.
-pub async fn probe(config: &ConnectionConfig, password: Option<&str>) -> AppResult<Probed> {
+pub async fn probe(
+    config: &ConnectionConfig,
+    password: Option<&str>,
+    ssh_secret: Option<&str>,
+) -> AppResult<Probed> {
     let key = format!("probe:{}", uuid::Uuid::new_v4());
     let result = async {
-        let config = tunnel::prepare(&key, config.clone()).await?;
+        let config = tunnel::prepare(&key, config.clone(), ssh_secret).await?;
         probe_direct(&config, password).await
     }
     .await;
@@ -346,9 +357,9 @@ impl Manager {
         config: ConnectionConfig,
         password: Option<String>,
     ) -> AppResult<ServerInfo> {
-        // A tunnel (Fly.io) stays up while the connection is open
+        // A tunnel (Fly.io, SSH) stays up while the connection is open
         let id = config.id.clone();
-        let config = tunnel::prepare(&id, config).await?;
+        let config = tunnel::prepare(&id, config, None).await?;
         let (info, mongo, session) = match probe_direct(&config, password.as_deref()).await {
             Ok(probed) => probed,
             Err(e) => {

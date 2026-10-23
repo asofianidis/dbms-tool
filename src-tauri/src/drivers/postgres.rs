@@ -146,6 +146,31 @@ impl PgSession {
         self.client.is_closed()
     }
 
+    /// `now()` is fixed at the start of the transaction, so it only differs from
+    /// the statement's start inside a transaction block. Sent as one simple
+    /// query: the extended protocol's separate messages would move the
+    /// statement's start past an implicit transaction's.
+    pub async fn in_transaction(&self) -> Option<bool> {
+        match self
+            .client
+            .simple_query("SELECT now() <> statement_timestamp()")
+            .await
+        {
+            Ok(messages) => messages.iter().find_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(|v| v == "t"),
+                _ => None,
+            }),
+            // A failed transaction block refuses everything until it ends
+            Err(e)
+                if e.code()
+                    == Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION) =>
+            {
+                Some(true)
+            }
+            Err(_) => None,
+        }
+    }
+
     /// The underlying client, for the built-in backup's COPY streams.
     pub fn client(&self) -> &Client {
         &self.client

@@ -83,6 +83,11 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
             )),
             _ => None,
         };
+        // Through a tunnel, replica set discovery would find members by their
+        // own (unreachable) names, so talk to the one the tunnel reaches
+        if cfg.tunneled.is_some() {
+            opts.direct_connection = Some(true);
+        }
         opts
     } else {
         let mut opts = ClientOptions::parse(super::mongo_srv::expand(uri).await?).await?;

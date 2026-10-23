@@ -6,6 +6,7 @@ import { ENGINES } from './engines'
 import type { QueryState } from './filters'
 import { createPersistentStore, createStore } from './store'
 import { errorMessage, toast } from './toast'
+import { clearTransactionState, openTransactionsStore } from './transactions'
 
 /* ---------- Tabs ---------- */
 
@@ -92,6 +93,15 @@ export type Tab =
       scope: CompareScope
       target: CompareTarget | null
     }
+  | {
+      id: string
+      kind: 'import'
+      connectionId: string
+      database: string
+      schema: string | null
+      /** Table or collection to import into; null to choose or create one in the wizard */
+      table: string | null
+    }
 
 /** The side of a comparison the migration script runs against. */
 export interface CompareTarget {
@@ -149,7 +159,20 @@ export function updateTab(id: string, patch: Partial<Tab>): void {
   }))
 }
 
-export function closeTab(id: string): void {
+export function closeTab(id: string, force = false): void {
+  // Ending the session rolls back whatever the tab hasn't committed
+  if (!force && openTransactionsStore.get()[id]) {
+    activateTab(id)
+    void confirm({
+      title: 'Close with an open transaction?',
+      message:
+        'This tab has a transaction that is still open. Closing it ends the session, which rolls back the uncommitted changes.',
+      confirmLabel: 'Roll back and close',
+      danger: true
+    }).then((ok) => ok && closeTab(id, true))
+    return
+  }
+  clearTransactionState(id)
   const tab = tabsStore.get().tabs.find((t) => t.id === id)
   if (tab && 'connectionId' in tab) void api.closeSession(tab.connectionId, tab.id).catch(() => {})
   runsStore.set((r) => {
@@ -411,6 +434,24 @@ export function openDiagram(connectionId: string, database: string, schema: stri
       t.connectionId === connectionId &&
       t.database === database &&
       t.schema === schema
+  )
+}
+
+/** Opens the import wizard for a table or collection (`table` null to pick or create one). */
+export function openImport(
+  connectionId: string,
+  database: string,
+  schema: string | null,
+  table: string | null = null
+): void {
+  openTab(
+    { id: tabId(), kind: 'import', connectionId, database, schema, table },
+    (t) =>
+      t.kind === 'import' &&
+      t.connectionId === connectionId &&
+      t.database === database &&
+      t.schema === schema &&
+      t.table === table
   )
 }
 
