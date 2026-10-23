@@ -41,6 +41,18 @@ export const queries = {
       queryKey: ['conn', id, 'definition', database, schema, name, kind, detail ?? null],
       queryFn: () => api.definition(id, database, schema, name, kind, detail)
     }),
+  routine: (
+    id: string,
+    database: string,
+    schema: string | null,
+    name: string,
+    kind: string,
+    detail?: string | null
+  ) =>
+    queryOptions({
+      queryKey: ['conn', id, 'routine', database, schema, name, kind, detail ?? null],
+      queryFn: () => api.routine(id, database, schema, name, kind, detail)
+    }),
   completion: (id: string, database: string) =>
     queryOptions({
       queryKey: ['conn', id, 'completion', database],

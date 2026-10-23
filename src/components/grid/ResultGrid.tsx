@@ -641,7 +641,7 @@ export const ResultGrid = memo(function ResultGrid({
               key={vr.key}
               className={cn(
                 'absolute left-0 flex border-b border-line/60',
-                vr.index % 2 === 1 && 'bg-white/[0.012]',
+                vr.index % 2 === 1 && 'bg-bright/[0.025]',
                 status === 'inserted' && 'bg-ok/[0.06]',
                 status === 'deleted' &&
                   'bg-danger/[0.07] text-faint line-through decoration-danger/60'

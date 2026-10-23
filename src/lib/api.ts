@@ -100,6 +100,20 @@ export interface TableInfo {
   foreignKeys: ForeignKeyInfo[]
 }
 
+export interface RoutineParam {
+  name: string
+  dataType: string
+  /** IN | OUT | INOUT | VARIADIC | OUTPUT (T-SQL) */
+  mode: string
+}
+
+export interface RoutineInfo {
+  params: RoutineParam[]
+  /** Return type for functions; `TABLE` for table-valued functions */
+  returns: string | null
+  language: string | null
+}
+
 export interface CompletionTable {
   schema: string | null
   name: string
@@ -248,6 +262,15 @@ export const api = {
       kind,
       detail: detail ?? null
     }),
+  routine: (
+    id: string,
+    database: string,
+    schema: string | null,
+    name: string,
+    kind: string,
+    detail?: string | null
+  ) =>
+    invoke<RoutineInfo>('db_routine', { id, database, schema, name, kind, detail: detail ?? null }),
   completion: (id: string, database: string) =>
     invoke<CompletionTable[]>('db_completion', { id, database }),
 

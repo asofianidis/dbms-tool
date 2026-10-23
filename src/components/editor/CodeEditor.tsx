@@ -116,7 +116,9 @@ const theme = EditorView.theme(
     '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
       backgroundColor: 'color-mix(in srgb, var(--color-accent) 22%, transparent) !important'
     },
-    '.cm-activeLine': { backgroundColor: 'rgb(255 255 255 / 0.025)' },
+    '.cm-activeLine': {
+      backgroundColor: 'color-mix(in srgb, var(--color-bright) 3%, transparent)'
+    },
     '.cm-gutters': {
       backgroundColor: 'transparent',
       color: 'var(--color-faint)',
@@ -130,7 +132,9 @@ const theme = EditorView.theme(
       backgroundColor: 'color-mix(in srgb, var(--color-accent) 18%, transparent)',
       outline: 'none'
     },
-    '.cm-selectionMatch': { backgroundColor: 'rgb(255 255 255 / 0.07)' },
+    '.cm-selectionMatch': {
+      backgroundColor: 'color-mix(in srgb, var(--color-bright) 9%, transparent)'
+    },
     '.cm-searchMatch': {
       backgroundColor: 'rgb(242 184 75 / 0.25)',
       outline: '1px solid rgb(242 184 75 / 0.5)'
@@ -141,7 +145,7 @@ const theme = EditorView.theme(
       backgroundColor: 'var(--color-raised)',
       border: '1px solid var(--color-line-strong)',
       borderRadius: '8px',
-      boxShadow: '0 16px 40px rgb(0 0 0 / 0.5)',
+      boxShadow: '0 16px 40px var(--shadow)',
       overflow: 'hidden'
     },
     '.cm-tooltip-autocomplete > ul': {

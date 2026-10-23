@@ -260,10 +260,10 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-center bg-black/50 pt-[12vh]"
+      className="fixed inset-0 z-50 flex justify-center bg-(--backdrop) pt-[12vh]"
       onMouseDown={(e) => e.target === e.currentTarget && closePalette()}
     >
-      <div className="flex h-fit max-h-[60vh] w-full max-w-xl animate-rise flex-col overflow-hidden rounded-xl border border-line-strong bg-panel shadow-2xl shadow-black/60">
+      <div className="flex h-fit max-h-[60vh] w-full max-w-xl animate-rise flex-col overflow-hidden rounded-xl border border-line-strong bg-panel shadow-2xl shadow-(color:--shadow)">
         <div className="flex items-center gap-2.5 border-b border-line px-3.5">
           <Search className="size-4 shrink-0 text-muted" />
           <input

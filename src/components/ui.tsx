@@ -424,7 +424,7 @@ export function Toaster(): React.JSX.Element {
         return (
           <div
             key={t.id}
-            className="pointer-events-auto flex animate-rise items-start gap-2.5 rounded-lg border border-line-strong bg-raised px-3.5 py-3 text-[13px] shadow-2xl shadow-black/50"
+            className="pointer-events-auto flex animate-rise items-start gap-2.5 rounded-lg border border-line-strong bg-raised px-3.5 py-3 text-[13px] shadow-2xl shadow-(color:--shadow)"
           >
             <Icon
               className={cn(
@@ -477,19 +477,19 @@ export function Modal({
     const first = ref.current?.querySelector<HTMLElement>(
       'input, textarea, select, [data-autofocus]'
     )
-    first?.focus()
+    first?.focus({ preventScroll: true })
     return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose])
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 px-4 pt-[10vh] pb-8 backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-(--backdrop) px-4 pt-[10vh] pb-8 backdrop-blur-[2px]"
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
       <div
         ref={ref}
         role="dialog"
         className={cn(
-          'flex max-h-[80vh] w-full animate-rise flex-col rounded-xl border border-line-strong bg-panel shadow-2xl shadow-black/60',
+          'flex max-h-[80vh] w-full animate-rise flex-col rounded-xl border border-line-strong bg-panel shadow-2xl shadow-(color:--shadow)',
           width === 'sm' && 'max-w-sm',
           width === 'md' && 'max-w-lg',
           width === 'lg' && 'max-w-2xl',

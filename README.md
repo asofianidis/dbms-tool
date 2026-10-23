@@ -21,6 +21,8 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   connection-string paste (`postgres://`, `mysql://`, `mongodb+srv://`, ADO.NET).
 - Passwords stored in the OS credential manager, never on disk.
 - Query history, file open/save, and tabs that survive restarts.
+- Dark and light themes (or follow the OS) with a title-bar toggle, an accent override, and a
+  theme editor with live preview and JSON import/export for sharing.
 
 **SQL**
 
@@ -37,6 +39,9 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   delete) applied in one transaction after you review the generated SQL.
 - Structure view, generated or server-provided DDL, and "Script as SELECT/INSERT/UPDATE/DELETE/
   CREATE/DROP".
+- Stored procedures and functions: parameters (with IN/OUT modes) and return types in the
+  explorer, an Execute dialog that builds the right `EXEC` / `CALL` / `SELECT` (capturing OUTPUT
+  parameters), Modify (ALTER) scripts, and new procedure/function templates per engine.
 - Confirmation before `DELETE`/`UPDATE` without `WHERE`, `DROP` and `TRUNCATE`.
 
 **Babelfish**

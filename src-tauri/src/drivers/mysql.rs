@@ -567,6 +567,45 @@ impl MySession {
         Ok(row.and_then(|r| text(&r, column)))
     }
 
+    pub async fn describe_routine(
+        &mut self,
+        database: &str,
+        name: &str,
+        kind: &str,
+    ) -> AppResult<RoutineInfo> {
+        let routine_type = if kind == "procedure" {
+            "PROCEDURE"
+        } else {
+            "FUNCTION"
+        };
+        let rows = self
+            .rows(
+                "SELECT ordinal_position, parameter_name, parameter_mode, dtd_identifier \
+                 FROM information_schema.parameters \
+                 WHERE specific_schema = ? AND specific_name = ? AND routine_type = ? \
+                 ORDER BY ordinal_position",
+                vec![database.into(), name.into(), routine_type.into()],
+            )
+            .await?;
+        let mut info = RoutineInfo {
+            language: Some("SQL".into()),
+            ..Default::default()
+        };
+        for r in &rows {
+            // Position 0 is a function's return value
+            if text(r, 0).as_deref() == Some("0") {
+                info.returns = text(r, 3);
+                continue;
+            }
+            info.params.push(RoutineParam {
+                name: text(r, 1).unwrap_or_default(),
+                mode: text(r, 2).unwrap_or_else(|| "IN".into()),
+                data_type: text(r, 3).unwrap_or_default(),
+            });
+        }
+        Ok(info)
+    }
+
     pub async fn completion(&mut self, database: &str) -> AppResult<Vec<CompletionTable>> {
         let rows = self
             .rows(

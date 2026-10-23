@@ -17,6 +17,7 @@
     "dialog:allow-open",
     "updater:default",
     "process:allow-restart",
-    "opener:allow-open-url"
+    "opener:allow-open-url",
+    "core:window:allow-set-background-color"
   ]
 }

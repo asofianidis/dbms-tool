@@ -52,6 +52,8 @@ export function createPersistentStore<T>(key: string, initial: T): Store<T> {
     clearTimeout(timer)
     timer = setTimeout(flush, 300)
   })
-  window.addEventListener('pagehide', () => timer !== undefined && flush())
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => timer !== undefined && flush())
+  }
   return store
 }

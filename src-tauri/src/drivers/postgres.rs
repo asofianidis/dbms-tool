@@ -506,6 +506,58 @@ impl PgSession {
         Ok(rows.first().map(|r| r.get(0)))
     }
 
+    pub async fn describe_routine(
+        &self,
+        schema: &str,
+        name: &str,
+        identity_args: &str,
+    ) -> AppResult<RoutineInfo> {
+        const FILTER: &str =
+            "n.nspname = $1 AND p.proname = $2 AND pg_get_function_identity_arguments(p.oid) = $3";
+        let head = self
+            .strings(
+                &format!(
+                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text \
+                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                     JOIN pg_language l ON l.oid = p.prolang WHERE {FILTER}"
+                ),
+                &[&schema, &name, &identity_args],
+            )
+            .await?;
+        let Some(head) = head.first() else {
+            return Err(AppError::msg(format!("{schema}.{name} no longer exists")));
+        };
+        let params = self
+            .strings(
+                &format!(
+                    "SELECT coalesce(a.n, ''), format_type(a.t, NULL), \
+                       CASE coalesce(a.m::text, 'i') WHEN 'o' THEN 'OUT' WHEN 'b' THEN 'INOUT' \
+                         WHEN 'v' THEN 'VARIADIC' WHEN 't' THEN 'TABLE' ELSE 'IN' END \
+                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                     CROSS JOIN LATERAL unnest(coalesce(p.proallargtypes, p.proargtypes::oid[]), \
+                       coalesce(p.proargnames, '{{}}'::text[]), coalesce(p.proargmodes, '{{}}'::\"char\"[])) \
+                       WITH ORDINALITY AS a(t, n, m, o) \
+                     WHERE {FILTER} AND a.t IS NOT NULL ORDER BY a.o"
+                ),
+                &[&schema, &name, &identity_args],
+            )
+            .await?;
+        Ok(RoutineInfo {
+            params: params
+                .iter()
+                .map(|r| RoutineParam {
+                    name: r.get(0),
+                    data_type: r.get(1),
+                    mode: r.get(2),
+                })
+                // Columns of RETURNS TABLE functions are part of the result, not inputs
+                .filter(|p| p.mode != "TABLE")
+                .collect(),
+            returns: head.get(0),
+            language: head.get(1),
+        })
+    }
+
     pub async fn completion(&self) -> AppResult<Vec<CompletionTable>> {
         let rows = self
             .strings(

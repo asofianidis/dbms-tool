@@ -445,3 +445,138 @@ async fn mongo_end_to_end() {
 
     run(json!({ "op": "dropDatabase", "database": "dbms_test" })).await;
 }
+
+/// Procedures and functions are listed and described on every SQL engine.
+#[tokio::test]
+async fn routines_end_to_end() {
+    let tsql = "IF OBJECT_ID('dbo.probe_proc') IS NOT NULL DROP PROCEDURE dbo.probe_proc;\n\
+        IF OBJECT_ID('dbo.probe_fn') IS NOT NULL DROP FUNCTION dbo.probe_fn;\n\
+        IF OBJECT_ID('dbo.probe_tvf') IS NOT NULL DROP FUNCTION dbo.probe_tvf;\nGO\n\
+        CREATE PROCEDURE dbo.probe_proc @x INT, @y NVARCHAR(10) = N'a' OUTPUT AS SELECT @x;\nGO\n\
+        CREATE FUNCTION dbo.probe_fn(@a INT) RETURNS INT AS BEGIN RETURN @a + 1 END;\nGO\n\
+        CREATE FUNCTION dbo.probe_tvf(@a INT) RETURNS TABLE AS RETURN SELECT @a AS a;";
+    let cases = [
+        (
+            Engine::Postgres,
+            "DBMS_TEST_PG",
+            "postgres",
+            "DROP PROCEDURE IF EXISTS probe_proc(int); DROP PROCEDURE IF EXISTS probe_proc(int, text); \n             CREATE OR REPLACE FUNCTION probe_fn(a int, b int DEFAULT 2) RETURNS int LANGUAGE sql AS $$ SELECT a + b $$; \
+             CREATE OR REPLACE PROCEDURE probe_proc(x int, INOUT y text) LANGUAGE plpgsql AS $$ BEGIN y := x::text; END $$;",
+        ),
+        (
+            Engine::Mysql,
+            "DBMS_TEST_MYSQL",
+            "probe",
+            "CREATE DATABASE IF NOT EXISTS probe; USE probe; DROP PROCEDURE IF EXISTS probe_proc; DROP FUNCTION IF EXISTS probe_fn; \
+             CREATE PROCEDURE probe_proc(IN x INT, OUT y INT) SET y = x * 2; \
+             CREATE FUNCTION probe_fn(a INT) RETURNS INT DETERMINISTIC RETURN a + 1;",
+        ),
+        (Engine::Mssql, "DBMS_TEST_MSSQL", "master", tsql),
+        (Engine::Babelfish, "DBMS_TEST_BABELFISH", "master", tsql),
+    ];
+    for (engine, var, db, setup) in cases {
+        let Some((m, id)) = open(engine, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let setup_db = if engine == Engine::Mysql { "" } else { db };
+        let out = s.execute("t", setup_db, setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+
+        let schema = (engine == Engine::Postgres).then_some("public");
+        let objects = s.list_objects(db, schema).await.unwrap();
+        let find = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+        };
+        assert_eq!(find("probe_proc").kind, "procedure", "{var}");
+        assert_eq!(find("probe_fn").kind, "function", "{var}");
+
+        let routine_schema = if engine == Engine::Mysql {
+            None
+        } else {
+            find("probe_fn").schema.as_deref()
+        };
+        let f = s
+            .describe_routine(
+                db,
+                routine_schema,
+                "probe_fn",
+                "function",
+                find("probe_fn").detail.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.params[0].mode, "IN", "{var}: {f:?}");
+        assert!(
+            f.returns.as_deref().is_some_and(|r| r.contains("int")),
+            "{var}: {f:?}"
+        );
+        let p = s
+            .describe_routine(
+                db,
+                routine_schema,
+                "probe_proc",
+                "procedure",
+                find("probe_proc").detail.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.params.len(), 2, "{var}: {p:?}");
+        assert!(
+            matches!(p.params[1].mode.as_str(), "OUT" | "INOUT" | "OUTPUT"),
+            "{var}: {p:?}"
+        );
+        assert!(p.returns.is_none(), "{var}: {p:?}");
+
+        if engine == Engine::Mssql || engine == Engine::Babelfish {
+            let tvf = s
+                .describe_routine(db, Some("dbo"), "probe_tvf", "function", None)
+                .await
+                .unwrap();
+            assert_eq!(tvf.returns.as_deref(), Some("TABLE"), "{var}: {tvf:?}");
+            assert!(
+                p.params[1].data_type.starts_with("nvarchar"),
+                "{var}: {p:?}"
+            );
+        }
+        println!("{var}: fn {f:?}\n{var}: proc {p:?}");
+
+        // Run the exact statements the Execute dialog generates (see routines.test.ts)
+        let calls: &[(&str, &str)] = match engine {
+            Engine::Postgres => &[
+                ("SELECT *\nFROM public.probe_fn(a => 1);", "3"),
+                ("CALL public.probe_proc(x => 3, y => NULL);", "3"),
+            ],
+            Engine::Mysql => &[(
+                "CALL `probe`.`probe_proc`(2 + 2, @y);\nSELECT @y AS `y`;",
+                "8",
+            )],
+            _ => &[
+                (
+                    "DECLARE @y nvarchar(10);\nEXEC [dbo].[probe_proc]\n  @x = 5,\n  @y = @y OUTPUT;\nSELECT @y AS [@y];",
+                    "5",
+                ),
+                ("SELECT [dbo].[probe_fn](1) AS [probe_fn];", "2"),
+                ("SELECT *\nFROM [dbo].[probe_tvf](3);", "3"),
+            ],
+        };
+        for (sql, expected) in calls {
+            let out = s.execute("t", db, sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {sql}\n{:?}", out.error);
+            assert_eq!(cell(&out, 0, 0, 0), json!(expected), "{var}: {sql}");
+        }
+
+        // MySQL routine bodies contain semicolons and are sent without DELIMITER
+        if engine == Engine::Mysql {
+            let template = "DROP PROCEDURE IF EXISTS new_procedure;\n\
+                CREATE PROCEDURE new_procedure(IN p_id INT, OUT p_count INT)\nBEGIN\n  -- procedure body\n  \
+                SELECT COUNT(*) INTO p_count FROM information_schema.tables WHERE table_schema = DATABASE();\nEND;\n\
+                CALL new_procedure(1, @c);\nSELECT @c IS NOT NULL;";
+            let out = s.execute("t", db, template, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        }
+    }
+}

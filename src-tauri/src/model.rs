@@ -96,6 +96,24 @@ pub struct TableInfo {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RoutineParam {
+    pub name: String,
+    pub data_type: String,
+    /// IN | OUT | INOUT | VARIADIC | OUTPUT (T-SQL)
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineInfo {
+    pub params: Vec<RoutineParam>,
+    /// Return type for functions; `TABLE` for table-valued functions
+    pub returns: Option<String>,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompletionTable {
     pub schema: Option<String>,
     pub name: String,

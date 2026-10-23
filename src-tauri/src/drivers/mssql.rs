@@ -768,6 +768,67 @@ impl MsSession {
         Ok(rows.first().and_then(|r| text(r, 0)))
     }
 
+    pub async fn describe_routine(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> AppResult<RoutineInfo> {
+        let qualified = format!("{}.{}", quote_ident(schema), quote_ident(name));
+        let rows = self
+            .rows_in(
+                database,
+                "SELECT p.name, \
+                   TYPE_NAME(p.user_type_id) + CASE \
+                     WHEN TYPE_NAME(p.user_type_id) IN ('varchar', 'char', 'varbinary', 'binary') \
+                       THEN '(' + CASE WHEN p.max_length = -1 THEN 'max' ELSE CAST(p.max_length AS varchar(10)) END + ')' \
+                     WHEN TYPE_NAME(p.user_type_id) IN ('nvarchar', 'nchar') \
+                       THEN '(' + CASE WHEN p.max_length = -1 THEN 'max' ELSE CAST(p.max_length / 2 AS varchar(10)) END + ')' \
+                     WHEN TYPE_NAME(p.user_type_id) IN ('decimal', 'numeric') \
+                       THEN '(' + CAST(p.precision AS varchar(10)) + ',' + CAST(p.scale AS varchar(10)) + ')' \
+                     ELSE '' END, \
+                   CAST(p.is_output AS int), p.parameter_id \
+                 FROM sys.all_parameters p WHERE p.object_id = OBJECT_ID(@P1) ORDER BY p.parameter_id",
+                Some(
+                    "SELECT PARAMETER_NAME, DATA_TYPE + CASE \
+                       WHEN CHARACTER_MAXIMUM_LENGTH = -1 THEN '(max)' \
+                       WHEN CHARACTER_MAXIMUM_LENGTH IS NOT NULL THEN '(' + CAST(CHARACTER_MAXIMUM_LENGTH AS varchar(10)) + ')' \
+                       ELSE '' END, \
+                       CASE PARAMETER_MODE WHEN 'IN' THEN 0 ELSE 1 END, \
+                       CASE IS_RESULT WHEN 'YES' THEN 0 ELSE ORDINAL_POSITION END \
+                     FROM INFORMATION_SCHEMA.PARAMETERS \
+                     WHERE QUOTENAME(SPECIFIC_SCHEMA) + '.' + QUOTENAME(SPECIFIC_NAME) = @P1 \
+                     ORDER BY ORDINAL_POSITION",
+                ),
+                &[&qualified.as_str()],
+            )
+            .await?;
+        let mut info = RoutineInfo {
+            language: Some("T-SQL".into()),
+            ..Default::default()
+        };
+        for r in &rows {
+            let name = text(r, 0).unwrap_or_default();
+            // Parameter 0 is a scalar function's return value
+            if text(r, 3).as_deref() == Some("0") || name.is_empty() {
+                info.returns.get_or_insert(text(r, 1).unwrap_or_default());
+                continue;
+            }
+            info.params.push(RoutineParam {
+                name,
+                data_type: text(r, 1).unwrap_or_default(),
+                mode: if flag(r, 2) { "OUTPUT" } else { "IN" }.into(),
+            });
+        }
+        // Scalar functions have a return-value row; table-valued ones don't. (Babelfish
+        // reports TVFs as type FN, so sys.objects can't tell them apart.)
+        if kind == "function" && info.returns.is_none() {
+            info.returns = Some("TABLE".into());
+        }
+        Ok(info)
+    }
+
     pub async fn completion(&mut self, database: &str) -> AppResult<Vec<CompletionTable>> {
         let rows = self
             .rows_in(

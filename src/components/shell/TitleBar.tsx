@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { Minus, Search, Square, X } from 'lucide-react'
+import { Minus, Moon, Search, Square, Sun, X } from 'lucide-react'
 import { cn } from '@/lib/cn'
 import { MOD } from '@/lib/keys'
 import { activeTab, connectionsStore, openPalette, tabsStore } from '@/lib/workspace'
 import { connectionLabel } from '@/lib/engines'
 import { Kbd, LogoMark } from '../ui'
 import { UpdateButton } from './UpdateButton'
+import { settingsStore } from '@/lib/settings'
+import { resolvedBase, toggleThemeMode } from '@/lib/themes'
 
 const appWindow = getCurrentWindow()
 
@@ -27,6 +29,8 @@ function RestoreIcon(): React.JSX.Element {
 
 export function TitleBar(): React.JSX.Element {
   const [maximized, setMaximized] = useState(false)
+  settingsStore.use()
+  const dark = resolvedBase() === 'dark'
   tabsStore.use()
   const connections = connectionsStore.use()
   const tab = activeTab()
@@ -89,6 +93,19 @@ export function TitleBar(): React.JSX.Element {
 
       <div className="relative z-10 mr-2 flex items-center">
         <UpdateButton />
+        <button
+          type="button"
+          onClick={toggleThemeMode}
+          title={dark ? 'Switch to light theme' : 'Switch to dark theme'}
+          aria-label={dark ? 'Switch to light theme' : 'Switch to dark theme'}
+          className="ml-1 flex size-7 items-center justify-center rounded-md text-muted transition-colors hover:bg-hover hover:text-bright"
+        >
+          {dark ? (
+            <Sun className="size-4" strokeWidth={1.75} />
+          ) : (
+            <Moon className="size-4" strokeWidth={1.75} />
+          )}
+        </button>
       </div>
 
       <div className="relative z-10 flex h-full">

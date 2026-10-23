@@ -22,6 +22,8 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
+      /** Run the whole script once when the tab first opens */
+      autorun?: boolean
     }
   | {
       id: string
@@ -258,7 +260,12 @@ export function defaultDatabase(id: string): string {
 
 let untitled = 0
 
-export function newQueryTab(connectionId?: string, database?: string, text = ''): void {
+export function newQueryTab(
+  connectionId?: string,
+  database?: string,
+  text = '',
+  options: { autorun?: boolean; title?: string } = {}
+): void {
   const fallback = connectionId ?? activeConnectionId() ?? connectionsStore.get()[0]?.id
   if (!fallback) {
     openConnectionDialog()
@@ -272,9 +279,10 @@ export function newQueryTab(connectionId?: string, database?: string, text = '')
     kind,
     connectionId: fallback,
     database: database ?? defaultDatabase(fallback),
-    title: `${kind === 'mongo' ? 'shell' : 'query'}-${untitled}`,
-    text
-  })
+    title: options.title ?? `${kind === 'mongo' ? 'shell' : 'query'}-${untitled}`,
+    text,
+    ...(options.autorun && kind === 'query' ? { autorun: true } : {})
+  } as Tab)
 }
 
 export function openTable(

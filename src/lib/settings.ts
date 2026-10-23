@@ -1,10 +1,17 @@
-import { readPersisted } from './persist'
 import { createPersistentStore } from './store'
 
+export type ThemeMode = 'dark' | 'light' | 'system'
+
 export interface Settings {
+  /** Accent override; empty uses the current theme's accent */
   accent: string
-  /** Bumped when the default accent changes, so old defaults can be migrated */
+  /** Bumped when accent semantics change, so stored values can be migrated (see themes.ts) */
   accentVersion: number
+  themeMode: ThemeMode
+  /** Theme used in dark mode */
+  darkTheme: string
+  /** Theme used in light mode */
+  lightTheme: string
   editorFontSize: number
   /** Rows kept per result set; the rest are counted but not transferred */
   maxRows: number
@@ -19,13 +26,12 @@ export interface Settings {
   autoUpdate: boolean
 }
 
+/** Fallback when an accent value is malformed */
 export const DEFAULT_ACCENT = '#a8c7fa'
-
-/** The default before the switch to blue; installs still on it move to the new default */
-const PREVIOUS_DEFAULT_ACCENT = '#c4f042'
 
 export const ACCENTS = [
   { value: '#a8c7fa', label: 'Sky' },
+  { value: '#2563d9', label: 'Blue' },
   { value: '#c4f042', label: 'Lime' },
   { value: '#5fe0c8', label: 'Teal' },
   { value: '#d49bff', label: 'Violet' },
@@ -35,8 +41,11 @@ export const ACCENTS = [
 ]
 
 export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1', {
-  accent: DEFAULT_ACCENT,
-  accentVersion: 2,
+  accent: '',
+  accentVersion: 3,
+  themeMode: 'dark',
+  darkTheme: 'graphite',
+  lightTheme: 'paper',
   editorFontSize: 13,
   maxRows: 10_000,
   pageSize: 200,
@@ -46,14 +55,6 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   sidebarWidth: 280,
   autoUpdate: true
 })
-
-// Settings saved before accentVersion existed still carry the old lime default
-if (
-  !readPersisted('dbms.settings.v1')?.includes('accentVersion') &&
-  settingsStore.get().accent === PREVIOUS_DEFAULT_ACCENT
-) {
-  settingsStore.set((s) => ({ ...s, accent: DEFAULT_ACCENT, accentVersion: 2 }))
-}
 
 function luminance(hex: string): number {
   const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
@@ -78,8 +79,10 @@ function mix(hex: string, toward: number, t: number): string {
 /** Writes the accent and its derived tones to CSS variables. */
 export function applyAccent(accent: string): void {
   const hex = /^#[0-9a-f]{6}$/i.test(accent) ? accent : DEFAULT_ACCENT
+  const light = luminance(hex) > 0.45
   const root = document.documentElement.style
   root.setProperty('--accent', hex)
-  root.setProperty('--accent-hover', mix(hex, 255, 0.25))
-  root.setProperty('--accent-fg', luminance(hex) > 0.45 ? '#0b0e14' : '#f4f6fa')
+  // Bright accents get lighter on hover, deep ones darker, so hover always reads
+  root.setProperty('--accent-hover', light ? mix(hex, 255, 0.25) : mix(hex, 0, 0.15))
+  root.setProperty('--accent-fg', light ? '#0b0e14' : '#f8fafc')
 }

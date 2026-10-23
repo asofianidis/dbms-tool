@@ -1,7 +1,12 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
+  ArrowLeft,
+  ArrowLeftRight,
+  ArrowRight,
   ChevronRight,
+  CornerDownLeft,
+  Play,
   ChevronsDownUp,
   Code2,
   Columns3,
@@ -57,7 +62,8 @@ import {
 } from '@/lib/workspace'
 import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { Button, EngineMark, Spinner } from '@/components/ui'
-import { collectionMenu, createCollection, dropDatabase, objectMenu } from './actions'
+import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
+import { openExecuteRoutine } from './ExecuteRoutineDialog'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -578,12 +584,17 @@ function SchemaNode({
   )
 }
 
-const FOLDERS: { kinds: ObjectKind[]; label: string }[] = [
-  { kinds: ['table', 'foreign_table'], label: 'Tables' },
-  { kinds: ['view'], label: 'Views' },
+const FOLDERS: {
+  kinds: ObjectKind[]
+  label: string
+  always?: boolean
+  routine?: 'procedure' | 'function'
+}[] = [
+  { kinds: ['table', 'foreign_table'], label: 'Tables', always: true },
+  { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
-  { kinds: ['procedure'], label: 'Procedures' },
-  { kinds: ['function'], label: 'Functions' },
+  { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
+  { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
   { kinds: ['sequence'], label: 'Sequences' },
   { kinds: ['synonym'], label: 'Synonyms' }
 ]
@@ -606,14 +617,17 @@ function ObjectFolders({
     <>
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
-        if (!objects.length && folder.label !== 'Tables' && folder.label !== 'Views') return null
+        if (!objects.length && !folder.always) return null
+        const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
           <ObjectFolder
             key={folder.label}
             id={`c:${connection.id}/d:${database}/s:${schema ?? ''}/f:${folder.label}`}
             connection={connection}
             database={database}
-            label={folder.label}
+            schema={schema}
+            label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
+            routine={folder.routine}
             objects={objects}
             depth={depth}
           />
@@ -627,14 +641,18 @@ function ObjectFolder({
   id,
   connection,
   database,
+  schema,
   label,
+  routine,
   objects,
   depth
 }: {
   id: string
   connection: ConnectionConfig
   database: string
+  schema: string | null
   label: string
+  routine?: 'procedure' | 'function'
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -655,6 +673,40 @@ function ObjectFolder({
         icon={isOpen ? <FolderOpen className="text-faint" /> : <Folder className="text-faint" />}
         label={label}
         detail={filter ? `${visible.length}/${objects.length}` : objects.length}
+        onMenu={(e) =>
+          showContextMenu(e, [
+            { heading: label },
+            ...(routine
+              ? [
+                  {
+                    label: routine === 'procedure' ? 'New procedure' : 'New function',
+                    icon: <Plus />,
+                    onSelect: () => newRoutine(connection.id, database, schema, routine)
+                  }
+                ]
+              : []),
+            {
+              label: 'Refresh',
+              icon: <RefreshCw />,
+              onSelect: () =>
+                void queryClient.invalidateQueries({
+                  queryKey: ['conn', connection.id, 'objects', database]
+                })
+            }
+          ])
+        }
+        actions={
+          routine && (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title={routine === 'procedure' ? 'New procedure' : 'New function'}
+              onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          )
+        }
       />
       {isOpen &&
         visible.map((obj) => (
@@ -702,6 +754,7 @@ function ObjectNode({
   const id = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}(${obj.detail ?? ''})`
   const [open, setOpen] = useExpanded(id)
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(obj.kind)
+  const isRoutine = obj.kind === 'procedure' || obj.kind === 'function'
   const showSchema =
     (connection.engine === 'mssql' || connection.engine === 'babelfish') && obj.schema
   return (
@@ -709,7 +762,7 @@ function ObjectNode({
       <Row
         id={id}
         depth={depth}
-        expandable={browsable}
+        expandable={browsable || isRoutine}
         open={open}
         onToggle={() => setOpen()}
         onOpen={() =>
@@ -743,9 +796,24 @@ function ObjectNode({
             ? compactCount(obj.rowEstimate)
             : undefined
         }
+        actions={
+          isRoutine && (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="Execute…"
+              onClick={() => openExecuteRoutine(connection.id, database, obj)}
+            >
+              <Play className="size-3.5" />
+            </Button>
+          )
+        }
       />
       {open && browsable && (
         <TableChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
+      )}
+      {open && isRoutine && (
+        <RoutineChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
       )}
     </>
   )
@@ -874,6 +942,68 @@ function TableChildren({
             ))}
         </>
       )}
+    </>
+  )
+}
+
+function RoutineChildren({
+  connection,
+  database,
+  obj,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  obj: DbObject
+  depth: number
+}): React.JSX.Element {
+  const base = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}(${obj.detail ?? ''})`
+  const q = useQuery(
+    queries.routine(connection.id, database, obj.schema, obj.name, obj.kind, obj.detail)
+  )
+  if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
+  if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
+  const { params, returns } = q.data
+  return (
+    <>
+      {params.map((p, i) => {
+        const out = /^(OUT|OUTPUT)$/i.test(p.mode)
+        const inout = /^INOUT$/i.test(p.mode)
+        return (
+          <Row
+            key={`${p.name}:${i}`}
+            id={`${base}/p:${i}`}
+            depth={depth}
+            icon={
+              inout ? (
+                <ArrowLeftRight className="text-syn-number" />
+              ) : out ? (
+                <ArrowLeft className="text-syn-number" />
+              ) : (
+                <ArrowRight className="text-faint" />
+              )
+            }
+            label={p.name || `$${i + 1}`}
+            detail={
+              <span className="font-mono">
+                {p.dataType}
+                {p.mode !== 'IN' && <span className="text-faint/70"> {p.mode.toLowerCase()}</span>}
+              </span>
+            }
+          />
+        )
+      })}
+      {returns && (
+        <Row
+          id={`${base}/returns`}
+          depth={depth}
+          icon={<CornerDownLeft className="text-syn-type" />}
+          label="returns"
+          muted
+          detail={<span className="font-mono">{returns}</span>}
+        />
+      )}
+      {!params.length && !returns && <EmptyRow depth={depth}>No parameters</EmptyRow>}
     </>
   )
 }

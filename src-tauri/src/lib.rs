@@ -41,6 +41,7 @@ pub fn run() {
             commands::db_objects,
             commands::db_table,
             commands::db_definition,
+            commands::db_routine,
             commands::db_completion,
             commands::query_execute,
             commands::query_cancel,

@@ -57,11 +57,20 @@
   body,
   #root {
     height: 100%;
-    overflow: hidden;
+    /* clip, not hidden: focusing an element must never scroll the whole window */
+    overflow: clip;
   }
 
   html {
     color-scheme: dark;
+    --backdrop: rgb(0 0 0 / 0.6);
+    --shadow: rgb(0 0 0 / 0.55);
+  }
+
+  html[data-theme='light'] {
+    color-scheme: light;
+    --backdrop: rgb(20 24 28 / 0.28);
+    --shadow: rgb(20 24 28 / 0.16);
   }
 
   body {
@@ -107,7 +116,11 @@
 
 /* Faint dot grid used behind empty states */
 @utility bg-dots {
-  background-image: radial-gradient(circle at 1px 1px, rgb(255 255 255 / 0.05) 1px, transparent 0);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    color-mix(in srgb, var(--color-bright) 6%, transparent) 1px,
+    transparent 0
+  );
   background-size: 18px 18px;
 }
 

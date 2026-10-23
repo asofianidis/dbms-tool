@@ -254,6 +254,29 @@ impl Server {
         }
     }
 
+    pub async fn describe_routine(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        name: &str,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> AppResult<RoutineInfo> {
+        let slot = self.session(META, database).await?;
+        let mut guard = slot.lock().await;
+        match &mut guard.session {
+            Session::Pg(s) => {
+                s.describe_routine(schema.unwrap_or("public"), name, detail.unwrap_or(""))
+                    .await
+            }
+            Session::My(s) => s.describe_routine(database, name, kind).await,
+            Session::Ms(s) => {
+                s.describe_routine(database, schema.unwrap_or("dbo"), name, kind)
+                    .await
+            }
+        }
+    }
+
     pub async fn completion(&self, database: &str) -> AppResult<Vec<CompletionTable>> {
         let slot = self.session(META, database).await?;
         let mut guard = slot.lock().await;

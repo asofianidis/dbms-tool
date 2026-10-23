@@ -96,7 +96,7 @@ function MenuList({
     <div
       ref={ref}
       style={pos}
-      className="fixed z-[70] min-w-48 animate-rise rounded-lg border border-line-strong bg-raised p-1 shadow-2xl shadow-black/60"
+      className="fixed z-[70] min-w-48 animate-rise rounded-lg border border-line-strong bg-raised p-1 shadow-2xl shadow-(color:--shadow)"
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
     >

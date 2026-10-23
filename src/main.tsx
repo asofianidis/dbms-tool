@@ -10,6 +10,10 @@ import { loadPersistedState } from './lib/persist'
 
 // Stores read persisted state when their modules load, so load it before importing the app
 await loadPersistedState()
+// Apply the saved theme before the first paint so light mode doesn't flash dark
+const themes = await import('./lib/themes')
+themes.migrateAccentSetting()
+themes.applyCurrentTheme()
 const [{ App }, { queryClient }] = await Promise.all([import('./App'), import('./lib/queries')])
 
 createRoot(document.getElementById('root')!).render(

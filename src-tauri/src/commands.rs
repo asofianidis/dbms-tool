@@ -165,6 +165,29 @@ pub async fn db_definition(
 }
 
 #[tauri::command]
+pub async fn db_routine(
+    state: State<'_, AppState>,
+    id: String,
+    database: String,
+    schema: Option<String>,
+    name: String,
+    kind: String,
+    detail: Option<String>,
+) -> AppResult<RoutineInfo> {
+    state
+        .manager
+        .get(&id)?
+        .describe_routine(
+            &database,
+            schema.as_deref(),
+            &name,
+            &kind,
+            detail.as_deref(),
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn db_completion(
     state: State<'_, AppState>,
     id: String,

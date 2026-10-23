@@ -9,6 +9,7 @@ import { StatusBar } from './components/shell/StatusBar'
 import { TabBar } from './components/shell/TabBar'
 import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
+import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { Explorer } from './features/explorer/Explorer'
 import { HistoryPanel } from './features/history/HistoryPanel'
 import { CollectionTab } from './features/mongo/CollectionTab'
@@ -21,8 +22,8 @@ import { WelcomeTab } from './features/welcome/WelcomeTab'
 import { cn } from './lib/cn'
 import { isMod } from './lib/keys'
 import { queryClient } from './lib/queries'
-import { applyAccent, settingsStore } from './lib/settings'
 import { toastError } from './lib/toast'
+import { migrateAccentSetting, startThemeSync } from './lib/themes'
 import { startUpdateChecks } from './lib/updater'
 import {
   activateTab,
@@ -114,7 +115,8 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     bindQueryClient(queryClient)
-    applyAccent(settingsStore.get().accent)
+    migrateAccentSetting()
+    const stopThemes = startThemeSync()
     loadConnections().catch(toastError)
     if (!tabsStore.get().tabs.length) openWelcome()
     // Native menus on right-click make the app feel like a web page
@@ -127,6 +129,7 @@ export function App(): React.JSX.Element {
     return () => {
       window.removeEventListener('contextmenu', onContextMenu)
       stopUpdates()
+      stopThemes()
     }
   }, [])
 
@@ -198,6 +201,7 @@ export function App(): React.JSX.Element {
       <PasswordPromptHost />
       <ConfirmHost />
       <PromptHost />
+      <ExecuteRoutineHost />
       <ContextMenuHost />
       <Toaster />
     </div>

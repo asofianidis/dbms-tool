@@ -15,6 +15,7 @@ import {
   Trash2
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
+import { modifyScript, routineTemplate } from '@/lib/routines'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
 import { shellCollection } from '@/lib/mongo-shell'
@@ -202,6 +203,20 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   } else if (isRoutine) {
     items.push(
       {
+        label: 'Execute…',
+        icon: <Play />,
+        onSelect: () =>
+          void import('./ExecuteRoutineDialog').then((m) =>
+            m.openExecuteRoutine(connectionId, database, obj)
+          )
+      },
+      {
+        label: dialect === 'tsql' ? 'Modify (ALTER)' : 'Modify',
+        icon: <FileCode2 />,
+        onSelect: () => void modifyRoutine(connectionId, database, obj)
+      },
+      'separator',
+      {
         label: 'Definition',
         icon: <ScrollText />,
         onSelect: () =>
@@ -219,11 +234,6 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         label: 'Script as CREATE',
         icon: <FileCode2 />,
         onSelect: () => void scriptTo(connectionId, database, obj, 'definition')
-      },
-      {
-        label: dialect === 'tsql' && obj.kind === 'procedure' ? 'Script as EXEC' : 'Script call',
-        icon: <Play />,
-        onSelect: () => void scriptTo(connectionId, database, obj, 'exec')
       },
       {
         label: 'Script as DROP',
@@ -256,6 +266,43 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
     }
   )
   return items
+}
+
+async function modifyRoutine(connectionId: string, database: string, obj: DbObject): Promise<void> {
+  try {
+    const definition = await queryClient.fetchQuery(
+      queries.definition(connectionId, database, obj.schema, obj.name, obj.kind, obj.detail)
+    )
+    if (!definition) throw new Error(`No definition available for ${obj.name}`)
+    const kind = obj.kind === 'procedure' ? 'procedure' : 'function'
+    newQueryTab(
+      connectionId,
+      database,
+      modifyScript(dialectOf(connectionId), definition, tableRef(connectionId, database, obj), kind)
+    )
+  } catch (e) {
+    toastError(e)
+  }
+}
+
+/** Opens a query tab with a template for a new procedure or function. */
+export function newRoutine(
+  connectionId: string,
+  database: string,
+  schema: string | null,
+  kind: 'procedure' | 'function'
+): void {
+  const connection = getConnection(connectionId)
+  const babelfish = connection?.engine === 'babelfish'
+  const target =
+    connection?.engine === 'mysql'
+      ? null
+      : (schema ?? (dialectOf(connectionId) === 'tsql' ? 'dbo' : 'public'))
+  newQueryTab(
+    connectionId,
+    database,
+    routineTemplate(dialectOf(connectionId), kind, target, babelfish)
+  )
 }
 
 export function collectionMenu(connectionId: string, database: string, obj: DbObject): MenuItem[] {

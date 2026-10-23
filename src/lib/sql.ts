@@ -354,7 +354,8 @@ export function splitStatements(sql: string, dialect: Dialect): StatementRange[]
     if (text) out.push({ from: start + lead, to: start + lead + text.length, text })
     start = next
   }
-  // BEGIN … END blocks in T-SQL procedures contain semicolons; only GO separates batches there
+  // BEGIN … END blocks in T-SQL procedures contain semicolons; only GO separates batches there.
+  // MySQL routine bodies are handled by insideMysqlBody.
   const tsqlBlock =
     dialect === 'tsql' &&
     /\b(create|alter)\s+(or\s+alter\s+)?(proc|procedure|function|trigger|view)\b/i
@@ -413,7 +414,9 @@ export function splitStatements(sql: string, dialect: Dialect): StatementRange[]
     }
     if (c === ';') {
       const current = sql.slice(start, i)
-      if (!(tsqlBlock && tsqlBlock.test(current))) push(i, i + 1)
+      if (!(tsqlBlock && tsqlBlock.test(current)) && !insideMysqlBody(current, dialect)) {
+        push(i, i + 1)
+      }
     }
     i++
   }
@@ -506,4 +509,19 @@ export function explainSql(
         ? `SET STATISTICS PROFILE ON;\nGO\n${body}\nGO\nSET STATISTICS PROFILE OFF;`
         : `SET SHOWPLAN_TEXT ON;\nGO\n${body}\nGO\nSET SHOWPLAN_TEXT OFF;`
   }
+}
+
+/**
+ * True while `current` is inside the BEGIN … END body of a MySQL CREATE
+ * PROCEDURE/FUNCTION/TRIGGER/EVENT, where semicolons don't end the statement.
+ */
+function insideMysqlBody(current: string, dialect: Dialect): boolean {
+  if (dialect !== 'mysql') return false
+  const text = current.replace(/--[^\n]*/g, ' ').replace(/'(?:[^'\\]|\\.|'')*'/g, "''")
+  if (!/^\s*create\s+(definer\s*=\s*\S+\s+)?(procedure|function|trigger|event)\b/i.test(text))
+    return false
+  const begins = (text.match(/\bbegin\b/gi) ?? []).length
+  // END IF / END LOOP / END WHILE / END REPEAT / END CASE close other blocks
+  const ends = (text.match(/\bend\b(?!\s+(if|loop|while|repeat|case)\b)/gi) ?? []).length
+  return begins > ends
 }

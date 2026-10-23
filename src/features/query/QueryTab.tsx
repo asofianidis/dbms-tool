@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { SQLNamespace } from '@codemirror/lang-sql'
 import type { KeyBinding } from '@codemirror/view'
@@ -281,6 +281,15 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [execute, dialect, babelfish, tab.filePath]
   )
+
+  // Tabs opened by "Execute…" run once, as soon as the editor exists
+  useEffect(() => {
+    if (!tab.autorun) return
+    updateTab(tab.id, { autorun: false })
+    const timer = setTimeout(() => void execute('all'), 50)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const running = !!run?.running
 

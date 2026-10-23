@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ChevronDown,
+  Pencil,
+  Play,
   ChevronLeft,
   ChevronRight,
   ClipboardCopy,
@@ -16,7 +18,15 @@ import {
   Save,
   Undo2
 } from 'lucide-react'
-import { api, type Cell, type ColumnMeta, type ExecOutput, type TableInfo } from '@/lib/api'
+import {
+  api,
+  type Cell,
+  type ColumnMeta,
+  type DbObject,
+  type ExecOutput,
+  type TableInfo
+} from '@/lib/api'
+import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
@@ -63,6 +73,7 @@ import {
 } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
+import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 
 interface Edits {
   updates: Map<number, Map<number, Cell>>
@@ -759,9 +770,45 @@ function DefinitionView({
       ? scriptCreateTable(dialect, tableRef, info.data)
       : ''
   const error = useServerDdl ? definition.error : info.error
+  const routineKind =
+    tab.objectKind === 'procedure' || tab.objectKind === 'function' ? tab.objectKind : null
+  const routine: DbObject = {
+    schema: tab.schema,
+    name: tab.name,
+    kind: tab.objectKind,
+    detail: tab.detail ?? null,
+    comment: null,
+    rowEstimate: null
+  }
   return (
     <>
       <Toolbar>
+        {routineKind && (
+          <>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => openExecuteRoutine(tab.connectionId, tab.database, routine)}
+            >
+              <Play className="size-3.5 fill-current" /> Execute…
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!definition.data}
+              onClick={() =>
+                definition.data &&
+                newQueryTab(
+                  tab.connectionId,
+                  tab.database,
+                  modifyScript(dialect, definition.data, tableRef, routineKind)
+                )
+              }
+            >
+              <Pencil className="size-3.5" /> {dialect === 'tsql' ? 'Modify (ALTER)' : 'Modify'}
+            </Button>
+          </>
+        )}
         <Button
           size="sm"
           variant="ghost"
