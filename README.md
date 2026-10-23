@@ -65,7 +65,26 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 
 ## Install
 
-Download the latest build for Windows, macOS or Linux from
+### macOS
+
+Install or update to the latest release with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/asofianidis/dbms-tool/main/scripts/install-mac.sh | bash
+```
+
+It downloads the universal build (Apple Silicon and Intel), quits the app if it's running,
+replaces `/Applications/dbms-tool.app` and opens it. From a clone, `bash scripts/install-mac.sh`
+does the same. Because the script downloads with `curl`, macOS doesn't mark the app as
+quarantined, so Gatekeeper doesn't block it even when the build isn't notarized.
+
+If you download the `.dmg` in a browser instead and macOS says it can't verify the developer, open
+**System Settings → Privacy & Security** and click **Open Anyway** (or run
+`xattr -dr com.apple.quarantine /Applications/dbms-tool.app`).
+
+### Windows and Linux
+
+Download the latest build from
 [Releases](https://github.com/asofianidis/dbms-tool/releases/latest). The app updates itself;
 updates are signed and verified before they install. Every download is listed in
 `SHA256SUMS.txt` and has a GitHub build-provenance attestation

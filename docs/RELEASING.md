@@ -49,8 +49,10 @@ pnpm tauri signer generate -w ~/.tauri/dbms-tool.key --force
 
 ### macOS: Developer ID signing and notarization (optional)
 
-Without these, macOS builds are unsigned, and Gatekeeper asks users to approve the app in
-System Settings → Privacy & Security on first launch. You need an
+Without these, macOS builds are unsigned, and Gatekeeper asks users who downloaded the `.dmg` in a
+browser to approve the app in System Settings → Privacy & Security on first launch.
+`scripts/install-mac.sh` (see the README's install section) avoids that prompt. It reads the
+release marked Latest and installs its `*_universal.app.tar.gz`. You need an
 [Apple Developer Program](https://developer.apple.com/programs/) membership.
 
 1. In Xcode or the developer portal create a **Developer ID Application** certificate and export

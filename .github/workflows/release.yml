@@ -311,6 +311,15 @@ jobs:
 
           Installed apps update themselves from this release.
 
+          ## Install on macOS
+
+          Install or update without the Gatekeeper prompt a browser download triggers on builds that
+          aren't notarized:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-mac.sh | bash
+          \`\`\`
+
           ## Verifying
 
           Every file is listed in \`SHA256SUMS.txt\` and has a build-provenance attestation tying it
