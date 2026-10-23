@@ -315,6 +315,14 @@ impl SqSession {
         matches!(self.backend, Backend::D1(_))
     }
 
+    /// D1 runs each request on its own, so only local files hold transactions open.
+    pub fn in_transaction(&self) -> Option<bool> {
+        match &self.backend {
+            Backend::File { conn, .. } => Some(!conn.lock().ok()?.is_autocommit()),
+            Backend::D1(_) => None,
+        }
+    }
+
     /// The first result set of a metadata query.
     async fn query(&self, sql: &str) -> AppResult<Vec<Vec<Value>>> {
         let (mut results, error) = self.backend.run(sql, usize::MAX).await;

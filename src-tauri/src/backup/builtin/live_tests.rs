@@ -35,6 +35,8 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         group: String::new(),
         last_used: None,
         cloud: None,
+        ssh: None,
+        tunneled: None,
     };
     if engine == Engine::Mongo {
         c.uri = raw;

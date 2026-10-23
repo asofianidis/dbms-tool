@@ -189,6 +189,8 @@ pub struct ExecOutput {
     pub cancelled: bool,
     /// Database the session ended up in (after `USE`)
     pub database: Option<String>,
+    /// Whether the session was left inside a transaction; `None` when unknown
+    pub in_transaction: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +365,7 @@ impl OutputBuilder {
             error: self.error,
             cancelled: self.cancelled,
             database,
+            in_transaction: None,
         }
     }
 }

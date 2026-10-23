@@ -4,6 +4,7 @@ import {
   Code2,
   FileCode2,
   FilePlus2,
+  FileUp,
   GitCompareArrows,
   Hash,
   KeyRound,
@@ -44,6 +45,7 @@ import {
   newQueryTab,
   openCollection,
   openCompare,
+  openImport,
   openTable,
   refreshConnection
 } from '@/lib/workspace'
@@ -184,6 +186,11 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
               label: 'Compare with…',
               icon: <GitCompareArrows />,
               onSelect: () => openCompare(connectionId, database, obj.schema, obj.name)
+            },
+            {
+              label: 'Import data…',
+              icon: <FileUp />,
+              onSelect: () => openImport(connectionId, database, obj.schema, obj.name)
             }
           ]
         : []),
@@ -379,6 +386,15 @@ export function collectionMenu(connectionId: string, database: string, obj: DbOb
       icon: <KeyRound />,
       onSelect: () => openCollection(connectionId, database, name, 'indexes')
     },
+    ...(obj.kind === 'view'
+      ? []
+      : [
+          {
+            label: 'Import documents…',
+            icon: <FileUp />,
+            onSelect: () => openImport(connectionId, database, null, name)
+          }
+        ]),
     'separator',
     {
       label: 'New shell',

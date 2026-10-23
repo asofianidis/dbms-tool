@@ -16,6 +16,9 @@ pub struct MySession {
     conn: Conn,
     opts: Opts,
     pub database: String,
+    /// Set when the server dropped the connection (KILL, restart, timeout); the
+    /// manager reconnects
+    pub broken: bool,
 }
 
 pub fn describe_error(e: &mysql_async::Error) -> String {
@@ -85,6 +88,7 @@ pub async fn connect(
         conn,
         opts,
         database: String::new(),
+        broken: false,
     };
     if cfg.read_only {
         session
@@ -232,6 +236,16 @@ impl MySession {
         self.conn.ping().await.is_ok()
     }
 
+    /// Read from the status flags of a no-op's OK packet.
+    pub async fn in_transaction(&mut self) -> Option<bool> {
+        self.conn.query_drop("DO 0").await.ok()?;
+        let ok = self.conn.last_ok_packet()?;
+        Some(
+            ok.status_flags()
+                .contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS),
+        )
+    }
+
     /// The underlying connection, for the built-in backup's streaming reads.
     pub fn conn(&mut self) -> &mut Conn {
         &mut self.conn
@@ -281,6 +295,10 @@ impl MySession {
             Ok(w) => w,
             Err(e) => {
                 let message = describe_error(&e);
+                // 1053 shutdown, 1927 killed (MariaDB), 4031 idle disconnect
+                self.broken = matches!(&e, mysql_async::Error::Io(_))
+                    || matches!(&e, mysql_async::Error::Server(s) if matches!(s.code, 1053 | 1927 | 4031))
+                    || self.conn.is_disconnected();
                 if out.cancelled {
                     out.message("warning", message);
                 } else {

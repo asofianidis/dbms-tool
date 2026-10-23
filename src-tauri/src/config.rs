@@ -44,6 +44,41 @@ pub enum AuthMode {
     Cloud,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAuth {
+    /// Whatever `ssh` would use on its own: the agent, default keys, ~/.ssh/config
+    #[default]
+    Agent,
+    /// A private key file, with an optional passphrase
+    Key,
+    Password,
+}
+
+/// An SSH server to tunnel the database connection through (see `tunnel.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfig {
+    /// Kept off rather than removed so the settings survive toggling
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host name or a `Host` alias from ~/.ssh/config
+    #[serde(default)]
+    pub host: String,
+    /// 0 for ssh's default (22, or the alias's `Port`)
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub auth: SshAuth,
+    #[serde(default)]
+    pub key_file: String,
+    /// `ssh -J` destinations, e.g. `user@bastion:22`
+    #[serde(default)]
+    pub jump_host: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionConfig {
@@ -87,6 +122,17 @@ pub struct ConnectionConfig {
     /// or provisioned as
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
+    /// The real host and port when `host`/`port` point at a local tunnel
+    #[serde(skip)]
+    pub tunneled: Option<(String, u16)>,
+}
+
+impl ConnectionConfig {
+    pub fn ssh_tunnel(&self) -> Option<&SshConfig> {
+        self.ssh.as_ref().filter(|s| s.enabled)
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -188,4 +234,9 @@ pub fn delete_password(id: &str) {
     if let Ok(entry) = keyring_entry(id) {
         let _ = entry.delete_credential();
     }
+}
+
+/// Credential-store key for a connection's SSH password or key passphrase.
+pub fn ssh_secret_id(id: &str) -> String {
+    format!("{id}#ssh")
 }

@@ -14,6 +14,7 @@ mod tunnel;
 use tauri::Manager as _;
 
 use commands::AppState;
+pub use tunnel::answer_askpass;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

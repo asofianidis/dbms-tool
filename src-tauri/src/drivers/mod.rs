@@ -68,7 +68,7 @@ impl Session {
     pub fn is_broken(&self) -> bool {
         match self {
             Session::Pg(s) => s.is_closed(),
-            Session::My(_) => false,
+            Session::My(s) => s.broken,
             Session::Ms(s) => s.broken,
             Session::Sq(_) => false,
         }
@@ -89,6 +89,17 @@ impl Session {
             Session::My(s) => s.server_info().await,
             Session::Ms(s) => s.server_info().await,
             Session::Sq(s) => s.server_info().await,
+        }
+    }
+
+    /// Whether a transaction is open (or failed and awaiting ROLLBACK); `None`
+    /// when the engine can't tell.
+    pub async fn in_transaction(&mut self) -> Option<bool> {
+        match self {
+            Session::Pg(s) => s.in_transaction().await,
+            Session::My(s) => s.in_transaction().await,
+            Session::Ms(s) => s.in_transaction().await,
+            Session::Sq(s) => s.in_transaction(),
         }
     }
 

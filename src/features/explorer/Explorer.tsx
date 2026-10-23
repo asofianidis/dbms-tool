@@ -15,6 +15,7 @@ import {
   Database,
   DatabaseBackup,
   Eye,
+  FileUp,
   Folder,
   FolderOpen,
   FunctionSquare,
@@ -65,6 +66,7 @@ import {
   openBackup,
   openCompare,
   openDiagram,
+  openImport,
   openServer,
   openTable,
   promptText,
@@ -474,6 +476,12 @@ function DatabaseNode({
         onSelect: () => void newDashboard(connection.id, database)
       },
       {
+        label: 'Import data…',
+        icon: <FileUp />,
+        disabled: connection.readOnly,
+        onSelect: () => openImport(connection.id, database, null)
+      },
+      {
         label: 'Refresh',
         icon: <RefreshCw />,
         onSelect: () => {
@@ -693,6 +701,12 @@ function SchemaNode({
               label: 'Compare with…',
               icon: <GitCompareArrows />,
               onSelect: () => openCompare(connection.id, database, schema)
+            },
+            {
+              label: 'Import data…',
+              icon: <FileUp />,
+              disabled: connection.readOnly,
+              onSelect: () => openImport(connection.id, database, schema)
             },
             {
               label: 'Edit schema…',

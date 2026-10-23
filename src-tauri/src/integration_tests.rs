@@ -41,6 +41,8 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         group: String::new(),
         last_used: None,
         cloud: None,
+        ssh: None,
+        tunneled: None,
     };
     if engine == Engine::Mongo {
         c.uri = raw;
@@ -586,4 +588,162 @@ async fn routines_end_to_end() {
             assert!(out.error.is_none(), "{var}: {:?}", out.error);
         }
     }
+}
+
+/// Each tab reports whether it holds a transaction open, and other sessions can
+/// be ended from the server tab.
+#[tokio::test]
+async fn transactions_and_session_kill() {
+    let engines = [
+        (
+            Engine::Postgres,
+            "DBMS_TEST_PG",
+            "BEGIN",
+            "SELECT pg_backend_pid()",
+        ),
+        (
+            Engine::Mysql,
+            "DBMS_TEST_MYSQL",
+            "START TRANSACTION",
+            "SELECT CONNECTION_ID()",
+        ),
+        (
+            Engine::Mssql,
+            "DBMS_TEST_MSSQL",
+            "BEGIN TRANSACTION",
+            "SELECT @@SPID",
+        ),
+        (
+            Engine::Babelfish,
+            "DBMS_TEST_BABELFISH",
+            "BEGIN TRANSACTION",
+            "SELECT @@SPID",
+        ),
+    ];
+    for (engine, var, begin, whoami) in engines {
+        let Some((m, id)) = open(engine, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let run = |sql: &'static str| {
+            let s = s.clone();
+            async move { s.execute("tx", "", sql, &opts()).await.unwrap() }
+        };
+        assert_eq!(run("SELECT 1").await.in_transaction, Some(false), "{var}");
+        assert_eq!(run(begin).await.in_transaction, Some(true), "{var}");
+        assert_eq!(run("SELECT 2").await.in_transaction, Some(true), "{var}");
+        let commit = if engine == Engine::Postgres || engine == Engine::Mysql {
+            "COMMIT"
+        } else {
+            "COMMIT TRANSACTION"
+        };
+        assert_eq!(run(commit).await.in_transaction, Some(false), "{var}");
+
+        // A failed PostgreSQL transaction still needs a ROLLBACK
+        if engine == Engine::Postgres {
+            run("BEGIN").await;
+            let out = run("SELECT 1/0").await;
+            assert!(out.error.is_some());
+            assert_eq!(out.in_transaction, Some(true));
+            assert_eq!(run("ROLLBACK").await.in_transaction, Some(false));
+        }
+
+        // Metadata sessions aren't probed
+        let meta = s.execute(META, "", "SELECT 1", &opts()).await.unwrap();
+        assert_eq!(meta.in_transaction, None, "{var}");
+
+        // Kill another session the way the server tab does
+        let victim = run(whoami).await;
+        let victim_id = match cell(&victim, 0, 0, 0) {
+            Value::String(v) => v,
+            other => other.to_string(),
+        };
+        let kill = match engine {
+            Engine::Postgres => format!("SELECT pg_terminate_backend({victim_id})"),
+            _ => format!("KILL {victim_id}"),
+        };
+        let out = s.execute(META, "", &kill, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        // The killed tab reconnects on its next run
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut ok = false;
+        for _ in 0..3 {
+            let out = s.execute("tx", "", whoami, &opts()).await;
+            if let Ok(out) = out
+                && out.error.is_none()
+            {
+                assert_ne!(cell(&out, 0, 0, 0).to_string(), victim_id, "{var}");
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "{var}: the killed session didn't reconnect");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_transactions() {
+    let dir = std::env::temp_dir().join(format!("dbms-tx-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db");
+    std::fs::write(&path, b"").unwrap();
+    let c: ConnectionConfig = serde_json::from_value(json!({
+        "id": "sqlite-tx", "name": "t", "engine": "sqlite", "host": path.to_string_lossy()
+    }))
+    .unwrap();
+    let m = Manager::default();
+    m.open(c, None).await.expect("open");
+    let s = m.get("sqlite-tx").unwrap();
+    let run = |sql: &'static str| {
+        let s = s.clone();
+        async move { s.execute("tx", "", sql, &opts()).await.unwrap() }
+    };
+    assert_eq!(run("CREATE TABLE t (x)").await.in_transaction, Some(false));
+    assert_eq!(run("BEGIN").await.in_transaction, Some(true));
+    assert_eq!(
+        run("INSERT INTO t VALUES (1)").await.in_transaction,
+        Some(true)
+    );
+    assert_eq!(run("ROLLBACK").await.in_transaction, Some(false));
+    m.close("sqlite-tx");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `DBMS_TEST_SSH=host:port:user:keyfile:dbhost` tunnels `DBMS_TEST_PG`
+/// through an SSH server that reaches PostgreSQL at `dbhost`.
+#[tokio::test]
+async fn postgres_through_ssh_tunnel() {
+    let Ok(raw) = std::env::var("DBMS_TEST_SSH") else {
+        return;
+    };
+    let Some((mut c, password)) = config(Engine::Postgres, "DBMS_TEST_PG") else {
+        return;
+    };
+    // The key file may hold a drive letter's colon, so the database host comes off the end
+    let (rest, db_host) = raw.rsplit_once(':').unwrap();
+    let parts: Vec<&str> = rest.splitn(4, ':').collect();
+    c.id = "ssh-tunnel".into();
+    c.host = db_host.into();
+    c.ssh = Some(crate::config::SshConfig {
+        enabled: true,
+        host: parts[0].into(),
+        port: parts[1].parse().unwrap(),
+        user: parts[2].into(),
+        auth: crate::config::SshAuth::Key,
+        key_file: parts[3].into(),
+        jump_host: String::new(),
+    });
+    let m = Manager::default();
+    let info = m
+        .open(c, password)
+        .await
+        .expect("connect through the tunnel");
+    assert!(info.product.contains("PostgreSQL"), "{}", info.product);
+    let s = m.get("ssh-tunnel").unwrap();
+    let out = s
+        .execute("t", "", "SELECT inet_server_addr()::text", &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    m.close("ssh-tunnel");
 }
