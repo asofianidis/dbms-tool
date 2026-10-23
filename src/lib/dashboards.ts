@@ -34,6 +34,11 @@ export interface Dashboard {
   refreshSecs: number
   /** Locked dashboards can be viewed and refreshed but not rearranged or edited */
   locked?: boolean
+  /**
+   * Imported from a file and not yet approved. MongoDB widget queries are
+   * JavaScript, so nothing runs until the user has read them.
+   */
+  unreviewed?: boolean
   createdAt: number
   updatedAt: number
 }

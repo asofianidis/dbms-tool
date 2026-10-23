@@ -328,7 +328,11 @@ pub async fn prepare(
     }
     let port = tunnels[key].port;
     let origin = (
-        config.host.clone(),
+        // What `ssh -L` forwards to; an empty host means the SSH server itself
+        match config.host.trim() {
+            "" => "localhost".to_string(),
+            h => h.to_string(),
+        },
         match config.port {
             0 => default_port(config.engine),
             p => p,
@@ -337,10 +341,12 @@ pub async fn prepare(
     Ok(ConnectionConfig {
         host: "127.0.0.1".into(),
         port,
-        // The tunnel carries the connection to the server; its certificate names
-        // the server, not 127.0.0.1
         ssl: if fly { SslMode::Prefer } else { config.ssl },
-        trust_server_certificate: true,
+        // The certificate names the server, not 127.0.0.1. The PostgreSQL and
+        // MySQL drivers check it against `tunneled`; the SQL Server and MongoDB
+        // drivers can only check the name they connect to, so they skip the check.
+        trust_server_certificate: config.trust_server_certificate
+            || !matches!(config.engine, Engine::Postgres | Engine::Mysql),
         tunneled: Some(origin),
         ..config
     })

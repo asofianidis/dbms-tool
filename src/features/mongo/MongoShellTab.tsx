@@ -23,6 +23,7 @@ import { formatDuration } from '@/lib/format'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createStore } from '@/lib/store'
+import { notPickedInDialog } from '@/lib/files'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import { toShell } from '@/lib/ejson'
 import {
@@ -240,9 +241,9 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
 
   const cancel = (): void => void api.cancel(tab.connectionId, tab.id).catch(toastError)
 
-  const saveFile = async (): Promise<void> => {
+  const saveFile = async (saveAs = false): Promise<void> => {
     const text = editor.current?.text() ?? tab.text
-    let path = tab.filePath
+    let path = saveAs ? undefined : tab.filePath
     if (!path) {
       path =
         (await saveDialog({
@@ -256,6 +257,8 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       updateTab(tab.id, { filePath: path, savedText: text, text })
       toast(`Saved ${path.split(/[\\/]/).pop()}`)
     } catch (e) {
+      // A file remembered from before saves were limited to picked files
+      if (!saveAs && notPickedInDialog(e)) return saveFile(true)
       toastError(e)
     }
   }

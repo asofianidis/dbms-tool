@@ -44,7 +44,9 @@ fn build_opts(cfg: &ConnectionConfig, password: Option<&str>, database: &str, tl
         builder = builder.ssl_opts(Some(
             SslOpts::default()
                 .with_danger_accept_invalid_certs(!verify)
-                .with_danger_skip_domain_validation(!verify),
+                .with_danger_skip_domain_validation(!verify)
+                // Through a tunnel the certificate names the real server, not 127.0.0.1
+                .with_danger_tls_hostname_override(cfg.tunneled.as_ref().map(|(h, _)| h.clone())),
         ));
     }
     builder.into()

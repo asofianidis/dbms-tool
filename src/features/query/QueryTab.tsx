@@ -29,6 +29,7 @@ import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
 import { createStore } from '@/lib/store'
+import { notPickedInDialog } from '@/lib/files'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import {
   beginSql,
@@ -311,6 +312,8 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       updateTab(tab.id, { filePath: path, savedText: text, text })
       toast(`Saved ${path.split(/[\\/]/).pop()}`)
     } catch (e) {
+      // A file remembered from before saves were limited to picked files
+      if (!saveAs && notPickedInDialog(e)) return saveFile(true)
       toastError(e)
     }
   }
