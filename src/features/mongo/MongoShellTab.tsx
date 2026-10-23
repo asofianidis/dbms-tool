@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { KeyBinding } from '@codemirror/view'
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels'
@@ -41,6 +41,7 @@ import {
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { Button, EmptyState, ProgressBar, Toolbar, ToolbarDivider } from '@/components/ui'
 import { ConnectionPicker, DatabasePicker } from '../query/pickers'
+import { SavedButton } from '../saved/SavedButton'
 import { mongoCompletion } from './completion'
 import { DocumentsView, type DocumentsMode } from './DocumentsView'
 
@@ -293,6 +294,18 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
     ]
   )
 
+  // Tabs opened from a saved query run once, after the editor has the text
+  const executeRef = useRef(execute)
+  executeRef.current = execute
+  useEffect(() => {
+    if (!tab.autorun) return
+    const timer = setTimeout(() => {
+      updateTab(tab.id, { autorun: false })
+      void executeRef.current('auto')
+    }, 50)
+    return () => clearTimeout(timer)
+  }, [tab.autorun, tab.id])
+
   const running = !!run?.running
   const current = typeof active === 'number' ? result?.results[active] : undefined
   const errors = result?.messages.filter((m) => m.level === 'error').length ?? 0
@@ -335,6 +348,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
           onChange={(database) => updateTab(tab.id, { database })}
         />
         <div className="flex-1" />
+        <SavedButton tab={tab} text={() => editor.current?.text() ?? tab.text} />
         <Button
           size="icon"
           variant="ghost"

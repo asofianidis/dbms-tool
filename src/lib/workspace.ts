@@ -22,8 +22,10 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
-      /** Run the whole script once when the tab first opens */
+      /** Run the whole script once, as soon as the editor has the text */
       autorun?: boolean
+      /** The saved query this tab was opened from or saved as */
+      savedQueryId?: string
     }
   | {
       id: string
@@ -34,6 +36,8 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
+      autorun?: boolean
+      savedQueryId?: string
     }
   | {
       id: string
@@ -264,7 +268,7 @@ export function newQueryTab(
   connectionId?: string,
   database?: string,
   text = '',
-  options: { autorun?: boolean; title?: string } = {}
+  options: { autorun?: boolean; title?: string; savedQueryId?: string } = {}
 ): void {
   const fallback = connectionId ?? activeConnectionId() ?? connectionsStore.get()[0]?.id
   if (!fallback) {
@@ -281,7 +285,8 @@ export function newQueryTab(
     database: database ?? defaultDatabase(fallback),
     title: options.title ?? `${kind === 'mongo' ? 'shell' : 'query'}-${untitled}`,
     text,
-    ...(options.autorun && kind === 'query' ? { autorun: true } : {})
+    ...(options.autorun ? { autorun: true } : {}),
+    ...(options.savedQueryId ? { savedQueryId: options.savedQueryId } : {})
   } as Tab)
 }
 
@@ -418,7 +423,7 @@ export const lastRunStore = createStore<
   Record<string, { rows: number; elapsedMs: number; ok: boolean }>
 >({})
 
-export type SidebarView = 'explorer' | 'history'
+export type SidebarView = 'explorer' | 'history' | 'saved'
 
 export const layoutStore = createPersistentStore<{ sidebar: SidebarView; sidebarOpen: boolean }>(
   'dbms.layout.v1',

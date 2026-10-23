@@ -41,6 +41,7 @@ import {
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
+import { SavedButton } from '../saved/SavedButton'
 import { ResultsPanel, type RunResult } from './ResultsPanel'
 import { ConnectionPicker, DatabasePicker } from './pickers'
 
@@ -282,14 +283,17 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     [execute, dialect, babelfish, tab.filePath]
   )
 
-  // Tabs opened by "Execute…" run once, as soon as the editor exists
+  // Tabs opened by "Execute…" or a saved query run once, after the editor has the text
+  const executeRef = useRef(execute)
+  executeRef.current = execute
   useEffect(() => {
     if (!tab.autorun) return
-    updateTab(tab.id, { autorun: false })
-    const timer = setTimeout(() => void execute('all'), 50)
+    const timer = setTimeout(() => {
+      updateTab(tab.id, { autorun: false })
+      void executeRef.current('all')
+    }, 50)
     return () => clearTimeout(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [tab.autorun, tab.id])
 
   const running = !!run?.running
 
@@ -359,6 +363,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           onChange={(database) => updateTab(tab.id, { database })}
         />
         <div className="flex-1" />
+        <SavedButton tab={tab} text={() => editor.current?.text() ?? tab.text} />
         <Button
           size="icon"
           variant="ghost"

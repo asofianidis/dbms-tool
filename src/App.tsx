@@ -13,6 +13,7 @@ import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { Explorer } from './features/explorer/Explorer'
 import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
+import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
@@ -168,7 +169,13 @@ export function App(): React.JSX.Element {
             }}
           >
             <div className="h-full bg-panel">
-              {layout.sidebar === 'history' ? <HistoryPanel /> : <Explorer />}
+              {layout.sidebar === 'history' ? (
+                <HistoryPanel />
+              ) : layout.sidebar === 'saved' ? (
+                <SavedQueriesPanel />
+              ) : (
+                <Explorer />
+              )}
             </div>
           </Panel>
           <Separator />

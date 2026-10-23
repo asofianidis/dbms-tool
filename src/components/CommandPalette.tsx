@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  Bookmark,
+  BookmarkPlus,
   CornerDownLeft,
   Database,
   Eye,
@@ -21,6 +23,7 @@ import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { MOD } from '@/lib/keys'
 import { queryClient } from '@/lib/queries'
+import { savedQueriesStore } from '@/lib/saved'
 import { settingsStore } from '@/lib/settings'
 import {
   activeTab,
@@ -39,6 +42,13 @@ import {
   paletteStore,
   statusStore
 } from '@/lib/workspace'
+import {
+  defaultTarget,
+  runSavedQuery,
+  saveTabQuery,
+  showSavedQueries,
+  targetLabel
+} from '@/features/saved/actions'
 import { EngineMark, Kbd } from './ui'
 
 interface Item {
@@ -86,6 +96,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
   const listRef = useRef<HTMLDivElement>(null)
   const connections = connectionsStore.use()
   const statuses = statusStore.use()
+  const saved = savedQueriesStore.use()
   const commandMode = query.startsWith('>')
   const term = (commandMode ? query.slice(1) : query).trim().toLowerCase()
 
@@ -127,6 +138,23 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'Show query history',
         icon: <History />,
         run: () => layoutStore.set({ sidebar: 'history', sidebarOpen: true })
+      },
+      {
+        id: 'saved',
+        group: 'Commands',
+        label: 'Show saved queries',
+        icon: <Bookmark />,
+        run: showSavedQueries
+      },
+      {
+        id: 'save-query',
+        group: 'Commands',
+        label: 'Save current query',
+        icon: <BookmarkPlus />,
+        run: () => {
+          const tab = activeTab()
+          if (tab?.kind === 'query' || tab?.kind === 'mongo') void saveTabQuery(tab, tab.text)
+        }
       },
       {
         id: 'explorer',
@@ -193,6 +221,15 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
             }
       ]
     })
+    const savedItems: Item[] = saved.map((q) => ({
+      id: `saved:${q.id}`,
+      group: 'Saved queries',
+      label: q.name,
+      detail: `Run on ${targetLabel(defaultTarget(q))}`,
+      icon: <Bookmark />,
+      weight: 1,
+      run: () => runSavedQuery(q)
+    }))
     // Objects from every list the explorer has loaded
     const objectItems: Item[] = []
     if (!commandMode) {
@@ -230,7 +267,9 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         }
       }
     }
-    const pool = commandMode ? commands : [...connectionItems, ...objectItems, ...commands]
+    const pool = commandMode
+      ? commands
+      : [...connectionItems, ...savedItems, ...objectItems, ...commands]
     return pool
       .map((item) => ({
         item,
@@ -245,7 +284,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       )
       .slice(0, 80)
       .map((m) => m.item)
-  }, [connections, statuses, term, commandMode])
+  }, [connections, statuses, saved, term, commandMode])
 
   useEffect(() => setIndex(0), [term])
   useEffect(() => {
