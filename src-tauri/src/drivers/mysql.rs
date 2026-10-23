@@ -539,7 +539,9 @@ impl MySession {
                         is_primary_key: text(r, 4).as_deref() == Some("PRI"),
                         is_generated: extra.contains("auto_increment")
                             || extra.contains("generated"),
+                        is_identity: extra.contains("auto_increment"),
                         comment: text(r, 6).filter(|c| !c.is_empty()),
+                        extra: text(r, 5).filter(|e| !e.is_empty()),
                     }
                 })
                 .collect(),

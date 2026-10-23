@@ -8,6 +8,7 @@ import {
   KeyRound,
   Leaf,
   ListTree,
+  Pencil,
   Play,
   RefreshCw,
   ScrollText,
@@ -41,6 +42,7 @@ import {
   refreshConnection
 } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
+import { openTableDesigner } from '../table/TableDesigner'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -156,6 +158,15 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         onSelect: () =>
           openTable(connectionId, database, obj.schema, obj.name, obj.kind, 'structure')
       },
+      ...(obj.kind === 'table'
+        ? [
+            {
+              label: 'Design table…',
+              icon: <Pencil />,
+              onSelect: () => openTableDesigner(connectionId, database, obj.schema, obj.name)
+            }
+          ]
+        : []),
       {
         label: isView ? 'Definition' : 'DDL',
         icon: <ScrollText />,

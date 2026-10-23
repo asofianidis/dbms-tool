@@ -59,7 +59,12 @@ pub struct ColumnInfo {
     pub is_primary_key: bool,
     /// Identity / auto_increment / serial / generated
     pub is_generated: bool,
+    /// Identity / auto_increment only (not serial defaults or computed columns)
+    pub is_identity: bool,
     pub comment: Option<String>,
+    /// MySQL `EXTRA` attributes such as `on update CURRENT_TIMESTAMP`, which a
+    /// `MODIFY COLUMN` has to restate
+    pub extra: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

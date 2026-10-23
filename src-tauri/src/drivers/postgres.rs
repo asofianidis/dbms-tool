@@ -363,7 +363,8 @@ impl PgSession {
             .strings(
                 "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
                    pg_get_expr(d.adbin, d.adrelid), col_description(a.attrelid, a.attnum), \
-                   a.attidentity <> '' OR a.attgenerated <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%' \
+                   a.attidentity <> '' OR a.attgenerated <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%', \
+                   a.attidentity <> '' \
                  FROM pg_attribute a \
                  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
                  WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass \
@@ -446,6 +447,8 @@ impl PgSession {
                         default: r.get(3),
                         comment: r.get(4),
                         is_generated: r.get(5),
+                        is_identity: r.get(6),
+                        extra: None,
                     }
                 })
                 .collect(),

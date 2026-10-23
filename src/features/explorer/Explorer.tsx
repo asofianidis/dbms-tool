@@ -64,6 +64,7 @@ import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { openTableDesigner } from '../table/TableDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -589,8 +590,9 @@ const FOLDERS: {
   label: string
   always?: boolean
   routine?: 'procedure' | 'function'
+  newTable?: boolean
 }[] = [
-  { kinds: ['table', 'foreign_table'], label: 'Tables', always: true },
+  { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
@@ -628,6 +630,7 @@ function ObjectFolders({
             schema={schema}
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
+            newTable={folder.newTable}
             objects={objects}
             depth={depth}
           />
@@ -644,6 +647,7 @@ function ObjectFolder({
   schema,
   label,
   routine,
+  newTable,
   objects,
   depth
 }: {
@@ -653,6 +657,7 @@ function ObjectFolder({
   schema: string | null
   label: string
   routine?: 'procedure' | 'function'
+  newTable?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -685,6 +690,15 @@ function ObjectFolder({
                   }
                 ]
               : []),
+            ...(newTable
+              ? [
+                  {
+                    label: 'New table…',
+                    icon: <Plus />,
+                    onSelect: () => openTableDesigner(connection.id, database, schema)
+                  }
+                ]
+              : []),
             {
               label: 'Refresh',
               icon: <RefreshCw />,
@@ -696,7 +710,7 @@ function ObjectFolder({
           ])
         }
         actions={
-          routine && (
+          routine ? (
             <Button
               size="icon-sm"
               variant="ghost"
@@ -705,6 +719,17 @@ function ObjectFolder({
             >
               <Plus className="size-3.5" />
             </Button>
+          ) : (
+            newTable && (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                title="New table"
+                onClick={() => openTableDesigner(connection.id, database, schema)}
+              >
+                <Plus className="size-3.5" />
+              </Button>
+            )
           )
         }
       />

@@ -89,7 +89,9 @@ describe('literals and identifiers', () => {
           default: null,
           isPrimaryKey: true,
           isGenerated: true,
-          comment: null
+          isIdentity: true,
+          comment: null,
+          extra: null
         },
         {
           name: 'name',
@@ -98,7 +100,9 @@ describe('literals and identifiers', () => {
           default: null,
           isPrimaryKey: false,
           isGenerated: false,
-          comment: null
+          isIdentity: false,
+          comment: null,
+          extra: null
         }
       ],
       primaryKey: ['id'],

@@ -461,15 +461,18 @@ export function Modal({
   onClose: () => void
   children: ReactNode
   footer?: ReactNode
-  width?: 'sm' | 'md' | 'lg' | 'xl'
+  width?: 'sm' | 'md' | 'lg' | 'xl' | '2xl'
   icon?: ReactNode
 }): React.JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
+  // Callers pass inline callbacks; a ref keeps the effect (and the initial focus) to mount only
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         e.stopPropagation()
-        onClose()
+        closeRef.current()
       }
     }
     window.addEventListener('keydown', onKey, true)
@@ -479,7 +482,7 @@ export function Modal({
     )
     first?.focus({ preventScroll: true })
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  }, [])
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-(--backdrop) px-4 pt-[10vh] pb-8 backdrop-blur-[2px]"
@@ -493,7 +496,8 @@ export function Modal({
           width === 'sm' && 'max-w-sm',
           width === 'md' && 'max-w-lg',
           width === 'lg' && 'max-w-2xl',
-          width === 'xl' && 'max-w-4xl'
+          width === 'xl' && 'max-w-4xl',
+          width === '2xl' && 'max-w-6xl'
         )}
       >
         <div className="flex items-start justify-between gap-4 px-5 pt-4">

@@ -12,6 +12,7 @@ import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { Explorer } from './features/explorer/Explorer'
 import { HistoryPanel } from './features/history/HistoryPanel'
+import { TableDesignerHost } from './features/table/TableDesigner'
 import { CollectionTab } from './features/mongo/CollectionTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { QueryTab } from './features/query/QueryTab'
@@ -202,6 +203,7 @@ export function App(): React.JSX.Element {
       <ConfirmHost />
       <PromptHost />
       <ExecuteRoutineHost />
+      <TableDesignerHost />
       <ContextMenuHost />
       <Toaster />
     </div>

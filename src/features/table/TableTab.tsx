@@ -74,6 +74,7 @@ import {
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
+import { openTableDesigner } from './TableDesigner'
 
 interface Edits {
   updates: Map<number, Map<number, Cell>>
@@ -601,120 +602,136 @@ function StructureView({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
     )
   const info: TableInfo = q.data
   return (
-    <div className="min-h-0 flex-1 overflow-auto p-4">
-      <Section title="Columns" count={info.columns.length}>
-        <table className="w-full text-left text-[12.5px]">
-          <thead className="text-[11px] text-muted">
-            <tr className="border-b border-line">
-              <th className="w-8 py-1.5 font-medium" />
-              <th className="py-1.5 font-medium">Name</th>
-              <th className="py-1.5 font-medium">Type</th>
-              <th className="py-1.5 font-medium">Nullable</th>
-              <th className="py-1.5 font-medium">Default</th>
-              <th className="py-1.5 font-medium">Comment</th>
-            </tr>
-          </thead>
-          <tbody className="select-text">
-            {info.columns.map((c, i) => (
-              <tr key={c.name} className="border-b border-line/60 hover:bg-hover/40">
-                <td className="py-1.5 text-faint tabular-nums">
-                  {c.isPrimaryKey ? <KeyRound className="size-3.5 text-warn" /> : i + 1}
-                </td>
-                <td className="py-1.5 font-mono text-bright">
-                  {c.name}
-                  {c.isGenerated && (
-                    <Badge className="ml-2" tone="info">
-                      generated
-                    </Badge>
-                  )}
-                </td>
-                <td className="py-1.5 font-mono text-syn-type">{c.dataType}</td>
-                <td className="py-1.5">
-                  {c.nullable ? (
-                    <span className="text-muted">null</span>
-                  ) : (
-                    <span className="text-fg">not null</span>
-                  )}
-                </td>
-                <td
-                  className="max-w-64 truncate py-1.5 font-mono text-[11.5px] text-muted"
-                  title={c.default ?? undefined}
-                >
-                  {c.default}
-                </td>
-                <td className="max-w-64 truncate py-1.5 text-muted" title={c.comment ?? undefined}>
-                  {c.comment}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Section>
-      <Section title="Indexes" count={info.indexes.length}>
-        {info.indexes.length ? (
+    <>
+      {tab.objectKind === 'table' && (
+        <Toolbar>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => openTableDesigner(tab.connectionId, tab.database, tab.schema, tab.name)}
+          >
+            <Pencil className="size-3.5" /> Design table…
+          </Button>
+        </Toolbar>
+      )}
+      <div className="min-h-0 flex-1 overflow-auto p-4">
+        <Section title="Columns" count={info.columns.length}>
           <table className="w-full text-left text-[12.5px]">
+            <thead className="text-[11px] text-muted">
+              <tr className="border-b border-line">
+                <th className="w-8 py-1.5 font-medium" />
+                <th className="py-1.5 font-medium">Name</th>
+                <th className="py-1.5 font-medium">Type</th>
+                <th className="py-1.5 font-medium">Nullable</th>
+                <th className="py-1.5 font-medium">Default</th>
+                <th className="py-1.5 font-medium">Comment</th>
+              </tr>
+            </thead>
             <tbody className="select-text">
-              {info.indexes.map((ix) => (
-                <tr key={ix.name} className="border-b border-line/60">
-                  <td className="py-1.5 font-mono text-bright">{ix.name}</td>
-                  <td className="py-1.5 font-mono text-muted">({ix.columns.join(', ')})</td>
-                  <td className="py-1.5">
-                    {ix.primary ? (
-                      <Badge tone="warning">primary</Badge>
-                    ) : ix.unique ? (
-                      <Badge tone="info">unique</Badge>
-                    ) : null}
+              {info.columns.map((c, i) => (
+                <tr key={c.name} className="border-b border-line/60 hover:bg-hover/40">
+                  <td className="py-1.5 text-faint tabular-nums">
+                    {c.isPrimaryKey ? <KeyRound className="size-3.5 text-warn" /> : i + 1}
                   </td>
-                  <td className="py-1.5 text-faint">{ix.method}</td>
+                  <td className="py-1.5 font-mono text-bright">
+                    {c.name}
+                    {c.isGenerated && (
+                      <Badge className="ml-2" tone="info">
+                        generated
+                      </Badge>
+                    )}
+                  </td>
+                  <td className="py-1.5 font-mono text-syn-type">{c.dataType}</td>
+                  <td className="py-1.5">
+                    {c.nullable ? (
+                      <span className="text-muted">null</span>
+                    ) : (
+                      <span className="text-fg">not null</span>
+                    )}
+                  </td>
+                  <td
+                    className="max-w-64 truncate py-1.5 font-mono text-[11.5px] text-muted"
+                    title={c.default ?? undefined}
+                  >
+                    {c.default}
+                  </td>
+                  <td
+                    className="max-w-64 truncate py-1.5 text-muted"
+                    title={c.comment ?? undefined}
+                  >
+                    {c.comment}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-        ) : (
-          <p className="text-xs text-faint">No indexes</p>
-        )}
-      </Section>
-      <Section title="Foreign keys" count={info.foreignKeys.length}>
-        {info.foreignKeys.length ? (
-          <div className="space-y-1.5">
-            {info.foreignKeys.map((fk) => (
-              <div
-                key={fk.name}
-                className="flex items-center gap-2 font-mono text-[12px] select-text"
-              >
-                <Link2 className="size-3.5 shrink-0 text-syn-fn" />
-                <span className="text-bright">{fk.name}</span>
-                <span className="text-muted">
-                  ({fk.columns.join(', ')}) →{' '}
-                  <button
-                    className="text-info hover:underline"
-                    onClick={() =>
-                      openTable(
-                        tab.connectionId,
-                        tab.database,
-                        fk.refSchema,
-                        fk.refTable,
-                        'table',
-                        'structure'
-                      )
-                    }
-                  >
-                    {fk.refSchema ? `${fk.refSchema}.` : ''}
-                    {fk.refTable}
-                  </button>
-                  ({fk.refColumns.join(', ')})
-                </span>
-                {fk.onDelete && fk.onDelete !== 'NO ACTION' && (
-                  <Badge>on delete {fk.onDelete.toLowerCase()}</Badge>
-                )}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-xs text-faint">No foreign keys</p>
-        )}
-      </Section>
-    </div>
+        </Section>
+        <Section title="Indexes" count={info.indexes.length}>
+          {info.indexes.length ? (
+            <table className="w-full text-left text-[12.5px]">
+              <tbody className="select-text">
+                {info.indexes.map((ix) => (
+                  <tr key={ix.name} className="border-b border-line/60">
+                    <td className="py-1.5 font-mono text-bright">{ix.name}</td>
+                    <td className="py-1.5 font-mono text-muted">({ix.columns.join(', ')})</td>
+                    <td className="py-1.5">
+                      {ix.primary ? (
+                        <Badge tone="warning">primary</Badge>
+                      ) : ix.unique ? (
+                        <Badge tone="info">unique</Badge>
+                      ) : null}
+                    </td>
+                    <td className="py-1.5 text-faint">{ix.method}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-xs text-faint">No indexes</p>
+          )}
+        </Section>
+        <Section title="Foreign keys" count={info.foreignKeys.length}>
+          {info.foreignKeys.length ? (
+            <div className="space-y-1.5">
+              {info.foreignKeys.map((fk) => (
+                <div
+                  key={fk.name}
+                  className="flex items-center gap-2 font-mono text-[12px] select-text"
+                >
+                  <Link2 className="size-3.5 shrink-0 text-syn-fn" />
+                  <span className="text-bright">{fk.name}</span>
+                  <span className="text-muted">
+                    ({fk.columns.join(', ')}) →{' '}
+                    <button
+                      className="text-info hover:underline"
+                      onClick={() =>
+                        openTable(
+                          tab.connectionId,
+                          tab.database,
+                          fk.refSchema,
+                          fk.refTable,
+                          'table',
+                          'structure'
+                        )
+                      }
+                    >
+                      {fk.refSchema ? `${fk.refSchema}.` : ''}
+                      {fk.refTable}
+                    </button>
+                    ({fk.refColumns.join(', ')})
+                  </span>
+                  {fk.onDelete && fk.onDelete !== 'NO ACTION' && (
+                    <Badge>on delete {fk.onDelete.toLowerCase()}</Badge>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-faint">No foreign keys</p>
+          )}
+        </Section>
+      </div>
+    </>
   )
 }
 

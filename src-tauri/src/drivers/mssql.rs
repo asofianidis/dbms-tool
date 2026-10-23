@@ -615,14 +615,15 @@ impl MsSession {
                      WHEN c.DATA_TYPE IN ('decimal', 'numeric') THEN '(' + CAST(c.NUMERIC_PRECISION AS varchar(10)) + ',' + CAST(c.NUMERIC_SCALE AS varchar(10)) + ')' \
                      ELSE '' END, \
                    CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, c.COLUMN_DEFAULT, \
-                   CAST(ISNULL(sc.is_identity, 0) | ISNULL(sc.is_computed, 0) AS int) \
+                   CAST(ISNULL(sc.is_identity, 0) | ISNULL(sc.is_computed, 0) AS int), \
+                   CAST(ISNULL(sc.is_identity, 0) AS int) \
                  FROM INFORMATION_SCHEMA.COLUMNS c \
                  LEFT JOIN sys.columns sc ON sc.object_id = OBJECT_ID(@P1) AND sc.name = c.COLUMN_NAME \
                  WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 \
                  ORDER BY c.ORDINAL_POSITION",
                 Some(
                     "SELECT c.COLUMN_NAME, c.DATA_TYPE, CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, \
-                       c.COLUMN_DEFAULT, 0, @P1 \
+                       c.COLUMN_DEFAULT, 0, 0, @P1 \
                      FROM INFORMATION_SCHEMA.COLUMNS c \
                      WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 ORDER BY c.ORDINAL_POSITION",
                 ),
@@ -734,7 +735,9 @@ impl MsSession {
                         nullable: flag(r, 2),
                         default: text(r, 3),
                         is_generated: flag(r, 4),
+                        is_identity: flag(r, 5),
                         comment: None,
+                        extra: None,
                     }
                 })
                 .collect(),

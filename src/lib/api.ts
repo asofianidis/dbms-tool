@@ -71,7 +71,11 @@ export interface ColumnInfo {
   default: string | null
   isPrimaryKey: boolean
   isGenerated: boolean
+  /** Identity / auto_increment only (not serial defaults or computed columns) */
+  isIdentity: boolean
   comment: string | null
+  /** MySQL column attributes such as `on update CURRENT_TIMESTAMP` */
+  extra: string | null
 }
 
 export interface IndexInfo {
