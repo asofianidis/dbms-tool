@@ -481,7 +481,8 @@ export const api = {
   /** Calls a provider's REST API (Render, Fly.io, Cloudflare) with its saved token */
   cloudApi: (provider: CloudProvider, method: string, path: string, body?: unknown) =>
     invoke<unknown>('cloud_api', { provider, method, path, body: body ?? null }),
-  cloudTokenStatus: (provider: CloudProvider) => invoke<boolean>('cloud_token_status', { provider }),
+  cloudTokenStatus: (provider: CloudProvider) =>
+    invoke<boolean>('cloud_token_status', { provider }),
   cloudTokenSet: (provider: CloudProvider, token: string) =>
     invoke<void>('cloud_token_set', { provider, token }),
   cloudTokenDelete: (provider: CloudProvider) => invoke<void>('cloud_token_delete', { provider }),

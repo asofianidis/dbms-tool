@@ -821,9 +821,19 @@ FROM pragma_page_count() p, pragma_page_size() s, pragma_freelist_count() f`
     free_pages: num(next, 'free_pages')
   }),
   tiles: [
-    { key: 'size_bytes', label: 'Database size', unit: 'bytes', hint: 'Pages in use times page size' },
+    {
+      key: 'size_bytes',
+      label: 'Database size',
+      unit: 'bytes',
+      hint: 'Pages in use times page size'
+    },
     { key: 'pages', label: 'Pages', unit: 'count', hint: 'Total pages in the database file' },
-    { key: 'free_pages', label: 'Free pages', unit: 'count', hint: 'Unused pages VACUUM would reclaim' }
+    {
+      key: 'free_pages',
+      label: 'Free pages',
+      unit: 'count',
+      hint: 'Unused pages VACUUM would reclaim'
+    }
   ],
   meters: [],
   facts: () => [],
