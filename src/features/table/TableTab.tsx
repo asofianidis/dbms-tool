@@ -23,7 +23,9 @@ import {
   type Cell,
   type ColumnMeta,
   type DbObject,
+  type Engine,
   type ExecOutput,
+  type ForeignKeyInfo,
   type TableInfo,
   type TriggerInfo
 } from '@/lib/api'
@@ -31,7 +33,14 @@ import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
-import { buildOrderBy, buildWhere, emptyQuery, newCondition, type QueryState } from '@/lib/filters'
+import {
+  buildOrderBy,
+  buildWhere,
+  emptyQuery,
+  newCondition,
+  type FilterCondition,
+  type QueryState
+} from '@/lib/filters'
 import { formatDuration, plural } from '@/lib/format'
 import {
   addInsert,
@@ -71,6 +80,7 @@ import {
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import { ResultGrid, type SortState } from '@/components/grid/ResultGrid'
+import type { MenuItem } from '@/components/ContextMenu'
 import {
   Badge,
   Button,
@@ -89,6 +99,26 @@ import { ChangesPanel } from './ChangesPanel'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { openTableDesigner } from './TableDesigner'
 import { openTriggerDesigner } from './TriggerDesigner'
+
+/** Where a foreign key points. MySQL reports the referenced database as its schema. */
+function fkTarget(
+  engine: Engine | undefined,
+  tab: TabOf<'table'>,
+  fk: ForeignKeyInfo
+): { database: string; schema: string | null } {
+  return engine === 'mysql'
+    ? { database: fk.refSchema ?? tab.database, schema: null }
+    : { database: tab.database, schema: fk.refSchema }
+}
+
+/** A filter condition matching a cell value exactly. */
+function valueCondition(column: string, value: Cell): FilterCondition {
+  return value === null
+    ? newCondition({ column, op: 'null' })
+    : typeof value === 'boolean'
+      ? newCondition({ column, op: value ? 'true' : 'false' })
+      : newCondition({ column, op: 'eq', value })
+}
 
 export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
   const connections = connectionsStore.use()
@@ -147,12 +177,13 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
       ) : tab.view === 'data' && browsable ? (
         <DataView
           tab={tab}
+          engine={connection.engine}
           dialect={dialect}
           tableRef={ref}
           readOnly={connection.readOnly || tab.objectKind !== 'table'}
         />
       ) : tab.view === 'structure' && browsable ? (
-        <StructureView tab={tab} dialect={dialect} />
+        <StructureView tab={tab} engine={connection.engine} dialect={dialect} />
       ) : (
         <DefinitionView tab={tab} dialect={dialect} tableRef={ref} />
       )}
@@ -162,18 +193,20 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
 
 function DataView({
   tab,
+  engine,
   dialect,
   tableRef,
   readOnly
 }: {
   tab: TabOf<'table'>
+  engine: Engine
   dialect: Dialect
   tableRef: TableRef
   readOnly: boolean
 }): React.JSX.Element {
   const { pageSize, confirmDangerous } = settingsStore.use()
   const info = useQuery(queries.table(tab.connectionId, tab.database, tab.schema, tab.name))
-  const [query, setQuery] = useState<QueryState>(emptyQuery)
+  const [query, setQuery] = useState<QueryState>(() => tab.query ?? emptyQuery())
   const [builderOpen, setBuilderOpen] = useState(false)
   const [page, setPage] = useState(0)
   const [output, setOutput] = useState<ExecOutput | null>(null)
@@ -205,6 +238,14 @@ function DataView({
     setPage(0)
     setTotal(null)
   }
+
+  // Apply a filter handed to an already open tab, e.g. by following a foreign key
+  const requested = useRef(tab.query)
+  useEffect(() => {
+    if (!tab.query || tab.query === requested.current) return
+    requested.current = tab.query
+    applyQuery(tab.query)
+  }, [tab.query])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -396,12 +437,7 @@ function DataView({
     : undefined
 
   const filterByValue = (column: string, value: Cell): void => {
-    const condition =
-      value === null
-        ? newCondition({ column, op: 'null' })
-        : typeof value === 'boolean'
-          ? newCondition({ column, op: value ? 'true' : 'false' })
-          : newCondition({ column, op: 'eq', value })
+    const condition = valueCondition(column, value)
     // Narrow the current filter. With "any", fold the existing conditions into one OR group first
     const orGroup = query.match === 'any' && query.conditions.filter((c) => c.enabled).length > 1
     applyQuery({
@@ -412,6 +448,37 @@ function DataView({
         : [...query.conditions, condition]
     })
   }
+
+  // Foreign key columns link to the row they reference
+  const referenceItems = (row: number, col: number): MenuItem[] =>
+    (info.data?.foreignKeys ?? [])
+      .filter((fk) => fk.columns.includes(columns[col].name))
+      .map((fk) => {
+        const values = fk.columns.map((name) => {
+          const i = columns.findIndex((c) => c.name === name)
+          return i < 0 ? null : rows[row][i]
+        })
+        const target = fkTarget(engine, tab, fk)
+        return {
+          label: `Go to ${fk.refTable} record`,
+          icon: <Link2 />,
+          disabled: values.some((v) => v === null),
+          onSelect: () =>
+            openTable(
+              tab.connectionId,
+              target.database,
+              target.schema,
+              fk.refTable,
+              'table',
+              'data',
+              null,
+              {
+                ...emptyQuery(),
+                conditions: fk.refColumns.map((c, i) => valueCondition(c, values[i]))
+              }
+            )
+        }
+      })
 
   // The grid header shows and sets the first sort column
   const firstSort = query.sorts[0]
@@ -562,6 +629,7 @@ function DataView({
               dialect={dialect}
               tableName={qualified(dialect, tableRef)}
               onFilterByValue={filterByValue}
+              cellMenuItems={referenceItems}
               rowOffset={from}
               onSelectionSummary={selectionSummaryStore.set}
             />
@@ -607,9 +675,11 @@ function DataView({
 
 function StructureView({
   tab,
+  engine,
   dialect
 }: {
   tab: TabOf<'table'>
+  engine: Engine
   dialect: Dialect
 }): React.JSX.Element {
   const q = useQuery(queries.table(tab.connectionId, tab.database, tab.schema, tab.name))
@@ -741,16 +811,17 @@ function StructureView({
                     ({fk.columns.join(', ')}) →{' '}
                     <button
                       className="text-info hover:underline"
-                      onClick={() =>
+                      onClick={() => {
+                        const target = fkTarget(engine, tab, fk)
                         openTable(
                           tab.connectionId,
-                          tab.database,
-                          fk.refSchema,
+                          target.database,
+                          target.schema,
                           fk.refTable,
                           'table',
                           'structure'
                         )
-                      }
+                      }}
                     >
                       {fk.refSchema ? `${fk.refSchema}.` : ''}
                       {fk.refTable}

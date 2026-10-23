@@ -2,6 +2,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { api, isAppError, type ConnectionConfig, type ObjectKind, type ServerInfo } from './api'
 import { ENGINES } from './engines'
+import type { QueryState } from './filters'
 import { createPersistentStore, createStore } from './store'
 import { errorMessage, toast } from './toast'
 
@@ -49,6 +50,8 @@ export type Tab =
       objectKind: ObjectKind
       detail?: string | null
       view: TableView
+      /** A filter for the data view to apply, e.g. when following a foreign key */
+      query?: QueryState
     }
   | {
       id: string
@@ -305,17 +308,33 @@ export function openTable(
   name: string,
   objectKind: ObjectKind,
   view: TableView = 'data',
-  detail?: string | null
+  detail?: string | null,
+  query?: QueryState
 ): void {
+  const sameAs = (t: Tab): boolean =>
+    t.kind === 'table' &&
+    t.connectionId === connectionId &&
+    t.database === database &&
+    t.schema === schema &&
+    t.name === name &&
+    (t.detail ?? null) === (detail ?? null)
+  const existing = tabsStore.get().tabs.find(sameAs)
+  // An already open tab picks up the new filter
+  if (existing && query) updateTab(existing.id, { query } as Partial<Tab>)
   openTab(
-    { id: tabId(), kind: 'table', connectionId, database, schema, name, objectKind, view, detail },
-    (t) =>
-      t.kind === 'table' &&
-      t.connectionId === connectionId &&
-      t.database === database &&
-      t.schema === schema &&
-      t.name === name &&
-      (t.detail ?? null) === (detail ?? null)
+    {
+      id: tabId(),
+      kind: 'table',
+      connectionId,
+      database,
+      schema,
+      name,
+      objectKind,
+      view,
+      detail,
+      ...(query ? { query } : {})
+    },
+    sameAs
   )
 }
 
