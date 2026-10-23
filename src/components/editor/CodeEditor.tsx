@@ -15,7 +15,15 @@ import {
 } from '@codemirror/commands'
 import { javascript } from '@codemirror/lang-javascript'
 import { json } from '@codemirror/lang-json'
-import { MSSQL, MySQL, PostgreSQL, sql, type SQLNamespace, SQLite } from '@codemirror/lang-sql'
+import {
+  MSSQL,
+  MySQL,
+  PostgreSQL,
+  schemaCompletionSource,
+  sql,
+  type SQLNamespace,
+  SQLite
+} from '@codemirror/lang-sql'
 import {
   bracketMatching,
   foldGutter,
@@ -43,6 +51,7 @@ import {
 } from '@codemirror/view'
 import { tags as t } from '@lezer/highlight'
 import type { Dialect } from '@/lib/engines'
+import { tableAwareCompletion } from './sql-completion'
 
 export type EditorLanguage =
   { kind: 'sql'; dialect: Dialect } | { kind: 'mongo' } | { kind: 'json' } | { kind: 'text' }
@@ -199,13 +208,16 @@ function languageExtension(
   extra: CompletionSource | undefined
 ): Extension {
   if (language.kind === 'sql') {
-    const ext = sql({
-      dialect: DIALECTS[language.dialect],
-      schema: completion,
-      defaultSchema,
-      upperCaseKeywords: true
-    })
-    return extra ? [ext, ext.language.data.of({ autocomplete: extra })] : ext
+    const dialect = DIALECTS[language.dialect]
+    const ext = sql({ dialect, upperCaseKeywords: true })
+    const names = tableAwareCompletion(
+      schemaCompletionSource({ dialect, schema: completion, defaultSchema })
+    )
+    return [
+      ext,
+      ext.language.data.of({ autocomplete: names }),
+      ...(extra ? [ext.language.data.of({ autocomplete: extra })] : [])
+    ]
   }
   if (language.kind === 'json') return json()
   if (language.kind === 'text') return []
