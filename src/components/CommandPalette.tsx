@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   ArchiveRestore,
   Bookmark,
+  ClipboardCopy,
   BookmarkPlus,
   Cloud,
   CornerDownLeft,
@@ -10,6 +11,7 @@ import {
   GitCompareArrows,
   Eye,
   FileCode2,
+  FileText,
   FunctionSquare,
   History,
   LayoutDashboard,
@@ -23,7 +25,7 @@ import {
   Unplug,
   WrapText
 } from 'lucide-react'
-import type { DbObject } from '@/lib/api'
+import { api, type DbObject } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { dashboardsStore } from '@/lib/dashboards'
 import { ENGINES, connectionLabel } from '@/lib/engines'
@@ -31,6 +33,7 @@ import { MOD } from '@/lib/keys'
 import { queryClient } from '@/lib/queries'
 import { savedQueriesStore } from '@/lib/saved'
 import { settingsStore } from '@/lib/settings'
+import { toast, toastError } from '@/lib/toast'
 import {
   activeTab,
   closePalette,
@@ -284,6 +287,29 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'Toggle word wrap',
         icon: <WrapText />,
         run: () => settingsStore.set((s) => ({ ...s, wordWrap: !s.wordWrap }))
+      },
+      {
+        id: 'logs-open',
+        group: 'Commands',
+        label: 'Open error log',
+        detail: 'Failed connections and queries',
+        icon: <FileText />,
+        run: () => void api.logsReveal().catch(toastError)
+      },
+      {
+        id: 'logs-copy',
+        group: 'Commands',
+        label: 'Copy error log',
+        icon: <ClipboardCopy />,
+        run: () =>
+          void api
+            .logsRead()
+            .then(async (text) => {
+              if (!text.trim()) return toast('Nothing has been logged yet', 'info')
+              await navigator.clipboard.writeText(text)
+              toast('Error log copied to the clipboard')
+            })
+            .catch(toastError)
       },
       {
         id: 'close-tab',

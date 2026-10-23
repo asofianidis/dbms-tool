@@ -513,5 +513,9 @@ export const api = {
   /** Runs to completion; output arrives as `backup-progress` events tagged with `jobId` */
   backupRun: (id: string, jobId: string, job: BackupJob, dir?: string | null) =>
     invoke<BackupOutcome>('backup_run', { id, jobId, job, dir: dir || null }),
-  backupCancel: (jobId: string) => invoke<void>('backup_cancel', { jobId })
+  backupCancel: (jobId: string) => invoke<void>('backup_cancel', { jobId }),
+  /** Shows the error log file in the OS file manager */
+  logsReveal: () => invoke<void>('logs_reveal'),
+  /** The end of the error log; empty when nothing has failed */
+  logsRead: () => invoke<string>('logs_read')
 }

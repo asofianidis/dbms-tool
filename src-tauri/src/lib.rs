@@ -18,6 +18,15 @@ use commands::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Failures go to stdout and the OS log dir (%LOCALAPPDATA%\<identifier>\logs on Windows)
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(5 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
@@ -67,6 +76,8 @@ pub fn run() {
             commands::backup_inspect,
             commands::backup_run,
             commands::backup_cancel,
+            commands::logs_reveal,
+            commands::logs_read,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

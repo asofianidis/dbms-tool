@@ -28,6 +28,51 @@ fn needs_password(config: &ConnectionConfig) -> bool {
     config.auth == AuthMode::Password && !config.user.is_empty()
 }
 
+/// `"name" [engine user@host:port]`, for log lines. Never includes secrets.
+fn describe(config: &ConnectionConfig) -> String {
+    let mut target = format!("{:?}", config.engine).to_lowercase();
+    if !config.host.is_empty() {
+        target.push(' ');
+        if !config.user.is_empty() {
+            target.push_str(&config.user);
+            target.push('@');
+        }
+        target.push_str(&config.host);
+        if config.port != 0 {
+            target.push_str(&format!(":{}", config.port));
+        }
+    }
+    format!("\"{}\" [{target}]", config.name)
+}
+
+fn connection_label(state: &AppState, id: &str) -> String {
+    state
+        .store
+        .get(id)
+        .map(|c| describe(&c))
+        .unwrap_or_else(|_| format!("connection {id}"))
+}
+
+/// Logs a failed command. A missing password is a prompt, not a failure.
+fn logged<T>(result: AppResult<T>, context: impl FnOnce() -> String) -> AppResult<T> {
+    if let Err(e) = &result
+        && !matches!(e, AppError::PasswordRequired)
+    {
+        log::error!("{}: {e}", context());
+    }
+    result
+}
+
+/// The start of a statement on one line, so log entries stay readable.
+fn snippet(sql: &str) -> String {
+    const MAX: usize = 200;
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}...", &flat[..i]),
+        None => flat,
+    }
+}
+
 fn resolve_password(config: &ConnectionConfig, given: Option<String>) -> Option<String> {
     given.or_else(|| {
         (config.save_password && !config.id.is_empty())
@@ -71,7 +116,9 @@ pub async fn connection_test(
     password: Option<String>,
 ) -> AppResult<ServerInfo> {
     let password = resolve_password(&config, password);
-    let (info, _, _) = manager::probe(&config, password.as_deref()).await?;
+    let (info, _, _) = logged(manager::probe(&config, password.as_deref()).await, || {
+        format!("Connection test to {} failed", describe(&config))
+    })?;
     Ok(info)
 }
 
@@ -87,7 +134,10 @@ pub async fn connection_open(
     if password.is_none() && needs_password(&config) {
         return Err(AppError::PasswordRequired);
     }
-    let info = state.manager.open(config.clone(), password.clone()).await?;
+    let info = logged(
+        state.manager.open(config.clone(), password.clone()).await,
+        || format!("Connecting to {} failed", describe(&config)),
+    )?;
     if remember == Some(true)
         && let Some(p) = &password
     {
@@ -106,7 +156,13 @@ pub fn connection_close(state: State<'_, AppState>, id: String) {
 
 #[tauri::command]
 pub async fn db_databases(state: State<'_, AppState>, id: String) -> AppResult<Vec<DatabaseInfo>> {
-    state.manager.get(&id)?.list_databases().await
+    let result = async { state.manager.get(&id)?.list_databases().await }.await;
+    logged(result, || {
+        format!(
+            "Listing databases on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -115,7 +171,13 @@ pub async fn db_schemas(
     id: String,
     database: String,
 ) -> AppResult<Vec<SchemaInfo>> {
-    state.manager.get(&id)?.list_schemas(&database).await
+    let result = async { state.manager.get(&id)?.list_schemas(&database).await }.await;
+    logged(result, || {
+        format!(
+            "Listing schemas in {database} on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -125,11 +187,20 @@ pub async fn db_objects(
     database: String,
     schema: Option<String>,
 ) -> AppResult<Vec<DbObject>> {
-    state
-        .manager
-        .get(&id)?
-        .list_objects(&database, schema.as_deref())
-        .await
+    let result = async {
+        state
+            .manager
+            .get(&id)?
+            .list_objects(&database, schema.as_deref())
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Listing objects in {database} on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -140,11 +211,20 @@ pub async fn db_table(
     schema: Option<String>,
     name: String,
 ) -> AppResult<TableInfo> {
-    state
-        .manager
-        .get(&id)?
-        .describe_table(&database, schema.as_deref(), &name)
-        .await
+    let result = async {
+        state
+            .manager
+            .get(&id)?
+            .describe_table(&database, schema.as_deref(), &name)
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Describing table {name} on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -157,17 +237,26 @@ pub async fn db_definition(
     kind: String,
     detail: Option<String>,
 ) -> AppResult<Option<String>> {
-    state
-        .manager
-        .get(&id)?
-        .object_definition(
-            &database,
-            schema.as_deref(),
-            &name,
-            &kind,
-            detail.as_deref(),
+    let result = async {
+        state
+            .manager
+            .get(&id)?
+            .object_definition(
+                &database,
+                schema.as_deref(),
+                &name,
+                &kind,
+                detail.as_deref(),
+            )
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Loading the definition of {kind} {name} on {} failed",
+            connection_label(&state, &id)
         )
-        .await
+    })
 }
 
 #[tauri::command]
@@ -180,17 +269,26 @@ pub async fn db_routine(
     kind: String,
     detail: Option<String>,
 ) -> AppResult<RoutineInfo> {
-    state
-        .manager
-        .get(&id)?
-        .describe_routine(
-            &database,
-            schema.as_deref(),
-            &name,
-            &kind,
-            detail.as_deref(),
+    let result = async {
+        state
+            .manager
+            .get(&id)?
+            .describe_routine(
+                &database,
+                schema.as_deref(),
+                &name,
+                &kind,
+                detail.as_deref(),
+            )
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Describing routine {kind} {name} on {} failed",
+            connection_label(&state, &id)
         )
-        .await
+    })
 }
 
 #[tauri::command]
@@ -199,7 +297,13 @@ pub async fn db_completion(
     id: String,
     database: String,
 ) -> AppResult<Vec<CompletionTable>> {
-    state.manager.get(&id)?.completion(&database).await
+    let result = async { state.manager.get(&id)?.completion(&database).await }.await;
+    logged(result, || {
+        format!(
+            "Loading completions for {database} on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -211,10 +315,43 @@ pub async fn query_execute(
     sql: String,
     options: Option<ExecOptions>,
 ) -> AppResult<ExecOutput> {
-    let server = state.manager.get(&id)?;
-    server
-        .execute(&session, &database, &sql, &options.unwrap_or_default())
-        .await
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .execute(&session, &database, &sql, &options.unwrap_or_default())
+            .await
+    }
+    .await;
+    let context = || {
+        format!(
+            "Query on {} ({database}) failed",
+            connection_label(&state, &id)
+        )
+    };
+    // Statement errors come back inside the output rather than as an Err
+    if let Ok(output) = &result
+        && let Some(error) = &output.error
+    {
+        let at = error
+            .line
+            .map(|l| format!(" at line {l}"))
+            .unwrap_or_default();
+        log::error!(
+            "{}{at}: {}
+  SQL: {}",
+            context(),
+            error.message,
+            snippet(&sql)
+        );
+    }
+    logged(result, || {
+        format!(
+            "{}
+  SQL: {}",
+            context(),
+            snippet(&sql)
+        )
+    })
 }
 
 #[tauri::command]
@@ -243,10 +380,19 @@ pub async fn mongo_execute(
     request: MongoRequest,
     options: Option<ExecOptions>,
 ) -> AppResult<MongoOutput> {
-    let server = state.manager.get(&id)?;
-    server
-        .mongo_execute(&session, request, &options.unwrap_or_default())
-        .await
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .mongo_execute(&session, request, &options.unwrap_or_default())
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "MongoDB command on {} failed",
+            connection_label(&state, &id)
+        )
+    })
 }
 
 #[tauri::command]
@@ -487,4 +633,47 @@ pub async fn cloud_api(
 ) -> AppResult<serde_json::Value> {
     let token = crate::cloud::api_token(provider, account.as_deref().unwrap_or_default()).await?;
     crate::cloud::api(provider, &method, &path, body, Some(&token)).await
+}
+
+/// The current log file, as named by `tauri_plugin_log`'s log-dir target.
+fn log_file(app: &tauri::AppHandle) -> AppResult<std::path::PathBuf> {
+    use tauri::Manager as _;
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| AppError::msg(e.to_string()))?;
+    Ok(dir.join(format!("{}.log", app.package_info().name)))
+}
+
+#[tauri::command]
+pub fn logs_reveal(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt as _;
+    let path = log_file(&app)?;
+    // Nothing has failed yet; create the file so there is something to show
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::File::create(&path)?;
+    }
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| AppError::msg(e.to_string()))
+}
+
+/// The end of the current log file (empty when nothing has been logged).
+#[tauri::command]
+pub async fn logs_read(app: tauri::AppHandle) -> AppResult<String> {
+    const MAX: usize = 256 * 1024;
+    let bytes = match tokio::fs::read(log_file(&app)?).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(MAX)..]);
+    // Start at a whole line when the tail cut one in half
+    Ok(match (bytes.len() > MAX, text.find('\n')) {
+        (true, Some(i)) => text[i + 1..].to_string(),
+        _ => text.into_owned(),
+    })
 }
