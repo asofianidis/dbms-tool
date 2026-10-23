@@ -252,6 +252,9 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          # setup-node v5 enables pnpm caching from package.json's packageManager field, but this
+          # job only runs dependency-free scripts and never installs pnpm
+          package-manager-cache: false
 
       - name: Download release assets
         env:
