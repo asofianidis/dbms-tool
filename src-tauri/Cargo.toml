@@ -31,8 +31,6 @@ native-tls = "0.2.18"
 mysql_async = { version = "0.37.1", features = ["native-tls-tls"] }
 tiberius = { version = "0.13.0", default-features = false, features = ["chrono", "rust_decimal", "tds73", "winauth", "native-tls", "sql-browser-tokio"] }
 mongodb = "3.9.1"
-# Resolves mongodb+srv ourselves; see drivers/mongo_srv.rs
-hickory-resolver = "0.26.3"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 thiserror = "2.0.21"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -61,6 +59,13 @@ strip = true
 # surfaced through QueryItem (see vendor/tiberius/PATCHES.md)
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+
+# Resolves mongodb+srv ourselves; see drivers/mongo_srv.rs
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns"] }
+
+[target.'cfg(not(windows))'.dependencies]
+hickory-resolver = "0.26.3"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2"

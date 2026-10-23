@@ -1,14 +1,16 @@
 //! Resolves `mongodb+srv://` strings into plain `mongodb://` seed lists before
-//! the driver sees them. The driver's resolver (hickory) sends each DNS query
-//! from a port it picks itself, which Windows Firewall treats as the app
-//! listening and answers with an admin "Allow access" prompt. Letting the OS
-//! pick the port avoids that, and the driver has no setting for it.
+//! the driver sees them. The driver's resolver (hickory) talks to DNS servers
+//! itself, which goes wrong on Windows in two ways: it sends each query from a
+//! port it picks, which Windows Firewall treats as the app listening and
+//! answers with an admin "Allow access" prompt; and it rejects replies that
+//! corporate DNS proxies commonly mangle (an EDNS OPT record in the answer
+//! section), which Windows itself accepts. So on Windows we ask the system's
+//! DNS client, which also honours VPN split DNS and the like. Elsewhere hickory
+//! still does the lookup, with OS-chosen ports. The driver has no setting for
+//! either.
 //!
 //! The cost is SRV polling: the driver won't notice mongos nodes added to a
 //! sharded cluster until the next connect.
-
-use hickory_resolver::TokioResolver;
-use hickory_resolver::proto::rr::RData;
 
 use crate::error::{AppError, AppResult};
 
@@ -20,43 +22,144 @@ pub async fn expand(uri: &str) -> AppResult<String> {
     let Some(srv) = Srv::parse(uri) else {
         return Ok(uri.to_string());
     };
-    let mut builder = TokioResolver::builder_tokio().map_err(|e| dns_error(srv.host, e))?;
-    builder.options_mut().os_port_selection = true;
-    let resolver = builder.build().map_err(|e| dns_error(srv.host, e))?;
-
     let service = srv.option("srvServiceName").unwrap_or("mongodb");
-    let lookup = resolver
-        .srv_lookup(format!("_{service}._tcp.{}", srv.host))
+    let (hosts, txt) = lookup::srv_and_txt(&format!("_{service}._tcp.{}", srv.host), srv.host)
         .await
         .map_err(|e| dns_error(srv.host, e))?;
-    let hosts = lookup
-        .answers()
-        .iter()
-        .filter_map(|record| match &record.data {
-            RData::SRV(s) => Some((s.target.to_utf8().trim_end_matches('.').to_string(), s.port)),
-            _ => None,
-        })
-        .collect();
+    srv.rewrite(hosts, &txt)
+}
 
-    let txt = match resolver.txt_lookup(srv.host).await {
-        Ok(lookup) => lookup
+#[cfg(windows)]
+mod lookup {
+    use windows_sys::Win32::Foundation::{DNS_ERROR_RCODE_NAME_ERROR, DNS_INFO_NO_RECORDS};
+    use windows_sys::Win32::NetworkManagement::Dns::{
+        DNS_QUERY_STANDARD, DNS_RECORDW, DNS_TYPE, DNS_TYPE_SRV, DNS_TYPE_TEXT, DnsFree,
+        DnsFreeRecordList, DnsQuery_W,
+    };
+
+    /// The SRV targets (host, port) for `srv_name` and the TXT records of `host`.
+    pub async fn srv_and_txt(
+        srv_name: &str,
+        host: &str,
+    ) -> Result<(Vec<(String, u16)>, Vec<String>), String> {
+        let (srv_name, host) = (srv_name.to_string(), host.to_string());
+        tokio::task::spawn_blocking(move || {
+            let hosts = query(&srv_name, DNS_TYPE_SRV, |r| unsafe {
+                let s = &r.Data.SRV;
+                (
+                    wide(s.pNameTarget).trim_end_matches('.').to_string(),
+                    s.wPort,
+                )
+            })?;
+            let txt = query(&host, DNS_TYPE_TEXT, |r| unsafe {
+                let t = &r.Data.TXT;
+                std::slice::from_raw_parts(t.pStringArray.as_ptr(), t.dwStringCount as usize)
+                    .iter()
+                    .map(|&s| wide(s))
+                    .collect::<String>()
+            })?;
+            Ok((hosts, txt))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Answer records of type `kind` for `name`, through the system's DNS
+    /// client. A name with no such records gives an empty list.
+    fn query<T>(
+        name: &str,
+        kind: DNS_TYPE,
+        read: impl Fn(&DNS_RECORDW) -> T,
+    ) -> Result<Vec<T>, String> {
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let mut list: *mut DNS_RECORDW = std::ptr::null_mut();
+        let status = unsafe {
+            DnsQuery_W(
+                name.as_ptr(),
+                kind,
+                DNS_QUERY_STANDARD,
+                std::ptr::null_mut(),
+                (&raw mut list).cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status == DNS_ERROR_RCODE_NAME_ERROR || status == DNS_INFO_NO_RECORDS as u32 {
+            return Ok(Vec::new());
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status as i32).to_string());
+        }
+        let mut out = Vec::new();
+        let mut record = list;
+        while let Some(r) = unsafe { record.as_ref() } {
+            // The low two flag bits are the section; 1 is the answer section
+            if r.wType == kind && unsafe { r.Flags.DW } & 0b11 == 1 {
+                out.push(read(r));
+            }
+            record = r.pNext;
+        }
+        unsafe { DnsFree(list.cast(), DnsFreeRecordList) };
+        Ok(out)
+    }
+
+    /// A NUL-terminated UTF-16 string the DNS client owns.
+    unsafe fn wide(s: *const u16) -> String {
+        if s.is_null() {
+            return String::new();
+        }
+        let len = (0..).take_while(|&i| unsafe { *s.add(i) } != 0).count();
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, len) })
+    }
+}
+
+#[cfg(not(windows))]
+mod lookup {
+    use hickory_resolver::TokioResolver;
+    use hickory_resolver::proto::rr::RData;
+
+    /// The SRV targets (host, port) for `srv_name` and the TXT records of `host`.
+    pub async fn srv_and_txt(
+        srv_name: &str,
+        host: &str,
+    ) -> Result<(Vec<(String, u16)>, Vec<String>), String> {
+        let mut builder = TokioResolver::builder_tokio().map_err(|e| e.to_string())?;
+        builder.options_mut().os_port_selection = true;
+        let resolver = builder.build().map_err(|e| e.to_string())?;
+
+        let lookup = resolver
+            .srv_lookup(srv_name)
+            .await
+            .map_err(|e| e.to_string())?;
+        let hosts = lookup
             .answers()
             .iter()
             .filter_map(|record| match &record.data {
-                RData::TXT(t) => Some(
-                    t.txt_data
-                        .iter()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .collect::<String>(),
-                ),
+                RData::SRV(s) => {
+                    Some((s.target.to_utf8().trim_end_matches('.').to_string(), s.port))
+                }
                 _ => None,
             })
-            .collect(),
-        Err(e) if e.is_no_records_found() => Vec::new(),
-        Err(e) => return Err(dns_error(srv.host, e)),
-    };
+            .collect();
 
-    srv.rewrite(hosts, &txt)
+        let txt = match resolver.txt_lookup(host).await {
+            Ok(lookup) => lookup
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::TXT(t) => Some(
+                        t.txt_data
+                            .iter()
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) if e.is_no_records_found() => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        Ok((hosts, txt))
+    }
 }
 
 fn dns_error(host: &str, e: impl std::fmt::Display) -> AppError {
