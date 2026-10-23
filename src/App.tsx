@@ -23,6 +23,7 @@ import { isMod } from './lib/keys'
 import { queryClient } from './lib/queries'
 import { applyAccent, settingsStore } from './lib/settings'
 import { toastError } from './lib/toast'
+import { startUpdateChecks } from './lib/updater'
 import {
   activateTab,
   activeTab,
@@ -122,7 +123,11 @@ export function App(): React.JSX.Element {
       if (!target.closest('input, textarea, .cm-editor')) e.preventDefault()
     }
     window.addEventListener('contextmenu', onContextMenu)
-    return () => window.removeEventListener('contextmenu', onContextMenu)
+    const stopUpdates = startUpdateChecks()
+    return () => {
+      window.removeEventListener('contextmenu', onContextMenu)
+      stopUpdates()
+    }
   }, [])
 
   useEffect(() => {

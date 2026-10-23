@@ -24,7 +24,10 @@ pub fn describe_error(e: &mongodb::error::Error) -> String {
             format!("Write error {}: {}", w.code, w.message)
         }
         ErrorKind::ServerSelection { message, .. } => {
-            format!("Could not reach the server: {}", server_selection_cause(message))
+            format!(
+                "Could not reach the server: {}",
+                server_selection_cause(message)
+            )
         }
         _ => e.to_string(),
     }
@@ -36,8 +39,16 @@ fn server_selection_cause(message: &str) -> &str {
         .split("Error: ")
         .nth(1)
         .map(|rest| rest.split(", labels:").next().unwrap_or(rest))
-        .map(|rest| rest.trim_start_matches("Kind: ").trim_start_matches("I/O error: "))
-        .map(|rest| rest.split(" (os error").next().unwrap_or(rest).trim_end_matches('.'))
+        .map(|rest| {
+            rest.trim_start_matches("Kind: ")
+                .trim_start_matches("I/O error: ")
+        })
+        .map(|rest| {
+            rest.split(" (os error")
+                .next()
+                .unwrap_or(rest)
+                .trim_end_matches('.')
+        })
         .unwrap_or("no server responded")
 }
 
@@ -792,7 +803,10 @@ mod tests {
     fn shortens_server_selection_errors() {
         let message = "Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: localhost:57017, Type: Unknown, Error: Kind: I/O error: No connection could be made because the target machine actively refused it. (os error 10061), labels: {\"RetryableError\"}, source: None } ] }";
         let cause = server_selection_cause(message);
-        assert_eq!(cause, "No connection could be made because the target machine actively refused it");
+        assert_eq!(
+            cause,
+            "No connection could be made because the target machine actively refused it"
+        );
     }
 
     #[test]

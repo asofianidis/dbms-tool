@@ -1,8 +1,10 @@
 import { useState } from 'react'
-import { Check } from 'lucide-react'
+import { Check, ExternalLink, RefreshCw } from 'lucide-react'
 import { getVersion } from '@tauri-apps/api/app'
 import { cn } from '@/lib/cn'
+import { timeAgo } from '@/lib/format'
 import { historyStore } from '@/lib/history'
+import { checkForUpdates, installUpdate, openReleasePage, updateStore } from '@/lib/updater'
 import { ACCENTS, applyAccent, settingsStore, type Settings } from '@/lib/settings'
 import { toast } from '@/lib/toast'
 import { confirm } from '@/lib/workspace'
@@ -48,6 +50,7 @@ function Section({
 export function SettingsTab(): React.JSX.Element {
   const settings = settingsStore.use()
   const history = historyStore.use()
+  const update = updateStore.use()
   const [version, setVersion] = useState('')
   const [customAccent, setCustomAccent] = useState(settings.accent)
   if (!version)
@@ -170,6 +173,60 @@ export function SettingsTab(): React.JSX.Element {
               checked={settings.showSystemObjects}
               onChange={(v) => set('showSystemObjects', v)}
             />
+          </Row>
+        </Section>
+
+        <Section title="Updates">
+          <Row
+            title={`Version ${version}`}
+            description={
+              update.state === 'checking'
+                ? 'Checking for updates…'
+                : update.state === 'current'
+                  ? `Up to date · checked ${timeAgo(update.checkedAt)}`
+                  : update.state === 'downloading'
+                    ? `Downloading v${update.version}${update.progress != null ? ` · ${update.progress}%` : ''}`
+                    : update.state === 'ready'
+                      ? `v${update.version} is ready to install`
+                      : update.state === 'installing'
+                        ? `Installing v${update.version}…`
+                        : update.state === 'error'
+                          ? `Update failed: ${update.error}`
+                          : 'Updates are signed and verified before they install'
+            }
+          >
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={() => openReleasePage()}>
+                <ExternalLink className="size-3.5" /> Releases
+              </Button>
+              {update.state === 'ready' ? (
+                <Button size="sm" variant="primary" onClick={() => void installUpdate()}>
+                  Restart to update
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={
+                    update.state === 'checking' ||
+                    update.state === 'downloading' ||
+                    update.state === 'installing'
+                  }
+                  onClick={() => void checkForUpdates(true)}
+                >
+                  <RefreshCw
+                    className={cn('size-3.5', update.state === 'checking' && 'animate-spin')}
+                  />{' '}
+                  Check now
+                </Button>
+              )}
+            </div>
+          </Row>
+          <Row
+            title="Check for updates automatically"
+            description="Looks for new releases at startup and every few hours, and downloads them in the background"
+          >
+            <Switch checked={settings.autoUpdate} onChange={(v) => set('autoUpdate', v)} />
           </Row>
         </Section>
 

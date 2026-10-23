@@ -1,0 +1,159 @@
+name: ci
+
+# main is checked by the release workflow, which runs this before building
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Format
+        run: pnpm exec prettier --check src
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libdbus-1-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # tauri::generate_context! expects the frontend output folder to exist
+      - name: Stub frontend build
+        shell: bash
+        run: mkdir -p dist && echo '<!doctype html>' > dist/index.html
+
+      - name: Format
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        working-directory: src-tauri
+        run: cargo test
+
+  databases:
+    # End-to-end driver tests against every supported engine
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: Dbms_test_pw1
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: Dbms_test_pw1
+        ports: ['53306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pDbms_test_pw1" --health-interval 5s --health-timeout 5s --health-retries 30
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Dbms_test_pw1
+        ports: ['51433:1433']
+      babelfish:
+        image: jonathanpotts/babelfishpg
+        ports: ['51434:1433']
+      mongo:
+        image: mongo:8
+        ports: ['57017:27017']
+    env:
+      DBMS_TEST_PG: localhost:55432:postgres:Dbms_test_pw1
+      DBMS_TEST_MYSQL: localhost:53306:root:Dbms_test_pw1
+      DBMS_TEST_MSSQL: localhost:51433:sa:Dbms_test_pw1
+      DBMS_TEST_BABELFISH: localhost:51434:babelfish_user:12345678
+      DBMS_TEST_MONGO: mongodb://localhost:57017
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libdbus-1-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Stub frontend build
+        run: mkdir -p dist && echo '<!doctype html>' > dist/index.html
+
+      - name: Build tests
+        working-directory: src-tauri
+        run: cargo test --no-run
+
+      - name: Wait for SQL Server and Babelfish
+        run: |
+          for i in $(seq 1 60); do
+            if docker logs "${{ job.services.mssql.id }}" 2>&1 | grep -q "SQL Server is now ready"; then break; fi
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/localhost/51434) 2>/dev/null && break
+            sleep 2
+          done
+          sleep 5
+
+      - name: Live database tests
+        working-directory: src-tauri
+        run: cargo test integration_tests -- --test-threads=1 --nocapture

@@ -6,6 +6,7 @@ import { MOD } from '@/lib/keys'
 import { activeTab, connectionsStore, openPalette, tabsStore } from '@/lib/workspace'
 import { connectionLabel } from '@/lib/engines'
 import { Kbd, LogoMark } from '../ui'
+import { UpdateButton } from './UpdateButton'
 
 const appWindow = getCurrentWindow()
 
@@ -85,6 +86,10 @@ export function TitleBar(): React.JSX.Element {
       </div>
 
       <div data-tauri-drag-region className="flex-1" />
+
+      <div className="relative z-10 mr-2 flex items-center">
+        <UpdateButton />
+      </div>
 
       <div className="relative z-10 flex h-full">
         {[

@@ -15,6 +15,8 @@ export interface Settings {
   /** Ask before running DELETE/UPDATE without WHERE, DROP, TRUNCATE */
   confirmDangerous: boolean
   sidebarWidth: number
+  /** Check GitHub Releases for signed updates in the background */
+  autoUpdate: boolean
 }
 
 export const DEFAULT_ACCENT = '#a8c7fa'
@@ -41,11 +43,15 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   showSystemObjects: false,
   wordWrap: false,
   confirmDangerous: true,
-  sidebarWidth: 280
+  sidebarWidth: 280,
+  autoUpdate: true
 })
 
 // Settings saved before accentVersion existed still carry the old lime default
-if (!readPersisted('dbms.settings.v1')?.includes('accentVersion') && settingsStore.get().accent === PREVIOUS_DEFAULT_ACCENT) {
+if (
+  !readPersisted('dbms.settings.v1')?.includes('accentVersion') &&
+  settingsStore.get().accent === PREVIOUS_DEFAULT_ACCENT
+) {
   settingsStore.set((s) => ({ ...s, accent: DEFAULT_ACCENT, accentVersion: 2 }))
 }
 

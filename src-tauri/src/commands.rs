@@ -266,9 +266,10 @@ pub fn state_load_all(
             && let (Some(stem), Ok(text)) = (
                 path.file_stem().and_then(|s| s.to_str()),
                 std::fs::read_to_string(&path),
-            ) {
-                out.insert(stem.to_string(), text);
-            }
+            )
+        {
+            out.insert(stem.to_string(), text);
+        }
     }
     Ok(out)
 }

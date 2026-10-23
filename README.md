@@ -58,6 +58,14 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 - Schema analysis over a `$sample`: field paths, presence and type mix.
 - Index management with usage statistics, and explain with collection-scan warnings.
 
+## Install
+
+Download the latest build for Windows, macOS or Linux from
+[Releases](https://github.com/asofianidis/dbms-tool/releases/latest). The app updates itself;
+updates are signed and verified before they install. Every download is listed in
+`SHA256SUMS.txt` and has a GitHub build-provenance attestation
+(`gh attestation verify <file> --repo asofianidis/dbms-tool`).
+
 ## Development
 
 Prerequisites: Node 20+, pnpm, and Rust (stable) with the
@@ -84,6 +92,13 @@ eval "$(./scripts/test-databases.sh env)"
 cd src-tauri && cargo test -- --test-threads=1
 ./scripts/test-databases.sh down
 ```
+
+### CI and releases
+
+`ci.yml` runs formatting, type checks, unit tests, clippy and the Rust tests on Windows, macOS and
+Linux, plus the live database suite against all five engines. `release.yml` builds and publishes
+signed installers; see [docs/RELEASING.md](docs/RELEASING.md) for versioning and the signing
+secrets.
 
 ### Layout
 
