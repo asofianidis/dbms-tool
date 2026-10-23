@@ -153,6 +153,50 @@ function shellKey(k: string): string {
   return IDENT.test(k) ? k : JSON.stringify(k)
 }
 
+/*
+ * `toShell` output is evaluated by `parseShellValue`, and documents come from the
+ * database, so every value written into it must stay a literal. MongoDB allows
+ * `$`-prefixed field names, so a plain document can look like `{ $oid: '…' }`.
+ */
+
+/** A string argument: single-quoted when that's plainly safe, else JSON-quoted. */
+function shellString(v: unknown): string {
+  const s = String(v)
+  return /^[\w.:+\-/=]*$/.test(s) ? `'${s}'` : JSON.stringify(s)
+}
+
+/** A numeric argument written verbatim only when it's a number literal. */
+function shellNumber(v: unknown): string {
+  const s = String(v)
+  return /^-?(\d+(\.\d*)?([eE][+-]?\d+)?|NaN|Infinity)$/.test(s) ? s : JSON.stringify(s)
+}
+
+/**
+ * A regex literal when it can't end early (every `/` escaped, no trailing lone
+ * `\`, no line breaks, no `/*` or `//` comment) and JavaScript accepts it;
+ * otherwise `BSONRegExp('…', '…')`, which also keeps PCRE-only syntax intact.
+ */
+function shellRegex(pattern: string, options: string): string {
+  const escaped = pattern.replace(/(\\*)\//g, (m, slashes: string) =>
+    slashes.length % 2 ? m : `${slashes}\\/`
+  )
+  const literal =
+    escaped !== '' &&
+    !escaped.startsWith('*') &&
+    !/[\r\n\p{Zl}\p{Zp}]/u.test(escaped) &&
+    (escaped.match(/\\*$/)?.[0].length ?? 0) % 2 === 0 &&
+    /^[a-z]*$/.test(options)
+  if (literal) {
+    try {
+      new RegExp(escaped, options)
+      return `/${escaped}/${options}`
+    } catch {
+      // Not valid JavaScript (possessive quantifiers, inline flags): keep the text as-is
+    }
+  }
+  return `BSONRegExp(${JSON.stringify(pattern)}, ${JSON.stringify(options)})`
+}
+
 /** mongosh-style text for an EJSON value; `parseShellValue` reads it back. */
 export function toShell(v: unknown, indent = 2, depth = 0): string {
   const t = bsonType(v)
@@ -168,34 +212,34 @@ export function toShell(v: unknown, indent = 2, depth = 0): string {
     case 'Int32':
       return typeof v === 'number' || typeof v === 'boolean'
         ? String(v)
-        : `NumberInt(${o.$numberInt})`
+        : `NumberInt(${shellNumber(o.$numberInt)})`
     case 'Double': {
       const text = typeof v === 'number' ? String(v) : String(o.$numberDouble)
       if (/^-?\d+$/.test(text)) return `${text}.0`
       if (/^(NaN|-?Infinity)$/.test(text)) return text
-      return text
+      return shellNumber(text) === text ? text : `Double(${JSON.stringify(text)})`
     }
     case 'ObjectId':
-      return `ObjectId('${o.$oid}')`
+      return `ObjectId(${shellString(o.$oid)})`
     case 'Date':
-      return `ISODate('${dateString(o.$date)}')`
+      return `ISODate(${shellString(dateString(o.$date))})`
     case 'Int64':
-      return `NumberLong('${o.$numberLong}')`
+      return `NumberLong(${shellString(o.$numberLong)})`
     case 'Decimal128':
-      return `NumberDecimal('${o.$numberDecimal}')`
+      return `NumberDecimal(${shellString(o.$numberDecimal)})`
     case 'UUID':
-      return `UUID('${scalarText(v)}')`
+      return `UUID(${shellString(scalarText(v))})`
     case 'Binary': {
       const b = o.$binary as { base64: string; subType: string }
-      return `BinData(${parseInt(b.subType, 16)}, '${b.base64}')`
+      return `BinData(${parseInt(b.subType, 16)}, ${shellString(b.base64)})`
     }
     case 'Regex': {
       const r = o.$regularExpression as { pattern: string; options: string }
-      return `/${r.pattern.replace(/\//g, '\\/')}/${r.options}`
+      return shellRegex(String(r.pattern), String(r.options))
     }
     case 'Timestamp': {
       const ts = o.$timestamp as { t: number; i: number }
-      return `Timestamp({ t: ${ts.t}, i: ${ts.i} })`
+      return `Timestamp({ t: ${shellNumber(ts.t)}, i: ${shellNumber(ts.i)} })`
     }
     case 'MinKey':
       return 'MinKey()'
@@ -273,6 +317,8 @@ export const shellHelpers = {
     new Ejson({ $binary: { base64, subType: subType.toString(16).padStart(2, '0') } }),
   Timestamp: (t: number | { t: number; i: number }, i?: number) =>
     new Ejson({ $timestamp: typeof t === 'object' ? { t: t.t, i: t.i } : { t, i: i ?? 0 } }),
+  BSONRegExp: (pattern: string, options = '') =>
+    new Ejson({ $regularExpression: { pattern: String(pattern), options: String(options) } }),
   MinKey: () => new Ejson({ $minKey: 1 }),
   MaxKey: () => new Ejson({ $maxKey: 1 })
 }

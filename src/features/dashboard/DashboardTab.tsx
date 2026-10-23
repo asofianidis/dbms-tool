@@ -53,6 +53,7 @@ import {
   renameDashboard,
   setLocked
 } from './actions'
+import { ImportReview } from './ImportReview'
 import { runWidgetQuery } from './run'
 import { WidgetBody } from './WidgetBody'
 import { WidgetEditor } from './WidgetEditor'
@@ -112,6 +113,7 @@ export function DashboardTab({ tab }: { tab: TabOf<'dashboard'> }): React.JSX.El
         title="This dashboard was deleted"
       />
     )
+  if (dashboard.unreviewed) return <ImportReview dashboard={dashboard} />
   return <DashboardView tab={tab} dashboard={dashboard} />
 }
 

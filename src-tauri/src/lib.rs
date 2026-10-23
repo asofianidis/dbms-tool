@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod drivers;
 mod error;
+mod file_scope;
 mod guard;
 #[cfg(test)]
 mod integration_tests;
@@ -29,12 +30,15 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        // Only for the scope dialogs add picked files to; grants the webview nothing
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
+            file_scope::init(app.handle())?;
             let dir = app.path().app_config_dir()?;
             app.manage(AppState {
                 store: config::ConnectionStore::load(dir),

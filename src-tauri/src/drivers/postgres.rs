@@ -72,8 +72,12 @@ pub async fn connect(
     database: &str,
 ) -> AppResult<PgSession> {
     let mut pg = tokio_postgres::Config::new();
-    pg.host(&cfg.host)
-        .port(if cfg.port == 0 { 5432 } else { cfg.port })
+    match (&cfg.tunneled, cfg.host.parse::<std::net::IpAddr>()) {
+        // Connect to the tunnel, but check the certificate against the real server
+        (Some((origin, _)), Ok(local)) => pg.host(origin).hostaddr(local),
+        _ => pg.host(&cfg.host),
+    };
+    pg.port(if cfg.port == 0 { 5432 } else { cfg.port })
         .user(&cfg.user)
         .dbname(if database.is_empty() {
             "postgres"

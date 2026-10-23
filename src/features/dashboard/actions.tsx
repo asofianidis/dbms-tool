@@ -143,7 +143,8 @@ export async function importDashboard(): Promise<void> {
       ...data,
       name: uniqueDashboardName(dashboardsStore.get(), data.name),
       connectionId,
-      database: data.database || defaultDatabase(connectionId)
+      database: data.database || defaultDatabase(connectionId),
+      unreviewed: true
     })
     dashboardsStore.set(result.list)
     openDashboard(result.dashboard.id)

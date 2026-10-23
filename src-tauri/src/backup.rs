@@ -610,8 +610,12 @@ fn mysql_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
         (SslMode::Require, true) => Some("--ssl"),
     };
     plan.args.extend(ssl.map(String::from));
-    // MariaDB 11.4+ verifies certificates by default; MySQL's REQUIRED never does
-    if mariadb && cfg.ssl != SslMode::Disable && cfg.trust_server_certificate {
+    // MariaDB 11.4+ verifies certificates by default; MySQL's REQUIRED never does.
+    // Through a tunnel the tools can only check the certificate against 127.0.0.1.
+    if mariadb
+        && cfg.ssl != SslMode::Disable
+        && (cfg.trust_server_certificate || cfg.tunneled.is_some())
+    {
         plan.args.push("--skip-ssl-verify-server-cert".into());
     }
 }

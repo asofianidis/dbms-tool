@@ -63,9 +63,42 @@ fn logged<T>(result: AppResult<T>, context: impl FnOnce() -> String) -> AppResul
     result
 }
 
+/// Blanks out quoted strings, so passwords (`IDENTIFIED BY '…'`) and data
+/// values never reach the log file. A doubled quote inside a string stays inside it.
+fn redact_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            None => {
+                out.push(c);
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push('…');
+                }
+            }
+            // MySQL's \' escape; elsewhere this can only hide more, never less
+            Some(_) if c == '\\' => {
+                chars.next();
+            }
+            Some(q) if c == q && chars.peek() == Some(&q) => {
+                chars.next();
+            }
+            Some(q) if c == q => {
+                out.push(c);
+                quote = None;
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
 /// The start of a statement on one line, so log entries stay readable.
 fn snippet(sql: &str) -> String {
     const MAX: usize = 200;
+    let sql = redact_literals(sql);
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(MAX) {
         Some((i, _)) => format!("{}...", &flat[..i]),
@@ -408,7 +441,12 @@ pub async fn mongo_execute(
 }
 
 #[tauri::command]
-pub async fn file_write_text(path: String, contents: String) -> AppResult<()> {
+pub async fn file_write_text(
+    app: tauri::AppHandle,
+    path: String,
+    contents: String,
+) -> AppResult<()> {
+    crate::file_scope::check(&app, &path)?;
     tokio::fs::write(&path, contents).await?;
     Ok(())
 }
@@ -416,7 +454,10 @@ pub async fn file_write_text(path: String, contents: String) -> AppResult<()> {
 /// Binary contents arrive as the raw request body (no JSON number arrays), with
 /// the URI-encoded destination in the `x-path` header.
 #[tauri::command]
-pub async fn file_write_bytes(request: tauri::ipc::Request<'_>) -> AppResult<()> {
+pub async fn file_write_bytes(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> AppResult<()> {
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err(AppError::msg("Expected binary contents"));
     };
@@ -426,6 +467,7 @@ pub async fn file_write_bytes(request: tauri::ipc::Request<'_>) -> AppResult<()>
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::msg("Missing destination path"))?;
     let path = percent_decode(path)?;
+    crate::file_scope::check(&app, &path)?;
     tokio::fs::write(&path, bytes).await?;
     Ok(())
 }
@@ -450,7 +492,8 @@ fn percent_decode(s: &str) -> AppResult<String> {
 }
 
 #[tauri::command]
-pub async fn file_read_text(path: String) -> AppResult<String> {
+pub async fn file_read_text(app: tauri::AppHandle, path: String) -> AppResult<String> {
+    crate::file_scope::check(&app, &path)?;
     Ok(tokio::fs::read_to_string(&path).await?)
 }
 
@@ -523,6 +566,7 @@ pub async fn cloud_cli(
     workdir: Option<String>,
     account: Option<String>,
 ) -> AppResult<String> {
+    crate::cloud::check_args(provider, &args)?;
     crate::cloud::run(
         provider,
         args,
@@ -688,4 +732,23 @@ pub async fn logs_read(app: tauri::AppHandle) -> AppResult<String> {
         (true, Some(i)) => text[i + 1..].to_string(),
         _ => text.into_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logged_sql_hides_quoted_strings() {
+        assert_eq!(
+            snippet("ALTER USER app IDENTIFIED BY 'hunter2'"),
+            "ALTER USER app IDENTIFIED BY '…'"
+        );
+        assert_eq!(
+            snippet("insert into t values ('it''s', \"x\") -- done"),
+            "insert into t values ('…', \"…\") -- done"
+        );
+        assert_eq!(snippet(r"SELECT 'a\'b secret' FROM t"), "SELECT '…' FROM t");
+        assert_eq!(snippet("SELECT 1"), "SELECT 1");
+    }
 }
