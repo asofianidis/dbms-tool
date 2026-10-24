@@ -27,6 +27,7 @@ import {
 import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
+import { ClusterPanel } from '../mongo/ClusterPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics } from './LiveMetrics'
 
@@ -218,6 +219,8 @@ function ServerDashboard({
         {babelfish && (
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
         )}
+
+        {connection.engine === 'mongo' && <ClusterPanel connection={connection} />}
 
         <section>
           <h2 className="mb-2 flex items-center gap-2 text-[11px] font-semibold tracking-wider text-muted uppercase">

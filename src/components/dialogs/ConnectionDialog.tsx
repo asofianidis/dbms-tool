@@ -476,7 +476,11 @@ function ConnectionDialog({
             <Field
               label="Host"
               hint={
-                tds ? 'Use host\\INSTANCE for a named instance (leave the port empty).' : undefined
+                tds
+                  ? 'Use host\\INSTANCE for a named instance (leave the port empty).'
+                  : config.engine === 'mongo'
+                    ? 'For a replica set or sharded cluster, list members or mongos routers: host1,host2:27018'
+                    : undefined
               }
             >
               <Input
@@ -602,6 +606,16 @@ function ConnectionDialog({
               />
             </Field>
           )}
+          {config.engine === 'mongo' && !usesUri && (
+            <Field label="Replica set" hint="Optional; checks the members belong to this set">
+              <Input
+                value={config.replicaSet ?? ''}
+                onChange={(e) => patch({ replicaSet: e.target.value })}
+                placeholder="rs0"
+              />
+            </Field>
+          )}
+          {config.engine === 'mongo' && <MongoReadPreference config={config} patch={patch} />}
           {!sqlite && (
             <Field
               label={tds ? 'Encryption' : 'SSL / TLS'}
@@ -732,4 +746,31 @@ const IAM_HINTS: Record<MajorCloud, string> = {
   gcp: 'Signs in with a token from "gcloud sql generate-login-token". The user is your Google account added to the instance as an IAM user (for MySQL, the part before the @), with the cloudsql.iam_authentication flag on.',
   azure:
     'Signs in with a Microsoft Entra token from "az account get-access-token". The user is your Entra user principal name (e.g. you@contoso.com), set up as an Entra admin or database user.'
+}
+
+function MongoReadPreference({
+  config,
+  patch
+}: {
+  config: ConnectionConfig
+  patch: (p: Partial<ConnectionConfig>) => void
+}): React.JSX.Element {
+  return (
+    <Field
+      label="Read preference"
+      hint="Which replica set members finds and aggregations read from"
+    >
+      <Select
+        value={config.readPreference ?? ''}
+        onChange={(e) => patch({ readPreference: e.target.value })}
+      >
+        <option value="">Default{config.uri ? ' (from the string)' : ' (primary)'}</option>
+        <option value="primary">Primary</option>
+        <option value="primaryPreferred">Primary preferred</option>
+        <option value="secondary">Secondary</option>
+        <option value="secondaryPreferred">Secondary preferred</option>
+        <option value="nearest">Nearest</option>
+      </Select>
+    </Field>
+  )
 }
