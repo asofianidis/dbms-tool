@@ -2,14 +2,21 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   ArrowDown,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   ArrowUpDown,
   Braces,
   ClipboardCopy,
   Columns3,
+  EyeOff,
   Eye,
   FileJson,
   Filter,
+  ListFilter,
+  Pin,
+  PinOff,
+  RotateCcw,
   Rows3,
   Table2,
   Trash2,
@@ -18,20 +25,36 @@ import {
 } from 'lucide-react'
 import type { Cell, ColumnMeta } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { displayTimestamp } from '@/lib/datetime'
 import type { Dialect } from '@/lib/engines'
 import { copyText, serialize, toTsv } from '@/lib/export'
+import {
+  columnFilter,
+  columnKeys,
+  emptyLayout,
+  gridLayoutStore,
+  moveColumn,
+  resetLayout,
+  updateLayout,
+  viewColumns,
+  type GridLayout
+} from '@/lib/grid-layout'
 import { isMod } from '@/lib/keys'
+import { settingsStore } from '@/lib/settings'
 import { isNumericType } from '@/lib/sql'
 import { showContextMenu, type MenuItem } from '../ContextMenu'
 import { ValueInspector } from './ValueInspector'
 
 const ROW_HEIGHT = 26
 const HEADER_HEIGHT = 30
+const FILTER_HEIGHT = 28
 const GUTTER = 52
 const MIN_WIDTH = 56
 const MAX_AUTO_WIDTH = 360
+/** Shared so a grid without a saved layout gets the same object every render */
+const NO_LAYOUT = emptyLayout()
 
-export type RowStatus = 'inserted' | 'deleted' | undefined
+export type RowStatus = 'inserted' | 'deleted' | 'changed' | undefined
 
 export interface GridEditing {
   /** Commit a new value for data row `row`, column `col` */
@@ -40,8 +63,14 @@ export interface GridEditing {
   isModified: (row: number, col: number) => boolean
   onDeleteRows: (rows: number[]) => void
   onRevertRows: (rows: number[]) => void
-  /** Columns that can't be edited (generated / identity) */
+  /** Columns that can't be edited (generated / identity, or not from the table) */
   readOnlyColumns?: Set<number>
+}
+
+/** Row and cell highlights without editing, e.g. for comparing results */
+export interface GridMarks {
+  rowStatus?: (row: number) => RowStatus
+  isModified?: (row: number, col: number) => boolean
 }
 
 export type SortState = { col: number; dir: 'asc' | 'desc' } | null
@@ -50,23 +79,32 @@ interface Props {
   columns: ColumnMeta[]
   rows: Cell[][]
   editing?: GridEditing
+  marks?: GridMarks
   /** When set, sorting is delegated (e.g. to an ORDER BY) instead of done in memory */
   sort?: SortState
   onSortChange?: (sort: SortState) => void
   /** Client-side quick filter */
   filter?: string
+  /** Show the per-column filter row; uncontrolled when absent */
+  columnFilters?: boolean
+  onColumnFiltersChange?: (open: boolean) => void
+  /** Remembers widths, order, hidden and frozen columns under this key */
+  layoutKey?: string
   dialect?: Dialect
   tableName?: string
   /** "Filter by this value" in the context menu */
   onFilterByValue?: (column: string, value: Cell) => void
   /** Extra context menu items for a cell, by data row and column */
   cellMenuItems?: (row: number, col: number) => MenuItem[]
+  /** Fetches a cell's whole value (binary cells arrive cut short) */
+  onLoadValue?: (row: number, col: number) => Promise<Cell>
   /** Row numbers start here (for paged views) */
   rowOffset?: number
   className?: string
   onSelectionSummary?: (summary: string | null) => void
 }
 
+/** Selection and focus are in view coordinates: filtered/sorted row, displayed column. */
 interface Pos {
   r: number
   c: number
@@ -95,13 +133,18 @@ export const ResultGrid = memo(function ResultGrid({
   columns,
   rows,
   editing,
+  marks,
   sort: controlledSort,
   onSortChange,
   filter,
+  columnFilters: controlledFilters,
+  onColumnFiltersChange,
+  layoutKey,
   dialect,
   tableName,
   onFilterByValue,
   cellMenuItems,
+  onLoadValue,
   rowOffset = 0,
   className,
   onSelectionSummary
@@ -114,17 +157,51 @@ export const ResultGrid = memo(function ResultGrid({
   const [editingCell, setEditingCell] = useState<Pos | null>(null)
   const [inspect, setInspect] = useState<{ row: number; col: number } | null>(null)
   const dragging = useRef(false)
+  const { timeZone, assumeUtc, dateFormat } = settingsStore.use()
+  const timeDisplay = useMemo(
+    () => ({ timeZone, assumeUtc, format: dateFormat }),
+    [timeZone, assumeUtc, dateFormat]
+  )
+
+  // Column layout: persisted under layoutKey, else kept for this grid's lifetime
+  const stored = gridLayoutStore.use()
+  const [localLayout, setLocalLayout] = useState<GridLayout>(emptyLayout)
+  const layout = layoutKey ? (stored[layoutKey] ?? NO_LAYOUT) : localLayout
+  const changeLayout = useCallback(
+    (update: (l: GridLayout) => Partial<GridLayout>) => {
+      if (layoutKey) updateLayout(layoutKey, update)
+      else setLocalLayout((l) => ({ ...l, ...update(l) }))
+    },
+    [layoutKey]
+  )
+  const keys = useMemo(() => columnKeys(columns), [columns])
+  const view = useMemo(() => {
+    const v = viewColumns(keys, layout)
+    return v.length ? v : keys.map((_, i) => i)
+  }, [keys, layout])
+  const hiddenCount = columns.length - view.length
+  const frozen = Math.max(0, Math.min(layout.frozen, view.length - 1))
+
+  const [localFilters, setLocalFilters] = useState(false)
+  const filtersOpen = controlledFilters ?? localFilters
+  const setFiltersOpen = (open: boolean): void => {
+    if (onColumnFiltersChange) onColumnFiltersChange(open)
+    else setLocalFilters(open)
+  }
+  const [colFilters, setColFilters] = useState<Record<string, string>>({})
+  const headerHeight = HEADER_HEIGHT + (filtersOpen ? FILTER_HEIGHT : 0)
 
   const numeric = useMemo(
     () => columns.map((c, i) => (c.typeName ? isNumericType(c.typeName) : looksNumeric(rows, i))),
     [columns, rows]
   )
 
-  // Initial widths from the header and a sample of values
-  const [widths, setWidths] = useState<number[]>([])
+  // Initial widths from the header and a sample of values, by data column
+  const [autoWidths, setAutoWidths] = useState<number[]>([])
+  const [dragWidth, setDragWidth] = useState<{ col: number; width: number } | null>(null)
   useEffect(() => {
     const sample = rows.slice(0, 200)
-    setWidths(
+    setAutoWidths(
       columns.map((c, i) => {
         // Header shows the name and the type side by side
         let chars = c.name.length + (c.typeName ? c.typeName.length * 0.8 + 2 : 0) + 3
@@ -143,7 +220,37 @@ export const ResultGrid = memo(function ResultGrid({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [columns])
 
+  const widthOf = useCallback(
+    (col: number): number =>
+      dragWidth?.col === col
+        ? dragWidth.width
+        : (layout.widths[keys[col]] ?? autoWidths[col] ?? 120),
+    [dragWidth, layout.widths, keys, autoWidths]
+  )
+  const frozenCols = useMemo(() => view.slice(0, frozen), [view, frozen])
+  const scrollCols = useMemo(() => view.slice(frozen), [view, frozen])
+  const frozenLefts = useMemo(() => {
+    let left = GUTTER
+    return frozenCols.map((c) => {
+      const at = left
+      left += widthOf(c)
+      return at
+    })
+  }, [frozenCols, widthOf])
+  const frozenWidth = frozenCols.reduce((n, c) => n + widthOf(c), 0)
+
   // View order: filter then sort; values are data-row indexes
+  const tests = useMemo(
+    () =>
+      Object.entries(colFilters)
+        .map(([key, text]) => {
+          const col = keys.indexOf(key)
+          const test = col >= 0 ? columnFilter(text, numeric[col]) : null
+          return test ? ([col, test] as const) : null
+        })
+        .filter((t) => t !== null),
+    [colFilters, keys, numeric]
+  )
   const order = useMemo(() => {
     let idx = rows.map((_, i) => i)
     const q = filter?.trim().toLowerCase()
@@ -151,6 +258,8 @@ export const ResultGrid = memo(function ResultGrid({
       idx = idx.filter((i) =>
         rows[i].some((v) => v !== null && String(v).toLowerCase().includes(q))
       )
+    if (filtersOpen && tests.length)
+      idx = idx.filter((i) => tests.every(([col, test]) => test(rows[i][col])))
     if (sort && !onSortChange) {
       const { col, dir } = sort
       const num = numeric[col]
@@ -160,7 +269,7 @@ export const ResultGrid = memo(function ResultGrid({
       })
     }
     return idx
-  }, [rows, filter, sort, onSortChange, numeric])
+  }, [rows, filter, filtersOpen, tests, sort, onSortChange, numeric])
 
   const rowVirtualizer = useVirtualizer({
     count: order.length,
@@ -170,13 +279,13 @@ export const ResultGrid = memo(function ResultGrid({
   })
   const colVirtualizer = useVirtualizer({
     horizontal: true,
-    count: columns.length,
+    count: scrollCols.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (i) => widths[i] ?? 120,
-    paddingStart: GUTTER,
+    estimateSize: (i) => widthOf(scrollCols[i]),
+    paddingStart: GUTTER + frozenWidth,
     overscan: 4
   })
-  useEffect(() => colVirtualizer.measure(), [widths, colVirtualizer])
+  useEffect(() => colVirtualizer.measure(), [widthOf, scrollCols, frozenWidth, colVirtualizer])
 
   const selection = useMemo(() => {
     if (!anchor || !focus) return null
@@ -198,7 +307,7 @@ export const ResultGrid = memo(function ResultGrid({
     let count = 0
     for (let r = selection.r1; r <= selection.r2 && r - selection.r1 < 5000; r++) {
       for (let c = selection.c1; c <= selection.c2; c++) {
-        const v = rows[order[r]]?.[c]
+        const v = rows[order[r]]?.[view[c]]
         if (typeof v === 'string' && v !== '' && !Number.isNaN(Number(v))) {
           sum += Number(v)
           count++
@@ -212,7 +321,7 @@ export const ResultGrid = memo(function ResultGrid({
         `Avg ${Number((sum / count).toPrecision(8)).toLocaleString()}`
       )
     onSelectionSummary(parts.join(' · '))
-  }, [selection, rows, order, onSelectionSummary])
+  }, [selection, rows, order, view, onSelectionSummary])
 
   const isSelected = useCallback(
     (r: number, c: number) =>
@@ -226,14 +335,15 @@ export const ResultGrid = memo(function ResultGrid({
 
   const scrollTo = (p: Pos): void => {
     rowVirtualizer.scrollToIndex(p.r, { align: 'auto' })
-    colVirtualizer.scrollToIndex(p.c, { align: 'auto' })
+    if (p.c >= frozen) colVirtualizer.scrollToIndex(p.c - frozen, { align: 'auto' })
   }
 
   const selectedData = (): { cols: ColumnMeta[]; data: Cell[][]; dataRows: number[] } => {
     if (!selection) return { cols: [], data: [], dataRows: [] }
-    const cols = columns.slice(selection.c1, selection.c2 + 1)
+    const shown = view.slice(selection.c1, selection.c2 + 1)
+    const cols = shown.map((i) => columns[i])
     const dataRows = order.slice(selection.r1, selection.r2 + 1)
-    const data = dataRows.map((r) => rows[r].slice(selection.c1, selection.c2 + 1))
+    const data = dataRows.map((r) => shown.map((i) => rows[r][i]))
     return { cols, data, dataRows }
   }
 
@@ -256,18 +366,20 @@ export const ResultGrid = memo(function ResultGrid({
     )
   }
 
-  const canEdit = (c: number): boolean => !!editing && !editing.readOnlyColumns?.has(c)
+  /** Whether data column `col` can be edited */
+  const canEdit = (col: number): boolean => !!editing && !editing.readOnlyColumns?.has(col)
 
   const beginEdit = (p: Pos): void => {
     const row = order[p.r]
-    if (!canEdit(p.c) || editing?.rowStatus(row) === 'deleted') return
+    if (!canEdit(view[p.c]) || editing?.rowStatus(row) === 'deleted') return
     setEditingCell(p)
   }
 
   const onKeyDown = (e: React.KeyboardEvent): void => {
     if (editingCell) return
+    if ((e.target as HTMLElement).tagName === 'INPUT') return
     const maxR = order.length - 1
-    const maxC = columns.length - 1
+    const maxC = view.length - 1
     if (isMod(e) && e.key.toLowerCase() === 'c') {
       e.preventDefault()
       copySelection(e.shiftKey)
@@ -330,7 +442,7 @@ export const ResultGrid = memo(function ResultGrid({
       case 'F2':
         e.preventDefault()
         if (editing) beginEdit(focus)
-        else setInspect({ row: order[focus.r], col: focus.c })
+        else setInspect({ row: order[focus.r], col: view[focus.c] })
         return
       case 'Delete':
         if (editing && selection) {
@@ -340,9 +452,9 @@ export const ResultGrid = memo(function ResultGrid({
           else if (
             selection.r1 === selection.r2 &&
             selection.c1 === selection.c2 &&
-            canEdit(selection.c1)
+            canEdit(view[selection.c1])
           ) {
-            editing.onEdit(order[selection.r1], selection.c1, null)
+            editing.onEdit(order[selection.r1], view[selection.c1], null)
           }
         }
         return
@@ -374,7 +486,7 @@ export const ResultGrid = memo(function ResultGrid({
 
   const selectRows = (r: number, extend: boolean): void => {
     scrollRef.current?.focus({ preventScroll: true })
-    const last = columns.length - 1
+    const last = view.length - 1
     if (extend && anchor) setFocus({ r, c: last })
     else {
       setAnchor({ r, c: 0 })
@@ -392,42 +504,158 @@ export const ResultGrid = memo(function ResultGrid({
     }
   }
 
-  const toggleSort = (c: number): void => {
+  const toggleSort = (col: number): void => {
     const next: SortState =
-      sort?.col !== c ? { col: c, dir: 'asc' } : sort.dir === 'asc' ? { col: c, dir: 'desc' } : null
+      sort?.col !== col ? { col, dir: 'asc' } : sort.dir === 'asc' ? { col, dir: 'desc' } : null
     if (onSortChange) onSortChange(next)
     else setLocalSort(next)
   }
 
-  const startResize = (e: React.MouseEvent, c: number): void => {
+  const setWidth = (col: number, width: number): void =>
+    changeLayout((l) => ({ widths: { ...l.widths, [keys[col]]: width } }))
+
+  const startResize = (e: React.MouseEvent, col: number): void => {
     e.preventDefault()
     e.stopPropagation()
     const startX = e.clientX
-    const start = widths[c]
+    const start = widthOf(col)
+    let width = start
     const onMove = (ev: MouseEvent): void => {
-      const w = Math.max(MIN_WIDTH, start + ev.clientX - startX)
-      setWidths((ws) => ws.map((x, i) => (i === c ? w : x)))
+      width = Math.max(MIN_WIDTH, start + ev.clientX - startX)
+      setDragWidth({ col, width })
     }
     const onUp = (): void => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       document.body.style.cursor = ''
+      setDragWidth(null)
+      if (width !== start) setWidth(col, width)
     }
     document.body.style.cursor = 'col-resize'
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }
 
-  const autoFit = (c: number): void => {
-    let chars = columns[c].name.length + 3
+  const autoFit = (col: number): void => {
+    let chars = columns[col].name.length + 3
     for (const r of rows.slice(0, 2000)) {
-      const v = r[c]
+      const v = r[col]
       const len = v === null ? 4 : String(v).length
       if (len > chars) chars = len
     }
-    setWidths((ws) =>
-      ws.map((x, i) => (i === c ? Math.max(MIN_WIDTH, Math.min(900, chars * 7.3 + 22)) : x))
-    )
+    setWidth(col, Math.max(MIN_WIDTH, Math.min(900, chars * 7.3 + 22)))
+  }
+
+  const hideColumn = (col: number): void => {
+    if (view.length <= 1) return
+    changeLayout((l) => ({ hidden: [...l.hidden, keys[col]] }))
+    setAnchor(null)
+    setFocus(null)
+  }
+
+  const showColumn = (col: number): void =>
+    changeLayout((l) => ({ hidden: l.hidden.filter((k) => k !== keys[col]) }))
+
+  const move = (from: number, to: number): void => {
+    if (to < 0 || to >= view.length || from === to) return
+    changeLayout(() => ({ order: moveColumn(keys, view, from, to) }))
+    setAnchor(null)
+    setFocus(null)
+  }
+
+  /** Show / hide choices for every column, plus reset. */
+  const columnsMenu = (): MenuItem[] => [
+    { heading: `${view.length} of ${columns.length} columns shown` },
+    ...columns.map((col, i): MenuItem => ({
+      label: col.name,
+      icon: view.includes(i) ? <Eye /> : <EyeOff />,
+      disabled: view.length === 1 && view[0] === i,
+      onSelect: () => (view.includes(i) ? hideColumn(i) : showColumn(i))
+    })),
+    'separator',
+    {
+      label: 'Show all columns',
+      disabled: !hiddenCount,
+      onSelect: () => changeLayout(() => ({ hidden: [] }))
+    },
+    {
+      label: 'Reset column layout',
+      icon: <RotateCcw />,
+      onSelect: () => (layoutKey ? resetLayout(layoutKey) : setLocalLayout(emptyLayout()))
+    }
+  ]
+
+  const headerMenu = (e: React.MouseEvent, pos: number): void => {
+    const col = view[pos]
+    const name = columns[col].name
+    showContextMenu(e, [
+      {
+        label: 'Sort ascending',
+        icon: <ArrowUp />,
+        onSelect: () =>
+          onSortChange ? onSortChange({ col, dir: 'asc' }) : setLocalSort({ col, dir: 'asc' })
+      },
+      {
+        label: 'Sort descending',
+        icon: <ArrowDown />,
+        onSelect: () =>
+          onSortChange ? onSortChange({ col, dir: 'desc' }) : setLocalSort({ col, dir: 'desc' })
+      },
+      {
+        label: 'Clear sort',
+        icon: <X />,
+        disabled: !sort,
+        onSelect: () => (onSortChange ? onSortChange(null) : setLocalSort(null))
+      },
+      'separator',
+      {
+        label: filtersOpen ? 'Hide column filters' : 'Filter columns',
+        icon: <ListFilter />,
+        onSelect: () => setFiltersOpen(!filtersOpen)
+      },
+      {
+        label: `Hide “${name}”`,
+        icon: <EyeOff />,
+        disabled: view.length <= 1,
+        onSelect: () => hideColumn(col)
+      },
+      {
+        label: 'Columns',
+        icon: <Columns3 />,
+        submenu: columnsMenu()
+      },
+      pos < frozen
+        ? {
+            label: frozen > 1 ? 'Unfreeze columns' : 'Unfreeze column',
+            icon: <PinOff />,
+            onSelect: () => changeLayout(() => ({ frozen: 0 }))
+          }
+        : {
+            label: pos === 0 ? `Freeze “${name}”` : `Freeze columns up to “${name}”`,
+            icon: <Pin />,
+            disabled: pos >= view.length - 1,
+            onSelect: () => changeLayout(() => ({ frozen: pos + 1 }))
+          },
+      {
+        label: 'Move left',
+        icon: <ArrowLeft />,
+        disabled: pos === 0,
+        onSelect: () => move(pos, pos - 1)
+      },
+      {
+        label: 'Move right',
+        icon: <ArrowRight />,
+        disabled: pos === view.length - 1,
+        onSelect: () => move(pos, pos + 1)
+      },
+      'separator',
+      {
+        label: 'Copy column name',
+        icon: <ClipboardCopy />,
+        onSelect: () => void copyText(name, 'Copied column name')
+      },
+      { label: 'Fit width to content', onSelect: () => autoFit(col) }
+    ])
   }
 
   const cellMenu = (e: React.MouseEvent, p: Pos): void => {
@@ -436,7 +664,8 @@ export const ResultGrid = memo(function ResultGrid({
       setFocus(p)
     }
     const row = order[p.r]
-    const value = rows[row]?.[p.c] ?? null
+    const col = view[p.c]
+    const value = rows[row]?.[col] ?? null
     const items: MenuItem[] = [
       {
         label: 'Copy',
@@ -463,24 +692,24 @@ export const ResultGrid = memo(function ResultGrid({
       {
         label: 'Copy column name',
         icon: <Columns3 />,
-        onSelect: () => void copyText(columns[p.c].name, 'Copied column name')
+        onSelect: () => void copyText(columns[col].name, 'Copied column name')
       },
       'separator',
       {
         label: 'View value',
         icon: <Eye />,
         shortcut: editing ? undefined : 'Enter',
-        onSelect: () => setInspect({ row, col: p.c })
+        onSelect: () => setInspect({ row, col })
       }
     ]
     if (onFilterByValue) {
       items.push({
         label: `Filter by this value`,
         icon: <Filter />,
-        onSelect: () => onFilterByValue(columns[p.c].name, value)
+        onSelect: () => onFilterByValue(columns[col].name, value)
       })
     }
-    if (cellMenuItems) items.push(...cellMenuItems(row, p.c))
+    if (cellMenuItems) items.push(...cellMenuItems(row, col))
     if (editing) {
       const sel = selection ?? { r1: p.r, r2: p.r, c1: p.c, c2: p.c }
       const dataRows = order.slice(sel.r1, sel.r2 + 1)
@@ -489,13 +718,13 @@ export const ResultGrid = memo(function ResultGrid({
         {
           label: 'Edit cell',
           shortcut: 'F2',
-          disabled: !canEdit(p.c),
+          disabled: !canEdit(col),
           onSelect: () => beginEdit(p)
         },
         {
           label: 'Set to NULL',
-          disabled: !canEdit(p.c),
-          onSelect: () => editing.onEdit(row, p.c, null)
+          disabled: !canEdit(col),
+          onSelect: () => editing.onEdit(row, col, null)
         },
         {
           label: dataRows.length > 1 ? `Delete ${dataRows.length} rows` : 'Delete row',
@@ -509,11 +738,26 @@ export const ResultGrid = memo(function ResultGrid({
     showContextMenu(e, items)
   }
 
+  const dragCol = useRef<number | null>(null)
+  const [dropAt, setDropAt] = useState<number | null>(null)
+
   const virtualRows = rowVirtualizer.getVirtualItems()
   const virtualCols = colVirtualizer.getVirtualItems()
   const totalWidth = colVirtualizer.getTotalSize()
-  const leftPad = (virtualCols[0]?.start ?? GUTTER) - GUTTER
-  const rightPad = totalWidth - (virtualCols[virtualCols.length - 1]?.end ?? GUTTER)
+  const scrollStart = GUTTER + frozenWidth
+  const leftPad = (virtualCols[0]?.start ?? scrollStart) - scrollStart
+  const rightPad = totalWidth - (virtualCols[virtualCols.length - 1]?.end ?? scrollStart)
+  /** View positions rendered in a row: every frozen column, then the virtual window */
+  const rendered = [
+    ...frozenCols.map((_, i) => ({ pos: i, width: widthOf(view[i]), key: `f${i}` })),
+    ...virtualCols.map((vc) => ({ pos: frozen + vc.index, width: vc.size, key: vc.key }))
+  ]
+  const stickyStyle = (pos: number): React.CSSProperties | undefined =>
+    pos < frozen ? { position: 'sticky', left: frozenLefts[pos] } : undefined
+
+  const rowStatusOf = (row: number): RowStatus => editing?.rowStatus(row) ?? marks?.rowStatus?.(row)
+  const modifiedOf = (row: number, col: number): boolean =>
+    editing?.isModified(row, col) ?? marks?.isModified?.(row, col) ?? false
 
   return (
     <div
@@ -526,213 +770,292 @@ export const ResultGrid = memo(function ResultGrid({
       )}
     >
       <div
-        style={{ width: totalWidth, height: rowVirtualizer.getTotalSize() + HEADER_HEIGHT }}
+        style={{ width: totalWidth, height: rowVirtualizer.getTotalSize() + headerHeight }}
         className="relative"
       >
         {/* Header */}
-        <div
-          className="sticky top-0 z-20 flex border-b border-line-strong bg-panel"
-          style={{ height: HEADER_HEIGHT, width: totalWidth }}
-        >
+        <div className="sticky top-0 z-20 bg-panel" style={{ width: totalWidth }}>
           <div
-            className="sticky left-0 z-30 flex shrink-0 items-center justify-end border-r border-line bg-panel pr-2 text-[10px] text-faint"
-            style={{ width: GUTTER }}
-            onMouseDown={() => {
-              setAnchor({ r: 0, c: 0 })
-              setFocus({ r: order.length - 1, c: columns.length - 1 })
-            }}
-            title="Select all"
+            className="flex border-b border-line-strong bg-panel"
+            style={{ height: HEADER_HEIGHT, width: totalWidth }}
           >
-            <Rows3 className="size-3" />
+            <div
+              className="sticky left-0 z-30 flex shrink-0 items-center justify-end gap-1 border-r border-line bg-panel pr-2 text-[10px] text-faint"
+              style={{ width: GUTTER }}
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                setAnchor({ r: 0, c: 0 })
+                setFocus({ r: order.length - 1, c: view.length - 1 })
+              }}
+              onContextMenu={(e) => showContextMenu(e, columnsMenu())}
+              title={
+                hiddenCount
+                  ? `Select all · ${hiddenCount} hidden column${hiddenCount > 1 ? 's' : ''} (right-click to show)`
+                  : 'Select all · right-click for columns'
+              }
+            >
+              {hiddenCount > 0 && <EyeOff className="size-3 text-warn" />}
+              <Rows3 className="size-3" />
+            </div>
+            {rendered.map(({ pos, width, key }, n) => {
+              const col = view[pos]
+              const meta = columns[col]
+              const sorted = sort?.col === col ? sort.dir : null
+              const colSelected =
+                !!selection &&
+                selection.r1 === 0 &&
+                selection.r2 === order.length - 1 &&
+                pos >= selection.c1 &&
+                pos <= selection.c2
+              return (
+                <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
+                  <div
+                    draggable
+                    onDragStart={(e) => {
+                      dragCol.current = pos
+                      e.dataTransfer.effectAllowed = 'move'
+                      e.dataTransfer.setData('text/plain', meta.name)
+                    }}
+                    onDragOver={(e) => {
+                      if (dragCol.current === null) return
+                      e.preventDefault()
+                      setDropAt(pos)
+                    }}
+                    onDragLeave={() => setDropAt((d) => (d === pos ? null : d))}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      if (dragCol.current !== null) move(dragCol.current, pos)
+                      dragCol.current = null
+                      setDropAt(null)
+                    }}
+                    onDragEnd={() => {
+                      dragCol.current = null
+                      setDropAt(null)
+                    }}
+                    className={cn(
+                      'group relative flex h-full shrink-0 items-center gap-1 border-r border-line px-2 font-sans text-[11.5px] font-medium',
+                      colSelected ? 'bg-accent/10 text-bright' : 'bg-panel text-fg',
+                      pos < frozen && 'z-20',
+                      pos === frozen - 1 && 'border-r-line-strong shadow-[2px_0_4px_var(--shadow)]',
+                      dropAt === pos &&
+                        dragCol.current !== pos &&
+                        (dragCol.current! > pos
+                          ? 'shadow-[inset_2px_0_0_var(--color-accent)]'
+                          : 'shadow-[inset_-2px_0_0_var(--color-accent)]')
+                    )}
+                    style={{ width, ...stickyStyle(pos) }}
+                    onMouseDown={(e) => e.button === 0 && selectColumn(pos, e.shiftKey)}
+                    onContextMenu={(e) => headerMenu(e, pos)}
+                    title={meta.typeName ? `${meta.name} · ${meta.typeName}` : meta.name}
+                  >
+                    {pos < frozen && <Pin className="size-2.5 shrink-0 text-faint" />}
+                    <span className="min-w-0 shrink truncate">{meta.name}</span>
+                    {meta.typeName && (
+                      <span className="min-w-0 shrink-[2] truncate font-mono text-[10px] font-normal text-faint">
+                        {meta.typeName}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={() => toggleSort(col)}
+                      className={cn(
+                        'ml-auto flex size-4 shrink-0 items-center justify-center rounded text-faint hover:text-bright',
+                        !sorted && 'opacity-0 group-hover:opacity-100'
+                      )}
+                      title="Sort"
+                    >
+                      {sorted === 'asc' ? (
+                        <ArrowUp className="size-3 text-accent" />
+                      ) : sorted === 'desc' ? (
+                        <ArrowDown className="size-3 text-accent" />
+                      ) : (
+                        <ArrowUpDown className="size-3" />
+                      )}
+                    </button>
+                    <div
+                      className="absolute top-0 -right-1 z-10 h-full w-2 cursor-col-resize hover:bg-accent/40"
+                      onMouseDown={(e) => startResize(e, col)}
+                      onDoubleClick={() => autoFit(col)}
+                    />
+                  </div>
+                </Padded>
+              )
+            })}
+            {rightPad > 0 && <div style={{ width: rightPad }} className="shrink-0" />}
           </div>
-          {leftPad > 0 && <div style={{ width: leftPad }} className="shrink-0" />}
-          {virtualCols.map((vc) => {
-            const col = columns[vc.index]
-            const sorted = sort?.col === vc.index ? sort.dir : null
-            const colSelected =
-              !!selection &&
-              selection.r1 === 0 &&
-              selection.r2 === order.length - 1 &&
-              vc.index >= selection.c1 &&
-              vc.index <= selection.c2
-            return (
-              <div
-                key={vc.key}
-                className={cn(
-                  'group relative flex shrink-0 items-center gap-1 border-r border-line px-2 font-sans text-[11.5px] font-medium',
-                  colSelected ? 'bg-accent/10 text-bright' : 'text-fg'
-                )}
-                style={{ width: vc.size }}
-                onMouseDown={(e) => e.button === 0 && selectColumn(vc.index, e.shiftKey)}
-                onContextMenu={(e) =>
-                  showContextMenu(e, [
-                    {
-                      label: 'Sort ascending',
-                      icon: <ArrowUp />,
-                      onSelect: () =>
-                        onSortChange
-                          ? onSortChange({ col: vc.index, dir: 'asc' })
-                          : setLocalSort({ col: vc.index, dir: 'asc' })
-                    },
-                    {
-                      label: 'Sort descending',
-                      icon: <ArrowDown />,
-                      onSelect: () =>
-                        onSortChange
-                          ? onSortChange({ col: vc.index, dir: 'desc' })
-                          : setLocalSort({ col: vc.index, dir: 'desc' })
-                    },
-                    {
-                      label: 'Clear sort',
-                      icon: <X />,
-                      disabled: !sort,
-                      onSelect: () => (onSortChange ? onSortChange(null) : setLocalSort(null))
-                    },
-                    'separator',
-                    {
-                      label: 'Copy column name',
-                      icon: <ClipboardCopy />,
-                      onSelect: () => void copyText(col.name, 'Copied column name')
-                    },
-                    { label: 'Fit width to content', onSelect: () => autoFit(vc.index) }
-                  ])
-                }
-                title={col.typeName ? `${col.name} · ${col.typeName}` : col.name}
+          {filtersOpen && (
+            <div
+              className="flex border-b border-line-strong bg-panel"
+              style={{ height: FILTER_HEIGHT, width: totalWidth }}
+            >
+              <button
+                type="button"
+                className="sticky left-0 z-30 flex shrink-0 items-center justify-end border-r border-line bg-panel pr-2 text-faint hover:text-bright"
+                style={{ width: GUTTER }}
+                title="Clear column filters and hide the filter row"
+                onClick={() => {
+                  setColFilters({})
+                  setFiltersOpen(false)
+                }}
               >
-                <span className="min-w-0 shrink truncate">{col.name}</span>
-                {col.typeName && (
-                  <span className="min-w-0 shrink-[2] truncate font-mono text-[10px] font-normal text-faint">
-                    {col.typeName}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={() => toggleSort(vc.index)}
-                  className={cn(
-                    'ml-auto flex size-4 shrink-0 items-center justify-center rounded text-faint hover:text-bright',
-                    !sorted && 'opacity-0 group-hover:opacity-100'
-                  )}
-                  title="Sort"
-                >
-                  {sorted === 'asc' ? (
-                    <ArrowUp className="size-3 text-accent" />
-                  ) : sorted === 'desc' ? (
-                    <ArrowDown className="size-3 text-accent" />
-                  ) : (
-                    <ArrowUpDown className="size-3" />
-                  )}
-                </button>
-                <div
-                  className="absolute top-0 -right-1 z-10 h-full w-2 cursor-col-resize hover:bg-accent/40"
-                  onMouseDown={(e) => startResize(e, vc.index)}
-                  onDoubleClick={() => autoFit(vc.index)}
-                />
-              </div>
-            )
-          })}
-          {rightPad > 0 && <div style={{ width: rightPad }} className="shrink-0" />}
+                <X className="size-3" />
+              </button>
+              {rendered.map(({ pos, width, key }, n) => {
+                const k = keys[view[pos]]
+                return (
+                  <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
+                    <div
+                      className={cn(
+                        'flex h-full shrink-0 items-center border-r border-line bg-panel px-1',
+                        pos < frozen && 'z-20'
+                      )}
+                      style={{ width, ...stickyStyle(pos) }}
+                    >
+                      <input
+                        value={colFilters[k] ?? ''}
+                        onChange={(e) => setColFilters((f) => ({ ...f, [k]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') setColFilters((f) => ({ ...f, [k]: '' }))
+                        }}
+                        placeholder="Filter"
+                        title="Text matches anywhere. Also =x, !=x, !x, >n, <=n, null, !null"
+                        spellCheck={false}
+                        className={cn(
+                          'h-5 w-full min-w-0 rounded border border-line bg-canvas px-1.5 font-mono text-[11px] text-bright placeholder:text-faint focus:border-accent/50 focus:outline-none',
+                          colFilters[k] && 'border-accent/40'
+                        )}
+                      />
+                    </div>
+                  </Padded>
+                )
+              })}
+              {rightPad > 0 && <div style={{ width: rightPad }} className="shrink-0" />}
+            </div>
+          )}
         </div>
 
         {/* Rows */}
         {virtualRows.map((vr) => {
           const dataRow = order[vr.index]
           const row = rows[dataRow]
-          const status = editing?.rowStatus(dataRow)
+          const status = rowStatusOf(dataRow)
           const rowSelected = !!selection && vr.index >= selection.r1 && vr.index <= selection.r2
+          const stripe = vr.index % 2 === 1
           return (
             <div
               key={vr.key}
               className={cn(
                 'absolute left-0 flex border-b border-line/60',
-                vr.index % 2 === 1 && 'bg-bright/[0.025]',
+                stripe && 'bg-bright/[0.025]',
                 status === 'inserted' && 'bg-ok/[0.06]',
+                status === 'changed' && 'bg-warn/[0.04]',
                 status === 'deleted' &&
                   'bg-danger/[0.07] text-faint line-through decoration-danger/60'
               )}
-              style={{ top: HEADER_HEIGHT + vr.start, height: ROW_HEIGHT, width: totalWidth }}
+              style={{ top: headerHeight + vr.start, height: ROW_HEIGHT, width: totalWidth }}
             >
               <div
                 className={cn(
                   'sticky left-0 z-10 flex shrink-0 items-center justify-end border-r border-line bg-panel pr-2 text-[10.5px] tabular-nums',
                   rowSelected ? 'text-accent' : 'text-faint',
                   status === 'inserted' && 'text-ok',
+                  status === 'changed' && 'text-warn',
                   status === 'deleted' && 'text-danger'
                 )}
                 style={{ width: GUTTER }}
                 onMouseDown={(e) => e.button === 0 && selectRows(vr.index, e.shiftKey)}
                 onMouseEnter={() => {
-                  if (dragging.current && anchor) setFocus({ r: vr.index, c: columns.length - 1 })
+                  if (dragging.current && anchor) setFocus({ r: vr.index, c: view.length - 1 })
                 }}
                 onContextMenu={(e) => cellMenu(e, { r: vr.index, c: 0 })}
               >
-                {status === 'inserted' ? '+' : rowOffset + dataRow + 1}
+                {status === 'inserted' && editing ? '+' : rowOffset + dataRow + 1}
               </div>
-              {leftPad > 0 && <div style={{ width: leftPad }} className="shrink-0" />}
-              {virtualCols.map((vc) => {
-                const c = vc.index
+              {rendered.map(({ pos, width, key }, n) => {
+                const c = view[pos]
                 const value = row?.[c] ?? null
-                const selected = isSelected(vr.index, c)
-                const isFocus = focus?.r === vr.index && focus?.c === c
-                const modified = editing?.isModified(dataRow, c)
-                if (editingCell && editingCell.r === vr.index && editingCell.c === c) {
+                const selected = isSelected(vr.index, pos)
+                const isFocus = focus?.r === vr.index && focus?.c === pos
+                const modified = modifiedOf(dataRow, c)
+                const sticky = stickyStyle(pos)
+                if (editingCell && editingCell.r === vr.index && editingCell.c === pos) {
                   return (
-                    <CellEditor
-                      key={vc.key}
-                      width={vc.size}
-                      initial={value}
-                      onDone={(next, moveBy) => {
-                        setEditingCell(null)
-                        if (next !== undefined && next !== value) editing?.onEdit(dataRow, c, next)
-                        scrollRef.current?.focus({ preventScroll: true })
-                        if (moveBy) {
-                          const p = {
-                            r: Math.min(order.length - 1, Math.max(0, vr.index + moveBy.r)),
-                            c: Math.min(columns.length - 1, Math.max(0, c + moveBy.c))
+                    <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
+                      <CellEditor
+                        width={width}
+                        style={sticky}
+                        initial={value}
+                        onDone={(next, moveBy) => {
+                          setEditingCell(null)
+                          if (next !== undefined && next !== value)
+                            editing?.onEdit(dataRow, c, next)
+                          scrollRef.current?.focus({ preventScroll: true })
+                          if (moveBy) {
+                            const p = {
+                              r: Math.min(order.length - 1, Math.max(0, vr.index + moveBy.r)),
+                              c: Math.min(view.length - 1, Math.max(0, pos + moveBy.c))
+                            }
+                            setAnchor(p)
+                            setFocus(p)
                           }
-                          setAnchor(p)
-                          setFocus(p)
-                        }
-                      }}
-                    />
+                        }}
+                      />
+                    </Padded>
                   )
                 }
+                const shown =
+                  typeof value === 'string'
+                    ? displayTimestamp(value, columns[c].typeName, timeDisplay)
+                    : null
                 return (
-                  <div
-                    key={vc.key}
-                    className={cn(
-                      'relative flex shrink-0 items-center overflow-hidden border-r border-line/60 px-2 whitespace-pre',
-                      numeric[c] && 'justify-end',
-                      selected && 'bg-accent/[0.13]',
-                      modified && 'bg-warn/[0.13] text-warn',
-                      isFocus && 'outline outline-1 -outline-offset-1 outline-accent/80'
-                    )}
-                    style={{ width: vc.size }}
-                    onMouseDown={(e) => onCellMouseDown(e, { r: vr.index, c })}
-                    onMouseEnter={() => {
-                      if (dragging.current && anchor) setFocus({ r: vr.index, c })
-                    }}
-                    onDoubleClick={() =>
-                      editing && canEdit(c)
-                        ? beginEdit({ r: vr.index, c })
-                        : setInspect({ row: dataRow, col: c })
-                    }
-                    onContextMenu={(e) => cellMenu(e, { r: vr.index, c })}
-                  >
-                    {value === null ? (
-                      <span className="text-faint italic">NULL</span>
-                    ) : typeof value === 'boolean' ? (
-                      <span className="text-syn-number">{String(value)}</span>
-                    ) : (
-                      <span
-                        className={cn('truncate', !modified && numeric[c] && 'text-syn-number/90')}
-                      >
-                        {value.length > 500
-                          ? value.slice(0, 500) + '…'
-                          : value.replace(/\r?\n/g, '↵ ')}
-                      </span>
-                    )}
-                  </div>
+                  <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
+                    <div
+                      className={cn(
+                        'relative flex shrink-0 items-center overflow-hidden border-r border-line/60 px-2 whitespace-pre',
+                        numeric[c] && 'justify-end',
+                        pos < frozen && 'z-[5] bg-canvas',
+                        pos < frozen &&
+                          stripe &&
+                          'bg-[color-mix(in_srgb,var(--color-bright)_2.5%,var(--color-canvas))]',
+                        pos === frozen - 1 && 'border-r-line-strong',
+                        selected && 'bg-accent/[0.13]',
+                        modified && 'bg-warn/[0.13] text-warn',
+                        isFocus && 'outline outline-1 -outline-offset-1 outline-accent/80'
+                      )}
+                      style={{ width, ...sticky }}
+                      onMouseDown={(e) => onCellMouseDown(e, { r: vr.index, c: pos })}
+                      onMouseEnter={() => {
+                        if (dragging.current && anchor) setFocus({ r: vr.index, c: pos })
+                      }}
+                      onDoubleClick={() =>
+                        editing && canEdit(c)
+                          ? beginEdit({ r: vr.index, c: pos })
+                          : setInspect({ row: dataRow, col: c })
+                      }
+                      onContextMenu={(e) => cellMenu(e, { r: vr.index, c: pos })}
+                      title={shown ? String(value) : undefined}
+                    >
+                      {value === null ? (
+                        <span className="text-faint italic">NULL</span>
+                      ) : typeof value === 'boolean' ? (
+                        <span className="text-syn-number">{String(value)}</span>
+                      ) : (
+                        <span
+                          className={cn(
+                            'truncate',
+                            !modified && numeric[c] && 'text-syn-number/90',
+                            shown && 'text-syn-type'
+                          )}
+                        >
+                          {shown ??
+                            (value.length > 500
+                              ? value.slice(0, 500) + '…'
+                              : value.replace(/\r?\n/g, '↵ '))}
+                        </span>
+                      )}
+                    </div>
+                  </Padded>
                 )
               })}
               {rightPad > 0 && <div style={{ width: rightPad }} className="shrink-0" />}
@@ -746,6 +1069,7 @@ export const ResultGrid = memo(function ResultGrid({
           value={rows[inspect.row]?.[inspect.col] ?? null}
           editable={canEdit(inspect.col) && editing?.rowStatus(inspect.row) !== 'deleted'}
           onSave={(v) => editing?.onEdit(inspect.row, inspect.col, v)}
+          onLoadFull={onLoadValue ? () => onLoadValue(inspect.row, inspect.col) : undefined}
           onClose={() => {
             setInspect(null)
             scrollRef.current?.focus({ preventScroll: true })
@@ -756,12 +1080,30 @@ export const ResultGrid = memo(function ResultGrid({
   )
 })
 
+/** A cell, preceded by the virtual window's left padding where the scrolled columns begin. */
+function Padded({
+  before,
+  children
+}: {
+  before: number
+  children: React.ReactNode
+}): React.JSX.Element {
+  return (
+    <>
+      {before > 0 && <div style={{ width: before }} className="shrink-0" />}
+      {children}
+    </>
+  )
+}
+
 function CellEditor({
   width,
+  style,
   initial,
   onDone
 }: {
   width: number
+  style?: React.CSSProperties
   initial: Cell
   onDone: (value: Cell | undefined, move?: Pos) => void
 }): React.JSX.Element {
@@ -774,7 +1116,7 @@ function CellEditor({
     onDone(v, move)
   }
   return (
-    <div className="relative shrink-0" style={{ width }}>
+    <div className="relative z-10 shrink-0" style={{ width, ...style }}>
       <input
         autoFocus
         value={value}

@@ -477,7 +477,8 @@ export async function formatSql(sql: string, dialect: Dialect): Promise<string> 
   })
 }
 
-function stripComments(sql: string): string {
+/** `sql` without comments, and with string literals emptied. */
+export function stripComments(sql: string): string {
   return sql
     .replace(/--[^\n]*/g, ' ')
     .replace(/\/\*[\s\S]*?\*\//g, ' ')

@@ -5,6 +5,8 @@ import { literal, quoteIdent } from './sql'
 import { toast, toastError } from './toast'
 
 export type ExportFormat = 'csv' | 'tsv' | 'json' | 'markdown' | 'sql'
+/** Text formats plus Excel, which only goes to a file */
+export type FileFormat = ExportFormat | 'xlsx'
 
 function cellText(v: Cell): string {
   if (v === null) return ''
@@ -69,12 +71,23 @@ export function serialize(
   }
 }
 
-const EXTENSIONS: Record<ExportFormat, string> = {
+export const EXTENSIONS: Record<FileFormat, string> = {
   csv: 'csv',
   tsv: 'tsv',
   json: 'json',
   markdown: 'md',
-  sql: 'sql'
+  sql: 'sql',
+  xlsx: 'xlsx'
+}
+
+const fileName = (path: string): string => path.split(/[\\/]/).pop() ?? path
+
+/** Asks where to save; null when the dialog was dismissed. */
+export async function pickSavePath(defaultName: string, extension: string): Promise<string | null> {
+  return save({
+    defaultPath: defaultName.includes('.') ? defaultName : `${defaultName}.${extension}`,
+    filters: [{ name: extension.toUpperCase(), extensions: [extension] }]
+  })
 }
 
 export async function saveToFile(
@@ -83,13 +96,28 @@ export async function saveToFile(
   extension: string
 ): Promise<boolean> {
   try {
-    const path = await save({
-      defaultPath: defaultName.includes('.') ? defaultName : `${defaultName}.${extension}`,
-      filters: [{ name: extension.toUpperCase(), extensions: [extension] }]
-    })
+    const path = await pickSavePath(defaultName, extension)
     if (!path) return false
     await api.writeText(path, contents)
-    toast(`Saved ${path.split(/[\/]/).pop()}`)
+    toast(`Saved ${fileName(path)}`)
+    return true
+  } catch (e) {
+    toastError(e)
+    return false
+  }
+}
+
+/** Saves raw bytes, e.g. a binary cell. */
+export async function saveBytesToFile(
+  bytes: Uint8Array,
+  defaultName: string,
+  extension: string
+): Promise<boolean> {
+  try {
+    const path = await pickSavePath(defaultName, extension)
+    if (!path) return false
+    await api.writeBytes(path, bytes)
+    toast(`Saved ${fileName(path)}`)
     return true
   } catch (e) {
     toastError(e)
@@ -98,13 +126,24 @@ export async function saveToFile(
 }
 
 export async function exportRows(
-  format: ExportFormat,
+  format: FileFormat,
   columns: ColumnMeta[],
   rows: Cell[][],
   name: string,
   options: { dialect?: Dialect; table?: string } = {}
 ): Promise<void> {
-  await saveToFile(serialize(format, columns, rows, options), name, EXTENSIONS[format])
+  if (format !== 'xlsx') {
+    await saveToFile(serialize(format, columns, rows, options), name, EXTENSIONS[format])
+    return
+  }
+  try {
+    const path = await pickSavePath(name, 'xlsx')
+    if (!path) return
+    await api.writeXlsx(path, columns, rows)
+    toast(`Saved ${fileName(path)}`)
+  } catch (e) {
+    toastError(e)
+  }
 }
 
 export async function copyText(text: string, what = 'Copied'): Promise<void> {
