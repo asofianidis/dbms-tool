@@ -53,7 +53,8 @@ export function imageType(bytes: Uint8Array): string | null {
   }
   // SVG is text; look for its root element near the start
   const head = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 512))
-  if (/^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(head)) return 'image/svg+xml'
+  if (/^\s*(<\?xml[^>]*>\s*)?(<!--(?:[^-]|-(?!->))*-->\s*)*<svg[\s>]/i.test(head))
+    return 'image/svg+xml'
   return null
 }
 

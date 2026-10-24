@@ -62,6 +62,9 @@ describe('literals and identifiers', () => {
     expect(literal('postgres', "O'Brien")).toBe("'O''Brien'")
     expect(literal('mysql', 'a\\b')).toBe("'a\\\\b'")
     expect(literal('tsql', 'ä', 'nvarchar(10)')).toBe("N'ä'")
+    expect(literal('tsql', 'a', 'nchar(1)')).toBe("N'a'")
+    expect(literal('tsql', 'a', 'ntext')).toBe("N'a'")
+    expect(literal('tsql', 'a', 'varchar(10)')).toBe("'a'")
     expect(literal('postgres', 't', 'boolean')).toBe('TRUE')
   })
 
