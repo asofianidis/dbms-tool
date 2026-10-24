@@ -1,6 +1,5 @@
 import type { Cell, ResultSet } from './api'
-import type { Dialect } from './engines'
-import { isNumericType, splitStatements } from './sql'
+import { isNumericType } from './sql'
 import { createPersistentStore } from './store'
 
 /* ---------- Model ---------- */
@@ -204,31 +203,6 @@ export function parseDashboardFile(
     refreshSecs: Number.isFinite(refresh) && refresh > 0 ? refresh : 0,
     widgets
   }
-}
-
-/* ---------- Safety ---------- */
-
-const WRITE_STATEMENT =
-  /^(insert|update|delete|merge|upsert|replace|drop|alter|create|truncate|rename|grant|revoke|call|exec|execute|do|copy|load|vacuum|reindex|cluster|lock|set|use|begin|commit|rollback)\b/i
-
-/**
- * The first statement that isn't a plain read, if any. Widgets re-run on every
- * refresh, so they're limited to queries that can't change anything.
- */
-export function writeStatement(sql: string, dialect: Dialect): string | null {
-  for (const statement of splitStatements(sql, dialect)) {
-    const s = statement.text
-      .replace(/--[^\n]*/g, ' ')
-      .replace(/\/\*[\s\S]*?\*\//g, ' ')
-      .trim()
-    if (!s) continue
-    const keyword = WRITE_STATEMENT.exec(s)?.[1]
-    if (keyword) return keyword.toUpperCase()
-    // Data-modifying CTEs: WITH x AS (DELETE … RETURNING …) SELECT …
-    if (/^with\b/i.test(s) && /\b(insert\s+into|update\s+\S+\s+set|delete\s+from)\b/i.test(s))
-      return 'WITH … (data-modifying)'
-  }
-  return null
 }
 
 /* ---------- Shaping results for charts ---------- */

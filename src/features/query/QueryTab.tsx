@@ -23,7 +23,13 @@ import { api, type CompletionTable } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
-import { paramNames, substituteParams, type ParamValue } from '@/lib/params'
+import {
+  fillParams,
+  paramNames,
+  sourceOffset,
+  type ParamValue,
+  type Substitution
+} from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
@@ -161,15 +167,16 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       }
       const names = paramNames(sql, dialect)
       let filled = sql
+      let spans: Substitution[] | undefined
       if (names.length) {
         const values = await askParams(names)
         if (!values) return
-        filled = substituteParams(sql, dialect, values)
+        ;({ sql: filled, spans } = fillParams(sql, dialect, values))
       }
       if (!(await connect(tab.connectionId))) return
       const toRun = transform ? transform(filled) : filled
-      // Error positions only map back onto the editor when the text ran unchanged
-      const runOffset = transform || names.length ? -1 : offset
+      // Error positions map back onto the editor unless the text was rewritten (Explain)
+      const runOffset = transform ? -1 : offset
       ed.clearErrors()
       setRunning(tab.id, true)
       if (resultsPanel.current?.isCollapsed()) resultsPanel.current.expand()
@@ -196,7 +203,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             : undefined
         sqlResultsStore.set((r) => ({
           ...r,
-          [tab.id]: { output, offset: runOffset, sql: toRun, plan }
+          [tab.id]: { output, offset: runOffset, sql: toRun, spans, plan }
         }))
         if (output.database && output.database !== tab.database)
           updateTab(tab.id, { database: output.database })
@@ -214,11 +221,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           ok: !output.error,
           kind: 'sql'
         })
-        if (output.error && runOffset >= 0) showError(output.error, runOffset, toRun)
+        if (output.error && runOffset >= 0) showError(output.error, runOffset, toRun, spans)
       } catch (e) {
         sqlResultsStore.set((r) => ({
           ...r,
-          [tab.id]: { error: errorMessage(e), offset: runOffset, sql: toRun }
+          [tab.id]: { error: errorMessage(e), offset: runOffset, sql: toRun, spans }
         }))
         lastRunStore.set((l) => ({ ...l, [tab.id]: { rows: 0, elapsedMs: 0, ok: false } }))
       } finally {
@@ -241,23 +248,33 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const showError = (
     error: { message: string; position: number | null; line: number | null },
     offset: number,
-    sql: string
+    sql: string,
+    spans: Substitution[] = []
   ): void => {
     const ed = editor.current
     if (!ed) return
     const firstLine = error.message.split('\n')[0]
     if (error.position != null) {
       // PostgreSQL positions are 1-based character offsets into the submitted text
-      const at = offset + Math.max(0, error.position - 1)
-      const rest = sql.slice(error.position - 1)
-      const word = /^\S+/.exec(rest)?.[0].length ?? 1
-      ed.showError(at, at + word, firstLine)
+      const start = Math.max(0, error.position - 1)
+      const word = /^\S+/.exec(sql.slice(start))?.[0].length ?? 1
+      ed.showError(
+        offset + sourceOffset(start, spans),
+        offset + sourceOffset(start + word, spans, 'end'),
+        firstLine
+      )
     } else if (error.line != null) {
       const view = ed.view()
       if (!view) return
-      const base = view.state.doc.lineAt(offset).number
-      const lineNo = Math.min(view.state.doc.lines, base + error.line - 1)
-      const line = view.state.doc.line(lineNo)
+      // Values can span lines, so find the line in the submitted text first
+      let lineStart = 0
+      for (let n = 1; n < error.line; n++) {
+        const next = sql.indexOf('\n', lineStart)
+        if (next < 0) break
+        lineStart = next + 1
+      }
+      const at = Math.min(view.state.doc.length, offset + sourceOffset(lineStart, spans))
+      const line = view.state.doc.lineAt(at)
       ed.showError(line.from, line.to, firstLine)
     }
   }
@@ -571,9 +588,10 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             running={running}
             startedAt={run?.startedAt}
             dialect={dialect}
+            source={{ connectionId: tab.connectionId, database: tab.database, session: tab.id }}
             onJumpToError={() => {
               if (result?.output?.error && result.offset >= 0)
-                showError(result.output.error, result.offset, result.sql)
+                showError(result.output.error, result.offset, result.sql, result.spans)
             }}
             emptyHint={
               !connected ? (

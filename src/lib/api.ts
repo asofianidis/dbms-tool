@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo' | 'sqlite'
-export type SslMode = 'disable' | 'prefer' | 'require'
+export type SslMode = 'disable' | 'prefer' | 'require' | 'verify-ca' | 'verify-full'
 export type AuthMode = 'password' | 'windows' | 'cloud'
 
 export interface ConnectionConfig {
@@ -14,7 +14,14 @@ export interface ConnectionConfig {
   database: string
   auth: AuthMode
   ssl: SslMode
+  /** Ignored by the verify modes */
   trustServerCertificate: boolean
+  /** CA certificate file (PEM) trusted in addition to the system roots */
+  sslRootCert?: string
+  /** Client certificate for mutual TLS: PEM, or a .p12/.pfx bundle */
+  sslClientCert?: string
+  /** Private key for sslClientCert (PEM, PKCS#8) */
+  sslClientKey?: string
   uri: string
   authSource: string
   savePassword: boolean
@@ -352,10 +359,24 @@ export interface ExecOutput {
 
 export interface ExecOptions {
   maxRows?: number
+  /** Block writes for this call even on a writable connection */
+  readOnly?: boolean
 }
 
 /** Extended JSON value as produced by the backend. */
 export type Ejson = unknown
+
+/** Cursor modifiers such as `.hint()` and `.maxTimeMS()`, for find, aggregate and count. */
+export interface MongoCursorOptions {
+  /** Index keys or an index name */
+  hint?: Ejson
+  maxTimeMS?: number
+  collation?: Ejson
+  allowDiskUse?: boolean
+  comment?: Ejson
+  readPreference?: string
+  readConcern?: string
+}
 
 export type MongoRequest =
   | {
@@ -368,9 +389,22 @@ export type MongoRequest =
       skip?: number
       limit?: number
       count?: boolean
+      options?: MongoCursorOptions
     }
-  | { op: 'aggregate'; database: string; collection: string; pipeline: Ejson[] }
-  | { op: 'count'; database: string; collection: string; filter?: Ejson }
+  | {
+      op: 'aggregate'
+      database: string
+      collection: string
+      pipeline: Ejson[]
+      options?: MongoCursorOptions
+    }
+  | {
+      op: 'count'
+      database: string
+      collection: string
+      filter?: Ejson
+      options?: MongoCursorOptions
+    }
   | { op: 'distinct'; database: string; collection: string; field: string; filter?: Ejson }
   | { op: 'insertOne'; database: string; collection: string; document: Ejson }
   | { op: 'insertMany'; database: string; collection: string; documents: Ejson[] }
@@ -410,8 +444,25 @@ export interface MongoOutput {
 
 export interface AppError {
   code:
-    'error' | 'password_required' | 'not_connected' | 'unknown_connection' | 'unsupported' | 'io'
+    | 'error'
+    | 'password_required'
+    | 'not_connected'
+    | 'unknown_connection'
+    | 'unsupported'
+    | 'io'
+    | 'host_key_unknown'
   message: string
+  /** With 'host_key_unknown': the SSH server's key, for the user to confirm */
+  hostKey?: HostKeyPrompt
+}
+
+export interface HostKeyPrompt {
+  /** Passed to sshTrustHostKey */
+  token: string
+  host: string
+  /** SHA256:... */
+  fingerprint: string
+  keyType: string
 }
 
 export function isAppError(e: unknown, code?: AppError['code']): e is AppError {
@@ -443,6 +494,8 @@ export const api = {
   connectionOpen: (id: string, password?: string | null, remember?: boolean) =>
     invoke<ServerInfo>('connection_open', { id, password: password ?? null, remember }),
   connectionClose: (id: string) => invoke<void>('connection_close', { id }),
+  /** Adds the SSH host key from a 'host_key_unknown' error to known_hosts */
+  sshTrustHostKey: (token: string) => invoke<void>('ssh_trust_host_key', { token }),
 
   databases: (id: string) => invoke<DatabaseInfo[]>('db_databases', { id }),
   schemas: (id: string, database: string) => invoke<SchemaInfo[]>('db_schemas', { id, database }),

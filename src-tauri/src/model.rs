@@ -198,6 +198,10 @@ pub struct ExecOutput {
 pub struct ExecOptions {
     #[serde(default = "default_max_rows")]
     pub max_rows: usize,
+    /// Apply the read-only check to this call even on a writable connection,
+    /// for dashboards and export re-runs
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 fn default_max_rows() -> usize {
@@ -208,6 +212,7 @@ impl Default for ExecOptions {
     fn default() -> Self {
         Self {
             max_rows: default_max_rows(),
+            read_only: false,
         }
     }
 }

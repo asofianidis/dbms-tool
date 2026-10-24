@@ -194,6 +194,12 @@ pub async fn connection_open(
     Ok(info)
 }
 
+/// Trusts the SSH host key a `host_key_unknown` error showed the user
+#[tauri::command]
+pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
+    crate::tunnel::trust_host_key(&token).await
+}
+
 #[tauri::command]
 pub fn connection_close(state: State<'_, AppState>, id: String) {
     state.manager.close(&id);

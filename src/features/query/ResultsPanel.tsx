@@ -10,12 +10,24 @@ import {
   Workflow,
   X
 } from 'lucide-react'
-import type { ExecOutput, ResultSet } from '@/lib/api'
+import { api, type ExecOutput, type ResultSet } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
-import { copyText, exportRows, serialize, type ExportFormat } from '@/lib/export'
+import {
+  copyText,
+  EXPORT_MAX_ROWS,
+  exportAll,
+  exportRows,
+  serialize,
+  type ExportFormat,
+  type FetchedRows
+} from '@/lib/export'
 import { formatDuration, plural } from '@/lib/format'
+import type { Substitution } from '@/lib/params'
 import type { Plan } from '@/lib/plan'
+import { errorMessage } from '@/lib/toast'
+import { openTransactionsStore } from '@/lib/transactions'
+import { confirm } from '@/lib/workspace'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Button, EmptyState, ProgressBar } from '@/components/ui'
@@ -29,8 +41,19 @@ export interface RunResult {
   /** Offset of the executed text within the editor, for error positions */
   offset: number
   sql: string
+  /** Filled-in parameters, so error positions map back onto the editor text */
+  spans?: Substitution[]
   /** Set when the run was an Explain whose output could be read as a plan */
   plan?: Plan
+}
+
+/** How "Save as" gets every row when the loaded ones are only part of the result. */
+export interface WholeResult {
+  /** Whether the loaded rows are missing some of the result */
+  partial: boolean
+  fetch: () => Promise<FetchedRows>
+  /** What to save instead when the fetch fails; null saves nothing */
+  onFetchError?: (error: unknown) => Promise<FetchedRows | null>
 }
 
 export function exportMenu(
@@ -38,24 +61,34 @@ export function exportMenu(
   set: Pick<ResultSet, 'columns' | 'rows'>,
   name: string,
   dialect?: Dialect,
-  table?: string
+  table?: string,
+  whole?: WholeResult
 ): void {
+  const partial = !!whole?.partial
   const run = (format: ExportFormat) => () =>
-    void exportRows(format, set.columns, set.rows, name, { dialect, table })
+    void (whole?.partial
+      ? exportAll(format, name, whole.fetch, {
+          dialect,
+          table,
+          onFetchError: whole.onFetchError
+        })
+      : exportRows(format, set.columns, set.rows, name, { dialect, table }))
   const copy = (format: ExportFormat, label: string) => () =>
     void copyText(
       serialize(format, set.columns, set.rows, { dialect, table }),
-      `Copied ${set.rows.length} rows as ${label}`
+      `Copied ${plural(set.rows.length, 'row')} as ${label}`
     )
   showMenuAt(anchor, [
-    { heading: 'Save as' },
+    { heading: partial ? 'Save all rows as' : 'Save as' },
     { label: 'CSV', icon: <Download />, onSelect: run('csv') },
     { label: 'JSON', icon: <Download />, onSelect: run('json') },
     { label: 'TSV', icon: <Download />, onSelect: run('tsv') },
     { label: 'Markdown', icon: <Download />, onSelect: run('markdown') },
     { label: 'SQL INSERT statements', icon: <Download />, onSelect: run('sql') },
     'separator',
-    { heading: 'Copy all rows as' },
+    {
+      heading: partial ? `Copy the ${plural(set.rows.length, 'loaded row')} as` : 'Copy all rows as'
+    },
     { label: 'TSV (spreadsheet)', icon: <ClipboardCopy />, onSelect: copy('tsv', 'TSV') },
     { label: 'JSON', icon: <ClipboardCopy />, onSelect: copy('json', 'JSON') },
     { label: 'Markdown', icon: <ClipboardCopy />, onSelect: copy('markdown', 'Markdown') },
@@ -63,13 +96,25 @@ export function exportMenu(
   ])
 }
 
+/** Where a result came from, so exports can re-run its script for every row. */
+export interface ResultSource {
+  connectionId: string
+  database: string
+  /** The query tab's session */
+  session: string
+}
+
+// Re-running these on a session with an open transaction would end or nest it
+const TRANSACTION_CONTROL = /\b(begin|start\s+transaction|commit|rollback|savepoint|release)\b/i
+
 export function ResultsPanel({
   result,
   running,
   startedAt,
   dialect,
   onJumpToError,
-  emptyHint
+  emptyHint,
+  source
 }: {
   result?: RunResult
   running: boolean
@@ -77,6 +122,7 @@ export function ResultsPanel({
   dialect: Dialect
   onJumpToError?: () => void
   emptyHint?: React.ReactNode
+  source?: ResultSource
 }): React.JSX.Element {
   const output = result?.output
   const sets = output?.results ?? []
@@ -84,6 +130,7 @@ export function ResultsPanel({
   const [filter, setFilter] = useState('')
   const [showFilter, setShowFilter] = useState(false)
   const [elapsed, setElapsed] = useState(0)
+  const [exporting, setExporting] = useState(false)
 
   // Jump to messages when a run produced no grids or failed outright
   useEffect(() => {
@@ -104,6 +151,58 @@ export function ResultsPanel({
   useEffect(() => () => selectionSummaryStore.set(null), [])
 
   const set = typeof active === 'number' ? sets[active] : undefined
+
+  /** A truncated set is saved by re-running the script read-only with a much higher row cap. */
+  const wholeResult = (index: number, loaded: ResultSet): WholeResult | undefined => {
+    if (!source || !result || !loaded.truncated) return undefined
+    const script = result.sql
+    const loadedRows = plural(loaded.rows.length, 'loaded row')
+    return {
+      partial: true,
+      fetch: async () => {
+        setExporting(true)
+        // The tab's own session sees its uncommitted changes; otherwise a separate
+        // session keeps the re-run clear of the tab's session state
+        const inTransaction = !!openTransactionsStore.get()[source.session]
+        const session = inTransaction ? source.session : `${source.session}:export`
+        try {
+          if (inTransaction && TRANSACTION_CONTROL.test(script))
+            throw new Error(
+              'The script starts or ends a transaction, so it can’t be re-run while this tab holds one open.'
+            )
+          const out = await api.execute(source.connectionId, session, source.database, script, {
+            maxRows: EXPORT_MAX_ROWS,
+            readOnly: true
+          })
+          if (out.error) throw new Error(out.error.message)
+          if (out.cancelled) throw new Error('The re-run was cancelled.')
+          const again = out.results[index]
+          if (!again || again.columns.length !== loaded.columns.length)
+            throw new Error('Running the script again returned different results.')
+          return { columns: again.columns, rows: again.rows, truncated: again.truncated }
+        } finally {
+          if (!inTransaction) void api.closeSession(source.connectionId, session).catch(() => {})
+          setExporting(false)
+        }
+      },
+      onFetchError: async (e) => {
+        const ok = await confirm({
+          title: 'Couldn’t fetch every row',
+          message: (
+            <span>
+              Saving the whole result re-runs the script read-only, and that failed:{' '}
+              <b className="text-bright">{errorMessage(e)}</b>
+              <br />
+              <br />
+              Save the {loadedRows} instead? The file won’t have the rest of the result.
+            </span>
+          ),
+          confirmLabel: `Save ${loadedRows}`
+        })
+        return ok ? { columns: loaded.columns, rows: loaded.rows, truncated: true } : null
+      }
+    }
+  }
   const errorCount =
     output?.messages.filter((m) => m.level === 'error').length ?? (result?.error ? 1 : 0)
 
@@ -187,7 +286,7 @@ export function ResultsPanel({
               {set.truncated && (
                 <span
                   className="flex items-center gap-1 px-1 text-warn"
-                  title="Raise the row limit in Settings to fetch more"
+                  title="Raise the row limit in Settings to fetch more. Saving from Export re-runs the query for every row."
                 >
                   <AlertTriangle className="size-3" /> first {plural(set.rows.length, 'row')}
                 </span>
@@ -231,12 +330,16 @@ export function ResultsPanel({
               <Button
                 size="xs"
                 variant="ghost"
+                disabled={exporting}
                 onClick={(e) =>
+                  typeof active === 'number' &&
                   exportMenu(
                     e.currentTarget,
                     set,
-                    `result-${typeof active === 'number' ? active + 1 : 1}`,
-                    dialect
+                    `result-${active + 1}`,
+                    dialect,
+                    undefined,
+                    wholeResult(active, set)
                   )
                 }
               >
@@ -246,7 +349,7 @@ export function ResultsPanel({
           )}
         </div>
       </div>
-      <ProgressBar active={running} />
+      <ProgressBar active={running || exporting} />
       <div
         className="min-h-0 flex-1"
         onKeyDown={(e) => {

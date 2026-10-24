@@ -134,13 +134,17 @@ impl Server {
         sql: &str,
         opts: &ExecOptions,
     ) -> AppResult<ExecOutput> {
-        if self.config.read_only
-            && let Some(keyword) = guard::first_write_keyword(sql)
+        if (self.config.read_only || opts.read_only)
+            && let Some(keyword) = guard::first_write_keyword(sql, self.config.engine)
         {
-            return Err(AppError::msg(format!(
-                "This connection is read-only, so {keyword} statements are blocked. \
+            return Err(AppError::msg(if self.config.read_only {
+                format!(
+                    "This connection is read-only, so {keyword} statements are blocked. \
                      Turn off \"Read-only\" in the connection settings to run them."
-            )));
+                )
+            } else {
+                format!("Only read-only queries can run here, and this one contains {keyword}.")
+            }));
         }
         // Register before connecting so a cancel during connection setup isn't lost
         let signal = self.begin(key);
@@ -178,6 +182,11 @@ impl Server {
         if self.config.read_only && request.is_write() {
             return Err(AppError::msg(
                 "This connection is read-only. Turn off \"Read-only\" in the connection settings to modify data.",
+            ));
+        }
+        if opts.read_only && request.is_write() {
+            return Err(AppError::msg(
+                "Only reads can run here: find, aggregate, count or distinct.",
             ));
         }
         let client = self.mongo()?;

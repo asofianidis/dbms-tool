@@ -92,7 +92,7 @@ function useLiveMetrics(
   return state
 }
 
-function useDocumentVisible(): boolean {
+export function useDocumentVisible(): boolean {
   const [visible, setVisible] = useState(() => document.visibilityState === 'visible')
   useEffect(() => {
     const onChange = (): void => setVisible(document.visibilityState === 'visible')

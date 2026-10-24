@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 import { api, type Cell, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { exportRows } from '@/lib/export'
+import { EXPORT_MAX_ROWS, saveFetched, serialize } from '@/lib/export'
 import { parseShellValue, scalarText, toShell } from '@/lib/ejson'
 import { emptyQuery, newCondition, type QueryState } from '@/lib/filters'
 import { andFilters, buildMongoFilter, buildMongoSort, sampleFields } from '@/lib/mongo-filters'
@@ -155,6 +155,7 @@ function DocumentsBrowser({
   const [editor, setEditor] = useState<DocumentEditorRequest | null>(null)
   const [query, setQuery] = useState<QueryState>(emptyQuery)
   const [builderOpen, setBuilderOpen] = useState(false)
+  const [exporting, setExporting] = useState(false)
   // Field paths and types sampled from every page loaded so far, for the builder
   const [fields, setFields] = useState<Record<string, string>>({})
   const fieldsRef = useRef(fields)
@@ -305,6 +306,41 @@ function DocumentsBrowser({
     }
   }
 
+  /** Every document matching the query: as documents for JSON, flattened for CSV. */
+  const exportDocuments = (): void => {
+    const asCsv = mode === 'table'
+    void saveFetched(tab.collection, asCsv ? 'csv' : 'json', async () => {
+      setExporting(true)
+      try {
+        const { filter, sort } = findQuery()
+        const out = await api.mongo(
+          tab.connectionId,
+          `${tab.id}:export`,
+          {
+            op: 'find',
+            database: tab.database,
+            collection: tab.collection,
+            filter,
+            projection: parse(applied.projection, 'Project'),
+            sort
+          },
+          { maxRows: EXPORT_MAX_ROWS, readOnly: true }
+        )
+        if (out.cancelled) throw new Error('The fetch was cancelled.')
+        const grid = asCsv ? documentsToGrid(out.documents) : null
+        return {
+          contents: grid
+            ? serialize('csv', grid.columns, grid.rows)
+            : JSON.stringify(out.documents, null, 2),
+          rows: out.documents.length,
+          truncated: out.truncated
+        }
+      } finally {
+        setExporting(false)
+      }
+    })
+  }
+
   const total = output?.total ?? null
   const shown = output?.documents.length ?? 0
   const from = page * pageSize
@@ -371,7 +407,7 @@ function DocumentsBrowser({
           </div>
         )}
       </div>
-      <ProgressBar active={loading} />
+      <ProgressBar active={loading || exporting} />
       <div className="min-h-0 flex-1">
         {error ? (
           <div className="p-4">
@@ -450,16 +486,13 @@ function DocumentsBrowser({
                 <Button
                   size="xs"
                   variant="ghost"
-                  title="Export this page"
-                  onClick={() => {
-                    const grid = documentsToGrid(output.documents)
-                    void exportRows(
-                      mode === 'table' ? 'csv' : 'json',
-                      grid.columns,
-                      grid.rows,
-                      tab.collection
-                    )
-                  }}
+                  title={
+                    mode === 'table'
+                      ? 'Export every matching document as CSV'
+                      : 'Export every matching document as JSON'
+                  }
+                  disabled={exporting}
+                  onClick={exportDocuments}
                 >
                   <Download className="size-3.5" />
                 </Button>

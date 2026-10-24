@@ -89,19 +89,16 @@ pub async fn connect(
         .ssl_mode(match cfg.ssl {
             SslMode::Disable => PgSslMode::Disable,
             SslMode::Prefer => PgSslMode::Prefer,
-            SslMode::Require => PgSslMode::Require,
+            // Certificate checks are the TLS connector's job
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => PgSslMode::Require,
         });
     if let Some(p) = password {
         pg.password(p);
     }
 
-    // Like libpq, only verify certificates when TLS is required and the user hasn't opted out
-    let verify = cfg.ssl == SslMode::Require && !cfg.trust_server_certificate;
-    let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(!verify)
-        .danger_accept_invalid_hostnames(!verify)
-        .build()
-        .map_err(|e| AppError::msg(format!("TLS setup failed: {e}")))?;
+    // Like libpq, Prefer never verifies; Require does unless the user opted out.
+    // Through a tunnel the name checked is the real server's (`pg.host` above).
+    let connector = super::tls::native_connector(cfg)?;
     let tls = MakeTlsConnector::new(connector);
 
     // connect_timeout only bounds the TCP connect; a server that accepts and then stalls

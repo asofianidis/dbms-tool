@@ -28,7 +28,30 @@ pub enum SslMode {
     Disable,
     #[default]
     Prefer,
+    /// Encrypt; the drivers also verify the certificate unless
+    /// `trust_server_certificate` is set
     Require,
+    /// Encrypt and verify the certificate chain, but not the host name
+    #[serde(rename = "verify-ca")]
+    VerifyCa,
+    /// Encrypt and verify the certificate chain and the host name
+    #[serde(rename = "verify-full")]
+    VerifyFull,
+}
+
+impl SslMode {
+    /// TLS must succeed; never falls back to plain text
+    pub fn required(self) -> bool {
+        matches!(
+            self,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+        )
+    }
+
+    /// The verify modes, which ignore `trust_server_certificate`
+    pub fn verifies(self) -> bool {
+        matches!(self, SslMode::VerifyCa | SslMode::VerifyFull)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -98,8 +121,18 @@ pub struct ConnectionConfig {
     pub auth: AuthMode,
     #[serde(default)]
     pub ssl: SslMode,
+    /// Skip certificate checks in Prefer / Require; the verify modes ignore it
     #[serde(default)]
     pub trust_server_certificate: bool,
+    /// CA certificate(s) to trust in addition to the system roots (PEM file)
+    #[serde(default)]
+    pub ssl_root_cert: String,
+    /// Client certificate for mutual TLS (PEM, or a PKCS#12 `.p12`/`.pfx` bundle)
+    #[serde(default)]
+    pub ssl_client_cert: String,
+    /// Private key for `ssl_client_cert` (PEM, PKCS#8)
+    #[serde(default)]
+    pub ssl_client_key: String,
     /// MongoDB connection string; when set it takes precedence over host/port
     #[serde(default)]
     pub uri: String,
@@ -132,6 +165,32 @@ pub struct ConnectionConfig {
 impl ConnectionConfig {
     pub fn ssh_tunnel(&self) -> Option<&SshConfig> {
         self.ssh.as_ref().filter(|s| s.enabled)
+    }
+
+    /// Whether the server certificate chain must be valid
+    pub fn verify_certificate(&self) -> bool {
+        match self.ssl {
+            SslMode::Disable | SslMode::Prefer => false,
+            SslMode::Require => !self.trust_server_certificate,
+            SslMode::VerifyCa | SslMode::VerifyFull => true,
+        }
+    }
+
+    /// Whether the certificate must also name the server
+    pub fn verify_hostname(&self) -> bool {
+        self.verify_certificate() && self.ssl != SslMode::VerifyCa
+    }
+
+    pub fn root_cert(&self) -> Option<&str> {
+        Some(self.ssl_root_cert.trim()).filter(|s| !s.is_empty())
+    }
+
+    pub fn client_cert(&self) -> Option<&str> {
+        Some(self.ssl_client_cert.trim()).filter(|s| !s.is_empty())
+    }
+
+    pub fn client_key(&self) -> Option<&str> {
+        Some(self.ssl_client_key.trim()).filter(|s| !s.is_empty())
     }
 }
 
@@ -239,4 +298,40 @@ pub fn delete_password(id: &str) {
 /// Credential-store key for a connection's SSH password or key passphrase.
 pub fn ssh_secret_id(id: &str) -> String {
     format!("{id}#ssh")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_modes_keep_their_json_names() {
+        for (mode, json) in [
+            (SslMode::Disable, "\"disable\""),
+            (SslMode::Prefer, "\"prefer\""),
+            (SslMode::Require, "\"require\""),
+            (SslMode::VerifyCa, "\"verify-ca\""),
+            (SslMode::VerifyFull, "\"verify-full\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), json);
+            assert_eq!(serde_json::from_str::<SslMode>(json).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn saved_connections_without_tls_files_still_load() {
+        let c: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "x", "engine": "mysql", "ssl": "require",
+            "trustServerCertificate": true
+        }))
+        .unwrap();
+        assert_eq!(c.ssl, SslMode::Require);
+        assert_eq!(
+            (c.root_cert(), c.client_cert(), c.client_key()),
+            (None, None, None)
+        );
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["sslRootCert"], "");
+        assert_eq!(json["sslClientKey"], "");
+    }
 }

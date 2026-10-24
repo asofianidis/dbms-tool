@@ -1,22 +1,31 @@
 import { save } from '@tauri-apps/plugin-dialog'
 import { api, type Cell, type ColumnMeta } from './api'
 import type { Dialect } from './engines'
+import { plural } from './format'
 import { literal, quoteIdent } from './sql'
-import { toast, toastError } from './toast'
+import { errorMessage, toast, toastError } from './toast'
 
 export type ExportFormat = 'csv' | 'tsv' | 'json' | 'markdown' | 'sql'
+
+/** Most rows a "Save as" export fetches; the toast says when a result has more. */
+export const EXPORT_MAX_ROWS = 1_000_000
 
 function cellText(v: Cell): string {
   if (v === null) return ''
   return typeof v === 'boolean' ? String(v) : v
 }
 
+/**
+ * PostgreSQL's COPY CSV convention, which round-trips: NULL is an empty
+ * unquoted field and an empty string is a quoted empty field.
+ */
 function delimited(columns: ColumnMeta[], rows: Cell[][], sep: string, header = true): string {
   const quote = (s: string): string =>
-    s.includes(sep) || s.includes('"') || s.includes('\n') || s.includes('\r')
+    s === '' || s.includes(sep) || s.includes('"') || s.includes('\n') || s.includes('\r')
       ? `"${s.replace(/"/g, '""')}"`
       : s
-  const lines = rows.map((r) => r.map((v) => quote(cellText(v))).join(sep))
+  const field = (v: Cell): string => (v === null ? '' : quote(cellText(v)))
+  const lines = rows.map((r) => r.map(field).join(sep))
   if (header) lines.unshift(columns.map((c) => quote(c.name)).join(sep))
   return lines.join('\r\n')
 }
@@ -44,7 +53,7 @@ export function serialize(
         2
       )
     case 'markdown': {
-      const esc = (s: string): string => s.replace(/\|/g, '\|').replace(/\n/g, ' ')
+      const esc = (s: string): string => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
       return [
         `| ${columns.map((c) => esc(c.name)).join(' | ')} |`,
         `| ${columns.map(() => '---').join(' | ')} |`,
@@ -77,19 +86,26 @@ const EXTENSIONS: Record<ExportFormat, string> = {
   sql: 'sql'
 }
 
+/** Asks where to save; null when the dialog was cancelled. */
+async function pickPath(defaultName: string, extension: string): Promise<string | null> {
+  return save({
+    defaultPath: defaultName.includes('.') ? defaultName : `${defaultName}.${extension}`,
+    filters: [{ name: extension.toUpperCase(), extensions: [extension] }]
+  })
+}
+
+const fileName = (path: string): string => path.split(/[\\/]/).pop() ?? path
+
 export async function saveToFile(
   contents: string,
   defaultName: string,
   extension: string
 ): Promise<boolean> {
   try {
-    const path = await save({
-      defaultPath: defaultName.includes('.') ? defaultName : `${defaultName}.${extension}`,
-      filters: [{ name: extension.toUpperCase(), extensions: [extension] }]
-    })
+    const path = await pickPath(defaultName, extension)
     if (!path) return false
     await api.writeText(path, contents)
-    toast(`Saved ${path.split(/[\/]/).pop()}`)
+    toast(`Saved ${fileName(path)}`)
     return true
   } catch (e) {
     toastError(e)
@@ -105,6 +121,93 @@ export async function exportRows(
   options: { dialect?: Dialect; table?: string } = {}
 ): Promise<void> {
   await saveToFile(serialize(format, columns, rows, options), name, EXTENSIONS[format])
+}
+
+/** A whole result fetched for export; `truncated` when it still stopped short. */
+export interface FetchedRows {
+  columns: ColumnMeta[]
+  rows: Cell[][]
+  truncated: boolean
+}
+
+export interface FetchedFile {
+  contents: string
+  rows: number
+  truncated: boolean
+}
+
+/**
+ * Asks for the file first, then fetches and writes it, so a cancelled dialog
+ * doesn't cost a long fetch. When the fetch fails, `onFetchError` may hand
+ * back something else to write (e.g. the rows already loaded); without it, or
+ * when it returns null, nothing is written.
+ */
+export async function saveFetched(
+  defaultName: string,
+  extension: string,
+  fetch: () => Promise<FetchedFile>,
+  onFetchError?: (error: unknown) => Promise<FetchedFile | null>
+): Promise<boolean> {
+  let path: string | null
+  try {
+    path = await pickPath(defaultName, extension)
+  } catch (e) {
+    toastError(e)
+    return false
+  }
+  if (!path) return false
+  toast('Fetching all rows for export…', 'info')
+  let file: FetchedFile | null
+  try {
+    file = await fetch()
+  } catch (e) {
+    if (!onFetchError) {
+      toast(`Export cancelled: ${errorMessage(e)}`, 'error')
+      return false
+    }
+    file = await onFetchError(e)
+  }
+  if (!file) return false
+  try {
+    await api.writeText(path, file.contents)
+  } catch (e) {
+    toastError(e)
+    return false
+  }
+  const what = plural(file.rows, 'row')
+  if (file.truncated)
+    toast(`Saved only ${what} to ${fileName(path)}; the result has more than that`, 'error')
+  else toast(`Saved ${what} to ${fileName(path)}`)
+  return true
+}
+
+/** "Save as" for a whole result, fetched by `fetch` rather than taken from what's loaded. */
+export async function exportAll(
+  format: ExportFormat,
+  name: string,
+  fetch: () => Promise<FetchedRows>,
+  options: {
+    dialect?: Dialect
+    table?: string
+    onFetchError?: (error: unknown) => Promise<FetchedRows | null>
+  } = {}
+): Promise<void> {
+  const render = (set: FetchedRows): FetchedFile => ({
+    contents: serialize(format, set.columns, set.rows, options),
+    rows: set.rows.length,
+    truncated: set.truncated
+  })
+  const onFetchError = options.onFetchError
+  await saveFetched(
+    name,
+    EXTENSIONS[format],
+    async () => render(await fetch()),
+    onFetchError &&
+      (async (e) => {
+        const set = await onFetchError(e)
+        return set && render(set)
+      })
+  )
 }
 
 export async function copyText(text: string, what = 'Copied'): Promise<void> {

@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use futures_util::TryStreamExt;
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
-use mongodb::options::{ClientOptions, Credential, Tls, TlsOptions};
+use mongodb::options::{
+    ClientOptions, Collation, Credential, Hint, ReadConcern, ReadPreference, SelectionCriteria,
+    Tls, TlsOptions,
+};
 use mongodb::results::CollectionType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -53,6 +56,21 @@ fn server_selection_cause(message: &str) -> &str {
 }
 
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<Client> {
+    // The driver's TLS library (rustls) always checks the host name, and can
+    // only check the one it connects to
+    if cfg.ssl == SslMode::VerifyCa {
+        return Err(AppError::Unsupported(
+            "MongoDB connections can't verify the certificate without its host name; use Verify full"
+                .into(),
+        ));
+    }
+    if cfg.ssl.verifies() && cfg.tunneled.is_some() {
+        return Err(AppError::Unsupported(
+            "MongoDB can't verify the server certificate through an SSH tunnel (it would be checked              against 127.0.0.1); use Require instead"
+                .into(),
+        ));
+    }
+    let client_cert = super::tls::combined_pem_cert(cfg)?;
     let uri = cfg.uri.trim();
     let mut opts = if uri.is_empty() {
         let host = if cfg.host.is_empty() {
@@ -75,14 +93,10 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
                     .build(),
             );
         }
-        opts.tls = match cfg.ssl {
-            SslMode::Require => Some(Tls::Enabled(
-                TlsOptions::builder()
-                    .allow_invalid_certificates(cfg.trust_server_certificate)
-                    .build(),
-            )),
-            _ => None,
-        };
+        opts.tls = cfg
+            .ssl
+            .required()
+            .then(|| Tls::Enabled(TlsOptions::default()));
         // Through a tunnel, replica set discovery would find members by their
         // own (unreachable) names, so talk to the one the tunnel reaches
         if cfg.tunneled.is_some() {
@@ -101,18 +115,29 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         // Prefer leaves TLS to the string (on for mongodb+srv); the others override it
         match cfg.ssl {
             SslMode::Disable => opts.tls = Some(Tls::Disabled),
-            SslMode::Require if !matches!(opts.tls, Some(Tls::Enabled(_))) => {
+            ssl if ssl.required() && !matches!(opts.tls, Some(Tls::Enabled(_))) => {
                 opts.tls = Some(Tls::Enabled(TlsOptions::default()))
             }
             _ => {}
         }
-        if cfg.trust_server_certificate
-            && let Some(Tls::Enabled(tls)) = opts.tls.as_mut()
-        {
-            tls.allow_invalid_certificates = Some(true);
-        }
         opts
     };
+    if let Some(Tls::Enabled(tls)) = opts.tls.as_mut() {
+        if cfg.ssl.verifies() {
+            tls.allow_invalid_certificates = Some(false);
+        } else if cfg.trust_server_certificate {
+            tls.allow_invalid_certificates = Some(true);
+        }
+        // Replaces the built-in roots rather than adding to them
+        if let Some(ca) = cfg.root_cert() {
+            super::tls::read_file(ca, "CA certificate")?;
+            tls.ca_file_path = Some(ca.into());
+        }
+        if let Some(cert) = client_cert {
+            super::tls::read_file(cert, "client certificate")?;
+            tls.cert_key_file_path = Some(cert.into());
+        }
+    }
     opts.app_name = Some("dbms-tool".into());
     opts.server_selection_timeout = Some(Duration::from_secs(10));
     opts.connect_timeout = Some(Duration::from_secs(10));
@@ -175,6 +200,99 @@ fn to_docs(values: Vec<Value>) -> AppResult<Vec<Document>> {
     values.into_iter().map(|v| to_doc(Some(v))).collect()
 }
 
+/// Cursor modifiers from the shell: `.hint()`, `.maxTimeMS()`, `.collation()`, …
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorOptions {
+    /// Index keys or an index name
+    hint: Option<Value>,
+    #[serde(rename = "maxTimeMS")]
+    max_time_ms: Option<u64>,
+    collation: Option<Value>,
+    allow_disk_use: Option<bool>,
+    comment: Option<Value>,
+    /// `primary`, `secondaryPreferred`, …
+    read_preference: Option<String>,
+    /// `local`, `majority`, …
+    read_concern: Option<String>,
+}
+
+/// `CursorOptions` in the driver's types, applied with `with_options!`.
+#[derive(Clone, Default)]
+struct DriverOptions {
+    hint: Option<Hint>,
+    max_time: Option<Duration>,
+    collation: Option<Collation>,
+    allow_disk_use: Option<bool>,
+    comment: Option<Bson>,
+    selection_criteria: Option<SelectionCriteria>,
+    read_concern: Option<ReadConcern>,
+}
+
+impl CursorOptions {
+    fn is_empty(&self) -> bool {
+        self.hint.is_none()
+            && self.max_time_ms.is_none()
+            && self.collation.is_none()
+            && self.allow_disk_use.is_none()
+            && self.comment.is_none()
+            && self.read_preference.is_none()
+            && self.read_concern.is_none()
+    }
+
+    fn driver(self) -> AppResult<DriverOptions> {
+        let hint = match self.hint {
+            None | Some(Value::Null) => None,
+            Some(Value::String(name)) => Some(Hint::Name(name)),
+            Some(keys) => Some(Hint::Keys(to_doc(Some(keys))?)),
+        };
+        let collation = match self.collation {
+            None | Some(Value::Null) => None,
+            Some(c) => Some(
+                mongodb::bson::from_document::<Collation>(to_doc(Some(c))?)
+                    .map_err(|e| AppError::msg(format!("Invalid collation: {e}")))?,
+            ),
+        };
+        let selection_criteria = match self.read_preference.as_deref() {
+            None => None,
+            Some(mode) => Some(SelectionCriteria::ReadPreference(match mode {
+                "primary" => ReadPreference::Primary,
+                "primaryPreferred" => ReadPreference::PrimaryPreferred { options: None },
+                "secondary" => ReadPreference::Secondary { options: None },
+                "secondaryPreferred" => ReadPreference::SecondaryPreferred { options: None },
+                "nearest" => ReadPreference::Nearest { options: None },
+                other => {
+                    return Err(AppError::msg(format!(
+                        "Unknown read preference \"{other}\"; use primary, primaryPreferred, \
+                         secondary, secondaryPreferred or nearest"
+                    )));
+                }
+            })),
+        };
+        Ok(DriverOptions {
+            hint,
+            max_time: self.max_time_ms.map(Duration::from_millis),
+            collation,
+            allow_disk_use: self.allow_disk_use,
+            comment: self.comment.map(to_bson).transpose()?,
+            selection_criteria,
+            read_concern: self.read_concern.map(ReadConcern::custom),
+        })
+    }
+}
+
+/// Calls the builder setter for each option that's set.
+macro_rules! with_options {
+    ($action:expr, $options:expr; $($field:ident),*) => {{
+        let mut action = $action;
+        let options: &DriverOptions = &$options;
+        $(if let Some(v) = options.$field.clone() {
+            action = action.$field(v);
+        })*
+        action
+    }};
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum MongoRequest {
@@ -189,16 +307,22 @@ pub enum MongoRequest {
         /// Also count all matching documents
         #[serde(default)]
         count: bool,
+        #[serde(default)]
+        options: CursorOptions,
     },
     Aggregate {
         database: String,
         collection: String,
         pipeline: Vec<Value>,
+        #[serde(default)]
+        options: CursorOptions,
     },
     Count {
         database: String,
         collection: String,
         filter: Option<Value>,
+        #[serde(default)]
+        options: CursorOptions,
     },
     Distinct {
         database: String,
@@ -442,10 +566,13 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             skip,
             limit,
             count,
+            options,
         } => {
             let c = coll(&database, &collection);
             let filter = to_doc(filter)?;
-            let mut find = c.find(filter.clone());
+            let options = options.driver()?;
+            let mut find = with_options!(c.find(filter.clone()), options;
+                hint, max_time, collation, allow_disk_use, comment, selection_criteria, read_concern);
             let projection = to_doc(projection)?;
             if !projection.is_empty() {
                 find = find.projection(projection);
@@ -470,7 +597,9 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
                 out.total = Some(if filter.is_empty() {
                     c.estimated_document_count().await?
                 } else {
-                    c.count_documents(filter).await?
+                    with_options!(c.count_documents(filter), options;
+                        hint, max_time, collation, comment, selection_criteria, read_concern)
+                    .await?
                 });
             }
             out
@@ -479,12 +608,20 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             database,
             collection,
             pipeline,
+            options,
         } => {
             let pipeline = to_docs(pipeline)?;
+            let options = options.driver()?;
             let cursor = if collection.is_empty() {
-                client.database(&database).aggregate(pipeline).await?
+                let db = client.database(&database);
+                with_options!(db.aggregate(pipeline), options;
+                    hint, max_time, collation, allow_disk_use, comment, selection_criteria, read_concern)
+                .await?
             } else {
-                coll(&database, &collection).aggregate(pipeline).await?
+                let c = coll(&database, &collection);
+                with_options!(c.aggregate(pipeline), options;
+                    hint, max_time, collation, allow_disk_use, comment, selection_criteria, read_concern)
+                .await?
             };
             let (documents, truncated) = drain(cursor, max).await?;
             MongoOutput::documents(documents, truncated)
@@ -493,13 +630,18 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             database,
             collection,
             filter,
+            options,
         } => {
             let c = coll(&database, &collection);
             let filter = to_doc(filter)?;
-            let n = if filter.is_empty() {
+            // estimatedDocumentCount reads metadata, so it can't honour a hint or collation
+            let n = if filter.is_empty() && options.is_empty() {
                 c.estimated_document_count().await?
             } else {
-                c.count_documents(filter).await?
+                let options = options.driver()?;
+                with_options!(c.count_documents(filter), options;
+                    hint, max_time, collation, comment, selection_criteria, read_concern)
+                .await?
             };
             MongoOutput::value(json!(n))
         }
