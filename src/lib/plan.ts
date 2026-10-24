@@ -232,7 +232,9 @@ function chargeSubplans(parent: PlanNode): void {
     if (!sub.label || !sub.timeMs) continue
     const refs = [sub.label.replace(/\s*\(.*$/, ''), ...(sub.label.match(/\$\d+/g) ?? [])]
     const mentions = (n: PlanNode): boolean =>
-      n.props.some(([, v]) => refs.some((r) => new RegExp(`${r.replace('$', '\\$')}\\b`).test(v)))
+      n.props.some(([, v]) =>
+        refs.some((r) => new RegExp(`${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(v))
+      )
     let user: PlanNode | undefined
     for (const sibling of parent.children)
       if (sibling !== sub) walkPlan(sibling, (n) => void (mentions(n) && (user = n)))

@@ -75,6 +75,10 @@ describe('binary values', () => {
     expect(imageType(new TextEncoder().encode('<?xml version="1.0"?><svg width="1">'))).toBe(
       'image/svg+xml'
     )
+    const svg = (s: string) => imageType(new TextEncoder().encode(s))
+    expect(svg('<!-- a --> <!-- b ---><svg>')).toBe('image/svg+xml')
+    // Linear on runs of comment delimiters (was exponential)
+    expect(svg(`<!--${'--><!--'.repeat(60)}x`)).toBeNull()
     expect(binaryExtension(new Uint8Array([0x25, 0x50, 0x44, 0x46]))).toBe('pdf')
     expect(binaryExtension(new Uint8Array([1, 2, 3]))).toBe('bin')
   })
