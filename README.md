@@ -89,6 +89,11 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   shades nodes by cost and suggests indexes.
 - Designers for tables, triggers and schemas, and a permissions designer for `GRANT`, `REVOKE` and
   `DENY` (PostgreSQL, MySQL, SQL Server) with a live script preview.
+- User and role management (PostgreSQL, MySQL / MariaDB, SQL Server, Babelfish): create, edit,
+  rename and drop users and roles with their passwords and attributes (login, superuser,
+  connection limits, account locks, default schemas, SQL logins), and assign roles from either
+  side, a user's "Member of" or a role's "Members", including built-in roles such as
+  `db_datareader`. Passwords are hidden in the script preview.
 
 **Data tools**
 
@@ -142,6 +147,9 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 - Schema analysis over a `$sample`: field paths, presence and type mix.
 - Index management with usage statistics, Atlas Search and Vector Search indexes, and explain with
   collection-scan warnings.
+- Users and custom roles across every database: create users with their authentication
+  database, change passwords, assign built-in and custom roles, write a role's privileges and
+  inherited roles, and add or remove a role's members.
 
 ## Install
 

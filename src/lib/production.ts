@@ -101,7 +101,9 @@ const READ_COMMANDS = new Set([
   'replsetgetstatus',
   'getlog',
   'top',
-  'validate'
+  'validate',
+  'usersinfo',
+  'rolesinfo'
 ])
 
 /** Whether a MongoDB request can modify data, like `MongoRequest::is_write` in the backend. */
@@ -140,6 +142,19 @@ export function describeMongoDanger(op: MongoRequest): string | null {
       return `drop() removes the ${op.collection} collection`
     case 'dropDatabase':
       return `dropDatabase() removes ${op.database}`
+    case 'runCommand': {
+      const command = (op.command && typeof op.command === 'object' ? op.command : {}) as Record<
+        string,
+        unknown
+      >
+      if (typeof command.dropUser === 'string')
+        return `dropUser removes the user ${command.dropUser}@${op.database}`
+      if (typeof command.dropRole === 'string')
+        return `dropRole removes the role ${command.dropRole}@${op.database}`
+      if ('dropAllUsersFromDatabase' in command)
+        return `dropAllUsersFromDatabase removes every user of ${op.database}`
+      return null
+    }
     default:
       return null
   }

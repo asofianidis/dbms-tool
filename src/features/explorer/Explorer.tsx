@@ -55,6 +55,7 @@ import {
   Terminal,
   Trash2,
   Unplug,
+  UserPlus,
   UserRound,
   Users,
   X,
@@ -68,6 +69,7 @@ import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
+import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
@@ -105,6 +107,8 @@ import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
+import { openPrincipalDesigner } from './PrincipalDesigner'
+import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -576,6 +580,7 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
         </>
       )}
       {!q.data.length && <EmptyRow depth={1}>No databases visible to this user</EmptyRow>}
+      {connection.engine === 'mongo' && <MongoPrincipalsFolder connection={connection} depth={1} />}
       {(connection.engine === 'postgres' || connection.engine === 'mysql') && (
         <PrincipalsFolder
           connection={connection}
@@ -1525,7 +1530,8 @@ function CatalogFolder<T>({
   options,
   itemKey,
   searchText,
-  render
+  render,
+  menu = []
 }: {
   id: string
   depth: number
@@ -1534,6 +1540,8 @@ function CatalogFolder<T>({
   itemKey: (item: T) => string
   searchText: (item: T) => (string | null)[]
   render: (item: T) => ReactNode
+  /** Folder menu items after Refresh */
+  menu?: MenuItem[]
 }): React.JSX.Element {
   const filter = useContext(FilterContext)
   const [open, setOpen] = useExpanded(id)
@@ -1558,7 +1566,8 @@ function CatalogFolder<T>({
               label: 'Refresh',
               icon: <RefreshCw />,
               onSelect: () => void queryClient.invalidateQueries({ queryKey: options.queryKey })
-            }
+            },
+            ...menu
           ])
         }
       />
@@ -1710,12 +1719,37 @@ function PrincipalsFolder({
   const permissions = supports(connection.engine, 'permissions')
   const designer = (p: Principal): void =>
     openPermissionsDesigner(connection.id, database, null, principalKey(p))
+  const properties = (p: Principal, drop = false): void =>
+    openPrincipalDesigner(
+      connection.id,
+      database,
+      principalKey(p),
+      p.kind === 'role' ? 'role' : 'user',
+      drop
+    )
   const options = catalogQueries.principals(connection.id, dialect, database)
   return (
     <CatalogFolder
       id={id}
       depth={depth}
       label={dialect === 'postgres' ? 'Roles' : 'Users and roles'}
+      menu={
+        permissions
+          ? [
+              'separator',
+              {
+                label: 'New user…',
+                icon: <UserPlus />,
+                onSelect: () => openPrincipalDesigner(connection.id, database, null, 'user')
+              },
+              {
+                label: 'New role…',
+                icon: <Users />,
+                onSelect: () => openPrincipalDesigner(connection.id, database, null, 'role')
+              }
+            ]
+          : []
+      }
       options={{
         queryKey: [...options.queryKey, showSystemObjects],
         queryFn: async () => {
@@ -1744,9 +1778,102 @@ function PrincipalsFolder({
             showContextMenu(e, [
               { heading: principalLabel(p) },
               ...(permissions
-                ? [{ label: 'Permissions…', icon: <ShieldCheck />, onSelect: () => designer(p) }]
+                ? [
+                    {
+                      label: p.builtin
+                        ? p.kind === 'role'
+                          ? 'Members…'
+                          : 'Roles…'
+                        : 'Properties…',
+                      icon: <Pencil />,
+                      onSelect: () => properties(p)
+                    },
+                    { label: 'Permissions…', icon: <ShieldCheck />, onSelect: () => designer(p) }
+                  ]
                 : []),
-              copyName(p.name)
+              copyName(p.name),
+              ...(permissions && !p.builtin
+                ? [
+                    'separator' as const,
+                    {
+                      label: `Drop ${p.kind === 'role' ? 'role' : 'user'}…`,
+                      icon: <Trash2 />,
+                      danger: true,
+                      disabled: connection.readOnly,
+                      onSelect: () => properties(p, true)
+                    }
+                  ]
+                : [])
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/** MongoDB users and custom roles of every database, each opening its designer. */
+function MongoPrincipalsFolder({
+  connection,
+  depth
+}: {
+  connection: ConnectionConfig
+  depth: number
+}): React.JSX.Element {
+  const id = `c:${connection.id}/mongoPrincipals`
+  const open = (p: MongoPrincipal, drop = false): void =>
+    openMongoUserDesigner(connection.id, p.kind, p.db, p.name, drop)
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label="Users and roles"
+      options={{
+        queryKey: ['conn', connection.id, 'mongoAccounts', 'list'],
+        queryFn: () => listMongoPrincipals(connection.id)
+      }}
+      itemKey={(p) => `${p.kind}:${mongoPrincipalKey(p)}`}
+      searchText={(p) => [p.name, p.db]}
+      menu={[
+        'separator',
+        {
+          label: 'New user…',
+          icon: <UserPlus />,
+          onSelect: () => openMongoUserDesigner(connection.id, 'user', 'admin')
+        },
+        {
+          label: 'New role…',
+          icon: <Users />,
+          onSelect: () => openMongoUserDesigner(connection.id, 'role', 'admin')
+        }
+      ]}
+      render={(p) => (
+        <Row
+          id={`${id}/${p.kind}:${mongoPrincipalKey(p)}`}
+          depth={depth + 1}
+          icon={
+            p.kind === 'user' ? (
+              <UserRound className="text-syn-prop" />
+            ) : (
+              <Users className="text-syn-keyword" />
+            )
+          }
+          label={mongoPrincipalKey(p)}
+          detail={p.kind}
+          onOpen={() => open(p)}
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: mongoPrincipalKey(p) },
+              { label: 'Properties…', icon: <Pencil />, onSelect: () => open(p) },
+              copyName(p.name),
+              'separator',
+              {
+                label: `Drop ${p.kind}…`,
+                icon: <Trash2 />,
+                danger: true,
+                disabled: connection.readOnly,
+                onSelect: () => open(p, true)
+              }
             ])
           }
         />
