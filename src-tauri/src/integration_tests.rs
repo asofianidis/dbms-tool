@@ -72,10 +72,7 @@ async fn open(engine: Engine, var: &str) -> Option<(Arc<Manager>, String)> {
 }
 
 fn opts() -> ExecOptions {
-    ExecOptions {
-        max_rows: 100,
-        ..Default::default()
-    }
+    ExecOptions::with_max_rows(100)
 }
 
 fn cell(out: &ExecOutput, set: usize, row: usize, col: usize) -> Value {

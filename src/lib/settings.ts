@@ -34,6 +34,11 @@ export interface Settings {
   sidebarWidth: number
   /** Check GitHub Releases for signed updates in the background */
   autoUpdate: boolean
+  /** Zone timestamps are shown in: '' as the server sent them, 'local', 'UTC' or an IANA name */
+  timeZone: string
+  /** Read `timestamp` / `datetime` values without an offset as UTC */
+  assumeUtc: boolean
+  dateFormat: 'iso' | 'locale'
 }
 
 /** Fallback when an accent value is malformed */
@@ -67,7 +72,10 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   wordWrap: false,
   confirmDangerous: true,
   sidebarWidth: 280,
-  autoUpdate: true
+  autoUpdate: true,
+  timeZone: '',
+  assumeUtc: false,
+  dateFormat: 'iso'
 })
 
 function luminance(hex: string): number {

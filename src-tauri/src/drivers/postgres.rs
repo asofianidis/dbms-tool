@@ -637,13 +637,49 @@ impl PgSession {
                 &[],
             )
             .await?;
-        Ok(rows
+        let mut tables: Vec<CompletionTable> = rows
             .iter()
             .map(|r| CompletionTable {
                 schema: r.get(0),
                 name: r.get(1),
                 columns: r.get(2),
+                foreign_keys: Vec::new(),
             })
-            .collect())
+            .collect();
+        // Join suggestions are a bonus; completion works without them
+        if let Ok(keys) = self
+            .strings(
+                "SELECT ns.nspname::text, cl.relname::text, co.oid::text, a.attname::text, \
+                 rns.nspname::text, rcl.relname::text, ra.attname::text \
+                 FROM pg_constraint co \
+                 JOIN pg_class cl ON cl.oid = co.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = cl.relnamespace \
+                 JOIN pg_class rcl ON rcl.oid = co.confrelid \
+                 JOIN pg_namespace rns ON rns.oid = rcl.relnamespace \
+                 CROSS JOIN LATERAL unnest(co.conkey, co.confkey) WITH ORDINALITY k(col, ref, i) \
+                 JOIN pg_attribute a ON a.attrelid = co.conrelid AND a.attnum = k.col \
+                 JOIN pg_attribute ra ON ra.attrelid = co.confrelid AND ra.attnum = k.ref \
+                 WHERE co.contype = 'f' AND ns.nspname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY 1, 2, 3, k.i LIMIT 20000",
+                &[],
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .map(|r| KeyColumn {
+                        schema: r.get(0),
+                        table: r.get(1),
+                        key: r.get(2),
+                        column: r.get(3),
+                        ref_schema: r.get(4),
+                        ref_table: r.get(5),
+                        ref_column: r.get(6),
+                    })
+                    .collect(),
+            );
+        }
+        Ok(tables)
     }
 }

@@ -19,14 +19,17 @@ import {
   TextCursorInput,
   Undo2
 } from 'lucide-react'
-import { api, type CompletionTable } from '@/lib/api'
+import { api, type CompletionTable, type StreamFormat } from '@/lib/api'
 import { ENGINES, connectionLabel } from '@/lib/engines'
+import { EXTENSIONS, pickSavePath } from '@/lib/export'
+import { plural } from '@/lib/format'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
 import { paramNames, substituteParams, type ParamValue } from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
 import { confirmProductionWrite, isProduction } from '@/lib/production'
-import { queries } from '@/lib/queries'
+import { queries, queryClient } from '@/lib/queries'
+import { isReadOnlyQuery, resolveTable, singleTableSource } from '@/lib/result-source'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
 import { createStore } from '@/lib/store'
@@ -60,10 +63,13 @@ import { showMenuAt } from '@/components/ContextMenu'
 import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
 import { SavedButton } from '../saved/SavedButton'
 import { ParamsDialog } from './ParamsDialog'
-import { ResultsPanel, type RunResult } from './ResultsPanel'
+import { ResultsPanel, type ResultEditTarget, type RunResult } from './ResultsPanel'
 import { ConnectionPicker, DatabasePicker } from './pickers'
 
 export const sqlResultsStore = createStore<Record<string, RunResult>>({})
+
+/** Excel's sheet holds this many rows below the header */
+const XLSX_ROWS = 1_048_575
 
 function completionNamespace(tables: CompletionTable[] | undefined): SQLNamespace | undefined {
   if (!tables) return undefined
@@ -271,6 +277,145 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   }
 
   const cancel = (): void => void api.cancel(tab.connectionId, tab.id).catch(toastError)
+
+  /** Runs the last result's text again, keeping the open view: more rows, or a refresh after edits. */
+  const rerun = async (maxRows: number): Promise<void> => {
+    const last = sqlResultsStore.get()[tab.id]
+    if (!last || runsStore.get()[tab.id]?.running) return
+    if (!(await connect(tab.connectionId))) return
+    setRunning(tab.id, true)
+    try {
+      const output = await api.execute(tab.connectionId, tab.id, tab.database, last.sql, {
+        maxRows,
+        timeoutSecs: settings.queryTimeoutSecs
+      })
+      if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
+      sqlResultsStore.set((r) => ({ ...r, [tab.id]: { ...last, output, keepView: true } }))
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setRunning(tab.id, false)
+    }
+  }
+
+  const rerunnable = !!result?.output && isReadOnlyQuery(result.sql, dialect)
+  const notRerunnable = 'Only for queries that just read: running this text again could change data'
+
+  const loadMore = (set: number): void => {
+    const shown = result?.output?.results[set]?.rows.length ?? 0
+    void rerun(shown + settings.maxRows)
+  }
+
+  const exportFull = async (set: number, format: StreamFormat): Promise<void> => {
+    if (!result || runsStore.get()[tab.id]?.running) return
+    const path = await pickSavePath(
+      `${tab.title.replace(/[\\/:*?"<>|]+/g, '_')}${set ? `-${set + 1}` : ''}`,
+      EXTENSIONS[format]
+    )
+    if (!path || !(await connect(tab.connectionId))) return
+    setRunning(tab.id, true)
+    try {
+      const output = await api.exportQuery(
+        tab.connectionId,
+        tab.id,
+        tab.database,
+        result.sql,
+        format,
+        path,
+        set
+      )
+      if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
+      const rows = output.results[set]?.rowCount ?? 0
+      const file = path.split(/[\\/]/).pop()
+      if (output.error) toast(`Export stopped: ${output.error.message}`, 'error')
+      else if (output.cancelled) toast(`Export cancelled after ${plural(rows, 'row')}`, 'error')
+      else if (!output.results[set]) toast('The query returned no result set to export', 'error')
+      else if (format === 'xlsx' && rows > XLSX_ROWS)
+        toast(
+          `Saved ${XLSX_ROWS.toLocaleString()} of ${rows.toLocaleString()} rows to ${file}: that's all an Excel sheet holds`,
+          'error'
+        )
+      else toast(`Exported ${plural(rows, 'row')} to ${file}`)
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setRunning(tab.id, false)
+    }
+  }
+
+  // Results read straight from one table with a primary key can be edited in place
+  const [editSource, setEditSource] = useState<Omit<
+    ResultEditTarget,
+    'execute' | 'confirmDangerous' | 'blocked' | 'onCommitted'
+  > | null>(null)
+  useEffect(() => {
+    const output = result?.output
+    const set = output?.results[0]
+    const source = result && singleTableSource(result.sql, dialect)
+    const table =
+      source && resolveTable(source.parts, completion.data ?? [], defaultSchema, dialect)
+    if (!set || output.error || output.results.length !== 1 || connection?.readOnly || !table) {
+      setEditSource(null)
+      return
+    }
+    let stale = false
+    queryClient
+      .fetchQuery(queries.table(tab.connectionId, tab.database, table.schema, table.name))
+      .then((info) => {
+        if (stale) return
+        const names = set.columns.map((c) => c.name)
+        const unique = (name: string): boolean => names.indexOf(name) === names.lastIndexOf(name)
+        const keyed =
+          info.primaryKey.length > 0 && info.primaryKey.every((k) => names.includes(k) && unique(k))
+        if (!keyed) return setEditSource(null)
+        const readOnly = new Set<number>()
+        set.columns.forEach((c, i) => {
+          const column = info.columns.find((col) => col.name === c.name)
+          const passedThrough = source.star || source.columns.has(c.name)
+          if (!column || column.isGenerated || !passedThrough || !unique(c.name)) readOnly.add(i)
+        })
+        setEditSource({ tableRef: { schema: table.schema, name: table.name }, info, readOnly })
+      })
+      .catch(() => !stale && setEditSource(null))
+    return () => {
+      stale = true
+    }
+    // Recomputed per run; completions arriving later only matter for the next run
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result])
+  const edit = useMemo<ResultEditTarget | undefined>(
+    () =>
+      editSource
+        ? {
+            ...editSource,
+            execute: (sql, options) =>
+              api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+            confirmDangerous: settings.confirmDangerous,
+            connection,
+            blocked: inTransaction
+              ? "This tab's transaction is open. Commit or roll back before committing edits, which run in their own transaction."
+              : undefined,
+            onCommitted: () =>
+              void rerun(
+                Math.max(
+                  settings.maxRows,
+                  sqlResultsStore.get()[tab.id]?.output?.results[0]?.rows.length ?? 0
+                )
+              )
+          }
+        : undefined,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      editSource,
+      tab.connectionId,
+      tab.id,
+      tab.database,
+      settings.confirmDangerous,
+      settings.maxRows,
+      inTransaction,
+      connection
+    ]
+  )
 
   const endTransaction = async (commit: boolean): Promise<void> => {
     const sql = commit ? commitSql(dialect) : rollbackSql(dialect)
@@ -568,6 +713,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             language={{ kind: 'sql', dialect }}
             completion={namespace}
             defaultSchema={defaultSchema}
+            sqlTables={completion.data}
             keys={keys}
             fontSize={settings.editorFontSize}
             wordWrap={settings.wordWrap}
@@ -591,6 +737,13 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             running={running}
             startedAt={run?.startedAt}
             dialect={dialect}
+            tabId={tab.id}
+            loadMore={{ run: loadMore, disabled: rerunnable ? undefined : notRerunnable }}
+            exportFull={{
+              run: (set, format) => void exportFull(set, format),
+              disabled: rerunnable ? undefined : notRerunnable
+            }}
+            edit={edit}
             onJumpToError={() => {
               if (result?.output?.error && result.offset >= 0)
                 showError(result.output.error, result.offset, result.sql)
