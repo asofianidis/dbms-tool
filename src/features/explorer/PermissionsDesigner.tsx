@@ -401,7 +401,7 @@ function PermissionsDesigner(request: Request): React.JSX.Element {
   )
 }
 
-function Hint({ children }: { children: React.ReactNode }): React.JSX.Element {
+export function Hint({ children }: { children: React.ReactNode }): React.JSX.Element {
   return (
     <p className="rounded-lg border border-dashed border-line px-3 py-6 text-center text-xs text-muted">
       {children}
@@ -409,7 +409,7 @@ function Hint({ children }: { children: React.ReactNode }): React.JSX.Element {
   )
 }
 
-function Loading(): React.JSX.Element {
+export function Loading(): React.JSX.Element {
   return (
     <div className="flex justify-center py-6">
       <Spinner className="size-5" />
@@ -769,7 +769,7 @@ function PrivilegeMatrix({
 }
 
 /** The roles the grantee could join, plus any they're already in. */
-function roleCandidates(
+export function roleCandidates(
   dialect: Dialect,
   principals: Principal[],
   grantee: Principal | null,
@@ -789,25 +789,31 @@ function roleCandidates(
   return [...list.filter((p) => !p.builtin), ...list.filter((p) => p.builtin)]
 }
 
-function MembershipList({
+/** Checkboxes for role memberships, keyed by principalKey of each listed principal. */
+export function MembershipList({
   dialect,
   roles,
   original,
   draft,
-  onChange
+  onChange,
+  label = 'Role',
+  empty = 'There are no roles to join.'
 }: {
   dialect: Dialect
   roles: Principal[]
   original: GrantMap
   draft: GrantMap
   onChange: (state: GrantMap) => void
+  /** Heading of the name column */
+  label?: string
+  empty?: string
 }): React.JSX.Element {
   const admin = dialect !== 'tsql'
   const grid = cn(
     'grid items-center gap-x-3 px-2',
     admin ? 'grid-cols-[12px_minmax(0,1fr)_72px_104px]' : 'grid-cols-[12px_minmax(0,1fr)_72px]'
   )
-  if (!roles.length) return <Hint>There are no roles to join.</Hint>
+  if (!roles.length) return <Hint>{empty}</Hint>
   return (
     <div className="rounded-lg border border-line">
       <div
@@ -817,7 +823,7 @@ function MembershipList({
         )}
       >
         <span />
-        <span className="!text-left">Role</span>
+        <span className="!text-left">{label}</span>
         <span>Member</span>
         {admin && <span>Admin option</span>}
       </div>

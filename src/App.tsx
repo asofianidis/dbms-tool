@@ -12,6 +12,7 @@ import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
 import { CreateCollectionHost } from './features/mongo/CreateCollectionDialog'
+import { MongoUserDesignerHost } from './features/mongo/MongoUserDesigner'
 import { Explorer } from './features/explorer/Explorer'
 import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
@@ -19,6 +20,7 @@ import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
+import { PrincipalDesignerHost } from './features/explorer/PrincipalDesigner'
 import { SeedHost } from './features/seed/SeedDialog'
 import { BackupTab } from './features/backup/BackupTab'
 import { CompareTab } from './features/compare/CompareTab'
@@ -252,6 +254,8 @@ export function App(): React.JSX.Element {
       <SchemaDesignerHost />
       <TriggerDesignerHost />
       <PermissionsDesignerHost />
+      <PrincipalDesignerHost />
+      <MongoUserDesignerHost />
       <SeedHost />
       <ContextMenuHost />
       <Toaster />

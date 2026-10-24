@@ -504,6 +504,8 @@ fn is_read_command(command: &Value) -> bool {
         "listShards",
         "balancerStatus",
         "getLog",
+        "usersInfo",
+        "rolesInfo",
     ];
     let Some((key, value)) = command.as_object().and_then(|o| o.iter().next()) else {
         return false;
@@ -1314,6 +1316,12 @@ mod tests {
         assert!(is_read_command(&json!({ "profile": -1 })));
         assert!(!is_read_command(&json!({ "profile": 1, "slowms": 100 })));
         assert!(!is_read_command(&json!({ "collMod": "users" })));
+        assert!(is_read_command(
+            &json!({ "usersInfo": { "forAllDBs": true } })
+        ));
+        assert!(!is_read_command(
+            &json!({ "createUser": "app", "pwd": "x", "roles": [] })
+        ));
     }
 
     #[test]
