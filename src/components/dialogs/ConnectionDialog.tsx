@@ -20,11 +20,14 @@ import {
   ENGINE_ORDER,
   ENGINES,
   newConnection,
-  parseConnectionString
+  parseConnectionString,
+  sslRequired,
+  sslVerifies
 } from '@/lib/engines'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import {
   closeConnectionDialog,
+  confirmSshHostKey,
   connect,
   connectionDialogStore,
   connectionsStore,
@@ -35,6 +38,7 @@ import {
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
 import { SshFields } from './SshFields'
+import { TlsFields } from './TlsFields'
 
 export function ConnectionDialogHost(): React.JSX.Element | null {
   const state = connectionDialogStore.use()
@@ -234,6 +238,10 @@ function ConnectionDialog({
     }
   }
   const cloudAuth = config.auth === 'cloud'
+  const tlsCanBeOn =
+    cloudAuth ||
+    // Prefer means off for MongoDB's host form
+    (config.engine === 'mongo' && !usesUri ? sslRequired(config.ssl) : config.ssl !== 'disable')
   // Babelfish's TDS endpoint has no IAM sign-in
   const iamCapable =
     config.engine === 'postgres' || config.engine === 'mysql' || config.engine === 'mssql'
@@ -259,11 +267,21 @@ function ConnectionDialog({
 
   const runTest = async (): Promise<void> => {
     setTest({ state: 'testing' })
-    try {
-      const info = await api.connectionTest(effective(), password || null, sshSecret)
-      setTest({ state: 'ok', info })
-    } catch (e) {
-      setTest({ state: 'error', error: errorMessage(e) })
+    for (;;) {
+      try {
+        const info = await api.connectionTest(effective(), password || null, sshSecret)
+        setTest({ state: 'ok', info })
+      } catch (e) {
+        // First connection to an SSH server: confirm its key, then test again
+        let error = errorMessage(e)
+        try {
+          if (await confirmSshHostKey(e)) continue
+        } catch (err) {
+          error = errorMessage(err)
+        }
+        setTest({ state: 'error', error })
+      }
+      return
     }
   }
 
@@ -624,12 +642,13 @@ function ConnectionDialog({
               }
             >
               <Select
-                value={cloudAuth ? 'require' : config.ssl}
-                disabled={cloudAuth}
+                value={cloudAuth && !sslRequired(config.ssl) ? 'require' : config.ssl}
                 onChange={(e) => patch({ ssl: e.target.value as ConnectionConfig['ssl'] })}
               >
-                <option value="disable">{tds ? 'Off' : 'Disable'}</option>
-                <option value="prefer">
+                <option value="disable" disabled={cloudAuth}>
+                  {tds ? 'Off' : 'Disable'}
+                </option>
+                <option value="prefer" disabled={cloudAuth}>
                   {tds
                     ? 'Login only (default)'
                     : usesUri
@@ -639,10 +658,17 @@ function ConnectionDialog({
                         : 'Prefer'}
                 </option>
                 <option value="require">{tds ? 'Mandatory' : 'Require'}</option>
+                {/* SQL Server's and MongoDB's drivers check the host name whenever they check the chain */}
+                {!tds && config.engine !== 'mongo' && (
+                  <option value="verify-ca">Verify CA (chain, not host name)</option>
+                )}
+                <option value="verify-full">Verify full (chain and host name)</option>
               </Select>
             </Field>
           )}
         </div>
+
+        {!sqlite && tlsCanBeOn && <TlsFields config={config} onChange={(files) => patch(files)} />}
 
         {!sqlite && config.cloud?.provider !== 'fly' && (
           <SshFields
@@ -674,10 +700,15 @@ function ConnectionDialog({
           />
           {!sqlite && (
             <Toggle
-              checked={config.trustServerCertificate}
+              checked={config.trustServerCertificate && !sslVerifies(config.ssl)}
               onChange={(trustServerCertificate) => patch({ trustServerCertificate })}
               label="Trust server certificate"
-              description="Accept self-signed TLS certificates"
+              description={
+                sslVerifies(config.ssl)
+                  ? 'Off: the verify modes always check it'
+                  : 'Accept self-signed TLS certificates'
+              }
+              disabled={sslVerifies(config.ssl)}
             />
           )}
           <Toggle
@@ -685,6 +716,15 @@ function ConnectionDialog({
             onChange={(readOnly) => patch({ readOnly })}
             label="Read-only"
             description="Block writes from editors and grids"
+          />
+          <Toggle
+            checked={!!config.production}
+            onChange={(production) =>
+              // A production connection without a colour gets red, so it stands out in tabs
+              patch(production && !config.color ? { production, color: '#ff6e61' } : { production })
+            }
+            label="Production"
+            description="Confirm every write; type the name for destructive ones"
           />
           <Field label="Group">
             <Input

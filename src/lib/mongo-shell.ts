@@ -3,10 +3,12 @@
  * against a recording `db` object: every call such as
  * `db.users.find({ age: { $gt: 30 } }).sort({ name: 1 }).limit(10)` becomes a
  * `MongoRequest` that runs on the server afterwards, in order. Results aren't
- * available to the script itself, which keeps evaluation synchronous.
+ * available to the script itself, which keeps evaluation synchronous, so
+ * anything that reads them (`forEach`, `.length`, `if (n > 0)`) raises a
+ * `ShellError` instead of quietly seeing nothing.
  */
 
-import type { MongoRequest } from './api'
+import type { MongoCursorOptions, MongoRequest } from './api'
 import { Ejson, shellHelpers, toEjson } from './ejson'
 
 export type ShellOp =
@@ -17,57 +19,203 @@ export type ShellOp =
 
 export class ShellError extends Error {}
 
-const CURSOR_NOOPS = [
-  'batchSize',
-  'collation',
-  'comment',
-  'hint',
-  'maxTimeMS',
-  'noCursorTimeout',
-  'readPref',
-  'allowDiskUse',
-  'readConcern',
-  'pretty',
-  'toArray',
-  'forEach',
-  'map'
+/** Cursor methods that don't change which documents come back. */
+const CURSOR_NOOPS = ['batchSize', 'noCursorTimeout', 'pretty', 'toArray']
+
+const READ_PREFERENCES = [
+  'primary',
+  'primaryPreferred',
+  'secondary',
+  'secondaryPreferred',
+  'nearest'
 ]
 
 function args(list: unknown[]): string {
   return list.length ? '…' : ''
 }
 
+function notAvailable(label: string, use: string): ShellError {
+  return new ShellError(
+    `${use} isn't supported here: ${label} runs on the server after the script has finished, ` +
+      `so the script never sees its results. The results are listed in the output instead.`
+  )
+}
+
+/** Options findAndModify takes as they are. */
+const FIND_AND_MODIFY_OPTIONS = [
+  'arrayFilters',
+  'collation',
+  'hint',
+  'maxTimeMS',
+  'bypassDocumentValidation',
+  'comment'
+]
+
+function pick(options: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  return Object.fromEntries(
+    keys.filter((k) => options[k] !== undefined).map((k) => [k, options[k]])
+  )
+}
+
+function upsertOption(method: string, options: unknown): boolean | undefined {
+  const upsert = checkOptions(method, options, ['upsert']).upsert
+  return upsert === undefined ? undefined : !!upsert
+}
+
+/** Throws on option keys this shell would otherwise drop. */
+function checkOptions(
+  method: string,
+  options: unknown,
+  allowed: string[]
+): Record<string, unknown> {
+  if (options === undefined || options === null) return {}
+  if (typeof options !== 'object' || Array.isArray(options))
+    throw new ShellError(`${method}: options must be an object`)
+  const unknown = Object.keys(options).filter((k) => !allowed.includes(k))
+  if (unknown.length)
+    throw new ShellError(
+      `${method}: ${unknown.join(', ')} ${unknown.length === 1 ? 'isn’t' : 'aren’t'} supported in this shell` +
+        (allowed.length ? ` (supported: ${allowed.join(', ')})` : '')
+    )
+  return options as Record<string, unknown>
+}
+
+const CURSOR_OPTIONS = [
+  'hint',
+  'maxTimeMS',
+  'collation',
+  'allowDiskUse',
+  'comment',
+  'readPreference',
+  'readConcern'
+]
+
+/** `{ hint, maxTimeMS, … }` from a find/aggregate/count options argument. */
+function cursorOptions(method: string, options: Record<string, unknown>): MongoCursorOptions {
+  const out: MongoCursorOptions = {}
+  if (options.hint !== undefined) out.hint = toEjson(options.hint)
+  if (options.maxTimeMS !== undefined) out.maxTimeMS = Number(options.maxTimeMS)
+  if (options.collation !== undefined) out.collation = toEjson(options.collation)
+  if (options.allowDiskUse !== undefined) out.allowDiskUse = !!options.allowDiskUse
+  if (options.comment !== undefined) out.comment = toEjson(options.comment)
+  if (options.readPreference !== undefined)
+    out.readPreference = readPreference(method, options.readPreference)
+  if (options.readConcern !== undefined) {
+    const rc = options.readConcern
+    out.readConcern = String(rc && typeof rc === 'object' ? (rc as { level?: unknown }).level : rc)
+  }
+  return out
+}
+
+function readPreference(method: string, mode: unknown): string {
+  const value =
+    mode && typeof mode === 'object' ? (mode as { mode?: unknown }).mode : (mode as unknown)
+  if (typeof value !== 'string' || !READ_PREFERENCES.includes(value))
+    throw new ShellError(`${method}: read preference must be one of ${READ_PREFERENCES.join(', ')}`)
+  return value
+}
+
 export function parseShell(script: string, database: string): ShellOp[] {
   const ops: ShellOp[] = []
   let current = database
 
-  const push = (
-    label: string,
-    request: MongoRequest,
-    single?: boolean
-  ): { kind: 'request'; label: string; request: MongoRequest; single?: boolean } => {
+  type RequestOp = { kind: 'request'; label: string; request: MongoRequest; single?: boolean }
+
+  const push = (label: string, request: MongoRequest, single?: boolean): RequestOp => {
     const op = { kind: 'request' as const, label, request, single }
     ops.push(op)
     return op
   }
 
-  const cursor = (op: ReturnType<typeof push>): unknown => {
+  /**
+   * What a call hands back to the script: `methods` for chaining, and an error
+   * for anything that would need the result, like `.length` or `n > 0`.
+   */
+  const pending = new WeakMap<object, () => string>()
+  const placeholder = (label: () => string, methods: Record<string, unknown> = {}): unknown => {
+    const proxy = new Proxy(methods, {
+      get: (target, prop) => {
+        if (prop === Symbol.toPrimitive || prop === 'valueOf' || prop === 'toString')
+          return () => {
+            throw notAvailable(label(), 'Using the result in an expression')
+          }
+        if (typeof prop === 'symbol') return undefined
+        if (prop in target) return target[prop]
+        if (prop === 'forEach' || prop === 'map')
+          return () => {
+            throw notAvailable(label(), `.${prop}()`)
+          }
+        throw notAvailable(label(), `Reading .${prop}`)
+      }
+    })
+    pending.set(proxy, label)
+    return proxy
+  }
+  const printable = (value: unknown): unknown => {
+    const label = value && typeof value === 'object' ? pending.get(value) : undefined
+    if (label) throw notAvailable(label(), 'Printing a result')
+    return value
+  }
+
+  /** Sets a cursor option on the op's current request. */
+  const setOption = (op: RequestOp, method: string, options: MongoCursorOptions): void => {
+    const req = op.request
+    if (req.op !== 'find' && req.op !== 'aggregate' && req.op !== 'count')
+      throw new ShellError(`Call .${method}() before .explain()`)
+    req.options = { ...req.options, ...options }
+  }
+
+  const optionMethods = (op: RequestOp, self: () => unknown): Record<string, unknown> => ({
+    hint: (h: unknown) => (setOption(op, 'hint', { hint: toEjson(h) }), self()),
+    maxTimeMS: (ms: number) => (setOption(op, 'maxTimeMS', { maxTimeMS: Number(ms) }), self()),
+    collation: (c: unknown) => (setOption(op, 'collation', { collation: toEjson(c) }), self()),
+    allowDiskUse: (allow = true) => (
+      setOption(op, 'allowDiskUse', { allowDiskUse: !!allow }),
+      self()
+    ),
+    comment: (c: unknown) => (setOption(op, 'comment', { comment: toEjson(c) }), self()),
+    readPref: (mode: unknown, tags?: unknown) => {
+      if (tags !== undefined) throw new ShellError('readPref: tag sets aren’t supported')
+      setOption(op, 'readPref', { readPreference: readPreference('readPref', mode) })
+      return self()
+    },
+    readConcern: (level: unknown) => (
+      setOption(op, 'readConcern', { readConcern: String(level) }),
+      self()
+    )
+  })
+
+  /** Explain options shared by find and aggregate: the ones the server reads from the command. */
+  const explainFields = (options: MongoCursorOptions | undefined): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    if (options?.hint !== undefined) out.hint = options.hint
+    if (options?.collation !== undefined) out.collation = options.collation
+    if (options?.maxTimeMS !== undefined) out.maxTimeMS = options.maxTimeMS
+    if (options?.allowDiskUse !== undefined) out.allowDiskUse = options.allowDiskUse
+    if (options?.comment !== undefined) out.comment = options.comment
+    return out
+  }
+
+  const cursor = (op: RequestOp): unknown => {
     const handle: Record<string, unknown> = {}
+    const self = (): unknown => proxy
     const req = op.request as Extract<MongoRequest, { op: 'find' }>
-    handle.sort = (s: unknown) => ((req.sort = toEjson(s)), handle)
-    handle.limit = (n: number) => ((req.limit = n), handle)
-    handle.skip = (n: number) => ((req.skip = n), handle)
-    handle.projection = (p: unknown) => ((req.projection = toEjson(p)), handle)
+    handle.sort = (s: unknown) => ((req.sort = toEjson(s)), self())
+    handle.limit = (n: number) => ((req.limit = n), self())
+    handle.skip = (n: number) => ((req.skip = n), self())
+    handle.projection = (p: unknown) => ((req.projection = toEjson(p)), self())
     handle.project = handle.projection
     handle.count = () => {
+      const { allowDiskUse: _, ...options } = req.options ?? {}
       op.request = {
         op: 'count',
         database: req.database,
         collection: req.collection,
-        filter: req.filter
+        filter: req.filter,
+        ...(Object.keys(options).length ? { options } : {})
       }
       op.label = op.label.replace(/\.find\(/, '.count(')
-      return handle
+      return self()
     }
     handle.size = handle.count
     handle.itcount = handle.count
@@ -77,105 +225,157 @@ export function parseShell(script: string, database: string): ShellOp[] {
       if (req.projection) find.projection = req.projection
       if (req.limit) find.limit = req.limit
       if (req.skip) find.skip = req.skip
+      Object.assign(find, explainFields(req.options))
       op.request = {
         op: 'runCommand',
         database: req.database,
         command: { explain: find, verbosity }
       }
       op.label += '.explain()'
-      return handle
+      return self()
     }
-    for (const name of CURSOR_NOOPS) handle[name] = () => handle
-    return handle
+    Object.assign(handle, optionMethods(op, self))
+    for (const name of CURSOR_NOOPS) handle[name] = () => self()
+    const proxy = placeholder(() => op.label, handle)
+    return proxy
   }
 
-  const aggregateCursor = (op: ReturnType<typeof push>): unknown => {
+  const aggregateCursor = (op: RequestOp): unknown => {
     const handle: Record<string, unknown> = {}
+    const self = (): unknown => proxy
     handle.explain = (verbosity = 'queryPlanner') => {
       const req = op.request as Extract<MongoRequest, { op: 'aggregate' }>
       op.request = {
         op: 'runCommand',
         database: req.database,
         command: {
-          explain: { aggregate: req.collection || 1, pipeline: req.pipeline, cursor: {} },
+          explain: {
+            aggregate: req.collection || 1,
+            pipeline: req.pipeline,
+            cursor: {},
+            ...explainFields(req.options)
+          },
           verbosity
         }
       }
       op.label += '.explain()'
-      return handle
+      return self()
     }
-    for (const name of CURSOR_NOOPS) handle[name] = () => handle
-    return handle
+    Object.assign(handle, optionMethods(op, self))
+    for (const name of CURSOR_NOOPS) handle[name] = () => self()
+    const proxy = placeholder(() => op.label, handle)
+    return proxy
+  }
+
+  /** Wraps calls that record an op so their return value can't be read by mistake. */
+  const recording = (methods: Record<string, (...a: never[]) => unknown>, prop: string) => {
+    const fn = methods[prop]
+    return (...a: never[]) => {
+      const result = fn(...a)
+      if (result && typeof result === 'object' && ops.includes(result as ShellOp)) {
+        const op = result as ShellOp
+        return placeholder(() => (op.kind === 'request' ? op.label : `show ${op.kind}`))
+      }
+      return result
+    }
   }
 
   const collection = (dbName: () => string, name: string): unknown => {
     const database = (): string => dbName()
     const label = (method: string, a: unknown[]): string => `${name}.${method}(${args(a)})`
+    /** find(filter, projection, options) and findOne(…) */
+    const find = (method: string, filter: unknown, projection: unknown, opts: unknown) => {
+      const o = checkOptions(method, opts, [
+        'sort',
+        'limit',
+        'skip',
+        'projection',
+        'batchSize',
+        'noCursorTimeout',
+        ...CURSOR_OPTIONS
+      ])
+      const options = cursorOptions(method, o)
+      const proj = projection ?? o.projection
+      return {
+        op: 'find' as const,
+        database: database(),
+        collection: name,
+        filter: toEjson(filter ?? {}),
+        projection: proj ? toEjson(proj) : undefined,
+        ...(o.sort !== undefined ? { sort: toEjson(o.sort) } : {}),
+        ...(o.skip !== undefined ? { skip: Number(o.skip) } : {}),
+        ...(o.limit !== undefined ? { limit: Number(o.limit) } : {}),
+        ...(Object.keys(options).length ? { options } : {})
+      }
+    }
+    const count = (method: string, filter: unknown, opts: unknown): MongoRequest => {
+      const options = cursorOptions(
+        method,
+        checkOptions(
+          method,
+          opts,
+          CURSOR_OPTIONS.filter((k) => k !== 'allowDiskUse')
+        )
+      )
+      return {
+        op: 'count',
+        database: database(),
+        collection: name,
+        filter: toEjson(filter ?? {}),
+        ...(Object.keys(options).length ? { options } : {})
+      }
+    }
     const methods: Record<string, (...a: never[]) => unknown> = {
-      find: (filter?: unknown, projection?: unknown) =>
-        cursor(
-          push(label('find', [filter]), {
-            op: 'find',
-            database: database(),
-            collection: name,
-            filter: toEjson(filter ?? {}),
-            projection: projection ? toEjson(projection) : undefined
-          })
-        ),
-      findOne: (filter?: unknown, projection?: unknown) =>
+      find: (filter?: unknown, projection?: unknown, options?: unknown) =>
+        cursor(push(label('find', [filter]), find('find', filter, projection, options))),
+      findOne: (filter?: unknown, projection?: unknown, options?: unknown) =>
         cursor(
           push(
             label('findOne', [filter]),
-            {
-              op: 'find',
-              database: database(),
-              collection: name,
-              filter: toEjson(filter ?? {}),
-              projection: projection ? toEjson(projection) : undefined,
-              limit: 1
-            },
+            { ...find('findOne', filter, projection, options), limit: 1 },
             true
           )
         ),
       aggregate: (...a: unknown[]) => {
         const pipeline = Array.isArray(a[0]) ? (a[0] as unknown[]) : a
+        const options = Array.isArray(a[0])
+          ? cursorOptions(
+              'aggregate',
+              checkOptions('aggregate', a[1], [...CURSOR_OPTIONS, 'batchSize', 'cursor'])
+            )
+          : {}
         return aggregateCursor(
           push(label('aggregate', [pipeline]), {
             op: 'aggregate',
             database: database(),
             collection: name,
-            pipeline: pipeline.map(toEjson)
+            pipeline: pipeline.map(toEjson),
+            ...(Object.keys(options).length ? { options } : {})
           })
         )
       },
-      countDocuments: (filter?: unknown) =>
-        push(label('countDocuments', [filter]), {
-          op: 'count',
-          database: database(),
-          collection: name,
-          filter: toEjson(filter ?? {})
-        }),
-      count: (filter?: unknown) =>
-        push(label('count', [filter]), {
-          op: 'count',
-          database: database(),
-          collection: name,
-          filter: toEjson(filter ?? {})
-        }),
-      estimatedDocumentCount: () =>
-        push(label('estimatedDocumentCount', []), {
+      countDocuments: (filter?: unknown, options?: unknown) =>
+        push(label('countDocuments', [filter]), count('countDocuments', filter, options)),
+      count: (filter?: unknown, options?: unknown) =>
+        push(label('count', [filter]), count('count', filter, options)),
+      estimatedDocumentCount: (options?: unknown) => {
+        checkOptions('estimatedDocumentCount', options, ['maxTimeMS'])
+        return push(label('estimatedDocumentCount', []), {
           op: 'count',
           database: database(),
           collection: name
-        }),
-      distinct: (field: string, filter?: unknown) =>
-        push(label('distinct', [field]), {
+        })
+      },
+      distinct: (field: string, filter?: unknown, options?: unknown) => {
+        checkOptions('distinct', options, [])
+        return push(label('distinct', [field]), {
           op: 'distinct',
           database: database(),
           collection: name,
           field,
           filter: toEjson(filter ?? {})
-        }),
+        })
+      },
       insertOne: (document: unknown) =>
         push(label('insertOne', [document]), {
           op: 'insertOne',
@@ -204,41 +404,44 @@ export function parseShell(script: string, database: string): ShellOp[] {
               collection: name,
               document: toEjson(doc)
             }),
-      updateOne: (filter: unknown, update: unknown, options?: { upsert?: boolean }) =>
+      updateOne: (filter: unknown, update: unknown, options?: unknown) =>
         push(label('updateOne', [filter]), {
           op: 'updateOne',
           database: database(),
           collection: name,
           filter: toEjson(filter),
           update: toEjson(update),
-          upsert: options?.upsert
+          upsert: upsertOption('updateOne', options)
         }),
-      updateMany: (filter: unknown, update: unknown, options?: { upsert?: boolean }) =>
+      updateMany: (filter: unknown, update: unknown, options?: unknown) =>
         push(label('updateMany', [filter]), {
           op: 'updateMany',
           database: database(),
           collection: name,
           filter: toEjson(filter),
           update: toEjson(update),
-          upsert: options?.upsert
+          upsert: upsertOption('updateMany', options)
         }),
-      replaceOne: (filter: unknown, replacement: unknown, options?: { upsert?: boolean }) =>
+      replaceOne: (filter: unknown, replacement: unknown, options?: unknown) =>
         push(label('replaceOne', [filter]), {
           op: 'replaceOne',
           database: database(),
           collection: name,
           filter: toEjson(filter),
           replacement: toEjson(replacement),
-          upsert: options?.upsert
+          upsert: upsertOption('replaceOne', options)
         }),
-      deleteOne: (filter: unknown) =>
-        push(label('deleteOne', [filter]), {
+      deleteOne: (filter: unknown, options?: unknown) => {
+        checkOptions('deleteOne', options, [])
+        return push(label('deleteOne', [filter]), {
           op: 'deleteOne',
           database: database(),
           collection: name,
           filter: toEjson(filter ?? {})
-        }),
-      deleteMany: (filter: unknown) => {
+        })
+      },
+      deleteMany: (filter: unknown, options?: unknown) => {
+        checkOptions('deleteMany', options, [])
         if (filter === undefined)
           throw new ShellError('deleteMany needs a filter; use {} to delete every document')
         return push(label('deleteMany', [filter]), {
@@ -248,26 +451,49 @@ export function parseShell(script: string, database: string): ShellOp[] {
           filter: toEjson(filter)
         })
       },
-      findOneAndUpdate: (filter: unknown, update: unknown, options?: Record<string, unknown>) =>
-        push(label('findOneAndUpdate', [filter]), {
+      findOneAndUpdate: (filter: unknown, update: unknown, opts?: unknown) => {
+        const options = checkOptions('findOneAndUpdate', opts, [
+          'returnDocument',
+          'returnNewDocument',
+          'upsert',
+          'sort',
+          'projection',
+          ...FIND_AND_MODIFY_OPTIONS
+        ])
+        return push(label('findOneAndUpdate', [filter]), {
           op: 'runCommand',
           database: database(),
           command: toEjson({
             findAndModify: name,
             query: filter,
             update,
-            new: options?.returnDocument === 'after' || options?.returnNewDocument === true,
-            upsert: options?.upsert ?? false,
-            ...(options?.sort ? { sort: options.sort } : {}),
-            ...(options?.projection ? { fields: options.projection } : {})
+            new: options.returnDocument === 'after' || options.returnNewDocument === true,
+            upsert: options.upsert ?? false,
+            ...(options.sort ? { sort: options.sort } : {}),
+            ...(options.projection ? { fields: options.projection } : {}),
+            ...pick(options, FIND_AND_MODIFY_OPTIONS)
           })
-        }),
-      findOneAndDelete: (filter: unknown) =>
-        push(label('findOneAndDelete', [filter]), {
+        })
+      },
+      findOneAndDelete: (filter: unknown, opts?: unknown) => {
+        const options = checkOptions('findOneAndDelete', opts, [
+          'sort',
+          'projection',
+          ...FIND_AND_MODIFY_OPTIONS
+        ])
+        return push(label('findOneAndDelete', [filter]), {
           op: 'runCommand',
           database: database(),
-          command: toEjson({ findAndModify: name, query: filter, remove: true })
-        }),
+          command: toEjson({
+            findAndModify: name,
+            query: filter,
+            remove: true,
+            ...(options.sort ? { sort: options.sort } : {}),
+            ...(options.projection ? { fields: options.projection } : {}),
+            ...pick(options, FIND_AND_MODIFY_OPTIONS)
+          })
+        })
+      },
       createIndex: (keys: unknown, options?: unknown) =>
         push(label('createIndex', [keys]), {
           op: 'createIndex',
@@ -308,7 +534,7 @@ export function parseShell(script: string, database: string): ShellOp[] {
     return new Proxy(methods, {
       get: (target, prop) => {
         if (typeof prop !== 'string') return undefined
-        if (prop in target) return target[prop]
+        if (prop in target) return recording(target, prop)
         // db.system.profile → collection "system.profile"
         return collection(dbName, `${name}.${prop}`)
       }
@@ -339,7 +565,11 @@ export function parseShell(script: string, database: string): ShellOp[] {
           collection: n
         }),
       dropDatabase: () => push(`db.dropDatabase()`, { op: 'dropDatabase', database: dbName() }),
-      getCollectionNames: () => ops.push({ kind: 'show', what: 'collections', database: dbName() }),
+      getCollectionNames: () => {
+        const op: ShellOp = { kind: 'show', what: 'collections', database: dbName() }
+        ops.push(op)
+        return op
+      },
       getCollectionInfos: (filter?: unknown) =>
         push(`db.getCollectionInfos()`, {
           op: 'runCommand',
@@ -376,7 +606,7 @@ export function parseShell(script: string, database: string): ShellOp[] {
     return new Proxy(methods, {
       get: (target, prop) => {
         if (typeof prop !== 'string') return undefined
-        if (prop in target) return target[prop]
+        if (prop in target) return recording(target, prop)
         return collection(dbName, prop)
       }
     })
@@ -410,10 +640,13 @@ export function parseShell(script: string, database: string): ShellOp[] {
     print: (...values: unknown[]) =>
       ops.push({
         kind: 'print',
-        text: values.map((v) => (typeof v === 'string' ? v : JSON.stringify(toEjson(v)))).join(' ')
+        text: values
+          .map(printable)
+          .map((v) => (typeof v === 'string' ? v : JSON.stringify(toEjson(v))))
+          .join(' ')
       }),
     printjson: (value: unknown) =>
-      ops.push({ kind: 'print', text: JSON.stringify(toEjson(value), null, 2) }),
+      ops.push({ kind: 'print', text: JSON.stringify(toEjson(printable(value)), null, 2) }),
     Ejson
   }
   const names = Object.keys(builtins)

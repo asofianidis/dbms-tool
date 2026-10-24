@@ -17,7 +17,10 @@
     "dialog:allow-open",
     "updater:default",
     "process:allow-restart",
-    "opener:allow-open-url",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }]
+    },
     "opener:allow-reveal-item-in-dir",
     "core:window:allow-set-background-color"
   ]

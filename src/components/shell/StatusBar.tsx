@@ -65,6 +65,14 @@ export function StatusBar(): React.JSX.Element {
               <Lock className="size-3" /> read-only
             </span>
           )}
+          {connection.production && (
+            <span
+              className="rounded-sm bg-danger/15 px-1 font-semibold tracking-wider text-danger uppercase"
+              title="Production connection: writes ask for confirmation"
+            >
+              production
+            </span>
+          )}
         </div>
       ) : (
         <div className="flex items-center px-3 text-faint">No connection</div>

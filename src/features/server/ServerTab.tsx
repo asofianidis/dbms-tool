@@ -33,7 +33,7 @@ import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
-import { LiveMetrics } from './LiveMetrics'
+import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
 import {
   BlockingTree,
   LocksSection,
@@ -100,7 +100,8 @@ function ServerDashboard({
     ? [...blockingIds(engineKey, activity.set.columns, activity.set.rows)]
     : []
   const locks = useLocks(connection, engineKey)
-  const [refresh, setRefresh] = useState<RefreshInterval>(0)
+  const [refresh, setRefresh] = useState<RefreshInterval>(5)
+  const visible = useDocumentVisible()
 
   // Blocking chains from the activity list's blocked-by column and the lock list's
   const forest = useMemo(() => {
@@ -123,17 +124,22 @@ function ServerDashboard({
     return blockingTree(edges)
   }, [activity.set, locks?.set, engineKey])
 
-  // Auto-refresh runs only while the tab is in front
+  // Auto-refresh runs only while the tab is in front and the window is visible
   const reloads = useRef<() => void>(() => {})
   reloads.current = () => {
     activity.reload()
     locks?.reload()
   }
+  // A tick that finds the last refresh still running is skipped
+  const busy = useRef(false)
+  busy.current = activity.loading || !!locks?.loading
   useEffect(() => {
-    if (!refresh || !active) return
-    const timer = setInterval(() => reloads.current(), refresh * 1000)
+    if (!refresh || !active || !visible) return
+    const timer = setInterval(() => {
+      if (!busy.current) reloads.current()
+    }, refresh * 1000)
     return () => clearInterval(timer)
-  }, [refresh, active])
+  }, [refresh, active, visible])
 
   const act = async (action: SessionAction, id: Cell): Promise<void> => {
     const what = engineKey === 'mongo' ? `operation ${id}` : `session ${id}`
@@ -272,12 +278,14 @@ function ServerDashboard({
                 {blocked} blocked{blockers.length > 0 && ` by ${blockers.join(', ')}`}
               </Badge>
             )}
-            {actions.length > 0 && (
-              <span className="ml-auto text-[11px] font-normal tracking-normal text-faint normal-case">
-                Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}kill
-                it
-              </span>
-            )}
+            <span className="ml-auto flex items-center gap-2 text-[11px] font-normal tracking-normal normal-case">
+              {actions.length > 0 && (
+                <span className="text-faint">
+                  Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}
+                  kill it
+                </span>
+              )}
+            </span>
           </h2>
           <div className="h-80 overflow-hidden rounded-lg border border-line">
             {activity.error ? (

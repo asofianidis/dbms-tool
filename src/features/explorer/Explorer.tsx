@@ -1,6 +1,7 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
+  ArrowDownUp,
   ArrowLeft,
   ArrowLeftRight,
   ArrowRight,
@@ -15,6 +16,8 @@ import {
   Database,
   DatabaseBackup,
   Eye,
+  FileInput,
+  FileOutput,
   FileUp,
   Folder,
   FolderOpen,
@@ -33,6 +36,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Sprout,
   Server,
   ShieldCheck,
   Table2,
@@ -72,11 +76,13 @@ import {
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
-import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { showContextMenu, showMenuAt, type MenuItem } from '@/components/ContextMenu'
+import { exportConnectionsToFile, openImportConnections } from '../connections/ImportConnections'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
@@ -278,6 +284,18 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
             }
           ]
         : []),
+      // Babelfish's T-SQL lacks the columnstore and identity reseeding the SQL Server DDL uses;
+      // D1 enforces foreign keys during the load
+      ...(connection.engine !== 'babelfish' && connection.cloud?.provider !== 'cloudflare'
+        ? [
+            {
+              label: 'Seed sample database…',
+              icon: <Sprout />,
+              disabled: !connected || connection.readOnly,
+              onSelect: () => openSeed(connection.id)
+            }
+          ]
+        : []),
       {
         label: 'Refresh',
         icon: <RefreshCw />,
@@ -355,6 +373,14 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               {connectionLabel(connection)}
             </span>
             {connection.readOnly && <Lock className="size-3 shrink-0 text-warn" />}
+            {connection.production && (
+              <span
+                className="shrink-0 rounded-sm bg-danger/15 px-1 text-[9.5px] font-semibold tracking-wider text-danger uppercase"
+                title="Production: writes ask for confirmation"
+              >
+                prod
+              </span>
+            )}
           </span>
         }
         detail={
@@ -1393,6 +1419,28 @@ export function Explorer(): React.JSX.Element {
           <Button
             size="icon-sm"
             variant="ghost"
+            title="Import or export connections"
+            onClick={(e) =>
+              showMenuAt(e.currentTarget, [
+                {
+                  label: 'Import from pgpass, DBeaver or DataGrip…',
+                  icon: <FileInput />,
+                  onSelect: openImportConnections
+                },
+                {
+                  label: 'Export connections (without passwords)…',
+                  icon: <FileOutput />,
+                  disabled: !connections.length,
+                  onSelect: () => void exportConnectionsToFile()
+                }
+              ])
+            }
+          >
+            <ArrowDownUp className="size-3.5" />
+          </Button>
+          <Button
+            size="icon-sm"
+            variant="ghost"
             title="Refresh all"
             onClick={() => {
               void loadConnections()
@@ -1442,6 +1490,9 @@ export function Explorer(): React.JSX.Element {
               <p>No connections yet.</p>
               <Button size="sm" variant="primary" onClick={() => openConnectionDialog()}>
                 <Plus className="size-3.5" /> New connection
+              </Button>
+              <Button size="sm" variant="ghost" onClick={openImportConnections}>
+                <FileInput className="size-3.5" /> Import from another client
               </Button>
             </div>
           )}

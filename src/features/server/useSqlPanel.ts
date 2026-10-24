@@ -36,7 +36,8 @@ export function useSqlPanel(connection: ConnectionConfig, sql: string | null): S
           continue
         }
         try {
-          const out = await api.execute(connection.id, '__meta', '', text)
+          // Listings only; `EXEC sp_babelfish_configure` reads settings, so no production prompt
+          const out = await api.execute(connection.id, '__meta', '', text, { confirmed: true })
           // Results for SQL that has since changed are stale
           if (queued.current) continue
           if (out.error) setError(out.error.message)

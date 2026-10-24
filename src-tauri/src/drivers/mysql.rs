@@ -1,16 +1,18 @@
 //! MySQL / MariaDB via mysql_async. Ad-hoc queries use the text protocol so
 //! multi-statement scripts and every column type round-trip as text.
 
-use std::time::Duration;
-
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::*;
-use mysql_async::{Column, Conn, Opts, OptsBuilder, Row, SslOpts, Value as MyValue};
+use mysql_async::{
+    ClientIdentity, Column, Conn, Opts, OptsBuilder, Row, SslOpts, Value as MyValue,
+};
 use serde_json::Value;
 
 use crate::config::{AuthMode, ConnectionConfig, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
+
+use super::tls::{self, ClientCert};
 
 pub struct MySession {
     conn: Conn,
@@ -28,7 +30,40 @@ pub fn describe_error(e: &mysql_async::Error) -> String {
     }
 }
 
-fn build_opts(cfg: &ConnectionConfig, password: Option<&str>, database: &str, tls: bool) -> Opts {
+/// CA and client certificate files, read once so reconnects reuse them
+fn ssl_opts(cfg: &ConnectionConfig) -> AppResult<SslOpts> {
+    let mut ssl = SslOpts::default()
+        .with_danger_accept_invalid_certs(!cfg.verify_certificate())
+        .with_danger_skip_domain_validation(!cfg.verify_hostname())
+        // Through a tunnel the certificate names the real server, not 127.0.0.1
+        .with_danger_tls_hostname_override(cfg.tunneled.as_ref().map(|(h, _)| h.clone()));
+    if let Some(path) = cfg.root_cert() {
+        ssl = ssl.with_root_certs(vec![tls::read_file(path, "CA certificate")?.into()]);
+    }
+    match tls::client_cert(cfg)? {
+        None => {}
+        Some(ClientCert::Pkcs12(path)) => {
+            ssl = ssl.with_client_identity(Some(ClientIdentity::new(
+                tls::read_file(path, "client certificate")?.into(),
+            )));
+        }
+        // mysql_async's native-tls backend only takes PKCS#12 identities
+        Some(ClientCert::Pem { .. }) => {
+            return Err(AppError::Unsupported(
+                "MySQL client certificates must be a PKCS#12 bundle (.p12/.pfx) without a password.                  Create one with `openssl pkcs12 -export -in client.crt -inkey client.key -out client.p12 -passout pass:`,                  choose it as the client certificate and leave the client key empty"
+                    .into(),
+            ));
+        }
+    }
+    Ok(ssl)
+}
+
+fn build_opts(
+    cfg: &ConnectionConfig,
+    password: Option<&str>,
+    database: &str,
+    tls: bool,
+) -> AppResult<Opts> {
     let mut builder = OptsBuilder::default()
         .ip_or_hostname(cfg.host.clone())
         .tcp_port(if cfg.port == 0 { 3306 } else { cfg.port })
@@ -40,20 +75,13 @@ fn build_opts(cfg: &ConnectionConfig, password: Option<&str>, database: &str, tl
         // IAM tokens are checked by the server's cleartext auth plugin
         .enable_cleartext_plugin(cfg.auth == AuthMode::Cloud);
     if tls {
-        let verify = cfg.ssl == SslMode::Require && !cfg.trust_server_certificate;
-        builder = builder.ssl_opts(Some(
-            SslOpts::default()
-                .with_danger_accept_invalid_certs(!verify)
-                .with_danger_skip_domain_validation(!verify)
-                // Through a tunnel the certificate names the real server, not 127.0.0.1
-                .with_danger_tls_hostname_override(cfg.tunneled.as_ref().map(|(h, _)| h.clone())),
-        ));
+        builder = builder.ssl_opts(Some(ssl_opts(cfg)?));
     }
-    builder.into()
+    Ok(builder.into())
 }
 
 async fn open(opts: Opts) -> AppResult<Conn> {
-    match tokio::time::timeout(Duration::from_secs(15), Conn::new(opts)).await {
+    match tokio::time::timeout(crate::limits::connect_timeout(), Conn::new(opts)).await {
         Ok(conn) => Ok(conn?),
         Err(_) => Err(AppError::msg("Timed out connecting to the server")),
     }
@@ -66,20 +94,20 @@ pub async fn connect(
 ) -> AppResult<MySession> {
     let (conn, opts) = match cfg.ssl {
         SslMode::Disable => {
-            let opts = build_opts(cfg, password, database, false);
+            let opts = build_opts(cfg, password, database, false)?;
             (open(opts.clone()).await?, opts)
         }
-        SslMode::Require => {
-            let opts = build_opts(cfg, password, database, true);
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            let opts = build_opts(cfg, password, database, true)?;
             (open(opts.clone()).await?, opts)
         }
         // Try TLS first and fall back to plain text when the server doesn't offer it
         SslMode::Prefer => {
-            let opts = build_opts(cfg, password, database, true);
+            let opts = build_opts(cfg, password, database, true)?;
             match open(opts.clone()).await {
                 Ok(conn) => (conn, opts),
                 Err(e) if is_tls_error(&e.to_string()) => {
-                    let opts = build_opts(cfg, password, database, false);
+                    let opts = build_opts(cfg, password, database, false)?;
                     (open(opts.clone()).await?, opts)
                 }
                 Err(e) => return Err(e),
@@ -158,7 +186,7 @@ fn type_name(col: &Column) -> &'static str {
     }
 }
 
-fn cell(value: &MyValue, col: &Column) -> Value {
+fn cell(value: &MyValue, col: &Column, max_binary: usize) -> Value {
     match value {
         MyValue::NULL => Value::Null,
         MyValue::Bytes(bytes) => match col.column_type() {
@@ -166,11 +194,11 @@ fn cell(value: &MyValue, col: &Column) -> Value {
                 let n = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
                 Value::String(n.to_string())
             }
-            ColumnType::MYSQL_TYPE_GEOMETRY => Value::String(hex_bytes(bytes)),
+            ColumnType::MYSQL_TYPE_GEOMETRY => Value::String(hex_bytes_max(bytes, max_binary)),
             _ if col.character_set() == 63
                 && matches!(type_name(col), "blob" | "varbinary" | "binary" | "vector") =>
             {
-                Value::String(hex_bytes(bytes))
+                Value::String(hex_bytes_max(bytes, max_binary))
             }
             _ => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         },
@@ -379,9 +407,10 @@ impl MySession {
                     };
                     let Some(row) = next else { break };
                     if out.wants_rows() {
+                        let max = out.max_binary();
                         let values = (0..row.len())
                             .map(|i| match row.as_ref(i) {
-                                Some(v) => cell(v, &columns[i]),
+                                Some(v) => cell(v, &columns[i], max),
                                 None => Value::Null,
                             })
                             .collect();
@@ -687,8 +716,39 @@ impl MySession {
                     schema: None,
                     name: table,
                     columns: vec![column],
+                    foreign_keys: Vec::new(),
                 }),
             }
+        }
+        // Join suggestions are a bonus; completion works without them
+        if let Ok(keys) = self
+            .rows(
+                "SELECT table_name, constraint_name, column_name, referenced_table_schema, \
+                 referenced_table_name, referenced_column_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE table_schema = ? AND referenced_table_name IS NOT NULL \
+                 ORDER BY table_name, constraint_name, ordinal_position LIMIT 20000",
+                vec![database.into()],
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .map(|r| {
+                        let ref_schema = text(r, 3).filter(|s| s != database);
+                        KeyColumn {
+                            schema: None,
+                            table: text(r, 0).unwrap_or_default(),
+                            key: text(r, 1).unwrap_or_default(),
+                            column: text(r, 2).unwrap_or_default(),
+                            ref_schema,
+                            ref_table: text(r, 4).unwrap_or_default(),
+                            ref_column: text(r, 5).unwrap_or_default(),
+                        }
+                    })
+                    .collect(),
+            );
         }
         Ok(tables)
     }

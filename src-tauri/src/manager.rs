@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -18,6 +19,37 @@ pub const META: &str = "__meta";
 
 /// Sessions idle longer than this get pinged before reuse.
 const IDLE_CHECK: Duration = Duration::from_secs(60);
+
+/// Cancels a statement that runs past `ExecOptions::timeout_secs`.
+struct Deadline {
+    secs: u64,
+    fired: Arc<AtomicBool>,
+    timer: tokio::task::JoinHandle<()>,
+}
+
+impl Deadline {
+    fn arm(opts: &ExecOptions, signal: &Arc<CancelSignal>) -> Option<Self> {
+        let secs = opts.timeout_secs.filter(|s| *s > 0)?;
+        let fired = Arc::new(AtomicBool::new(false));
+        let (flag, signal) = (fired.clone(), signal.clone());
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            flag.store(true, Ordering::SeqCst);
+            signal.fire();
+        });
+        Some(Self { secs, fired, timer })
+    }
+
+    /// Stops the timer; returns the limit when it was what cancelled the statement.
+    fn disarm(self) -> Option<u64> {
+        self.timer.abort();
+        self.fired.load(Ordering::SeqCst).then_some(self.secs)
+    }
+}
+
+fn timed_out_message(secs: u64) -> String {
+    format!("Query timed out after {secs}s and was cancelled (see Settings → Results)")
+}
 
 pub struct Slot {
     pub session: Session,
@@ -134,13 +166,17 @@ impl Server {
         sql: &str,
         opts: &ExecOptions,
     ) -> AppResult<ExecOutput> {
-        if self.config.read_only
-            && let Some(keyword) = guard::first_write_keyword(sql)
+        if (self.config.read_only || opts.read_only)
+            && let Some(keyword) = guard::first_write_keyword(sql, self.config.engine)
         {
-            return Err(AppError::msg(format!(
-                "This connection is read-only, so {keyword} statements are blocked. \
+            return Err(AppError::msg(if self.config.read_only {
+                format!(
+                    "This connection is read-only, so {keyword} statements are blocked. \
                      Turn off \"Read-only\" in the connection settings to run them."
-            )));
+                )
+            } else {
+                format!("Only read-only queries can run here, and this one contains {keyword}.")
+            }));
         }
         // Register before connecting so a cancel during connection setup isn't lost
         let signal = self.begin(key);
@@ -157,7 +193,21 @@ impl Server {
             out.finish(None)
         } else {
             let mut guard = slot.lock().await;
+            let deadline = Deadline::arm(opts, &signal);
             let mut output = guard.session.execute(sql, opts, &signal).await;
+            if let Some(secs) = deadline.and_then(Deadline::disarm) {
+                let message = timed_out_message(secs);
+                output.messages.push(Message {
+                    level: "error",
+                    text: message.clone(),
+                    at_ms: output.elapsed_ms,
+                });
+                output.error.get_or_insert(ErrorDetail {
+                    message,
+                    position: None,
+                    line: None,
+                });
+            }
             // Editor tabs show when they hold a transaction open
             if !key.starts_with(META) && !guard.session.is_broken() {
                 output.in_transaction = guard.session.in_transaction().await;
@@ -180,11 +230,20 @@ impl Server {
                 "This connection is read-only. Turn off \"Read-only\" in the connection settings to modify data.",
             ));
         }
+        if opts.read_only && request.is_write() {
+            return Err(AppError::msg(
+                "Only reads can run here: find, aggregate, count or distinct.",
+            ));
+        }
         let client = self.mongo()?;
         let signal = self.begin(key);
+        let deadline = Deadline::arm(opts, &signal);
         let result = mongo::execute(client, request, opts, &signal).await;
         self.end(key, &signal);
-        result
+        match deadline.and_then(Deadline::disarm) {
+            Some(secs) => Err(AppError::msg(timed_out_message(secs))),
+            None => result,
+        }
     }
 
     /// Streams a whole find or pipeline result to `path`; cancelled like a query on `key`.
@@ -429,5 +488,43 @@ impl Manager {
         }
         let id = id.to_string();
         tauri::async_runtime::spawn(async move { tunnel::close(&id).await });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(timeout_secs: Option<u64>) -> ExecOptions {
+        ExecOptions {
+            timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_fires_the_cancel_signal() {
+        let signal = Arc::new(CancelSignal::default());
+        let deadline = Deadline::arm(&opts(Some(1)), &signal).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), signal.wait())
+            .await
+            .unwrap();
+        assert_eq!(deadline.disarm(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn disarmed_deadline_never_fires() {
+        let signal = Arc::new(CancelSignal::default());
+        let deadline = Deadline::arm(&opts(Some(1)), &signal).unwrap();
+        assert_eq!(deadline.disarm(), None);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!signal.is_fired());
+    }
+
+    #[test]
+    fn no_deadline_without_a_limit() {
+        let signal = Arc::new(CancelSignal::default());
+        assert!(Deadline::arm(&opts(None), &signal).is_none());
+        assert!(Deadline::arm(&opts(Some(0)), &signal).is_none());
     }
 }

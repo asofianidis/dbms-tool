@@ -397,7 +397,7 @@ function DocumentsBrowser({
           </div>
         )}
       </div>
-      <ProgressBar active={loading} />
+      <ProgressBar active={loading || exporting} />
       <div className="min-h-0 flex-1">
         {error ? (
           <div className="p-4">

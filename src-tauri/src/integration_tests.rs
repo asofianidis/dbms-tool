@@ -33,12 +33,16 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         auth: AuthMode::Password,
         ssl: SslMode::Prefer,
         trust_server_certificate: true,
+        ssl_root_cert: String::new(),
+        ssl_client_cert: String::new(),
+        ssl_client_key: String::new(),
         uri: String::new(),
         auth_source: String::new(),
         replica_set: String::new(),
         read_preference: String::new(),
         save_password: false,
         read_only: false,
+        production: false,
         color: String::new(),
         group: String::new(),
         last_used: None,
@@ -73,7 +77,7 @@ async fn open(engine: Engine, var: &str) -> Option<(Arc<Manager>, String)> {
 }
 
 fn opts() -> ExecOptions {
-    ExecOptions { max_rows: 100 }
+    ExecOptions::with_max_rows(100)
 }
 
 fn cell(out: &ExecOutput, set: usize, row: usize, col: usize) -> Value {

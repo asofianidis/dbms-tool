@@ -4,6 +4,7 @@ pub mod mssql;
 pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
+pub mod tls;
 
 use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::error::{AppError, AppResult};
@@ -33,7 +34,12 @@ impl Session {
         let (config, password) = if config.auth == AuthMode::Cloud {
             token = crate::cloud::database_token(config).await?;
             cloud_config = ConnectionConfig {
-                ssl: SslMode::Require,
+                // At least Require; a stricter verify mode stays
+                ssl: if config.ssl.required() {
+                    config.ssl
+                } else {
+                    SslMode::Require
+                },
                 ..config.clone()
             };
             (&cloud_config, Some(token.as_str()))
