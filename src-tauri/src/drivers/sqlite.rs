@@ -998,6 +998,7 @@ DELETE FROM t WHERE b = 2"
         let written = std::sync::Arc::default();
         let opts = ExecOptions {
             max_rows: 1,
+            timeout_secs: None,
             max_binary_bytes: 1,
             sink: Some(SinkHandle::new(
                 Box::new(Collect(std::sync::Arc::clone(&written))),

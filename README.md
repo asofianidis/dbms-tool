@@ -19,6 +19,12 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   way they do in SSMS or psql.
 - Connection colours (tinting tabs and the status bar), groups, read-only connections, and
   connection-string paste (`postgres://`, `mysql://`, `mongodb+srv://`, ADO.NET).
+- Production connections: every write asks first, and destructive statements (`DROP`,
+  `TRUNCATE`, `DELETE` without `WHERE`, `deleteMany({})`…) need the connection's name typed.
+- Import connections from pgpass, DBeaver or DataGrip, and export your own as JSON without
+  passwords.
+- Settings for query and connect timeouts, the default commit mode for new query tabs, and the
+  editor font.
 - Passwords stored in the OS credential manager, never on disk.
 - SSH tunnels through the system's OpenSSH (agent, key file or password, jump hosts, `~/.ssh/config`
   aliases), with the host key's fingerprint shown for confirmation the first time.

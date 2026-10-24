@@ -130,9 +130,12 @@ fn build_config(
 async fn open(mut config: Config) -> AppResult<Client<Compat<TcpStream>>> {
     // Azure SQL may redirect the login to another node; follow it once
     for _ in 0..2 {
-        let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect_named(&config))
-            .await
-            .map_err(|_| AppError::msg("Timed out connecting to the server"))??;
+        let tcp = tokio::time::timeout(
+            crate::limits::connect_timeout(),
+            TcpStream::connect_named(&config),
+        )
+        .await
+        .map_err(|_| AppError::msg("Timed out connecting to the server"))??;
         tcp.set_nodelay(true)?;
         match Client::connect(config.clone(), tcp.compat_write()).await {
             Ok(client) => return Ok(client),

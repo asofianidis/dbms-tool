@@ -40,6 +40,7 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         auth_source: String::new(),
         save_password: false,
         read_only: false,
+        production: false,
         color: String::new(),
         group: String::new(),
         last_used: None,

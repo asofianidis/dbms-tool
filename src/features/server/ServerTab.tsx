@@ -78,7 +78,8 @@ function useSqlPanel(
     setLoading(true)
     setError(null)
     try {
-      const out = await api.execute(connection.id, '__meta', '', sql)
+      // Listings only; `EXEC sp_babelfish_configure` reads settings, so no production prompt
+      const out = await api.execute(connection.id, '__meta', '', sql, { confirmed: true })
       if (out.error) setError(out.error.message)
       else setSet(out.results[out.results.length - 1] ?? null)
     } catch (e) {

@@ -2,6 +2,8 @@ import { createPersistentStore } from './store'
 
 export type ThemeMode = 'dark' | 'light' | 'system'
 
+export type CommitMode = 'auto' | 'manual'
+
 export interface Settings {
   /** Accent override; empty uses the current theme's accent */
   accent: string
@@ -13,10 +15,18 @@ export interface Settings {
   /** Theme used in light mode */
   lightTheme: string
   editorFontSize: number
+  /** CSS font family for code editors; empty uses the bundled JetBrains Mono */
+  editorFontFamily: string
   /** Rows kept per result set; the rest are counted but not transferred */
   maxRows: number
   /** Rows per page in table and collection browsers */
   pageSize: number
+  /** Seconds before a query run from an editor is cancelled; 0 never times out */
+  queryTimeoutSecs: number
+  /** Seconds to wait for a server when connecting */
+  connectTimeoutSecs: number
+  /** Commit mode for query tabs that haven't picked one */
+  defaultCommitMode: CommitMode
   showSystemObjects: boolean
   wordWrap: boolean
   /** Ask before running DELETE/UPDATE without WHERE, DROP, TRUNCATE */
@@ -52,8 +62,12 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   darkTheme: 'graphite',
   lightTheme: 'paper',
   editorFontSize: 13,
+  editorFontFamily: '',
   maxRows: 10_000,
   pageSize: 200,
+  queryTimeoutSecs: 0,
+  connectTimeoutSecs: 15,
+  defaultCommitMode: 'auto',
   showSystemObjects: false,
   wordWrap: false,
   confirmDangerous: true,

@@ -14,11 +14,17 @@ import {
   Square,
   TextCursorInput
 } from 'lucide-react'
-import { api, type MongoOutput, type MongoRequest } from '@/lib/api'
+import { api, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { recordHistory } from '@/lib/history'
 import { MOD } from '@/lib/keys'
 import { parseShell, type ShellOp } from '@/lib/mongo-shell'
+import {
+  confirmProductionWrite,
+  describeMongoDanger,
+  isProduction,
+  mongoIsWrite
+} from '@/lib/production'
 import { formatDuration } from '@/lib/format'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
@@ -61,23 +67,6 @@ interface ShellRun {
 }
 
 export const shellResultsStore = createStore<Record<string, ShellRun>>({})
-
-function describeDanger(op: MongoRequest): string | null {
-  const empty = (f: unknown): boolean =>
-    !f || (typeof f === 'object' && Object.keys(f as object).length === 0)
-  switch (op.op) {
-    case 'deleteMany':
-      return empty(op.filter) ? `deleteMany({}) on ${op.collection} deletes every document` : null
-    case 'updateMany':
-      return empty(op.filter) ? `updateMany({}) on ${op.collection} updates every document` : null
-    case 'dropCollection':
-      return `drop() removes the ${op.collection} collection`
-    case 'dropDatabase':
-      return `dropDatabase() removes ${op.database}`
-    default:
-      return null
-  }
-}
 
 /** The statement block (blank-line separated) around the cursor. */
 function blockAt(text: string, pos: number): { from: number; to: number; text: string } {
@@ -138,9 +127,21 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       return
     }
     if (!ops.length) return
-    if (settings.confirmDangerous) {
+    if (isProduction(connection)) {
+      const writes = ops.flatMap((op) =>
+        op.kind === 'request' && mongoIsWrite(op.request) ? [op] : []
+      )
+      if (
+        writes.length &&
+        !(await confirmProductionWrite(connection, {
+          action: `This script runs ${[...new Set(writes.map((w) => w.request.op))].join(', ')}`,
+          dangers: writes.flatMap((w) => describeMongoDanger(w.request) ?? [])
+        }))
+      )
+        return
+    } else if (settings.confirmDangerous) {
       const reasons = ops
-        .flatMap((op) => (op.kind === 'request' ? [describeDanger(op.request)] : []))
+        .flatMap((op) => (op.kind === 'request' ? [describeMongoDanger(op.request)] : []))
         .filter(Boolean)
       if (reasons.length) {
         const ok = await confirm({
@@ -196,7 +197,9 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
           }
         } else {
           const output = await api.mongo(tab.connectionId, tab.id, op.request, {
-            maxRows: settings.maxRows
+            maxRows: settings.maxRows,
+            timeoutSecs: settings.queryTimeoutSecs,
+            confirmed: true
           })
           out.results.push({ label: op.label, output, single: op.single })
           const count =
@@ -293,6 +296,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       tab.filePath,
       connection,
       settings.maxRows,
+      settings.queryTimeoutSecs,
       settings.confirmDangerous
     ]
   )

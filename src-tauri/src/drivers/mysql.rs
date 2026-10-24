@@ -1,8 +1,6 @@
 //! MySQL / MariaDB via mysql_async. Ad-hoc queries use the text protocol so
 //! multi-statement scripts and every column type round-trip as text.
 
-use std::time::Duration;
-
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::*;
 use mysql_async::{
@@ -83,7 +81,7 @@ fn build_opts(
 }
 
 async fn open(opts: Opts) -> AppResult<Conn> {
-    match tokio::time::timeout(Duration::from_secs(15), Conn::new(opts)).await {
+    match tokio::time::timeout(crate::limits::connect_timeout(), Conn::new(opts)).await {
         Ok(conn) => Ok(conn?),
         Err(_) => Err(AppError::msg("Timed out connecting to the server")),
     }

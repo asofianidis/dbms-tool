@@ -144,6 +144,10 @@ pub struct ConnectionConfig {
     /// Blocks writes from the query editor and data grid
     #[serde(default)]
     pub read_only: bool,
+    /// Opaque to the backend; the frontend asks for stronger confirmation
+    /// before writes
+    #[serde(default)]
+    pub production: bool,
     #[serde(default)]
     pub color: String,
     #[serde(default)]

@@ -1,0 +1,217 @@
+import { setWriteGuard, type ConnectionConfig, type GuardedWrite, type MongoRequest } from './api'
+import { ENGINES, connectionLabel } from './engines'
+import { dangerousStatements } from './sql'
+import { confirm, getConnection } from './workspace'
+
+/** Same list as the backend's read-only guard (guard.rs). */
+const WRITE_KEYWORDS = new Set([
+  'insert',
+  'update',
+  'delete',
+  'merge',
+  'upsert',
+  'replace',
+  'truncate',
+  'drop',
+  'alter',
+  'create',
+  'rename',
+  'grant',
+  'revoke',
+  'deny',
+  'exec',
+  'execute',
+  'call',
+  'do',
+  'copy',
+  'load',
+  'import',
+  'vacuum',
+  'reindex',
+  'cluster',
+  'refresh',
+  'lock',
+  'into',
+  'backup',
+  'restore',
+  'dbcc',
+  'kill',
+  'shutdown',
+  'bulk',
+  'writetext',
+  'updatetext',
+  'reassign',
+  'discard',
+  'optimize',
+  'repair',
+  'flush',
+  'purge',
+  'install',
+  'uninstall'
+])
+
+/** The first keyword that could modify data, ignoring strings, quoted identifiers and comments. */
+export function sqlWriteKeyword(sql: string): string | null {
+  const n = sql.length
+  let i = 0
+  while (i < n) {
+    const c = sql[i]
+    const next = sql[i + 1]
+    if ((c === '-' && next === '-') || c === '#') {
+      while (i < n && sql[i] !== '\n') i++
+    } else if (c === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end < 0 ? n : end + 2
+    } else if (c === "'" || c === '"' || c === '`' || c === '[') {
+      const close = c === '[' ? ']' : c
+      i++
+      while (i < n && sql[i] !== close) i += sql[i] === '\\' && c !== '[' ? 2 : 1
+      i++
+    } else if (/[A-Za-z_]/.test(c)) {
+      const start = i
+      while (i < n && /[A-Za-z0-9_$]/.test(sql[i])) i++
+      const word = sql.slice(start, i).toLowerCase()
+      if (WRITE_KEYWORDS.has(word)) return word.toUpperCase()
+    } else {
+      i++
+    }
+  }
+  return null
+}
+
+const READ_COMMANDS = new Set([
+  'ping',
+  'buildinfo',
+  'serverstatus',
+  'dbstats',
+  'collstats',
+  'hello',
+  'ismaster',
+  'listcollections',
+  'listdatabases',
+  'listindexes',
+  'explain',
+  'count',
+  'distinct',
+  'find',
+  'getparameter',
+  'hostinfo',
+  'connectionstatus',
+  'currentop',
+  'replsetgetstatus',
+  'getlog',
+  'top',
+  'validate'
+])
+
+/** Whether a MongoDB request can modify data, like `MongoRequest::is_write` in the backend. */
+export function mongoIsWrite(request: MongoRequest): boolean {
+  switch (request.op) {
+    case 'find':
+    case 'count':
+    case 'distinct':
+    case 'listIndexes':
+      return false
+    case 'aggregate':
+      return request.pipeline.some(
+        (stage) => !!stage && typeof stage === 'object' && ('$out' in stage || '$merge' in stage)
+      )
+    case 'runCommand': {
+      const command = request.command
+      const name =
+        command && typeof command === 'object' ? Object.keys(command as object)[0] : undefined
+      return !name || !READ_COMMANDS.has(name.toLowerCase())
+    }
+    default:
+      return true
+  }
+}
+
+/** Why a MongoDB request deserves a confirmation, or null when it's routine. */
+export function describeMongoDanger(op: MongoRequest): string | null {
+  const empty = (f: unknown): boolean =>
+    !f || (typeof f === 'object' && Object.keys(f as object).length === 0)
+  switch (op.op) {
+    case 'deleteMany':
+      return empty(op.filter) ? `deleteMany({}) on ${op.collection} deletes every document` : null
+    case 'updateMany':
+      return empty(op.filter) ? `updateMany({}) on ${op.collection} updates every document` : null
+    case 'dropCollection':
+      return `drop() removes the ${op.collection} collection`
+    case 'dropDatabase':
+      return `dropDatabase() removes ${op.database}`
+    default:
+      return null
+  }
+}
+
+export function isProduction(connection: ConnectionConfig | undefined): boolean {
+  return !!connection?.production
+}
+
+interface WriteSummary {
+  /** What the write does, in a few words */
+  action: string
+  /** Destructive parts; any of these means the name has to be typed */
+  dangers: string[]
+  code?: string
+}
+
+function summarize(connection: ConnectionConfig, write: GuardedWrite): WriteSummary | null {
+  if ('sql' in write) {
+    const keyword = sqlWriteKeyword(write.sql)
+    if (!keyword) return null
+    const dialect = ENGINES[connection.engine].dialect ?? 'postgres'
+    const sql = write.sql
+    return {
+      action: `This script runs ${keyword}`,
+      dangers: dangerousStatements(sql, dialect),
+      code: sql.length > 2000 ? sql.slice(0, 2000) + '\n…' : sql
+    }
+  }
+  const { request } = write
+  if (!mongoIsWrite(request)) return null
+  const target =
+    'collection' in request ? `${request.database}.${request.collection}` : request.database
+  const danger = describeMongoDanger(request)
+  return { action: `This runs ${request.op} on ${target}`, dangers: danger ? [danger] : [] }
+}
+
+/**
+ * Asks before a write on a production connection; destructive ones need the connection's
+ * name typed. Resolves true for anything that isn't a production write.
+ */
+export async function confirmProductionWrite(
+  connection: ConnectionConfig | undefined,
+  write: GuardedWrite | WriteSummary
+): Promise<boolean> {
+  if (!connection || !isProduction(connection)) return true
+  const summary = 'action' in write ? write : summarize(connection, write)
+  if (!summary) return true
+  const label = connectionLabel(connection)
+  const typed = summary.dangers.length > 0
+  return confirm({
+    title: `Change production database ${label}?`,
+    message: `${label} is marked as production. ${summary.action}${
+      typed ? `, including ${summary.dangers.join('; ')}` : ''
+    }.`,
+    code: summary.code,
+    confirmLabel: 'Run on production',
+    danger: true,
+    typeToConfirm: typed ? label : undefined
+  })
+}
+
+let queue: Promise<unknown> = Promise.resolve()
+
+/** Routes every write through `confirmProductionWrite`, one dialog at a time. */
+export function startProductionGuard(): () => void {
+  setWriteGuard((id, write) => {
+    const connection = getConnection(id)
+    if (!isProduction(connection)) return Promise.resolve(true)
+    const ask = queue.then(() => confirmProductionWrite(connection, write))
+    queue = ask.catch(() => {})
+    return ask
+  })
+  return () => setWriteGuard(null)
+}
