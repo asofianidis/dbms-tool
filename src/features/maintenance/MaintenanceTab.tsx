@@ -219,7 +219,8 @@ function MaintenanceForm({
           options={tasks.map((t) => ({
             value: t.value,
             label: t.label,
-            description: t.description
+            description: t.description,
+            title: t.hint
           }))}
           onChange={(task) => patch({ task })}
         />
@@ -229,7 +230,7 @@ function MaintenanceForm({
         <Section title="Options">
           <div className="space-y-3 rounded-lg border border-line bg-panel px-4 py-3">
             {info.options.map((option) => {
-              const { label, description } = optionInfo(engine, draft.task, option)
+              const { label, description, hint } = optionInfo(engine, draft.task, option)
               return (
                 <Toggle
                   key={option}
@@ -237,6 +238,7 @@ function MaintenanceForm({
                   onChange={(on) => patch({ options: { ...draft.options, [option]: on } })}
                   label={label}
                   description={description}
+                  title={hint}
                 />
               )
             })}

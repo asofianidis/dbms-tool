@@ -6,6 +6,7 @@ import {
   maintenanceTasks,
   mongoReplyLines,
   newMaintenanceDraft,
+  optionInfo,
   resultErrors,
   resultLines,
   validateMaintenance,
@@ -30,6 +31,17 @@ describe('maintenance tasks', () => {
       expect(maintenanceTasks(engine).length).toBeGreaterThan(0)
     }
     expect(maintenanceTasks('babelfish')).toEqual([])
+  })
+
+  it('explains every task and option in a tooltip', () => {
+    for (const engine of ['postgres', 'mysql', 'mssql', 'sqlite', 'mongo'] as Engine[]) {
+      for (const task of maintenanceTasks(engine)) {
+        expect(task.hint.length).toBeGreaterThan(task.description.length)
+        for (const option of task.options) {
+          expect(optionInfo(engine, task.value, option).hint).toBeTruthy()
+        }
+      }
+    }
   })
 
   it('defaults Postgres to VACUUM (ANALYZE)', () => {

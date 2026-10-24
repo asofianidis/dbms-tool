@@ -37,6 +37,8 @@ export interface MaintenanceTaskInfo {
   value: MaintenanceTask
   label: string
   description: string
+  /** What the task does in more depth, shown as its tooltip */
+  hint: string
   /** Options shown for the task, in order */
   options: MaintenanceOption[]
   /** Whether the task can be limited to chosen tables (or collections) */
@@ -57,40 +59,70 @@ export interface MaintenanceDraft {
 export type MaintenanceStep =
   { label: string; sql: string } | { label: string; command: Record<string, unknown> }
 
-export const OPTION_INFO: Record<MaintenanceOption, { label: string; description: string }> = {
+export interface OptionText {
+  label: string
+  description: string
+  /** What the option does in more depth, shown as its tooltip */
+  hint: string
+}
+
+export const OPTION_INFO: Record<MaintenanceOption, OptionText> = {
   full: {
     label: 'Full',
     description:
-      'Rewrites each table to return space to the operating system; takes an exclusive lock'
+      'Rewrites each table to return space to the operating system; takes an exclusive lock',
+    hint: 'VACUUM FULL writes a new copy of each table without dead rows and swaps it in, returning space to the operating system. Holds an ACCESS EXCLUSIVE lock (no reads or writes) on each table while it runs.'
   },
-  analyze: { label: 'Analyze', description: 'Also update planner statistics' },
-  freeze: { label: 'Freeze', description: 'Freeze row versions aggressively' },
-  verbose: { label: 'Verbose', description: 'Report progress for each table' },
+  analyze: {
+    label: 'Analyze',
+    description: 'Also update planner statistics',
+    hint: "Adds ANALYZE, so each table's planner statistics are refreshed right after it's vacuumed."
+  },
+  freeze: {
+    label: 'Freeze',
+    description: 'Freeze row versions aggressively',
+    hint: "Adds FREEZE: marks every row as frozen now instead of waiting for autovacuum's age thresholds. Useful before heavy write load, or to head off transaction ID wraparound."
+  },
+  verbose: {
+    label: 'Verbose',
+    description: 'Report progress for each table',
+    hint: 'Adds VERBOSE: prints a report for each table and index (pages and rows removed, time taken) in the output.'
+  },
   concurrently: {
     label: 'Concurrently',
-    description: 'Rebuild without blocking writes; slower, PostgreSQL 12 and later'
+    description: 'Rebuild without blocking writes; slower, PostgreSQL 12 and later',
+    hint: 'Adds CONCURRENTLY: builds each new index alongside the old one so reads and writes continue, then swaps them. Slower and uses more resources, and system catalogs are skipped. PostgreSQL 12 and later.'
   },
   local: {
     label: 'Skip the binary log',
-    description: 'NO_WRITE_TO_BINLOG: don’t replicate the statement to replicas'
+    description: 'NO_WRITE_TO_BINLOG: don’t replicate the statement to replicas',
+    hint: "Adds NO_WRITE_TO_BINLOG: the statement isn't written to the binary log, so replicas don't run it too."
   },
   extended: {
     label: 'Extended',
-    description: 'Check every row and key thoroughly; slow on big tables'
+    description: 'Check every row and key thoroughly; slow on big tables',
+    hint: 'Adds EXTENDED: does a full key lookup for every key in every row, so the table is fully consistent. Much slower than the default check.'
   },
   physicalOnly: {
     label: 'Physical only',
-    description: 'Check page and record structure only; much faster on large databases'
+    description: 'Check page and record structure only; much faster on large databases',
+    hint: 'Adds PHYSICAL_ONLY: checks only page structure, record headers and allocation, skipping the logical checks. Much faster on large databases, and still catches torn pages and checksum failures.'
   },
   fullScan: {
     label: 'Full scan',
-    description: 'Read every row instead of sampling; slower but exact'
+    description: 'Read every row instead of sampling; slower but exact',
+    hint: 'Adds WITH FULLSCAN: reads every row to build the statistics instead of a sample. Exact, but slower on large tables. Runs one statement per table.'
   },
   online: {
     label: 'Online',
-    description: 'Keep tables available during the rebuild (Enterprise, Developer and Azure)'
+    description: 'Keep tables available during the rebuild (Enterprise, Developer and Azure)',
+    hint: 'Adds WITH (ONLINE = ON): tables stay readable and writable during the rebuild, with only short locks at the start and end. Needs Enterprise or Developer edition, or Azure SQL.'
   },
-  quick: { label: 'Quick', description: 'quick_check: skip index consistency checks' }
+  quick: {
+    label: 'Quick',
+    description: 'quick_check: skip index consistency checks',
+    hint: "Uses PRAGMA quick_check instead: skips checking that index contents match the tables, so it's much faster but finds less."
+  }
 }
 
 const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
@@ -99,6 +131,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'vacuum',
       label: 'Vacuum',
       description: 'Reclaim space from dead rows and keep the visibility map current',
+      hint: "Runs VACUUM. Updates and deletes leave dead row versions behind; vacuum marks their space reusable, updates the visibility map so index-only scans work, and prevents transaction ID wraparound. Autovacuum normally does this, so run it by hand after bulk deletes or updates. It doesn't block reads or writes unless Full is on.",
       options: ['analyze', 'full', 'freeze', 'verbose'],
       perTable: true
     },
@@ -106,6 +139,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'analyze',
       label: 'Analyze',
       description: 'Refresh the statistics the query planner relies on',
+      hint: 'Runs ANALYZE. Samples each table and stores column statistics (distinct values, common values, histograms) that the planner uses to estimate row counts. Run it after bulk loads or big data changes when query plans look wrong. Takes only a light lock.',
       options: ['verbose'],
       perTable: true
     },
@@ -113,6 +147,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'reindex',
       label: 'Reindex',
       description: 'Rebuild indexes to remove bloat or recover from corruption',
+      hint: 'Runs REINDEX. Rebuilds every index on the database or chosen tables from the table data. Use it to shrink bloated indexes after heavy updates and deletes, or to repair an index that is corrupt or was left invalid by a failed concurrent build.',
       options: ['concurrently', 'verbose'],
       perTable: true
     }
@@ -122,6 +157,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'optimize',
       label: 'Optimize',
       description: 'Rebuild tables to defragment data and reclaim unused space',
+      hint: "Runs OPTIMIZE TABLE on each table. For InnoDB this recreates the table and its indexes and then analyzes it, which defragments the data and returns space freed by deletes. Worth running after deleting or updating a large share of a table's rows.",
       options: ['local'],
       perTable: true,
       eachTable: true
@@ -130,6 +166,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'analyze',
       label: 'Analyze',
       description: 'Refresh index statistics used by the optimizer',
+      hint: 'Runs ANALYZE TABLE on each table. Recalculates the index key distribution the optimizer uses to choose indexes and join order. Fast, and it only briefly locks each table. Run it when plans look wrong after big data changes.',
       options: ['local'],
       perTable: true,
       eachTable: true
@@ -138,6 +175,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'check',
       label: 'Check',
       description: 'Look for errors in tables and their indexes',
+      hint: "Runs CHECK TABLE on each table. Reads tables and indexes looking for corruption and reports OK or the errors found. Read-only, so it's safe to run at any time; repair or restore any tables it reports.",
       options: ['extended'],
       perTable: true,
       eachTable: true
@@ -146,6 +184,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'repair',
       label: 'Repair',
       description: 'Repair damaged MyISAM, ARCHIVE and CSV tables',
+      hint: "Runs REPAIR TABLE on each table. Rebuilds damaged MyISAM, ARCHIVE and CSV tables and their indexes. InnoDB doesn't support it; recover InnoDB tables by restoring a backup or dumping and reloading them. Back up the table first, since a repair can lose rows.",
       options: ['extended', 'local'],
       perTable: true,
       eachTable: true
@@ -156,6 +195,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'checkdb',
       label: 'Check integrity',
       description: 'DBCC CHECKDB: check the logical and physical integrity of every object',
+      hint: 'Runs DBCC CHECKDB, or DBCC CHECKTABLE for chosen tables. Checks the allocation, structure and logical consistency of every page, table, index and catalog entry, and reports any corruption. Read-only but I/O heavy, so schedule it outside busy hours. Run it regularly so corruption is caught while good backups still exist.',
       options: ['physicalOnly'],
       perTable: true
     },
@@ -163,6 +203,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'statistics',
       label: 'Update statistics',
       description: 'Refresh the statistics the query optimizer relies on',
+      hint: 'Runs sp_updatestats, or UPDATE STATISTICS for each table. Refreshes the histograms and density information the optimizer uses to estimate row counts. sp_updatestats samples and skips statistics with no changes; Full scan reads every row for exact statistics.',
       options: ['fullScan'],
       perTable: true
     },
@@ -170,6 +211,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'rebuild',
       label: 'Rebuild indexes',
       description: 'Recreate indexes from scratch, removing all fragmentation',
+      hint: "Runs ALTER INDEX ALL ... REBUILD on each table. Drops and recreates every index on the table, removing all fragmentation, compacting pages and refreshing the indexes' statistics with a full scan. Usually recommended over reorganizing above about 30% fragmentation.",
       options: ['online'],
       perTable: true,
       eachTable: true
@@ -178,6 +220,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'reorganize',
       label: 'Reorganize indexes',
       description: 'Defragment index leaf pages in place; always online and interruptible',
+      hint: "Runs ALTER INDEX ALL ... REORGANIZE on each table. Reorders and compacts index leaf pages in place. Lighter than a rebuild: always online, and stopping it partway keeps the work already done. Suits light fragmentation (roughly 5-30%). It doesn't update statistics.",
       options: [],
       perTable: true,
       eachTable: true
@@ -186,6 +229,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'shrink',
       label: 'Shrink',
       description: 'Release unused space in the data and log files back to the operating system',
+      hint: 'Runs DBCC SHRINKDATABASE. Moves pages toward the start of each data and log file and releases the free space at the end to the operating system. It heavily fragments indexes and the files usually grow again, so only use it after removing a lot of data for good.',
       options: [],
       perTable: false
     }
@@ -196,6 +240,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'vacuum',
       label: 'Vacuum',
       description: 'Rebuild the database file, reclaiming free pages and defragmenting it',
+      hint: 'Runs VACUUM. Rebuilds the whole database into a new file, dropping free pages, defragmenting tables and indexes, and shrinking the file. Needs exclusive access and up to twice the database size in free disk space while it runs.',
       options: [],
       perTable: false
     },
@@ -203,6 +248,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'analyze',
       label: 'Analyze',
       description: 'Gather statistics about tables and indexes for the query planner',
+      hint: 'Runs ANALYZE. Gathers statistics about tables and indexes into the sqlite_stat tables so the query planner can choose better indexes. Run it after big data changes or after adding indexes.',
       options: [],
       perTable: true
     },
@@ -210,6 +256,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'pragma-optimize',
       label: 'Optimize',
       description: 'PRAGMA optimize: let SQLite run the analysis it thinks is worthwhile',
+      hint: 'Runs PRAGMA optimize. Lets SQLite decide which tables need fresh statistics and analyze only those. Cheap; SQLite suggests running it periodically and before closing long-lived connections.',
       options: [],
       perTable: false
     },
@@ -217,6 +264,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'integrity',
       label: 'Check integrity',
       description: 'Look for corruption, out-of-order records and malformed indexes',
+      hint: 'Runs PRAGMA integrity_check. Scans the whole database for corruption: malformed records, out-of-order rows, missing or extra index entries, constraint violations and free-list problems. Prints ok when nothing is wrong.',
       options: ['quick'],
       perTable: false
     },
@@ -224,6 +272,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'reindex',
       label: 'Reindex',
       description: 'Delete and recreate indexes from scratch',
+      hint: "Runs REINDEX. Deletes and recreates indexes from the table data. Mainly needed after a collation's definition changes, or to repair a corrupt index.",
       options: [],
       perTable: true
     },
@@ -231,6 +280,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'checkpoint',
       label: 'Checkpoint',
       description: 'Copy the write-ahead log into the database and truncate it',
+      hint: 'Runs PRAGMA wal_checkpoint(TRUNCATE). In WAL mode, copies all changes from the -wal file into the main database file and truncates the WAL to zero bytes. Useful before copying the database file or when the WAL has grown large. Does nothing in rollback-journal mode.',
       options: [],
       perTable: false
     }
@@ -240,6 +290,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       value: 'validate',
       label: 'Validate',
       description: 'Check collections and their indexes for correctness',
+      hint: "Runs the validate command on each collection. Checks the collection's data and index structures and reports corrupt documents, index inconsistencies and record counts. It locks each collection while it runs, so avoid busy production collections.",
       options: ['full'],
       perTable: true,
       eachTable: true
@@ -249,6 +300,7 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
       label: 'Compact',
       description:
         'Defragment collection data and indexes to release space to the operating system',
+      hint: "Runs the compact command on each collection. Rewrites and defragments the collection's data and indexes so WiredTiger can return freed space to the operating system, typically after deleting many documents. On a replica set it only compacts the member you're connected to.",
       options: [],
       perTable: true,
       eachTable: true
@@ -257,11 +309,16 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
 }
 
 /** Overrides of OPTION_INFO for tasks where an option means something else. */
-const OPTION_OVERRIDES: Partial<Record<string, { label: string; description: string }>> = {
-  'mongo:full': { label: 'Full', description: 'Check every document thoroughly; slow and locking' },
+const OPTION_OVERRIDES: Partial<Record<string, OptionText>> = {
+  'mongo:full': {
+    label: 'Full',
+    description: 'Check every document thoroughly; slow and locking',
+    hint: 'Adds full: true. Checks every document and index entry in depth instead of the default faster checks. Much slower, and takes an exclusive lock on each collection.'
+  },
   'mysql:extended:repair': {
     label: 'Extended',
-    description: 'Rebuild the index row by row instead of by sorting'
+    description: 'Rebuild the index row by row instead of by sorting',
+    hint: 'Adds EXTENDED: rebuilds the index row by row instead of by sorting. Very slow; use it only when a plain repair fails.'
   }
 }
 
@@ -269,7 +326,7 @@ export function optionInfo(
   engine: Engine,
   task: MaintenanceTask,
   option: MaintenanceOption
-): { label: string; description: string } {
+): OptionText {
   return (
     OPTION_OVERRIDES[`${engine}:${option}:${task}`] ??
     OPTION_OVERRIDES[`${engine}:${option}`] ??
