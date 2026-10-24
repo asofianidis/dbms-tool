@@ -70,6 +70,10 @@ signed, the script also requires the signature and notarization to verify, so se
 secrets together. You need an [Apple Developer Program](https://developer.apple.com/programs/)
 membership.
 
+With all six set, the bundler notarizes and staples the `.app`, and the **Notarize dmg** step then
+notarizes and staples the `.dmg` and replaces the uploaded copy. A team's first notarizations can
+take an hour or more; later ones usually finish in minutes.
+
 1. In Xcode or the developer portal create a **Developer ID Application** certificate and export
    it from Keychain Access as a `.p12` with a password.
 2. Create an [app-specific password](https://support.apple.com/102654) for your Apple ID.

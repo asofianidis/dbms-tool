@@ -253,6 +253,40 @@ jobs:
           # latest.json is generated once all platforms have uploaded
           uploadUpdaterJson: false
 
+      # The bundler notarizes and staples the .app but only signs the .dmg around it. Notarize and
+      # staple the .dmg too, so Gatekeeper accepts the disk image a browser downloaded, then replace
+      # the uploaded copy before the publish job checksums the release assets.
+      - name: Notarize dmg
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          shopt -s nullglob
+          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::Expected one .dmg, found ${#dmgs[@]}"
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          name=$(basename "$dmg")
+
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait --timeout 2h
+          xcrun stapler staple "$dmg"
+          spctl -a -vvv -t open --context context:primary-signature "$dmg"
+
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            --jq ".[] | select(.name == \"$name\") | .id")
+          if [ -z "$id" ]; then
+            echo "::error::$name is not attached to release $RELEASE_ID"
+            exit 1
+          fi
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
+          gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" \
+            -H "Content-Type: application/octet-stream" --input "$dmg" --jq .name
+          echo "Notarized and stapled $name" >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-latest
