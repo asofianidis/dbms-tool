@@ -412,6 +412,7 @@ impl SqSession {
             name: MAIN.into(),
             is_system: false,
             size_bytes: size,
+            keys: None,
         }])
     }
 

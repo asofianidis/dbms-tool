@@ -12,7 +12,8 @@ export const SESSION_ID_COLUMN: Record<string, string> = {
   mysql: 'id',
   mssql: 'session_id',
   babelfish: 'spid',
-  mongo: 'opid'
+  mongo: 'opid',
+  redis: 'id'
 }
 
 /** The activity column naming the session a row waits on, where the engine reports it. */
@@ -31,6 +32,7 @@ export function sessionActions(engineKey: string): SessionAction[] {
     case 'mssql':
     case 'babelfish':
     case 'mongo':
+    case 'redis':
       return ['kill']
     default:
       return []

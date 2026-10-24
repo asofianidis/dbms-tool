@@ -114,7 +114,7 @@ function backupCommands(): Item[] {
   const tab = activeTab()
   if (!tab || !('connectionId' in tab)) return []
   const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
-  if (!connection || connection.engine === 'babelfish') return []
+  if (!connection || connection.engine === 'babelfish' || connection.engine === 'redis') return []
   const database = 'database' in tab ? tab.database : ''
   const name = connectionLabel(connection)
   return [
@@ -146,7 +146,7 @@ function compareCommands(): Item[] {
   const tab = activeTab()
   if (!tab || !('connectionId' in tab) || tab.kind === 'compare') return []
   const connection = connectionsStore.get().find((c) => c.id === tab.connectionId)
-  if (!connection || connection.engine === 'mongo') return []
+  if (!connection || connection.engine === 'mongo' || connection.engine === 'redis') return []
   const database = 'database' in tab ? tab.database : ''
   const schema = 'schema' in tab ? tab.schema : null
   const table = tab.kind === 'table' && tab.objectKind === 'table' ? tab.name : null

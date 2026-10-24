@@ -15,6 +15,7 @@ export function ConnectionPicker({
   onChange,
   sql,
   mongo,
+  redis,
   disabled
 }: {
   value: string
@@ -24,12 +25,20 @@ export function ConnectionPicker({
   sql?: boolean
   /** Only offer MongoDB connections */
   mongo?: boolean
+  /** Only offer Redis connections */
+  redis?: boolean
 }): React.JSX.Element {
   const connections = connectionsStore.use()
   const statuses = statusStore.use()
   const current = connections.find((c) => c.id === value)
   const options = connections.filter((c) =>
-    sql ? c.engine !== 'mongo' : mongo ? c.engine === 'mongo' : true
+    sql
+      ? c.engine !== 'mongo' && c.engine !== 'redis'
+      : mongo
+        ? c.engine === 'mongo'
+        : redis
+          ? c.engine === 'redis'
+          : true
   )
   return (
     <button
@@ -90,7 +99,7 @@ export function DatabasePicker({
                 ...list
                   .filter((d) => !d.isSystem)
                   .map((d): MenuItem => ({
-                    label: d.name,
+                    label: d.keys !== undefined ? `${d.name}  ·  ${d.keys} keys` : d.name,
                     icon: <Database className="text-info" />,
                     shortcut: d.name === value ? '✓' : undefined,
                     onSelect: () => onChange(d.name)

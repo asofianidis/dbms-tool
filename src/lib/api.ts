@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
-export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo' | 'sqlite'
+export type Engine = 'postgres' | 'mysql' | 'mssql' | 'babelfish' | 'mongo' | 'sqlite' | 'redis'
 export type SslMode = 'disable' | 'prefer' | 'require'
 export type AuthMode = 'password' | 'windows' | 'cloud'
 
@@ -214,6 +215,8 @@ export interface DatabaseInfo {
   name: string
   isSystem: boolean
   sizeBytes: number | null
+  /** Keys in a Redis keyspace */
+  keys?: number
 }
 
 export interface SchemaInfo {
@@ -371,8 +374,8 @@ export interface ExecOptions {
   confirmed?: boolean
 }
 
-/** What a write guard is asked about: SQL text or a MongoDB request. */
-export type GuardedWrite = { sql: string } | { request: MongoRequest }
+/** What a write guard is asked about: SQL text, a MongoDB request or a Redis request. */
+export type GuardedWrite = { sql: string } | { request: MongoRequest } | { redis: RedisRequest }
 
 type WriteGuard = (id: string, write: GuardedWrite) => Promise<boolean>
 
@@ -452,6 +455,109 @@ export interface MongoOutput {
   truncated: boolean
   elapsedMs: number
   cancelled: boolean
+}
+
+/** A Redis key, field or value: text when it's UTF-8, hex otherwise. */
+export type RData = string | { $hex: string }
+
+export type RedisKeyType = 'string' | 'list' | 'hash' | 'set' | 'zset' | 'stream' | 'ReJSON-RL'
+
+export type RedisRequest =
+  | {
+      op: 'scan'
+      database: string
+      cursor?: string | null
+      pattern?: string
+      keyType?: string
+      count?: number
+    }
+  | {
+      op: 'get'
+      database: string
+      key: RData
+      cursor?: string | null
+      offset?: number
+      count?: number
+    }
+  | {
+      op: 'set'
+      database: string
+      key: RData
+      value: RData
+      ttlMs?: number | null
+      keepTtl?: boolean
+      onlyNew?: boolean
+    }
+  | { op: 'hashSet'; database: string; key: RData; field: RData; value: RData; onlyNew?: boolean }
+  | { op: 'hashDelete'; database: string; key: RData; fields: RData[] }
+  | { op: 'listPush'; database: string; key: RData; values: RData[]; head?: boolean }
+  | { op: 'listSet'; database: string; key: RData; index: number; value: RData }
+  | { op: 'listRemove'; database: string; key: RData; index: number }
+  | { op: 'setAdd' | 'setRemove'; database: string; key: RData; members: RData[] }
+  | { op: 'zsetAdd'; database: string; key: RData; member: RData; score: number }
+  | { op: 'zsetRemove'; database: string; key: RData; members: RData[] }
+  | { op: 'streamAdd'; database: string; key: RData; id?: string; fields: [RData, RData][] }
+  | { op: 'streamDelete'; database: string; key: RData; ids: string[] }
+  | { op: 'jsonSet'; database: string; key: RData; json: string }
+  | { op: 'expire'; database: string; key: RData; ttlMs?: number | null }
+  | { op: 'rename'; database: string; key: RData; newKey: RData }
+  | { op: 'delete'; database: string; keys: RData[] }
+  | { op: 'deleteMatching'; database: string; pattern: string }
+  | { op: 'flush'; database: string }
+  | { op: 'command'; database: string; args: string[] }
+
+/** A server reply, tagged the way redis-cli prints it. */
+export type RedisReply =
+  | { t: 'nil' }
+  | { t: 'int'; v: number | string }
+  | { t: 'double'; v: number }
+  | { t: 'bool'; v: boolean }
+  | { t: 'bulk'; v: RData }
+  | { t: 'status'; v: string }
+  | { t: 'error'; v: string }
+  | { t: 'array' | 'set'; v: RedisReply[] }
+  | { t: 'map'; v: [RedisReply, RedisReply][] }
+
+export interface RedisKeyEntry {
+  key: RData
+  type: string
+  /** Milliseconds left; -1 when the key never expires */
+  ttl: number
+}
+
+export interface RedisOutput {
+  kind: 'keys' | 'key' | 'reply'
+  keys: RedisKeyEntry[]
+  /** Where the next page continues; null when there is no more */
+  cursor: string | null
+  scanned: number
+  type: string | null
+  ttl: number | null
+  encoding: string | null
+  memory: number | null
+  length: number | null
+  value: RData | null
+  entries: Record<string, unknown>[]
+  groups: Record<string, unknown>[]
+  truncated: boolean
+  reply: RedisReply | null
+  elapsedMs: number
+  cancelled: boolean
+}
+
+export interface PubSubMessage {
+  channel: string
+  pattern: string | null
+  payload: RData
+  /** Unix time in milliseconds */
+  at: number
+}
+
+export interface PubSubBatch {
+  subscription: string
+  messages: PubSubMessage[]
+  dropped: number
+  error: string | null
 }
 
 export interface AppError {
@@ -569,6 +675,28 @@ export const api = {
       options: wireOptions(options)
     })
   },
+
+  redis: async (
+    id: string,
+    session: string,
+    request: RedisRequest,
+    options?: ExecOptions
+  ): Promise<RedisOutput> => {
+    await guarded(id, { redis: request }, options)
+    return invoke<RedisOutput>('redis_execute', {
+      id,
+      session,
+      request,
+      options: wireOptions(options)
+    })
+  },
+  /** Messages arrive through `onRedisMessages`, tagged with `subscription` */
+  redisSubscribe: (id: string, subscription: string, channels: string[], patterns: string[]) =>
+    invoke<void>('redis_subscribe', { id, subscription, channels, patterns }),
+  redisUnsubscribe: (id: string, subscription: string) =>
+    invoke<void>('redis_unsubscribe', { id, subscription }),
+  onRedisMessages: (handler: (batch: PubSubBatch) => void): Promise<UnlistenFn> =>
+    listen<PubSubBatch>('redis-pubsub', (e) => handler(e.payload)),
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),

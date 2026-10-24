@@ -28,6 +28,9 @@ import { DashboardTab } from './features/dashboard/DashboardTab'
 import { DashboardsPanel } from './features/dashboard/DashboardsPanel'
 import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
+import { KeyBrowserTab } from './features/redis/KeyBrowserTab'
+import { PubSubTab } from './features/redis/PubSubTab'
+import { RedisConsoleTab } from './features/redis/RedisConsoleTab'
 import { QueryTab } from './features/query/QueryTab'
 import { ServerTab } from './features/server/ServerTab'
 import { SettingsTab } from './features/settings/SettingsTab'
@@ -67,6 +70,12 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <QueryTab tab={tab} />
     case 'mongo':
       return <MongoShellTab tab={tab} />
+    case 'redis':
+      return <RedisConsoleTab tab={tab} />
+    case 'redisKeys':
+      return <KeyBrowserTab tab={tab} />
+    case 'redisPubsub':
+      return <PubSubTab tab={tab} />
     case 'table':
       return <TableTab tab={tab} />
     case 'collection':

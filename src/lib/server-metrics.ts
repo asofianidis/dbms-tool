@@ -1,5 +1,6 @@
 import { api, type ConnectionConfig, type ResultSet } from './api'
 import { formatBytes } from './format'
+import { dataText, parseInfo } from './redis'
 
 /** Raw readings from one poll, keyed by normalized column / variable / document path. */
 export type Raw = Record<string, string | null>
@@ -9,6 +10,7 @@ export type Point = Record<string, number | null>
 export type Probe =
   | { id: string; sql: string; shape: 'row' | 'pairs' }
   | { id: string; command: Record<string, unknown>; prefix?: string }
+  | { id: string; redis: string[] }
 
 export type Unit = 'count' | 'perSec' | 'bytes' | 'bytesPerSec' | 'percent' | 'seconds'
 
@@ -783,6 +785,106 @@ const MONGO: ServerDashboardSpec = {
   }
 }
 
+const REDIS: ServerDashboardSpec = {
+  probes: [{ id: 'info', redis: ['INFO'] }],
+  derive: (next, prev, s) => {
+    const keys = Object.keys(next).filter((k) => /^db\d+\.keys$/.test(k))
+    const maxmemory = num(next, 'maxmemory') || null
+    return {
+      uptime: num(next, 'uptime_in_seconds'),
+      ops:
+        rate(next, prev, s, 'total_commands_processed') ?? num(next, 'instantaneous_ops_per_sec'),
+      hits: hitPercent(next, prev, 'keyspace_hits', 'keyspace_misses'),
+      clients: num(next, 'connected_clients'),
+      blocked: num(next, 'blocked_clients'),
+      keys: keys.length ? sum(next, keys) : 0,
+      expired: rate(next, prev, s, 'expired_keys'),
+      evicted: rate(next, prev, s, 'evicted_keys'),
+      netIn: rate(next, prev, s, 'total_net_input_bytes'),
+      netOut: rate(next, prev, s, 'total_net_output_bytes'),
+      memory: percentOf(num(next, 'used_memory'), maxmemory ?? num(next, 'total_system_memory')),
+      connections: percentOf(num(next, 'connected_clients'), num(next, 'maxclients'))
+    }
+  },
+  tiles: [
+    { key: 'ops', label: 'Commands', unit: 'perSec', hint: 'Commands processed per second' },
+    {
+      key: 'hits',
+      label: 'Hit rate',
+      unit: 'percent',
+      hint: 'Key lookups that found the key (keyspace hits vs misses)'
+    },
+    { key: 'keys', label: 'Keys', unit: 'count', hint: 'Keys across every database' },
+    { key: 'clients', label: 'Clients', unit: 'count', hint: 'Connected clients' },
+    {
+      key: 'blocked',
+      label: 'Blocked clients',
+      unit: 'count',
+      hint: 'Clients waiting in BLPOP, XREAD BLOCK and similar'
+    },
+    {
+      key: 'expired',
+      label: 'Expired keys',
+      unit: 'perSec',
+      hint: 'Keys removed by their TTL per second'
+    },
+    {
+      key: 'evicted',
+      label: 'Evicted keys',
+      unit: 'perSec',
+      hint: 'Keys dropped to stay under maxmemory per second'
+    },
+    { key: 'netIn', label: 'Network in', unit: 'bytesPerSec', hint: 'Bytes received per second' },
+    { key: 'netOut', label: 'Network out', unit: 'bytesPerSec', hint: 'Bytes sent per second' }
+  ],
+  meters: [
+    {
+      key: 'memory',
+      label: 'Memory',
+      detail: (raw) => {
+        const max = num(raw, 'maxmemory') || null
+        const used = usage(num(raw, 'used_memory'), max ?? num(raw, 'total_system_memory'))
+        return used && (max ? `${used} maxmemory` : `${used} host memory (no maxmemory)`)
+      },
+      warn: 85,
+      danger: 95
+    },
+    {
+      key: 'connections',
+      label: 'Clients',
+      detail: (raw) => `${raw.connected_clients ?? '—'} of ${raw.maxclients ?? '—'}`,
+      warn: 75,
+      danger: 90
+    }
+  ],
+  facts: (raw) =>
+    facts([
+      ['Version', raw.valkey_version ? `Valkey ${raw.valkey_version}` : raw.redis_version],
+      ['Mode', raw.redis_mode ?? raw.server_mode],
+      [
+        'Role',
+        raw.role &&
+          (raw.role === 'master'
+            ? `primary · ${raw.connected_slaves ?? 0} replica${raw.connected_slaves === '1' ? '' : 's'}`
+            : `replica of ${raw.master_host}:${raw.master_port} (${raw.master_link_status})`)
+      ],
+      ['Eviction policy', raw.maxmemory_policy],
+      ['Fragmentation', raw.mem_fragmentation_ratio && `${raw.mem_fragmentation_ratio}×`],
+      ['Peak memory', raw.used_memory_peak_human],
+      [
+        'Persistence',
+        [
+          raw.rdb_last_bgsave_status && `RDB ${raw.rdb_last_bgsave_status}`,
+          raw.aof_enabled === '1' ? 'AOF on' : raw.aof_enabled === '0' ? 'AOF off' : null
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      ],
+      ['Operating system', raw.os],
+      ['Port', raw.tcp_port]
+    ])
+}
+
 export function dashboardFor(
   engine: ConnectionConfig['engine'],
   babelfish: boolean
@@ -801,6 +903,8 @@ export function dashboardFor(
       return MONGO
     case 'sqlite':
       return SQLITE
+    case 'redis':
+      return REDIS
   }
 }
 
@@ -854,6 +958,15 @@ export async function collect(
 ): Promise<Collected> {
   const settled = await Promise.allSettled(
     spec.probes.map(async (probe): Promise<Raw> => {
+      if ('redis' in probe) {
+        const out = await api.redis(connectionId, session, {
+          op: 'command',
+          database: '0',
+          args: probe.redis
+        })
+        if (out.reply?.t === 'error') throw new Error(out.reply.v)
+        return parseInfo(out.reply?.t === 'bulk' ? dataText(out.reply.v) : '')
+      }
       if ('command' in probe) {
         const out = await api.mongo(connectionId, session, {
           op: 'runCommand',

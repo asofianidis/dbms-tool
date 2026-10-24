@@ -44,6 +44,35 @@ export type Tab =
     }
   | {
       id: string
+      /** Redis console */
+      kind: 'redis'
+      connectionId: string
+      database: string
+      title: string
+      /** The command being typed */
+      text: string
+      filePath?: string
+      savedText?: string
+      autorun?: boolean
+      savedQueryId?: string
+    }
+  | {
+      id: string
+      kind: 'redisKeys'
+      connectionId: string
+      database: string
+      /** SCAN pattern to start with */
+      pattern?: string
+    }
+  | {
+      id: string
+      kind: 'redisPubsub'
+      connectionId: string
+      /** Channels and patterns to subscribe to on open, comma separated */
+      channels?: string
+    }
+  | {
+      id: string
       kind: 'table'
       connectionId: string
       database: string
@@ -340,14 +369,17 @@ export function newQueryTab(
     return
   }
   const connection = getConnection(fallback)
-  const kind = connection?.engine === 'mongo' ? 'mongo' : 'query'
+  const kind =
+    connection?.engine === 'mongo' ? 'mongo' : connection?.engine === 'redis' ? 'redis' : 'query'
   untitled++
   openTab({
     id: tabId(),
     kind,
     connectionId: fallback,
     database: database ?? defaultDatabase(fallback),
-    title: options.title ?? `${kind === 'mongo' ? 'shell' : 'query'}-${untitled}`,
+    title:
+      options.title ??
+      `${kind === 'mongo' ? 'shell' : kind === 'redis' ? 'console' : 'query'}-${untitled}`,
     text,
     ...(options.autorun ? { autorun: true } : {}),
     ...(options.savedQueryId ? { savedQueryId: options.savedQueryId } : {})
@@ -405,6 +437,19 @@ export function openCollection(
       t.database === database &&
       t.collection === collection
   )
+}
+
+/** The key browser for one Redis keyspace; an open one picks up `pattern`. */
+export function openRedisKeys(connectionId: string, database: string, pattern?: string): void {
+  const sameAs = (t: Tab): boolean =>
+    t.kind === 'redisKeys' && t.connectionId === connectionId && t.database === database
+  const existing = tabsStore.get().tabs.find(sameAs)
+  if (existing && pattern !== undefined) updateTab(existing.id, { pattern } as Partial<Tab>)
+  openTab({ id: tabId(), kind: 'redisKeys', connectionId, database, pattern }, sameAs)
+}
+
+export function openRedisPubsub(connectionId: string, channels?: string): void {
+  openTab({ id: tabId(), kind: 'redisPubsub', connectionId, channels })
 }
 
 export function openSettings(): void {

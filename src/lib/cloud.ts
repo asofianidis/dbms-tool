@@ -813,6 +813,7 @@ const ENGINE_PORTS: Record<Engine, number> = {
   mssql: 1433,
   babelfish: 1433,
   mongo: 27017,
+  redis: 6379,
   sqlite: 0
 }
 

@@ -9,7 +9,7 @@ export interface HistoryEntry {
   at: number
   elapsedMs: number
   ok: boolean
-  kind: 'sql' | 'mongo'
+  kind: 'sql' | 'mongo' | 'redis'
 }
 
 const LIMIT = 500

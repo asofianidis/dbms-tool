@@ -531,6 +531,7 @@ impl MsSession {
                     ),
                     name,
                     size_bytes: None,
+                    keys: None,
                 }
             })
             .collect())

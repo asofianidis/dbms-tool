@@ -1,8 +1,8 @@
 # dbms-tool
 
 A free, open-source, developer-focused database client for **PostgreSQL**, **MySQL / MariaDB**,
-**SQL Server**, **Babelfish for Aurora PostgreSQL**, **MongoDB** and **SQLite** (local files and
-Cloudflare D1). Built with Tauri 2, Rust and React.
+**SQL Server**, **Babelfish for Aurora PostgreSQL**, **MongoDB**, **Redis** (and Valkey, KeyDB,
+Dragonfly) and **SQLite** (local files and Cloudflare D1). Built with Tauri 2, Rust and React.
 
 The aim is the directness of SSMS and pgAdmin, with MongoDB treated as a first-class citizen
 rather than a plugin, in a fast native app that doesn't get in your way.
@@ -12,13 +12,14 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 **Everywhere**
 
 - Object explorer per engine: pgAdmin-style schemas for PostgreSQL, SSMS-style folders for SQL
-  Server and Babelfish, databases and collections for MongoDB. Row estimates, sizes, columns,
+  Server and Babelfish, databases and collections for MongoDB, keyspaces with key counts for
+  Redis. Row estimates, sizes, columns,
   indexes and foreign keys inline.
 - Command palette (`Ctrl+K`) that searches connections, tables, views, routines and collections.
 - Every editor tab gets its own server session, so transactions, temp tables and `USE` behave the
   way they do in SSMS or psql.
 - Connection colours (tinting tabs and the status bar), groups, read-only connections, and
-  connection-string paste (`postgres://`, `mysql://`, `mongodb+srv://`, ADO.NET).
+  connection-string paste (`postgres://`, `mysql://`, `mongodb+srv://`, `redis://`, ADO.NET).
 - Production connections: every write asks first, and destructive statements (`DROP`,
   `TRUNCATE`, `DELETE` without `WHERE`, `deleteMany({})`…) need the connection's name typed.
 - Import connections from pgpass, DBeaver or DataGrip, and export your own as JSON without
@@ -98,6 +99,24 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 - Schema analysis over a `$sample`: field paths, presence and type mix.
 - Index management with usage statistics, and explain with collection-scan warnings.
 
+**Redis**
+
+- Key browser: SCAN-based, so it stays fast on big keyspaces. Keys group into folders on `:` (or
+  any delimiter), with type badges, TTLs, a text or glob filter, a type filter, and multi-select
+  or delete-by-prefix.
+- Editors for every type: strings (with JSON pretty-printing and a hex view for binary values),
+  hashes, lists, sets, sorted sets, streams (with consumer groups) and RedisJSON documents. TTLs
+  count down live and can be changed in place; keys can be renamed without clobbering another.
+- redis-cli style console: command history, `Tab` completion, greyed-out argument hints, `help`,
+  multi-line scripts, and replies printed the way redis-cli prints them.
+- Pub/Sub: subscribe to channels and patterns, watch every key change through keyspace
+  notifications, and publish messages.
+- Server page with live ops/sec, hit rate, memory, clients and evictions, a client list you can
+  kill from, and the slow log.
+- Read-only connections only allow read commands; production connections confirm writes and need
+  the name typed for `FLUSHDB`, `FLUSHALL` and pattern deletes. TLS (`rediss://`), ACL users and SSH
+  tunnels work as they do for the other engines.
+
 ## Install
 
 ### macOS
@@ -164,12 +183,12 @@ secrets.
 ```
 src/                     React frontend
   components/            UI primitives, grid, editor, dialogs, shell (title bar, tabs, status bar)
-  features/              explorer, query, table, mongo, server, settings, history, welcome
-  lib/                   API bindings, SQL and Mongo helpers, stores
+  features/              explorer, query, table, mongo, redis, server, settings, history, welcome
+  lib/                   API bindings, SQL, Mongo and Redis helpers, stores
 src-tauri/src/
   drivers/               postgres (tokio-postgres), mysql (mysql_async),
                          mssql (tiberius; SQL Server + Babelfish), mongo (official driver),
-                         sqlite (rusqlite for files, REST for Cloudflare D1)
+                         redis (redis-rs), sqlite (rusqlite for files, REST for Cloudflare D1)
   manager.rs             open connections and per-tab sessions, cancellation
   commands.rs            Tauri command surface
   cloud.rs               cloud CLIs (aws, gcloud, az, railway, flyctl) and REST APIs (Render,

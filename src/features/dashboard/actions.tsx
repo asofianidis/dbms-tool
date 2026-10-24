@@ -13,7 +13,7 @@ import {
   type Dashboard
 } from '@/lib/dashboards'
 import { exampleDashboard } from '@/lib/dashboard-example'
-import { connectionLabel } from '@/lib/engines'
+import { connectionLabel, isKeyValue } from '@/lib/engines'
 import { saveToFile } from '@/lib/export'
 import { toast, toastError } from '@/lib/toast'
 import {
@@ -32,10 +32,12 @@ import {
 } from '@/lib/workspace'
 
 /** The active tab's connection, else a connected one, else the first. */
+/** Dashboards run SQL or MongoDB queries, so Redis connections can't hold one. */
 function pickConnection(): string | undefined {
-  const connections = connectionsStore.get()
+  const connections = connectionsStore.get().filter((c) => !isKeyValue(c.engine))
+  const active = activeConnectionId()
   return (
-    activeConnectionId() ??
+    connections.find((c) => c.id === active)?.id ??
     connections.find((c) => statusOf(c.id).state === 'connected')?.id ??
     connections[0]?.id
   )

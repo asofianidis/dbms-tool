@@ -281,3 +281,13 @@ describe('settings helpers', () => {
     expect(isManualCommit('t1', { t1: true }, 'auto')).toBe(true)
   })
 })
+
+describe('Redis connections', () => {
+  it('reads Redis URIs without keeping the password', () => {
+    expect(parseJdbcUrl('jdbc:redis://:secret@cache:6380/2')).toEqual({
+      engine: 'redis',
+      patch: { uri: 'redis://cache:6380/2' }
+    })
+    expect(parseJdbcUrl('rediss://app:pw@cache:6380')?.patch.uri).toBe('rediss://app@cache:6380')
+  })
+})

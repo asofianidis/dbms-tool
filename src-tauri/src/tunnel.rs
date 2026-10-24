@@ -87,6 +87,7 @@ fn default_port(engine: Engine) -> u16 {
         Engine::Postgres => 5432,
         Engine::Mysql => 3306,
         Engine::Mongo => 27017,
+        Engine::Redis => crate::drivers::redis::DEFAULT_PORT,
         _ => 1433,
     }
 }
@@ -114,6 +115,11 @@ fn ssh_command(
     if config.engine == Engine::Mongo && !config.uri.trim().is_empty() {
         return Err(AppError::msg(
             "SSH tunnels need the host and port form of a MongoDB connection, not a connection string",
+        ));
+    }
+    if config.engine == Engine::Redis && !config.uri.trim().is_empty() {
+        return Err(AppError::msg(
+            "SSH tunnels need the host and port form of a Redis connection, not a connection string",
         ));
     }
     if matches!(config.engine, Engine::Mssql | Engine::Babelfish) && config.host.contains('\\') {

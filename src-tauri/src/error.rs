@@ -68,6 +68,12 @@ impl From<mongodb::error::Error> for AppError {
     }
 }
 
+impl From<redis::RedisError> for AppError {
+    fn from(e: redis::RedisError) -> Self {
+        AppError::Message(crate::drivers::redis::describe_error(&e))
+    }
+}
+
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         AppError::Message(e.to_string())

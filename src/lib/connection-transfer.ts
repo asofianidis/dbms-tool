@@ -20,7 +20,8 @@ export const EXPORT_FORMAT = 'dbms-tool.connections'
 
 /** Drops the password from a `scheme://user:password@host` URI. */
 export function stripUriPassword(uri: string): string {
-  return uri.replace(/(\/\/[^:/@]+):[^@/]*@/, '$1@')
+  // Redis URIs often carry only a password: redis://:secret@host
+  return uri.replace(/\/\/([^:/@]*):[^@/]*@/, (_, user: string) => (user ? `//${user}@` : '//'))
 }
 
 function candidate(engine: Engine, patch: Partial<ConnectionConfig>): ConnectionConfig {
@@ -50,13 +51,14 @@ function sslFrom(value: string | undefined): SslMode | undefined {
   return 'prefer'
 }
 
-/** Reads a JDBC URL (or a MongoDB URI) into connection fields. */
+/** Reads a JDBC URL (or a MongoDB or Redis URI) into connection fields. */
 export function parseJdbcUrl(
   url: string
 ): { engine: Engine; patch: Partial<ConnectionConfig> } | null {
   const s = url.trim().replace(/^jdbc:/i, '')
   if (/^mongodb(\+srv)?:\/\//i.test(s))
     return { engine: 'mongo', patch: { uri: stripUriPassword(s) } }
+  if (/^rediss?:\/\//i.test(s)) return { engine: 'redis', patch: { uri: stripUriPassword(s) } }
   const sqlite = /^sqlite:(.*)$/i.exec(s)
   if (sqlite) return { engine: 'sqlite', patch: { host: sqlite[1].replace(/^file:(\/\/)?/i, '') } }
 
@@ -206,6 +208,7 @@ function dbeaverEngine(provider = '', driver = ''): Engine | null {
     return 'mssql'
   if (p === 'sqlite' || d.startsWith('sqlite')) return 'sqlite'
   if (p.startsWith('mongo')) return 'mongo'
+  if (p.startsWith('redis') || d.startsWith('redis')) return 'redis'
   return null
 }
 
@@ -299,6 +302,7 @@ function datagripEngine(driver: string): Engine | null {
   if (d.startsWith('sqlserver') || d.startsWith('azure')) return 'mssql'
   if (d.startsWith('sqlite')) return 'sqlite'
   if (d.startsWith('mongo')) return 'mongo'
+  if (d.startsWith('redis')) return 'redis'
   return null
 }
 

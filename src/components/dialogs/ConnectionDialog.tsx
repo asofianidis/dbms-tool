@@ -78,8 +78,9 @@ function ConnectionDialog({
   const [paste, setPaste] = useState('')
   const [test, setTest] = useState<TestState>({ state: 'idle' })
   const [saving, setSaving] = useState(false)
-  const [mongoMode, setMongoMode] = useState<'uri' | 'fields'>(
-    editing?.engine === 'mongo' && !editing.uri ? 'fields' : 'uri'
+  // MongoDB and Redis connect with either a connection string or host and port
+  const [uriMode, setUriMode] = useState<'uri' | 'fields'>(
+    editing && !editing.uri ? 'fields' : 'uri'
   )
   const groups = useMemo(
     () =>
@@ -101,7 +102,8 @@ function ConnectionDialog({
 
   const pickEngine = (engine: Engine): void => {
     setConfig(newConnection(engine))
-    setMongoMode('uri')
+    // Most Redis servers are local or reached by host; Atlas hands out strings
+    setUriMode(engine === 'redis' ? 'fields' : 'uri')
   }
 
   const applyPaste = (text: string): boolean => {
@@ -112,7 +114,7 @@ function ConnectionDialog({
       ...parsed.patch
     }))
     if (parsed.password) setPassword(parsed.password)
-    if (parsed.engine === 'mongo') setMongoMode('uri')
+    if (parsed.engine === 'mongo' || parsed.engine === 'redis') setUriMode('uri')
     setPaste('')
     setTest({ state: 'idle' })
     return true
@@ -175,7 +177,7 @@ function ConnectionDialog({
         <div className="mt-4">
           <Field
             label="Or paste a connection string"
-            hint="postgres://…, mysql://…, mongodb+srv://… or an ADO.NET string like Server=…;Database=…"
+            hint="postgres://…, mysql://…, mongodb+srv://…, redis://… or an ADO.NET string like Server=…;Database=…"
           >
             <div className="flex gap-2">
               <Input
@@ -206,7 +208,8 @@ function ConnectionDialog({
 
   const info = ENGINES[config.engine]
   const tds = config.engine === 'mssql' || config.engine === 'babelfish'
-  const usesUri = config.engine === 'mongo' && mongoMode === 'uri'
+  const hasUriForm = config.engine === 'mongo' || config.engine === 'redis'
+  const usesUri = hasUriForm && uriMode === 'uri'
   const hasSavedPassword = !!editing?.savePassword && !duplicate
   const needsUser = !(tds && config.auth === 'windows')
   const sqlite = config.engine === 'sqlite'
@@ -254,7 +257,7 @@ function ConnectionDialog({
 
   const effective = (): ConnectionConfig => ({
     ...config,
-    uri: config.engine === 'mongo' && mongoMode === 'uri' ? config.uri : ''
+    uri: usesUri ? config.uri : ''
   })
 
   const runTest = async (): Promise<void> => {
@@ -327,7 +330,7 @@ function ConnectionDialog({
             <Input
               value={config.name}
               onChange={(e) => patch({ name: e.target.value })}
-              placeholder={`e.g. ${config.engine === 'mongo' ? 'Atlas prod' : 'Local dev'}`}
+              placeholder={`e.g. ${config.engine === 'mongo' ? 'Atlas prod' : config.engine === 'redis' ? 'Session cache' : 'Local dev'}`}
             />
           </Field>
           <Field label="Colour">
@@ -362,11 +365,11 @@ function ConnectionDialog({
           </div>
         )}
 
-        {config.engine === 'mongo' && (
+        {hasUriForm && (
           <Segmented
-            value={mongoMode}
+            value={uriMode}
             onChange={(m) => {
-              setMongoMode(m)
+              setUriMode(m)
               setTest({ state: 'idle' })
             }}
             options={[
@@ -468,7 +471,11 @@ function ConnectionDialog({
               rows={3}
               value={config.uri}
               onChange={(e) => patch({ uri: e.target.value })}
-              placeholder="mongodb+srv://user@cluster0.example.net/?retryWrites=true&w=majority"
+              placeholder={
+                config.engine === 'redis'
+                  ? 'rediss://default@example.upstash.io:6379/0'
+                  : 'mongodb+srv://user@cluster0.example.net/?retryWrites=true&w=majority'
+              }
             />
           </Field>
         ) : (
@@ -548,12 +555,24 @@ function ConnectionDialog({
         {!sqlite && (
           <div className="grid grid-cols-2 gap-3">
             {(needsUser || config.auth === 'windows') && !usesUri && (
-              <Field label={config.auth === 'windows' ? 'Domain user (optional)' : 'User'}>
+              <Field
+                label={
+                  config.auth === 'windows'
+                    ? 'Domain user (optional)'
+                    : config.engine === 'redis'
+                      ? 'ACL user (optional)'
+                      : 'User'
+                }
+              >
                 <Input
                   value={config.user}
                   onChange={(e) => patch({ user: e.target.value })}
                   placeholder={
-                    config.auth === 'windows' ? 'Current Windows user' : info.defaultUser
+                    config.auth === 'windows'
+                      ? 'Current Windows user'
+                      : config.engine === 'redis'
+                        ? 'default'
+                        : info.defaultUser
                   }
                 />
               </Field>
@@ -568,7 +587,13 @@ function ConnectionDialog({
                     setTest({ state: 'idle' })
                   }}
                   placeholder={
-                    hasSavedPassword ? '•••••••• (saved)' : usesUri ? 'If not in the string' : ''
+                    hasSavedPassword
+                      ? '•••••••• (saved)'
+                      : usesUri
+                        ? 'If not in the string'
+                        : config.engine === 'redis'
+                          ? 'Leave empty when AUTH is off'
+                          : ''
                   }
                 />
               </Field>
@@ -583,13 +608,15 @@ function ConnectionDialog({
               hint={
                 config.engine === 'postgres'
                   ? 'Defaults to postgres'
-                  : 'Optional; the server default is used when empty'
+                  : config.engine === 'redis'
+                    ? 'Database number to open; 0 when empty'
+                    : 'Optional; the server default is used when empty'
               }
             >
               <Input
                 value={config.database}
                 onChange={(e) => patch({ database: e.target.value })}
-                placeholder={info.defaultDatabase || 'default'}
+                placeholder={info.defaultDatabase || (config.engine === 'redis' ? '0' : 'default')}
               />
             </Field>
           )}
@@ -620,7 +647,7 @@ function ConnectionDialog({
                     ? 'Login only (default)'
                     : usesUri
                       ? 'As in the connection string'
-                      : config.engine === 'mongo'
+                      : hasUriForm
                         ? 'Off'
                         : 'Prefer'}
                 </option>
