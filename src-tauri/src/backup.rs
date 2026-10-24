@@ -545,7 +545,14 @@ fn port(cfg: &ConnectionConfig, default: u16) -> u16 {
 }
 
 fn pg_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&str>, db: &str) {
-    plan.args.push(format!("--host={}", host(cfg)));
+    match &cfg.tunneled {
+        // Connect to the tunnel, but check the certificate against the real server
+        Some((origin, _)) if cfg.ssl == SslMode::VerifyFull => {
+            plan.args.push(format!("--host={origin}"));
+            plan.env.push(("PGHOSTADDR", host(cfg).to_string()));
+        }
+        _ => plan.args.push(format!("--host={}", host(cfg))),
+    }
     plan.args.push(format!("--port={}", port(cfg, 5432)));
     if !cfg.user.is_empty() {
         plan.args.push(format!("--username={}", cfg.user));
@@ -566,8 +573,25 @@ fn pg_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&str>
         SslMode::Disable => "disable",
         SslMode::Prefer => "prefer",
         SslMode::Require => "require",
+        SslMode::VerifyCa => "verify-ca",
+        SslMode::VerifyFull => "verify-full",
     };
     plan.env.push(("PGSSLMODE", ssl.into()));
+    // libpq verifies whenever it has a root certificate, so only pass one
+    // where the app verifies too
+    match cfg.root_cert() {
+        Some(ca) if cfg.verify_certificate() => plan.env.push(("PGSSLROOTCERT", ca.into())),
+        // Without a file libpq wants ~/.postgresql/root.crt; "system" (libpq 16+)
+        // is the OS store the app uses, but libpq only allows it with verify-full
+        None if cfg.ssl == SslMode::VerifyFull => plan.env.push(("PGSSLROOTCERT", "system".into())),
+        _ => {}
+    }
+    if cfg.ssl != SslMode::Disable
+        && let (Some(cert), Some(key)) = (cfg.client_cert(), cfg.client_key())
+    {
+        plan.env.push(("PGSSLCERT", cert.into()));
+        plan.env.push(("PGSSLKEY", key.into()));
+    }
     plan.env.push(("PGCONNECT_TIMEOUT", "15".into()));
     plan.env.push(("PGAPPNAME", "dbms-tool".into()));
 }
@@ -605,15 +629,33 @@ fn mysql_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
         (SslMode::Disable, false) => Some("--ssl-mode=DISABLED"),
         (SslMode::Prefer, false) => Some("--ssl-mode=PREFERRED"),
         (SslMode::Require, false) => Some("--ssl-mode=REQUIRED"),
+        (SslMode::VerifyCa, false) => Some("--ssl-mode=VERIFY_CA"),
+        (SslMode::VerifyFull, false) => Some("--ssl-mode=VERIFY_IDENTITY"),
         (SslMode::Disable, true) => Some("--skip-ssl"),
         (SslMode::Prefer, true) => None,
         (SslMode::Require, true) => Some("--ssl"),
+        // MariaDB's tools check the chain and the host name together
+        (SslMode::VerifyCa | SslMode::VerifyFull, true) => Some("--ssl --ssl-verify-server-cert"),
     };
-    plan.args.extend(ssl.map(String::from));
+    plan.args.extend(
+        ssl.into_iter()
+            .flat_map(str::split_whitespace)
+            .map(String::from),
+    );
+    if cfg.ssl != SslMode::Disable {
+        if let Some(ca) = cfg.root_cert() {
+            plan.args.push(format!("--ssl-ca={ca}"));
+        }
+        // The tools take PEM files only
+        if let (Some(cert), Some(key)) = (cfg.client_cert(), cfg.client_key()) {
+            plan.args.push(format!("--ssl-cert={cert}"));
+            plan.args.push(format!("--ssl-key={key}"));
+        }
+    }
     // MariaDB 11.4+ verifies certificates by default; MySQL's REQUIRED never does.
     // Through a tunnel the tools can only check the certificate against 127.0.0.1.
     if mariadb
-        && cfg.ssl != SslMode::Disable
+        && matches!(cfg.ssl, SslMode::Prefer | SslMode::Require)
         && (cfg.trust_server_certificate || cfg.tunneled.is_some())
     {
         plan.args.push("--skip-ssl-verify-server-cert".into());
@@ -677,6 +719,7 @@ fn mongo_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
     // JSON strings are valid YAML double-quoted scalars
     let yaml = |s: &str| serde_json::to_string(s).unwrap_or_default();
     let mut config = String::new();
+    let tls_on;
     if uri.is_empty() {
         plan.args.push(format!("--host={}", host(cfg)));
         plan.args.push(format!("--port={}", port(cfg, 27017)));
@@ -692,9 +735,10 @@ fn mongo_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
                 config.push_str(&format!("password: {}\n", yaml(p)));
             }
         }
-        if cfg.ssl == SslMode::Require {
+        tls_on = cfg.ssl.required();
+        if tls_on {
             plan.args.push("--ssl".into());
-            if cfg.trust_server_certificate {
+            if cfg.trust_server_certificate && !cfg.ssl.verifies() {
                 plan.args.push("--tlsInsecure".into());
             }
         }
@@ -709,8 +753,23 @@ fn mongo_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
         let tls = lower.starts_with("mongodb+srv:")
             || lower.contains("tls=true")
             || lower.contains("ssl=true");
-        if tls && cfg.trust_server_certificate {
+        if tls && cfg.trust_server_certificate && !cfg.ssl.verifies() {
             plan.args.push("--tlsInsecure".into());
+        }
+        if !tls && cfg.ssl.verifies() {
+            plan.args.push("--ssl".into());
+        }
+        tls_on = tls || cfg.ssl.verifies();
+    }
+    if tls_on {
+        if cfg.ssl == SslMode::VerifyCa {
+            plan.args.push("--tlsAllowInvalidHostnames".into());
+        }
+        if let Some(ca) = cfg.root_cert() {
+            plan.args.push(format!("--tlsCAFile={ca}"));
+        }
+        if let Ok(Some(cert)) = crate::drivers::tls::combined_pem_cert(cfg) {
+            plan.args.push(format!("--tlsCertificateKeyFile={cert}"));
         }
     }
     if !config.is_empty() {
@@ -1753,6 +1812,9 @@ mod tests {
             auth: AuthMode::Password,
             ssl: SslMode::Prefer,
             trust_server_certificate: false,
+            ssl_root_cert: String::new(),
+            ssl_client_cert: String::new(),
+            ssl_client_key: String::new(),
             uri: String::new(),
             auth_source: String::new(),
             save_password: false,
@@ -1843,6 +1905,74 @@ mod tests {
         assert!(plan.env.contains(&("PGSSLMODE", "prefer".into())));
         assert!(plan.discard_on_failure);
         assert!(!plan.args.iter().any(|a| a.contains("pw")));
+    }
+
+    #[test]
+    fn tls_files_and_verify_modes_reach_the_tools() {
+        let mut c = cfg(Engine::Postgres);
+        c.ssl = SslMode::VerifyFull;
+        c.ssl_root_cert = "/certs/ca.pem".into();
+        c.ssl_client_cert = "/certs/c.crt".into();
+        c.ssl_client_key = "/certs/c.key".into();
+        c.tunneled = Some(("db.example.com".into(), 5432));
+        c.host = "127.0.0.1".into();
+        let dump = job(serde_json::json!({
+            "tool": "pg_dump", "database": "shop", "file": "s.sql", "format": "plain"
+        }));
+        let plan = dump
+            .plan(
+                &c,
+                None,
+                &tool(ToolKind::PgDump, "pg_dump (PostgreSQL) 17.2"),
+            )
+            .unwrap();
+        for env in [
+            ("PGSSLMODE", "verify-full"),
+            ("PGSSLROOTCERT", "/certs/ca.pem"),
+            ("PGSSLCERT", "/certs/c.crt"),
+            ("PGSSLKEY", "/certs/c.key"),
+            // Checked against the real server's name through the tunnel
+            ("PGHOSTADDR", "127.0.0.1"),
+        ] {
+            assert!(plan.env.contains(&(env.0, env.1.into())), "{env:?}");
+        }
+        assert!(plan.args.contains(&"--host=db.example.com".to_string()));
+
+        c.engine = Engine::Mysql;
+        c.ssl = SslMode::VerifyCa;
+        c.tunneled = None;
+        let dump = job(serde_json::json!({
+            "tool": "mysqldump", "database": "shop", "file": "s.sql"
+        }));
+        let mysql = dump
+            .plan(&c, None, &tool(ToolKind::Mysqldump, "mysqldump  Ver 8.4.0"))
+            .unwrap();
+        for flag in [
+            "--ssl-mode=VERIFY_CA",
+            "--ssl-ca=/certs/ca.pem",
+            "--ssl-cert=/certs/c.crt",
+            "--ssl-key=/certs/c.key",
+        ] {
+            assert!(mysql.args.contains(&flag.to_string()), "{flag}");
+        }
+        // The verify modes never skip the check, even with "trust" on
+        c.trust_server_certificate = true;
+        let mariadb = dump
+            .plan(
+                &c,
+                None,
+                &tool(
+                    ToolKind::Mysqldump,
+                    "mysqldump from 11.4.2-MariaDB, client 10.19",
+                ),
+            )
+            .unwrap();
+        assert!(
+            mariadb
+                .args
+                .contains(&"--ssl-verify-server-cert".to_string())
+        );
+        assert!(!mariadb.args.iter().any(|a| a.starts_with("--skip-ssl")));
     }
 
     #[test]

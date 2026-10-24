@@ -32,7 +32,7 @@ import {
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
-import { copyText } from '@/lib/export'
+import { copyText, EXPORT_MAX_ROWS, type FetchedRows } from '@/lib/export'
 import {
   buildOrderBy,
   buildWhere,
@@ -205,6 +205,7 @@ function DataView({
   const [total, setTotal] = useState<number | null>(null)
   const [panelOpen, setPanelOpen] = useState(false)
   const [filter, setFilter] = useState('')
+  const [exporting, setExporting] = useState(false)
 
   const set = output?.results[0]
   const columns: ColumnMeta[] = set?.columns ?? []
@@ -220,6 +221,9 @@ function DataView({
     [dialect, query, info.data]
   )
   const appliedOrder = useMemo(() => buildOrderBy(dialect, query.sorts), [dialect, query.sorts])
+  // Default to primary-key order so rows don't move around after an edit
+  const orderBy =
+    appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
 
   /** Applies a new filter / sort from the builder, chips or grid header. */
   const applyQuery = (next: QueryState): void => {
@@ -241,18 +245,16 @@ function DataView({
     setError(null)
     setRunning(tab.id, true)
     try {
-      // Default to primary-key order so rows don't move around after an edit
-      const orderBy =
-        appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
+      // One row past the page tells whether there's a next page
       const sql = selectRows(dialect, tableRef, {
         where: appliedWhere,
         orderBy,
-        limit: pageSize,
+        limit: pageSize + 1,
         offset: page * pageSize,
         keyColumns: pk
       })
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
-        maxRows: pageSize
+        maxRows: pageSize + 1
       })
       // Pending changes are keyed by primary key, so they survive reloads and paging
       if (out.error) setError(out.error.message)
@@ -297,7 +299,8 @@ function DataView({
     }
   }
 
-  const baseRows = set?.rows ?? []
+  // The page shown, without the extra row fetched to detect a next page
+  const baseRows = useMemo(() => set?.rows.slice(0, pageSize) ?? [], [set, pageSize])
   const generatedColumns = useMemo(() => {
     const generated = new Set<number>()
     columns.forEach((c, i) => {
@@ -393,7 +396,34 @@ function DataView({
       : null
 
   const from = page * pageSize
-  const hasNext = (set?.rowCount ?? 0) >= pageSize
+  const hasNext = (set?.rows.length ?? 0) > pageSize
+
+  /** Every row matching the filter, in the same order, for "Save as". */
+  const fetchAllRows = async (): Promise<FetchedRows> => {
+    // A separate session leaves the tab free to page and commit during a long fetch
+    const session = `${tab.id}:export`
+    setExporting(true)
+    try {
+      const sql = selectRows(dialect, tableRef, {
+        where: appliedWhere,
+        orderBy,
+        limit: EXPORT_MAX_ROWS + 1,
+        keyColumns: pk
+      })
+      const out = await api.execute(tab.connectionId, session, tab.database, sql, {
+        maxRows: EXPORT_MAX_ROWS,
+        readOnly: true
+      })
+      if (out.error) throw new Error(out.error.message)
+      if (out.cancelled) throw new Error('The fetch was cancelled.')
+      const all = out.results[0]
+      if (!all) throw new Error('The query returned no rows.')
+      return { columns: all.columns, rows: all.rows, truncated: all.truncated }
+    } finally {
+      void api.closeSession(tab.connectionId, session).catch(() => {})
+      setExporting(false)
+    }
+  }
 
   return (
     <>
@@ -426,7 +456,7 @@ function DataView({
           </Button>
           <span className="px-1 tabular-nums">
             {set
-              ? `${(from + (set.rows.length ? 1 : 0)).toLocaleString()}–${(from + set.rows.length).toLocaleString()}`
+              ? `${(from + (baseRows.length ? 1 : 0)).toLocaleString()}–${(from + baseRows.length).toLocaleString()}`
               : '—'}
           </span>
           <Button
@@ -487,13 +517,17 @@ function DataView({
           <Button
             size="xs"
             variant="ghost"
+            disabled={exporting}
             onClick={(e) =>
               exportMenu(
                 e.currentTarget,
                 { columns, rows },
                 tab.name,
                 dialect,
-                qualified(dialect, tableRef)
+                qualified(dialect, tableRef),
+                undefined,
+                // A single complete page saves what's shown, pending edits included
+                { partial: page > 0 || hasNext, fetch: fetchAllRows }
               )
             }
           >
@@ -510,7 +544,7 @@ function DataView({
           onClose={() => setBuilderOpen(false)}
         />
       )}
-      <ProgressBar active={loading} />
+      <ProgressBar active={loading || exporting} />
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
           {error ? (
@@ -581,7 +615,7 @@ function DataView({
       </div>
       {output && (
         <div className="flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 text-[11px] text-muted">
-          <span>{plural(set?.rows.length ?? 0, 'row')}</span>
+          <span>{plural(baseRows.length, 'row')}</span>
           <span className="text-faint">{formatDuration(output.elapsedMs)}</span>
           {canEdit && (
             <span className="text-faint">

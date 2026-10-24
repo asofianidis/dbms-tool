@@ -29,6 +29,12 @@ const CURSOR_METHODS = [
   'projection',
   'count',
   'explain',
+  'hint',
+  'maxTimeMS',
+  'collation',
+  'allowDiskUse',
+  'comment',
+  'readPref',
   'toArray',
   'pretty'
 ]

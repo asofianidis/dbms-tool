@@ -56,6 +56,7 @@ pub fn run() {
             commands::connection_test,
             commands::connection_open,
             commands::connection_close,
+            commands::ssh_trust_host_key,
             commands::limits_set,
             commands::db_databases,
             commands::db_schemas,

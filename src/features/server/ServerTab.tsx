@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Square } from 'lucide-react'
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
@@ -26,9 +26,20 @@ import {
 } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
-import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
+import {
+  Badge,
+  Button,
+  EmptyState,
+  EngineMark,
+  ErrorText,
+  Segmented,
+  Spinner
+} from '@/components/ui'
 import { documentsToGrid } from '../mongo/DocumentsView'
-import { LiveMetrics } from './LiveMetrics'
+import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
+
+const ACTIVITY_INTERVALS = ['off', '5', '15', '60'] as const
+type ActivityInterval = (typeof ACTIVITY_INTERVALS)[number]
 
 const ACTIVITY_SQL: Record<string, string> = {
   postgres: `SELECT pid, usename AS "user", datname AS "database", application_name AS app, client_addr AS client,
@@ -111,6 +122,21 @@ function ServerDashboard({
   const babelfish = connection.engine === 'babelfish' || !!info?.babelfishVersion
   const engineKey = babelfish ? 'babelfish' : connection.engine
   const activity = useActivity(connection, engineKey)
+  const [activityEvery, setActivityEvery] = useState<ActivityInterval>('5')
+  const visible = useDocumentVisible()
+  // The latest reload and loading state, so the timer isn't reset on every render
+  const activityRef = useRef(activity)
+  activityRef.current = activity
+  useEffect(() => {
+    if (activityEvery === 'off' || !active || !visible) return
+    const timer = setInterval(
+      () => {
+        if (!activityRef.current.loading) activityRef.current.reload()
+      },
+      Number(activityEvery) * 1000
+    )
+    return () => clearInterval(timer)
+  }, [activityEvery, active, visible])
   const spec = dashboardFor(connection.engine, babelfish)
   const actions = sessionActions(engineKey)
   const blocked = activity.set
@@ -254,12 +280,24 @@ function ServerDashboard({
                 {blocked} blocked{blockers.length > 0 && ` by ${blockers.join(', ')}`}
               </Badge>
             )}
-            {actions.length > 0 && (
-              <span className="ml-auto text-[11px] font-normal tracking-normal text-faint normal-case">
-                Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}kill
-                it
-              </span>
-            )}
+            <span className="ml-auto flex items-center gap-2 text-[11px] font-normal tracking-normal normal-case">
+              {actions.length > 0 && (
+                <span className="text-faint">
+                  Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}
+                  kill it
+                </span>
+              )}
+              <span className="text-muted">Refresh</span>
+              <Segmented
+                size="sm"
+                value={activityEvery}
+                onChange={setActivityEvery}
+                options={ACTIVITY_INTERVALS.map((v) => ({
+                  value: v,
+                  label: v === 'off' ? 'Off' : `${v}s`
+                }))}
+              />
+            </span>
           </h2>
           <div className="h-80 overflow-hidden rounded-lg border border-line">
             {activity.error ? (

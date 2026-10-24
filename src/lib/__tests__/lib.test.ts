@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { parseShellValue, scalarText, toShell } from '../ejson'
-import { parseConnectionString } from '../engines'
+import { parseConnectionString, sslModeFromParam } from '../engines'
 import { parseShell } from '../mongo-shell'
 import {
   dangerousStatements,
@@ -151,6 +151,25 @@ describe('parseConnectionString', () => {
     expect(parseConnectionString('mongodb+srv://u:pw@cluster0.x.net/db')?.engine).toBe('mongo')
   })
 
+  it('maps TLS modes and certificate files', () => {
+    const pg = parseConnectionString(
+      'postgres://me@db.example.com/app?sslmode=verify-full&sslrootcert=%2Fcerts%2Fca.pem&sslcert=%2Fcerts%2Fc.crt&sslkey=%2Fcerts%2Fc.key'
+    )
+    expect(pg?.patch).toMatchObject({
+      ssl: 'verify-full',
+      sslRootCert: '/certs/ca.pem',
+      sslClientCert: '/certs/c.crt',
+      sslClientKey: '/certs/c.key'
+    })
+    const my = parseConnectionString('mysql://u@h/db?ssl-mode=VERIFY_CA&ssl-ca=ca.pem')
+    expect(my?.patch).toMatchObject({ ssl: 'verify-ca', sslRootCert: 'ca.pem' })
+    expect(parseConnectionString('postgres://u@h/db')?.patch).not.toHaveProperty('sslRootCert')
+    expect(sslModeFromParam('VERIFY_IDENTITY')).toBe('verify-full')
+    expect(sslModeFromParam('REQUIRED')).toBe('require')
+    expect(sslModeFromParam('DISABLED')).toBe('disable')
+    expect(sslModeFromParam('allow')).toBe('prefer')
+  })
+
   it('reads ADO.NET strings', () => {
     const ms = parseConnectionString(
       'Server=tcp:sql.example.com,1444;Database=Shop;User Id=sa;Password=x;TrustServerCertificate=True'
@@ -256,5 +275,71 @@ describe('parseShell', () => {
 
   it('reports syntax errors', () => {
     expect(() => parseShell('db.users.find({ a: }', 'app')).toThrow(/Syntax error/)
+  })
+
+  it('sends cursor options instead of dropping them', () => {
+    const [find] = parseShell(
+      "db.users.find({ a: 1 }).hint({ a: 1 }).maxTimeMS(500).collation({ locale: 'fr' }).allowDiskUse().readPref('secondary')",
+      'app'
+    )
+    expect(find.kind === 'request' && find.request).toMatchObject({
+      op: 'find',
+      options: {
+        hint: { a: 1 },
+        maxTimeMS: 500,
+        collation: { locale: 'fr' },
+        allowDiskUse: true,
+        readPreference: 'secondary'
+      }
+    })
+    const [agg] = parseShell(
+      "db.o.aggregate([{ $sort: { x: 1 } }], { allowDiskUse: true, hint: 'x_1' })",
+      'app'
+    )
+    expect(agg.kind === 'request' && agg.request).toMatchObject({
+      op: 'aggregate',
+      options: { allowDiskUse: true, hint: 'x_1' }
+    })
+    const [count] = parseShell("db.users.find({ a: 1 }).hint('a_1').count()", 'app')
+    expect(count.kind === 'request' && count.request).toMatchObject({
+      op: 'count',
+      options: { hint: 'a_1' }
+    })
+    const [explain] = parseShell("db.users.find({ a: 1 }).hint('a_1').explain()", 'app')
+    expect(explain.kind === 'request' && explain.request).toMatchObject({
+      op: 'runCommand',
+      command: { explain: { find: 'users', hint: 'a_1' } }
+    })
+  })
+
+  it('rejects scripts that read query results', () => {
+    expect(() => parseShell('db.users.find().forEach((d) => print(d.name))', 'app')).toThrow(
+      /forEach\(\) isn't supported/
+    )
+    expect(() => parseShell('db.users.find().map((d) => d.name)', 'app')).toThrow(/map/)
+    expect(() => parseShell('const docs = db.users.find().toArray(); docs.length', 'app')).toThrow(
+      /\.length/
+    )
+    expect(() => parseShell('if (db.users.countDocuments() > 0) print("x")', 'app')).toThrow(
+      /expression/
+    )
+    expect(() => parseShell('print(db.users.findOne())', 'app')).toThrow(/Printing/)
+    // A trailing toArray() only shows the results, which is fine
+    expect(parseShell('db.users.find().toArray()', 'app')).toHaveLength(1)
+  })
+
+  it('rejects options it would otherwise ignore', () => {
+    expect(() =>
+      parseShell("db.u.updateOne({}, { $set: { 'a.$[x]': 1 } }, { arrayFilters: [] })", 'app')
+    ).toThrow(/arrayFilters/)
+    expect(() => parseShell('db.u.deleteMany({}, { hint: { a: 1 } })', 'app')).toThrow(/hint/)
+    expect(() => parseShell('db.u.find({}, null, { tailable: true })', 'app')).toThrow(/tailable/)
+    const [upd] = parseShell(
+      "db.u.findOneAndUpdate({}, { $set: { a: 1 } }, { arrayFilters: [{ 'x.y': 1 }] })",
+      'app'
+    )
+    expect(upd.kind === 'request' && upd.request).toMatchObject({
+      command: { arrayFilters: [{ 'x.y': 1 }] }
+    })
   })
 })

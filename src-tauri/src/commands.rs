@@ -194,6 +194,12 @@ pub async fn connection_open(
     Ok(info)
 }
 
+/// Trusts the SSH host key a `host_key_unknown` error showed the user
+#[tauri::command]
+pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
+    crate::tunnel::trust_host_key(&token).await
+}
+
 #[tauri::command]
 pub fn connection_close(state: State<'_, AppState>, id: String) {
     state.manager.close(&id);
@@ -431,6 +437,8 @@ pub async fn query_export(
             timeout_secs: None,
             max_binary_bytes: usize::MAX,
             sink: Some(handle.clone()),
+            // Only offered for text that just reads; the backend check backs that up
+            read_only: true,
         };
         let server = state.manager.get(&id)?;
         let output = server.execute(&session, &database, &sql, &opts).await?;
