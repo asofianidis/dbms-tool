@@ -55,6 +55,51 @@ fn server_selection_cause(message: &str) -> &str {
         .unwrap_or("no server responded")
 }
 
+/// The host field as a seed list: `a,b:27018` → `a:27017,b:27018`. A replica
+/// set or a group of mongos routers is entered as several comma-separated hosts.
+pub fn host_list(cfg: &ConnectionConfig) -> String {
+    let port = if cfg.port == 0 { 27017 } else { cfg.port };
+    let hosts: Vec<String> = cfg
+        .host
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            let has_port = if h.starts_with('[') {
+                h.contains("]:")
+            } else {
+                h.matches(':').count() == 1
+            };
+            if has_port {
+                h.to_string()
+            } else if h.contains(':') && !h.starts_with('[') {
+                format!("[{h}]:{port}")
+            } else {
+                format!("{h}:{port}")
+            }
+        })
+        .collect();
+    if hosts.is_empty() {
+        format!("localhost:{port}")
+    } else {
+        hosts.join(",")
+    }
+}
+
+fn read_preference(mode: &str) -> AppResult<Option<ReadPreference>> {
+    Ok(Some(match mode.trim() {
+        "" => return Ok(None),
+        "primary" => ReadPreference::Primary,
+        "primaryPreferred" => ReadPreference::PrimaryPreferred { options: None },
+        "secondary" => ReadPreference::Secondary { options: None },
+        "secondaryPreferred" => ReadPreference::SecondaryPreferred { options: None },
+        "nearest" => ReadPreference::Nearest { options: None },
+        other => {
+            return Err(AppError::msg(format!("Unknown read preference '{other}'")));
+        }
+    }))
+}
+
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<Client> {
     // The driver's TLS library (rustls) always checks the host name, and can
     // only check the one it connects to
@@ -73,13 +118,10 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     let client_cert = super::tls::combined_pem_cert(cfg)?;
     let uri = cfg.uri.trim();
     let mut opts = if uri.is_empty() {
-        let host = if cfg.host.is_empty() {
-            "localhost"
-        } else {
-            cfg.host.as_str()
-        };
-        let port = if cfg.port == 0 { 27017 } else { cfg.port };
-        let mut opts = ClientOptions::parse(format!("mongodb://{host}:{port}/")).await?;
+        let mut opts = ClientOptions::parse(format!("mongodb://{}/", host_list(cfg))).await?;
+        if !cfg.replica_set.trim().is_empty() {
+            opts.repl_set_name = Some(cfg.replica_set.trim().to_string());
+        }
         if !cfg.user.is_empty() {
             opts.credential = Some(
                 Credential::builder()
@@ -101,6 +143,7 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         // own (unreachable) names, so talk to the one the tunnel reaches
         if cfg.tunneled.is_some() {
             opts.direct_connection = Some(true);
+            opts.repl_set_name = None;
         }
         opts
     } else {
@@ -137,6 +180,9 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
             super::tls::read_file(cert, "client certificate")?;
             tls.cert_key_file_path = Some(cert.into());
         }
+    }
+    if let Some(pref) = read_preference(&cfg.read_preference)? {
+        opts.selection_criteria = Some(pref.into());
     }
     opts.app_name = Some("dbms-tool".into());
     opts.server_selection_timeout = Some(crate::limits::connect_timeout());
@@ -454,12 +500,16 @@ fn is_read_command(command: &Value) -> bool {
         "top",
         "validate",
         "replSetGetStatus",
+        "replSetGetConfig",
+        "listShards",
+        "balancerStatus",
         "getLog",
     ];
-    command
-        .as_object()
-        .and_then(|o| o.keys().next())
-        .is_some_and(|k| READS.contains(&k.as_str()))
+    let Some((key, value)) = command.as_object().and_then(|o| o.iter().next()) else {
+        return false;
+    };
+    // `{ profile: -1 }` reads the profiler level; any other level changes it
+    READS.contains(&key.as_str()) || (key == "profile" && value.as_i64() == Some(-1))
 }
 
 #[derive(Debug, Serialize)]
@@ -949,6 +999,266 @@ pub async fn list_collections(client: &Client, database: &str) -> AppResult<Vec<
     Ok(objects)
 }
 
+/* ---------- Export ---------- */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// One JSON array (`mongoimport --jsonArray`)
+    Json,
+    /// One document per line (`mongoimport`'s default)
+    Jsonl,
+    Csv,
+}
+
+/// A whole find or pipeline result, streamed to a file instead of the grid.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    pub database: String,
+    pub collection: String,
+    pub filter: Option<Value>,
+    pub projection: Option<Value>,
+    pub sort: Option<Value>,
+    /// Exports the pipeline's output instead of a find
+    pub pipeline: Option<Vec<Value>>,
+    pub format: ExportFormat,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub documents: u64,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+    pub cancelled: bool,
+    /// CSV only: fields first seen after the header was written, left out of the file
+    pub dropped_fields: Vec<String>,
+}
+
+/// Documents a CSV export reads before writing its header.
+const CSV_SAMPLE: usize = 1000;
+
+/// Turns documents into file bytes. Pure, so the formats can be tested without a server.
+struct ExportWriter {
+    format: ExportFormat,
+    count: u64,
+    columns: Vec<String>,
+    header_written: bool,
+    pending: Vec<Document>,
+    dropped: std::collections::BTreeSet<String>,
+}
+
+impl ExportWriter {
+    fn new(format: ExportFormat) -> Self {
+        Self {
+            format,
+            count: 0,
+            columns: Vec::new(),
+            header_written: false,
+            pending: Vec::new(),
+            dropped: Default::default(),
+        }
+    }
+
+    fn push(&mut self, doc: Document) -> Vec<u8> {
+        self.count += 1;
+        match self.format {
+            ExportFormat::Json => {
+                let sep = if self.count == 1 { "[\n" } else { ",\n" };
+                format!("{sep}{}", Bson::Document(doc).into_relaxed_extjson()).into_bytes()
+            }
+            ExportFormat::Jsonl => {
+                format!("{}\n", Bson::Document(doc).into_relaxed_extjson()).into_bytes()
+            }
+            ExportFormat::Csv if self.header_written => self.csv_row(&doc).into_bytes(),
+            ExportFormat::Csv => {
+                self.pending.push(doc);
+                if self.pending.len() >= CSV_SAMPLE {
+                    self.flush_csv()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        match self.format {
+            ExportFormat::Json if self.count == 0 => b"[]\n".to_vec(),
+            ExportFormat::Json => b"\n]\n".to_vec(),
+            ExportFormat::Jsonl => Vec::new(),
+            ExportFormat::Csv => self.flush_csv(),
+        }
+    }
+
+    /// Writes the header (every field the sampled documents have) and the sampled rows.
+    fn flush_csv(&mut self) -> Vec<u8> {
+        if self.header_written {
+            return Vec::new();
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for doc in &pending {
+            for key in doc.keys() {
+                if !self.columns.contains(key) {
+                    self.columns.push(key.clone());
+                }
+            }
+        }
+        self.header_written = true;
+        if self.columns.is_empty() {
+            return Vec::new();
+        }
+        let header = self
+            .columns
+            .iter()
+            .map(|c| csv_quote(c))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut out = format!("{header}\r\n");
+        for doc in &pending {
+            out.push_str(&self.csv_row(doc));
+        }
+        out.into_bytes()
+    }
+
+    fn csv_row(&mut self, doc: &Document) -> String {
+        for key in doc.keys() {
+            if !self.columns.contains(key) {
+                self.dropped.insert(key.clone());
+            }
+        }
+        let cells = self
+            .columns
+            .iter()
+            .map(|c| csv_quote(&doc.get(c).map(csv_cell).unwrap_or_default()))
+            .collect::<Vec<_>>();
+        format!("{}\r\n", cells.join(","))
+    }
+}
+
+/// A field as spreadsheet text: plain scalars, Extended JSON for everything else.
+fn csv_cell(value: &Bson) -> String {
+    match value {
+        Bson::Null | Bson::Undefined => String::new(),
+        Bson::String(s) => s.clone(),
+        Bson::Boolean(b) => b.to_string(),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(f) => f.to_string(),
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::ObjectId(id) => id.to_hex(),
+        Bson::DateTime(d) => d
+            .try_to_rfc3339_string()
+            .unwrap_or_else(|_| d.timestamp_millis().to_string()),
+        other => other.clone().into_relaxed_extjson().to_string(),
+    }
+}
+
+fn csv_quote(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Streams the result to `path`, through a `.part` file that only replaces
+/// `path` once every document is written.
+pub async fn export(
+    client: &Client,
+    request: ExportRequest,
+    path: &std::path::Path,
+    cancel: &CancelSignal,
+) -> AppResult<ExportSummary> {
+    let started = Instant::now();
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    match write_export(client, request, &part, cancel).await {
+        Ok(Some(mut summary)) => {
+            tokio::fs::rename(&part, path).await?;
+            summary.elapsed_ms = started.elapsed().as_millis() as u64;
+            Ok(summary)
+        }
+        Ok(None) => {
+            let _ = tokio::fs::remove_file(&part).await;
+            Ok(ExportSummary {
+                cancelled: true,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                ..Default::default()
+            })
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&part).await;
+            Err(e)
+        }
+    }
+}
+
+/// `None` when cancelled.
+async fn write_export(
+    client: &Client,
+    request: ExportRequest,
+    part: &std::path::Path,
+    cancel: &CancelSignal,
+) -> AppResult<Option<ExportSummary>> {
+    use tokio::io::AsyncWriteExt;
+    let c = client
+        .database(&request.database)
+        .collection::<Document>(&request.collection);
+    let opened = async {
+        if let Some(pipeline) = request.pipeline {
+            if pipeline_writes(&pipeline) {
+                return Err(AppError::msg(
+                    "Remove the $out or $merge stage to export the pipeline's output",
+                ));
+            }
+            return Ok(c.aggregate(to_docs(pipeline)?).await?);
+        }
+        let mut find = c.find(to_doc(request.filter)?);
+        let projection = to_doc(request.projection)?;
+        if !projection.is_empty() {
+            find = find.projection(projection);
+        }
+        let sort = to_doc(request.sort)?;
+        if !sort.is_empty() {
+            find = find.sort(sort);
+        }
+        Ok(find.await?)
+    };
+    let mut cursor = tokio::select! {
+        biased;
+        _ = cancel.wait() => return Ok(None),
+        c = opened => c?,
+    };
+    let mut file = tokio::io::BufWriter::new(tokio::fs::File::create(part).await?);
+    let mut writer = ExportWriter::new(request.format);
+    let mut bytes = 0u64;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.wait() => return Ok(None),
+            d = cursor.try_next() => d?,
+        };
+        let Some(doc) = next else { break };
+        let chunk = writer.push(doc);
+        bytes += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    let tail = writer.finish();
+    bytes += tail.len() as u64;
+    file.write_all(&tail).await?;
+    file.flush().await?;
+    Ok(Some(ExportSummary {
+        documents: writer.count,
+        bytes,
+        elapsed_ms: 0,
+        cancelled: false,
+        dropped_fields: writer.dropped.into_iter().collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1272,22 @@ mod tests {
             cause,
             "No connection could be made because the target machine actively refused it"
         );
+    }
+
+    #[test]
+    fn builds_seed_lists_from_the_host_field() {
+        let cfg = |host: &str, port: u16| -> ConnectionConfig {
+            serde_json::from_value(json!({
+                "id": "", "name": "", "engine": "mongo", "host": host, "port": port
+            }))
+            .unwrap()
+        };
+        assert_eq!(host_list(&cfg("", 0)), "localhost:27017");
+        assert_eq!(
+            host_list(&cfg("a, b:27018 ,c", 27019)),
+            "a:27019,b:27018,c:27019"
+        );
+        assert_eq!(host_list(&cfg("::1,[::2]:5", 0)), "[::1]:27017,[::2]:5");
     }
 
     #[test]
@@ -981,5 +1307,57 @@ mod tests {
         let json = to_json(Bson::Document(doc.clone()));
         assert_eq!(json["_id"]["$oid"], json!(oid.to_hex()));
         assert_eq!(to_bson(json).unwrap(), Bson::Document(doc));
+    }
+
+    #[test]
+    fn reading_the_profiler_level_is_a_read() {
+        assert!(is_read_command(&json!({ "profile": -1 })));
+        assert!(!is_read_command(&json!({ "profile": 1, "slowms": 100 })));
+        assert!(!is_read_command(&json!({ "collMod": "users" })));
+    }
+
+    #[test]
+    fn exports_json_arrays_and_lines() {
+        let docs = || vec![doc! { "a": 1, "b": "x" }, doc! { "a": 2 }];
+        let mut json = ExportWriter::new(ExportFormat::Json);
+        let mut out: Vec<u8> = docs().into_iter().flat_map(|d| json.push(d)).collect();
+        out.extend(json.finish());
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, json!([{ "a": 1, "b": "x" }, { "a": 2 }]));
+
+        let mut empty = ExportWriter::new(ExportFormat::Json);
+        assert_eq!(empty.finish(), b"[]\n");
+
+        let mut lines = ExportWriter::new(ExportFormat::Jsonl);
+        let out: Vec<u8> = docs().into_iter().flat_map(|d| lines.push(d)).collect();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"a\":1,\"b\":\"x\"}\n{\"a\":2}\n"
+        );
+    }
+
+    #[test]
+    fn exports_csv_with_a_sampled_header() {
+        let id = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        let mut csv = ExportWriter::new(ExportFormat::Csv);
+        let mut out = csv.push(doc! { "_id": id, "name": "a, b" });
+        out.extend(csv.push(doc! { "_id": id, "tags": ["x"], "n": Bson::Null }));
+        out.extend(csv.finish());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "_id,name,tags,n\r\n65a1b2c3d4e5f60718293a4b,\"a, b\",,\r\n65a1b2c3d4e5f60718293a4b,,\"[\"\"x\"\"]\",\r\n"
+        );
+        assert!(csv.dropped.is_empty());
+    }
+
+    #[test]
+    fn reports_csv_fields_seen_after_the_header() {
+        let mut csv = ExportWriter::new(ExportFormat::Csv);
+        for i in 0..CSV_SAMPLE {
+            csv.push(doc! { "i": i as i32 });
+        }
+        let row = csv.push(doc! { "i": 1, "late": true });
+        assert_eq!(row, b"1\r\n");
+        assert_eq!(csv.dropped.iter().collect::<Vec<_>>(), ["late"]);
     }
 }

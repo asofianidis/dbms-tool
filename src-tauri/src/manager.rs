@@ -246,6 +246,20 @@ impl Server {
         }
     }
 
+    /// Streams a whole find or pipeline result to `path`; cancelled like a query on `key`.
+    pub async fn mongo_export(
+        &self,
+        key: &str,
+        request: mongo::ExportRequest,
+        path: &std::path::Path,
+    ) -> AppResult<mongo::ExportSummary> {
+        let client = self.mongo()?;
+        let signal = self.begin(key);
+        let result = mongo::export(client, request, path, &signal).await;
+        self.end(key, &signal);
+        result
+    }
+
     pub async fn list_databases(&self) -> AppResult<Vec<DatabaseInfo>> {
         if let Some(client) = &self.mongo {
             return mongo::list_databases(client).await;

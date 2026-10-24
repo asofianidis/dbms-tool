@@ -721,8 +721,24 @@ fn mongo_connection(plan: &mut Plan, cfg: &ConnectionConfig, password: Option<&s
     let mut config = String::new();
     let tls_on;
     if uri.is_empty() {
-        plan.args.push(format!("--host={}", host(cfg)));
-        plan.args.push(format!("--port={}", port(cfg, 27017)));
+        let replica_set = cfg.replica_set.trim();
+        if cfg.host.contains(',') || (!replica_set.is_empty() && cfg.tunneled.is_none()) {
+            // A seed list goes in --host as `<set>/<host:port>,…`
+            let hosts = crate::drivers::mongo::host_list(cfg);
+            plan.args
+                .push(if replica_set.is_empty() || cfg.tunneled.is_some() {
+                    format!("--host={hosts}")
+                } else {
+                    format!("--host={replica_set}/{hosts}")
+                });
+        } else {
+            plan.args.push(format!("--host={}", host(cfg)));
+            plan.args.push(format!("--port={}", port(cfg, 27017)));
+        }
+        if !cfg.read_preference.trim().is_empty() {
+            plan.args
+                .push(format!("--readPreference={}", cfg.read_preference.trim()));
+        }
         if !cfg.user.is_empty() {
             plan.args.push(format!("--username={}", cfg.user));
             let source = if cfg.auth_source.is_empty() {
@@ -1817,6 +1833,8 @@ mod tests {
             ssl_client_key: String::new(),
             uri: String::new(),
             auth_source: String::new(),
+            replica_set: String::new(),
+            read_preference: String::new(),
             save_password: false,
             read_only: false,
             production: false,

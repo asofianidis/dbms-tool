@@ -139,6 +139,13 @@ pub struct ConnectionConfig {
     /// MongoDB authentication database
     #[serde(default)]
     pub auth_source: String,
+    /// MongoDB replica set name, for the host and port form
+    #[serde(default)]
+    pub replica_set: String,
+    /// MongoDB read preference (`secondaryPreferred`, …); empty keeps the
+    /// driver's default or the connection string's
+    #[serde(default)]
+    pub read_preference: String,
     #[serde(default)]
     pub save_password: bool,
     /// Blocks writes from the query editor and data grid

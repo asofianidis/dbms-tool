@@ -24,6 +24,10 @@ export interface ConnectionConfig {
   sslClientKey?: string
   uri: string
   authSource: string
+  /** MongoDB replica set name (host and port form) */
+  replicaSet?: string
+  /** MongoDB read preference; empty keeps the default */
+  readPreference?: string
   savePassword: boolean
   readOnly: boolean
   /** Writes need an extra confirmation, and destructive ones the connection's name typed */
@@ -488,6 +492,28 @@ export interface MongoOutput {
   cancelled: boolean
 }
 
+export type MongoExportFormat = 'json' | 'jsonl' | 'csv'
+
+/** A whole find (or, with `pipeline`, aggregation) result written to a file. */
+export interface MongoExportRequest {
+  database: string
+  collection: string
+  filter?: Ejson
+  projection?: Ejson
+  sort?: Ejson
+  pipeline?: Ejson[]
+  format: MongoExportFormat
+}
+
+export interface MongoExportSummary {
+  documents: number
+  bytes: number
+  elapsedMs: number
+  cancelled: boolean
+  /** CSV only: fields first seen after the header was written */
+  droppedFields: string[]
+}
+
 export interface AppError {
   code:
     | 'error'
@@ -622,6 +648,8 @@ export const api = {
       options: wireOptions(options)
     })
   },
+  mongoExport: (id: string, session: string, request: MongoExportRequest, path: string) =>
+    invoke<MongoExportSummary>('mongo_export', { id, session, request, path }),
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),

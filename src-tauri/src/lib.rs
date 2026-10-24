@@ -70,6 +70,7 @@ pub fn run() {
             commands::query_export,
             commands::session_close,
             commands::mongo_execute,
+            commands::mongo_export,
             commands::file_write_text,
             commands::file_write_bytes,
             commands::file_write_xlsx,

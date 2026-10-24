@@ -499,6 +499,29 @@ pub async fn mongo_execute(
     })
 }
 
+/// Writes a whole collection or query result to a file the user picked.
+#[tauri::command]
+pub async fn mongo_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    session: String,
+    request: crate::drivers::mongo::ExportRequest,
+    path: String,
+) -> AppResult<crate::drivers::mongo::ExportSummary> {
+    crate::file_scope::check(&app, &path)?;
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .mongo_export(&session, request, std::path::Path::new(&path))
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!("MongoDB export on {} failed", connection_label(&state, &id))
+    })
+}
+
 #[tauri::command]
 pub async fn file_write_text(
     app: tauri::AppHandle,

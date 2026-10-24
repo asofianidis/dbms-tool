@@ -4,7 +4,8 @@ import type { Dialect } from './engines'
 /* ---------- Model ---------- */
 
 /** What the EXPLAIN statement asked the server for, and so how to read its output. */
-export type PlanFormat = 'postgres-json' | 'postgres-text' | 'mysql-tree' | 'showplan-xml'
+export type PlanFormat =
+  'postgres-json' | 'postgres-text' | 'mysql-tree' | 'showplan-xml' | 'mongo-explain'
 
 export interface PlanNode {
   /** Depth-first position across the whole plan */
@@ -78,16 +79,16 @@ export interface Plan {
   hints: PlanHint[]
 }
 
-type RawHint = Omit<PlanHint, 'nodeId'> & { node?: PlanNode }
+export type RawHint = Omit<PlanHint, 'nodeId'> & { node?: PlanNode }
 
-interface Parsed {
+export interface Parsed {
   trees: PlanTree[]
   planningMs?: number | null
   executionMs?: number | null
   hints?: RawHint[]
 }
 
-function blankNode(op: string): PlanNode {
+export function blankNode(op: string): PlanNode {
   return {
     id: 0,
     op,
@@ -183,7 +184,7 @@ export function parsePlan(output: ExecOutput, format: PlanFormat): Plan | null {
   return buildPlan(format, parsed)
 }
 
-function buildPlan(format: PlanFormat, parsed: Parsed): Plan {
+export function buildPlan(format: PlanFormat, parsed: Parsed): Plan {
   let id = 0
   let analyzed = false
   let hasCost = false
@@ -815,8 +816,9 @@ function planHints(plan: Plan): RawHint[] {
   for (const t of plan.trees) walkPlan(t.root, (node, parent) => nodes.push({ node, parent }))
 
   for (const { node, parent } of nodes) {
-    // Scans that read a lot to keep a little, or that repeat for every outer row
-    if (node.fullScan) {
+    // Scans that read a lot to keep a little, or that repeat for every outer row.
+    // MongoDB's parser writes its own, with an index to create
+    if (node.fullScan && plan.format !== 'mongo-explain') {
       const where = node.target ?? node.relation ?? 'the table'
       const loops = node.loops ?? node.estLoops ?? 1
       const kept = node.actualRows

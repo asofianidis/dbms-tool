@@ -11,7 +11,7 @@ import { clearTransactionState, openTransactionsStore } from './transactions'
 /* ---------- Tabs ---------- */
 
 export type TableView = 'data' | 'structure' | 'definition'
-export type CollectionView = 'documents' | 'aggregation' | 'schema' | 'indexes'
+export type CollectionView = 'documents' | 'aggregation' | 'schema' | 'indexes' | 'validation'
 
 export type Tab =
   | { id: string; kind: 'welcome' }

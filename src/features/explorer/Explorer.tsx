@@ -73,14 +73,14 @@ import {
   openImport,
   openServer,
   openTable,
-  promptText,
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
 import { showContextMenu, showMenuAt, type MenuItem } from '@/components/ContextMenu'
 import { exportConnectionsToFile, openImportConnections } from '../connections/ImportConnections'
 import { Button, EngineMark, Spinner } from '@/components/ui'
-import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
+import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
+import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
@@ -542,14 +542,15 @@ function DatabaseNode({
         {
           label: 'Create collection…',
           icon: <Plus />,
-          onSelect: async () => {
-            const name = await promptText({
-              title: 'Create collection',
-              label: `Name of the new collection in ${database}`,
-              confirmLabel: 'Create'
-            })
-            if (name?.trim()) void createCollection(connection.id, database, name.trim())
-          }
+          disabled: connection.readOnly,
+          onSelect: () => openCreateCollection({ connectionId: connection.id, database })
+        },
+        {
+          label: 'Create view…',
+          icon: <Eye />,
+          disabled: connection.readOnly,
+          onSelect: () =>
+            openCreateCollection({ connectionId: connection.id, database, kind: 'view' })
         },
         {
           label: 'Drop database',
