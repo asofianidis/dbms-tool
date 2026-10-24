@@ -1,0 +1,10 @@
+# Changes to the build, release and security surface need the maintainer's review
+/.github/                       @asofianidis
+/scripts/                       @asofianidis
+/src-tauri/tauri.conf.json      @asofianidis
+/src-tauri/capabilities/        @asofianidis
+/src-tauri/Cargo.toml           @asofianidis
+/src-tauri/.cargo/              @asofianidis
+/src-tauri/vendor/              @asofianidis
+/package.json                   @asofianidis
+/SECURITY.md                    @asofianidis

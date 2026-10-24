@@ -23,9 +23,22 @@ The release stays a draft until every platform has uploaded. The publish job the
 `SHA256SUMS.txt`, a build-provenance attestation for every file, and `latest.json` for the
 auto-updater, and only then makes the release public.
 
+## Approving a release
+
+The build job runs in the `release` environment (**Settings → Environments**), which only `main`
+and `v*` tags may use and which needs a maintainer's approval. After CI passes, the run waits at
+**Review deployments**; approve it to build, sign and publish. Merging to `main` therefore never
+ships an update to installed apps on its own.
+
 ## Secrets
 
-Add these under **Settings → Secrets and variables → Actions** in the GitHub repository.
+Add these as **environment secrets of `release`** (Settings → Environments → release), not as
+repository secrets, so that only the approved build job can read them:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env release < ~/.tauri/dbms-tool.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release
+```
 
 ### Required: update signing
 
@@ -51,9 +64,11 @@ pnpm tauri signer generate -w ~/.tauri/dbms-tool.key --force
 
 Without these, macOS builds are unsigned, and Gatekeeper asks users who downloaded the `.dmg` in a
 browser to approve the app in System Settings → Privacy & Security on first launch.
-`scripts/install-mac.sh` (see the README's install section) avoids that prompt. It reads the
-release marked Latest and installs its `*_universal.app.tar.gz`. You need an
-[Apple Developer Program](https://developer.apple.com/programs/) membership.
+`scripts/install-mac.sh` (see the README's install section) reads the release marked Latest,
+checks its `*_universal.app.tar.gz` against `SHA256SUMS.txt` and installs it. Once builds are
+signed, the script also requires the signature and notarization to verify, so set all six
+secrets together. You need an [Apple Developer Program](https://developer.apple.com/programs/)
+membership.
 
 1. In Xcode or the developer portal create a **Developer ID Application** certificate and export
    it from Keychain Access as a `.p12` with a password.
