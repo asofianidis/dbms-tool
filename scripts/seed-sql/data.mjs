@@ -3,7 +3,7 @@
 // (e.g. an order's customer) without a lookup and foreign keys stay consistent across parallel workers.
 // Child-table ids are derived from the parent id (order_id * 64 + line), so they are unique but sparse.
 
-export const N = {
+const BASE = {
   customers: 1_000_000,
   products: 100_000,
   orders: 5_000_000,
@@ -12,8 +12,12 @@ export const N = {
   tickets: 500_000,
   hosts: 200,
 };
-export function configure(scale) {
-  for (const k of Object.keys(N)) N[k] = Math.max(k === "hosts" ? 10 : 100, Math.round(N[k] * scale));
+export const N = { ...BASE };
+// Days of per-minute metrics each host gets, ending at NOW.
+let metricDays = 17;
+export function configure(scale, days = 17) {
+  for (const k of Object.keys(N)) N[k] = Math.max(k === "hosts" ? 10 : 100, Math.round(BASE[k] * scale));
+  metricDays = days;
 }
 
 const DAY = 86_400_000;
@@ -562,7 +566,7 @@ export function genHost(h, emit) {
   const region = REGIONS[Math.floor(h / SERVICES.length) % REGIONS.length];
   const env = h % 25 === 0 ? "staging" : "prod";
   emit("hosts", { id: h + 1, hostname: `${service}-${region}-${String(h).padStart(3, "0")}`, service, region, az: region + pick(r, ["a", "b", "c"]), instance_type: pick(r, ["m6i.large", "m6i.xlarge", "c6g.2xlarge", "r6i.large"]), env });
-  const from = NOW - 17 * DAY, to = NOW;
+  const from = NOW - metricDays * DAY, to = NOW;
   const baseCpu = 15 + r() * 30, baseLat = 20 + r() * 80;
   // a few incidents per host: cpu spike + latency + errors
   const incidents = Array.from({ length: int(r, 1, 4) }, () => { const s = from + r() * (to - from); return [s, s + (10 + r() * 120) * 60_000, 1.5 + r() * 3]; });

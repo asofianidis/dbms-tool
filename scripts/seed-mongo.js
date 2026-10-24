@@ -4,10 +4,14 @@
 // cross-collection references stay consistent across parallel workers.
 //
 // env: COLL (users|products|orders|reviews|events|tickets|inventory|metrics|warehouses), START, END
+//      SCALE (default 1) multiplies the collection sizes, METRIC_DAYS (default 17) of per-minute metrics.
+// The app's "Seed sample database" also runs this file, with shims for process, db, print and ObjectId.
 
 const COLL = process.env.COLL;
 const START = Number(process.env.START || 0);
 const END = Number(process.env.END || 0);
+const SCALE = Number(process.env.SCALE || 1);
+const METRIC_DAYS = Number(process.env.METRIC_DAYS || 17);
 
 const N = {
   users: 1_000_000,
@@ -17,8 +21,9 @@ const N = {
   events: 10_000_000,
   tickets: 500_000,
   hosts: 200,
-  warehouses: 12,
 };
+for (const k of Object.keys(N)) N[k] = Math.max(k === "hosts" ? 10 : 100, Math.round(N[k] * SCALE));
+N.warehouses = 12;
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 9, 22, 23, 59);
 const T_ORDERS = Date.UTC(2023, 0, 1);
@@ -633,7 +638,7 @@ function run() {
   const started = Date.now();
   if (gen) for (let i = START; i < END; i++) push(gen(i));
   else if (COLL === "inventory") for (let i = START; i < END; i++) for (const d of inventoryDocs(i)) push(d);
-  else if (COLL === "metrics") { for (let h = START; h < END; h++) for (const d of metricDocsForHost(h, NOW - 17 * DAY, NOW)) push(d); }
+  else if (COLL === "metrics") { for (let h = START; h < END; h++) for (const d of metricDocsForHost(h, NOW - METRIC_DAYS * DAY, NOW)) push(d); }
   else if (COLL === "warehouses") for (const d of warehouseDocs()) push(d);
   else throw new Error("unknown COLL " + COLL);
   flush();

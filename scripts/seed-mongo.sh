@@ -44,22 +44,9 @@ jobs() {
 fi
 
 echo "Building indexes..."
+docker cp "$HERE/seed-mongo-indexes.js" "$CONTAINER:/tmp/seed-mongo-indexes.js"
+docker exec "$CONTAINER" mongosh --quiet "$URI" /tmp/seed-mongo-indexes.js
 docker exec "$CONTAINER" mongosh --quiet "$URI" --eval '
-  db.users.createIndexes([{ country: 1, tier: 1 }, { createdAt: -1 }]);
-  db.users.createIndex({ email: 1 }, { unique: true, name: "email_unique" });
-  db.products.createIndex({ sku: 1 }, { unique: true });
-  db.products.createIndexes([{ "category.l1": 1, price: -1 }, { brand: 1 }, { tags: 1 }]);
-  db.orders.createIndex({ orderNumber: 1 }, { unique: true });
-  db.orders.createIndexes([{ customerId: 1, createdAt: -1 }, { status: 1, createdAt: -1 }, { createdAt: -1 }, { "items.productId": 1 }]);
-  db.reviews.createIndexes([{ productId: 1, createdAt: -1 }, { userId: 1 }]);
-  db.reviews.createIndex({ title: "text", body: "text" }, { name: "review_text", language_override: "textLanguage" });
-  db.events.createIndexes([{ ts: -1 }, { userId: 1, ts: -1 }, { type: 1, ts: -1 }]);
-  db.events.createIndex({ "geo.loc": "2dsphere" });
-  db.tickets.createIndexes([{ customerId: 1 }, { orderId: 1 }, { status: 1, priority: 1 }, { "assignee.id": 1, createdAt: -1 }]);
-  db.inventory.createIndex({ productId: 1, warehouseId: 1 }, { unique: true });
-  db.inventory.createIndex({ warehouseId: 1, onHand: 1 });
-  db.warehouses.createIndex({ location: "2dsphere" });
-  // left unindexed on purpose: orders.totals.totalUsd, orders.shipping.address.city, events.props.*, reviews.rating
   db.getCollectionNames().sort().forEach((c) => {
     const s = db.runCommand({ collStats: c });
     print(c.padEnd(12), String(s.count).padStart(10), "docs", (s.size / 1e9).toFixed(2).padStart(7), "GB data", (s.storageSize / 1e9).toFixed(2).padStart(6), "GB disk");
