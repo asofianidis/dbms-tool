@@ -1,4 +1,5 @@
 import { setWriteGuard, type ConnectionConfig, type GuardedWrite, type MongoRequest } from './api'
+import { describeRedisDanger, redisIsWrite, redisSummary } from './redis'
 import { ENGINES, connectionLabel } from './engines'
 import { dangerousStatements } from './sql'
 import { confirm, getConnection } from './workspace'
@@ -183,6 +184,11 @@ function summarize(connection: ConnectionConfig, write: GuardedWrite): WriteSumm
       dangers: dangerousStatements(sql, dialect),
       code: sql.length > 2000 ? sql.slice(0, 2000) + '\n…' : sql
     }
+  }
+  if ('redis' in write) {
+    if (!redisIsWrite(write.redis)) return null
+    const danger = describeRedisDanger(write.redis)
+    return { action: redisSummary(write.redis), dangers: danger ? [danger] : [] }
   }
   const { request } = write
   if (!mongoIsWrite(request)) return null

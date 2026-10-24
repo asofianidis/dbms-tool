@@ -29,6 +29,9 @@ pub struct DatabaseInfo {
     pub name: String,
     pub is_system: bool,
     pub size_bytes: Option<i64>,
+    /// Keys in a Redis keyspace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

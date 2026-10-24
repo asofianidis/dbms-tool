@@ -13,6 +13,7 @@ import {
   type SeedDialect
 } from '../../scripts/seed-sql/schema.mjs'
 import mongoScript from '../../scripts/seed-mongo.js?raw'
+export { redisSeedBatches } from '../../scripts/seed-redis/commands.mjs'
 import mongoIndexScript from '../../scripts/seed-mongo-indexes.js?raw'
 import type { Cell, Ejson } from './api'
 import type { Dialect } from './engines'
@@ -38,6 +39,17 @@ export const SEED_SIZES: Record<
 }
 
 export const DEFAULT_SEED_DATABASE = 'acme_prod'
+
+/** Redis keeps everything in memory, so it offers the sizes that fit a laptop. */
+export const REDIS_SEED_HINTS: Partial<Record<SeedSize, string>> = {
+  small: 'About 40k keys and 25 MB of memory, a few seconds',
+  medium: 'About 380k keys and 210 MB of memory, under a minute'
+}
+
+/** The keyspace a Redis seed goes into by default: the first empty one, else 0. */
+export function defaultRedisSeedDatabase(databases: { name: string; keys?: number }[]): string {
+  return databases.find((d) => d.keys === 0)?.name ?? '0'
+}
 
 /** Tables the SQL dataset creates, plus its portable views, for replacing them on SQLite. */
 export const SEED_TABLES = Object.keys(TABLES)

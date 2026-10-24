@@ -61,9 +61,11 @@ import {
   Wrench,
   X,
   Zap,
-  GitCompareArrows
+  GitCompareArrows,
+  RadioTower,
+  Eraser
 } from 'lucide-react'
-import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
+import type { ConnectionConfig, DatabaseInfo, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
 import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
@@ -95,6 +97,8 @@ import {
   openImport,
   openServer,
   openTable,
+  openRedisKeys,
+  openRedisPubsub,
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
@@ -360,11 +364,21 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         ? { label: 'Disconnect', icon: <Unplug />, onSelect: () => void disconnect(connection.id) }
         : { label: 'Connect', icon: <PlugZap />, onSelect: () => void toggle() },
       {
-        label: connection.engine === 'mongo' ? 'New shell' : 'New query',
+        label: newTabLabel(connection),
         icon: <Terminal />,
         shortcut: 'Ctrl+N',
         onSelect: () => newQueryTab(connection.id)
       },
+      ...(connection.engine === 'redis'
+        ? [
+            {
+              label: 'Pub/Sub',
+              icon: <RadioTower />,
+              disabled: !connected,
+              onSelect: () => openRedisPubsub(connection.id)
+            }
+          ]
+        : []),
       {
         label: 'Server info',
         icon: <Server />,
@@ -508,7 +522,7 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
             <Button
               size="icon-sm"
               variant="ghost"
-              title={connection.engine === 'mongo' ? 'New shell' : 'New query'}
+              title={newTabLabel(connection)}
               onClick={() => newQueryTab(connection.id)}
             >
               <Terminal className="size-3.5" />
@@ -541,8 +555,14 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
   const [systemOpen, setSystemOpen] = useExpanded(`c:${connection.id}/system`)
   if (q.isPending) return <EmptyRow depth={1}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={1} error={q.error} onRetry={() => void q.refetch()} />
-  const user = q.data.filter((d) => showSystemObjects || !d.isSystem)
-  const system = showSystemObjects ? [] : q.data.filter((d) => d.isSystem)
+  // Redis always has 16 or so numbered keyspaces; the empty ones fold away like system databases
+  const tucked = (d: DatabaseInfo): boolean =>
+    d.keys !== undefined
+      ? d.keys === 0 && d.name !== (connection.database || '0')
+      : !showSystemObjects && d.isSystem
+  const user = q.data.filter((d) => !tucked(d))
+  const system = q.data.filter(tucked)
+  const redis = connection.engine === 'redis'
   return (
     <>
       {user.map((db) => (
@@ -552,6 +572,7 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
           database={db.name}
           depth={1}
           size={db.sizeBytes}
+          keys={db.keys}
         />
       ))}
       {system.length > 0 && (
@@ -566,7 +587,7 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
             icon={
               systemOpen ? <FolderOpen className="text-faint" /> : <Folder className="text-faint" />
             }
-            label="System databases"
+            label={redis ? 'Empty databases' : 'System databases'}
             detail={system.length}
           />
           {systemOpen &&
@@ -577,6 +598,7 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
                 database={db.name}
                 depth={2}
                 size={db.sizeBytes}
+                keys={db.keys}
               />
             ))}
         </>
@@ -594,20 +616,34 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
   )
 }
 
+function newTabLabel(connection: ConnectionConfig): string {
+  return connection.engine === 'mongo'
+    ? 'New shell'
+    : connection.engine === 'redis'
+      ? 'New console'
+      : 'New query'
+}
+
 function DatabaseNode({
   connection,
   database,
   depth,
-  size
+  size,
+  keys
 }: {
   connection: ConnectionConfig
   database: string
   depth: number
   size: number | null
+  keys?: number
 }): React.JSX.Element {
   const id = `c:${connection.id}/d:${database}`
   const [open, setOpen] = useExpanded(id)
   const isMongo = connection.engine === 'mongo'
+  if (connection.engine === 'redis')
+    return (
+      <RedisDatabaseNode connection={connection} database={database} depth={depth} keys={keys} />
+    )
 
   const menu = (e: React.MouseEvent): void => {
     const items: MenuItem[] = [
@@ -793,6 +829,99 @@ function DatabaseNode({
           </>
         ))}
     </>
+  )
+}
+
+function RedisDatabaseNode({
+  connection,
+  database,
+  depth,
+  keys
+}: {
+  connection: ConnectionConfig
+  database: string
+  depth: number
+  keys?: number
+}): React.JSX.Element {
+  const flush = async (): Promise<void> => {
+    const ok = await confirm({
+      title: `Empty database ${database}?`,
+      message: `FLUSHDB deletes all ${keys ?? ''} keys in database ${database}. This can't be undone.`,
+      confirmLabel: 'Delete every key',
+      danger: true,
+      typeToConfirm: `db${database}`
+    })
+    if (!ok) return
+    try {
+      // Typing the database name confirmed it; production connections still ask for their name
+      await api.redis(
+        connection.id,
+        '__meta',
+        { op: 'flush', database },
+        { confirmed: !connection.production }
+      )
+      toast(`Emptied database ${database}`)
+      void queryClient.invalidateQueries({ queryKey: ['conn', connection.id, 'databases'] })
+    } catch (e) {
+      toastError(e)
+    }
+  }
+  const menu = (e: React.MouseEvent): void =>
+    showContextMenu(e, [
+      { heading: `Database ${database}` },
+      {
+        label: 'Browse keys',
+        icon: <KeyRound />,
+        onSelect: () => openRedisKeys(connection.id, database)
+      },
+      {
+        label: 'New console here',
+        icon: <Terminal />,
+        onSelect: () => newQueryTab(connection.id, database)
+      },
+      { label: 'Pub/Sub', icon: <RadioTower />, onSelect: () => openRedisPubsub(connection.id) },
+      {
+        label: 'Refresh',
+        icon: <RefreshCw />,
+        onSelect: () =>
+          void queryClient.invalidateQueries({ queryKey: ['conn', connection.id, 'databases'] })
+      },
+      ...(connection.readOnly
+        ? []
+        : ([
+            'separator',
+            {
+              label: 'Empty database (FLUSHDB)…',
+              icon: <Eraser />,
+              danger: true,
+              disabled: keys === 0,
+              onSelect: () => void flush()
+            }
+          ] as MenuItem[]))
+    ])
+  return (
+    <Row
+      id={`c:${connection.id}/d:${database}`}
+      depth={depth}
+      onOpen={() => openRedisKeys(connection.id, database)}
+      onMenu={menu}
+      icon={<Database className={keys ? 'text-info' : 'text-faint'} />}
+      label={`db${database}`}
+      detail={
+        keys !== undefined ? `${compactCount(keys)} ${keys === 1 ? 'key' : 'keys'}` : undefined
+      }
+      title="Double-click to browse keys"
+      actions={
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          title="Browse keys"
+          onClick={() => openRedisKeys(connection.id, database)}
+        >
+          <KeyRound className="size-3.5" />
+        </Button>
+      }
+    />
   )
 }
 

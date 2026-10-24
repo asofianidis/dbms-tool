@@ -235,6 +235,8 @@ const TASKS: Record<Engine, MaintenanceTaskInfo[]> = {
     }
   ],
   babelfish: [],
+  // Redis manages its own memory and persistence; there's nothing to vacuum or reindex
+  redis: [],
   sqlite: [
     {
       value: 'vacuum',
@@ -529,6 +531,7 @@ export function maintenanceSteps(
     case 'mongo':
       return mongoSteps(draft, targets)
     case 'babelfish':
+    case 'redis':
       return []
   }
 }

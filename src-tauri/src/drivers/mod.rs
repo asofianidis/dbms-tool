@@ -3,6 +3,7 @@ pub mod mongo_srv;
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
+pub mod redis;
 pub mod sqlite;
 pub mod tls;
 
@@ -56,6 +57,11 @@ impl Session {
             Engine::Mongo => {
                 return Err(AppError::Unsupported(
                     "MongoDB doesn't use SQL sessions".into(),
+                ));
+            }
+            Engine::Redis => {
+                return Err(AppError::Unsupported(
+                    "Redis doesn't use SQL sessions".into(),
                 ));
             }
         })

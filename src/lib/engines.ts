@@ -117,10 +117,43 @@ export const ENGINES: Record<Engine, EngineInfo> = {
       routines: false,
       databases: false
     }
+  },
+  redis: {
+    id: 'redis',
+    label: 'Redis',
+    mark: 'RD',
+    description:
+      'Redis 5+, Valkey, KeyDB, Dragonfly and managed services like Upstash and ElastiCache',
+    defaultPort: 6379,
+    defaultUser: '',
+    defaultDatabase: '0',
+    dialect: null,
+    tone: 'bg-redis/15 text-redis',
+    hasSchemas: false,
+    features: {
+      designers: false,
+      tableDesigner: false,
+      permissions: false,
+      routines: false,
+      databases: false
+    }
   }
 }
 
-export const ENGINE_ORDER: Engine[] = ['postgres', 'mysql', 'mssql', 'babelfish', 'mongo', 'sqlite']
+export const ENGINE_ORDER: Engine[] = [
+  'postgres',
+  'mysql',
+  'mssql',
+  'babelfish',
+  'mongo',
+  'redis',
+  'sqlite'
+]
+
+/** Engines whose data isn't SQL or documents: no query editor, designers, compare, import or dashboards. */
+export function isKeyValue(engine: Engine): boolean {
+  return engine === 'redis'
+}
 
 export const CONNECTION_COLORS = [
   { value: '', label: 'None' },
@@ -164,6 +197,7 @@ export function connectionLabel(c: ConnectionConfig): string {
     return c.host ? (c.host.split(/[\\/]/).pop() ?? c.host) : 'Cloudflare D1'
   }
   if (c.engine === 'mongo' && c.uri) return hostFromUri(c.uri) ?? 'MongoDB'
+  if (c.engine === 'redis' && c.uri) return hostFromUri(c.uri) ?? 'Redis'
   return c.host
     ? `${c.host}${c.port && c.port !== ENGINES[c.engine].defaultPort ? `:${c.port}` : ''}`
     : ENGINES[c.engine].label
@@ -171,7 +205,7 @@ export function connectionLabel(c: ConnectionConfig): string {
 
 export function connectionSubtitle(c: ConnectionConfig): string {
   if (c.engine === 'sqlite') return c.host || (c.cloud ? `D1 · ${c.cloud.resource}` : '')
-  if (c.engine === 'mongo' && c.uri) return redactUri(c.uri)
+  if ((c.engine === 'mongo' || c.engine === 'redis') && c.uri) return redactUri(c.uri)
   const user = c.auth === 'windows' ? 'Windows auth' : c.user
   return [user && `${user}@`, c.host, c.port ? `:${c.port}` : '', c.database && `/${c.database}`]
     .filter(Boolean)
@@ -179,12 +213,13 @@ export function connectionSubtitle(c: ConnectionConfig): string {
 }
 
 function hostFromUri(uri: string): string | null {
-  const match = uri.match(/^mongodb(?:\+srv)?:\/\/(?:[^@/]*@)?([^/?]+)/)
+  const match = uri.match(/^(?:mongodb(?:\+srv)?|rediss?|valkeys?):\/\/(?:[^@/]*@)?([^/?#]+)/)
   return match?.[1] ?? null
 }
 
 export function redactUri(uri: string): string {
-  return uri.replace(/(\/\/[^:/@]+:)([^@]*)@/, '$1••••@')
+  // Redis strings often carry only a password: redis://:secret@host
+  return uri.replace(/(\/\/[^:/@]*:)([^@]*)@/, '$1••••@')
 }
 
 /** TLS must succeed (no plain-text fallback) */
@@ -209,7 +244,7 @@ export function sslModeFromParam(value: string): SslMode {
 
 /**
  * Parses a pasted connection string into connection fields. Understands
- * postgres://, mysql://, mongodb(+srv):// URIs and SQL Server ADO strings.
+ * postgres://, mysql://, mongodb(+srv)://, redis(s):// URIs and SQL Server ADO strings.
  */
 export function parseConnectionString(
   text: string
@@ -224,6 +259,16 @@ export function parseConnectionString(
       // Multi-host URIs aren't valid URLs; keep the raw string
     }
     return { engine: 'mongo', patch: { uri: s }, password }
+  }
+  if (/^(rediss?|valkeys?):\/\//i.test(s)) {
+    let password: string | undefined
+    try {
+      const url = new URL(s.replace(/^[a-z]+:/i, 'http:'))
+      if (url.password) password = decodeURIComponent(url.password)
+    } catch {
+      // Keep the raw string; the backend reports what's wrong with it
+    }
+    return { engine: 'redis', patch: { uri: s }, password }
   }
   const uriMatch = s.match(/^(postgres(?:ql)?|mysql|mariadb|sqlserver|mssql):\/\//i)
   if (uriMatch) {

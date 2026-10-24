@@ -17,6 +17,9 @@ import {
   Plus,
   Server,
   Settings,
+  KeyRound,
+  RadioTower,
+  SquareTerminal,
   Table2,
   Wrench,
   X
@@ -45,7 +48,12 @@ export function tabTitle(tab: Tab): string {
       return 'Settings'
     case 'query':
     case 'mongo':
+    case 'redis':
       return tab.filePath ? (tab.filePath.split(/[\\/]/).pop() ?? tab.title) : tab.title
+    case 'redisKeys':
+      return `Keys · db${tab.database}`
+    case 'redisPubsub':
+      return 'Pub/Sub'
     case 'table':
       return tab.schema && tab.schema !== 'dbo' && tab.schema !== 'public'
         ? `${tab.schema}.${tab.name}`
@@ -84,6 +92,12 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       return <FileCode2 className={cn(c, 'text-info')} />
     case 'mongo':
       return <Code2 className={cn(c, 'text-mongo')} />
+    case 'redis':
+      return <SquareTerminal className={cn(c, 'text-redis')} />
+    case 'redisKeys':
+      return <KeyRound className={cn(c, 'text-redis')} />
+    case 'redisPubsub':
+      return <RadioTower className={cn(c, 'text-redis')} />
     case 'table':
       if (tab.objectKind === 'view' || tab.objectKind === 'materialized_view') {
         return <Eye className={cn(c, 'text-syn-type')} />
@@ -182,7 +196,9 @@ export function TabBar(): React.JSX.Element {
               <span
                 className={cn(
                   'truncate',
-                  (tab.kind === 'query' || tab.kind === 'mongo') && !tab.filePath && 'italic'
+                  (tab.kind === 'query' || tab.kind === 'mongo' || tab.kind === 'redis') &&
+                    !tab.filePath &&
+                    'italic'
                 )}
               >
                 {tabTitle(tab)}

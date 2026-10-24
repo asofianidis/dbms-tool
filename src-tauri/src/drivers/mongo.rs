@@ -946,6 +946,7 @@ pub async fn list_databases(client: &Client) -> AppResult<Vec<DatabaseInfo>> {
                     name: db.name().to_string(),
                     is_system: false,
                     size_bytes: None,
+                    keys: None,
                 }]);
             }
             None => return Err(e.into()),
@@ -956,6 +957,7 @@ pub async fn list_databases(client: &Client) -> AppResult<Vec<DatabaseInfo>> {
         .map(|d| DatabaseInfo {
             is_system: matches!(d.name.as_str(), "admin" | "local" | "config"),
             size_bytes: Some(d.size_on_disk as i64),
+            keys: None,
             name: d.name,
         })
         .collect())

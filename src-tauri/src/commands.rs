@@ -4,6 +4,7 @@ use tauri::State;
 
 use crate::config::{self, AuthMode, ConnectionConfig, ConnectionStore, Engine};
 use crate::drivers::mongo::{MongoOutput, MongoRequest};
+use crate::drivers::redis::{RedisOutput, RedisRequest};
 use crate::error::{AppError, AppResult};
 use crate::manager::{self, Manager};
 use crate::model::*;
@@ -23,6 +24,10 @@ fn needs_password(config: &ConnectionConfig) -> bool {
     if config.engine == Engine::Mongo {
         // A URI may carry its own credentials; only ask when we built it ourselves
         return config.uri.trim().is_empty() && !config.user.is_empty();
+    }
+    // Many Redis servers have no AUTH at all, so a missing password is tried as is
+    if config.engine == Engine::Redis {
+        return false;
     }
     // Cloud tokens are fetched at connect time, and Windows auth needs none
     config.auth == AuthMode::Password && !config.user.is_empty()
@@ -161,7 +166,7 @@ pub async fn connection_test(
 ) -> AppResult<ServerInfo> {
     let password = resolve_password(&config, password);
     let probed = manager::probe(&config, password.as_deref(), ssh_secret.as_deref()).await;
-    let (info, _, _) = logged(probed, || {
+    let (info, _) = logged(probed, || {
         format!("Connection test to {} failed", describe(&config))
     })?;
     Ok(info)
@@ -520,6 +525,64 @@ pub async fn mongo_export(
     logged(result, || {
         format!("MongoDB export on {} failed", connection_label(&state, &id))
     })
+}
+
+#[tauri::command]
+pub async fn redis_execute(
+    state: State<'_, AppState>,
+    id: String,
+    session: String,
+    request: RedisRequest,
+    options: Option<ExecOptions>,
+) -> AppResult<RedisOutput> {
+    // Console arguments can hold values, so only the command name is logged
+    let command = match &request {
+        RedisRequest::Command { args, .. } => args.first().cloned().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .redis_execute(&session, request, &options.unwrap_or_default())
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Redis command {command} on {} failed",
+            connection_label(&state, &id)
+        )
+    })
+}
+
+/// Subscribes to Redis channels and patterns; messages arrive as
+/// `redis-pubsub` events tagged with `subscription`.
+#[tauri::command]
+pub async fn redis_subscribe(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    subscription: String,
+    channels: Vec<String>,
+    patterns: Vec<String>,
+) -> AppResult<()> {
+    use tauri::Emitter as _;
+    let server = state.manager.get(&id)?;
+    let result = server
+        .redis_subscribe(subscription, channels, patterns, move |batch| {
+            let _ = app.emit("redis-pubsub", batch);
+        })
+        .await;
+    logged(result, || {
+        format!("Subscribing on {} failed", connection_label(&state, &id))
+    })
+}
+
+#[tauri::command]
+pub fn redis_unsubscribe(state: State<'_, AppState>, id: String, subscription: String) {
+    if let Ok(server) = state.manager.get(&id) {
+        server.redis_unsubscribe(&subscription);
+    }
 }
 
 #[tauri::command]

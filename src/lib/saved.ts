@@ -9,7 +9,7 @@ export interface SavedQuery {
   id: string
   name: string
   text: string
-  kind: 'sql' | 'mongo'
+  kind: 'sql' | 'mongo' | 'redis'
   createdAt: number
   updatedAt: number
   lastRunAt?: number
@@ -23,7 +23,7 @@ export interface SavedQuery {
 export const savedQueriesStore = createPersistentStore<SavedQuery[]>('dbms.saved.v1', [])
 
 export function queryKindOf(engine: Engine): SavedQuery['kind'] {
-  return engine === 'mongo' ? 'mongo' : 'sql'
+  return engine === 'mongo' || engine === 'redis' ? engine : 'sql'
 }
 
 export function findByName(

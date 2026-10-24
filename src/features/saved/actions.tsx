@@ -67,7 +67,8 @@ export function targetLabel(target: RunTarget | undefined): string {
 }
 
 function missingConnection(query: SavedQuery): void {
-  toast(`Add a ${query.kind === 'mongo' ? 'MongoDB' : 'SQL'} connection to run this query`, 'error')
+  const engine = query.kind === 'mongo' ? 'MongoDB' : query.kind === 'redis' ? 'Redis' : 'SQL'
+  toast(`Add a ${engine} connection to run this query`, 'error')
 }
 
 /** Opens the query in a new tab; with `autorun` it runs as soon as the tab opens. */

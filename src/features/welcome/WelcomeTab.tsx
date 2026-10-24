@@ -46,7 +46,9 @@ export function WelcomeTab(): React.JSX.Element {
       const text = await api.readText(path)
       const target =
         connections.find((c) =>
-          path.endsWith('.sql') ? c.engine !== 'mongo' : c.engine === 'mongo'
+          path.endsWith('.sql')
+            ? c.engine !== 'mongo' && c.engine !== 'redis'
+            : c.engine === 'mongo'
         ) ?? connections[0]
       if (!target) return openConnectionDialog()
       newQueryTab(target.id, undefined, text)

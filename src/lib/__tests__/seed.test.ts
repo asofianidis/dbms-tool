@@ -6,9 +6,12 @@ import {
   postStatements,
   recreateDatabaseSql,
   schemaStatements,
+  defaultRedisSeedDatabase,
+  redisSeedBatches,
   seedCell,
   sqlSeedBatches
 } from '../seed'
+import { redisIsWrite } from '../redis'
 
 describe('sqlSeedBatches', () => {
   it('covers every table with batches no larger than the dialect allows', () => {
@@ -104,5 +107,42 @@ describe('mongo seed', () => {
       options: { unique: true, name: 'email_unique' }
     })
     expect(indexes.filter((i) => i.collection === 'orders')).toHaveLength(5)
+  })
+})
+
+describe('Redis seed', () => {
+  const all = (): string[][] => [...redisSeedBatches(0.001, 1)].flatMap((b) => b.commands)
+
+  it('emits text-only commands for every data type', () => {
+    const commands = all()
+    expect(commands.every((c) => c.every((a) => typeof a === 'string'))).toBe(true)
+    const names = new Set(commands.map((c) => c[0]))
+    for (const n of ['HSET', 'SET', 'RPUSH', 'SADD', 'ZADD', 'XADD', 'GEOADD', 'PFADD'])
+      expect(names.has(n)).toBe(true)
+    expect(commands).toContainEqual(['XGROUP', 'CREATE', 'events', 'analytics', '0'])
+    expect(commands.some((c) => c[1]?.startsWith('session:') && c[3] === 'EX')).toBe(true)
+  })
+
+  it('is reproducible and counts every generated record', () => {
+    const a = [...redisSeedBatches(0.001, 1)]
+    const b = [...redisSeedBatches(0.001, 1)]
+    // XADD * ids are assigned by the server, so the commands themselves match exactly
+    expect(a.flatMap((x) => x.commands)).toEqual(b.flatMap((x) => x.commands))
+    expect(a.reduce((n, x) => n + x.rows, 0)).toBeGreaterThan(80_000)
+    expect(a.at(-1)?.progress).toBe(1)
+  })
+
+  it('runs as a write pipeline into the first empty database', () => {
+    expect(redisIsWrite({ op: 'pipeline', database: '0', commands: [['GET', 'a']] })).toBe(false)
+    expect(
+      redisIsWrite({ op: 'pipeline', database: '0', commands: [['HSET', 'a', 'b', 'c']] })
+    ).toBe(true)
+    expect(
+      defaultRedisSeedDatabase([
+        { name: '0', keys: 4 },
+        { name: '1', keys: 0 }
+      ])
+    ).toBe('1')
+    expect(defaultRedisSeedDatabase([{ name: '0', keys: 4 }])).toBe('0')
   })
 })

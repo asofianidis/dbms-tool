@@ -6,6 +6,7 @@
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
+//! DBMS_TEST_REDIS=redis://localhost:6379
 //! ```
 //!
 //! `scripts/test-databases.sh` starts matching containers.
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::drivers::mongo::MongoRequest;
+use crate::drivers::redis::RedisRequest;
 use crate::manager::{META, Manager};
 use crate::model::*;
 
@@ -50,7 +52,7 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         ssh: None,
         tunneled: None,
     };
-    if engine == Engine::Mongo {
+    if engine == Engine::Mongo || engine == Engine::Redis {
         c.uri = raw;
         return Some((c, None));
     }
@@ -459,6 +461,213 @@ async fn mongo_end_to_end() {
     assert!(ro.mongo_execute("tab", req, &opts()).await.is_err());
 
     run(json!({ "op": "dropDatabase", "database": "dbms_test" })).await;
+}
+
+#[tokio::test]
+async fn redis_end_to_end() {
+    let Some((m, id)) = open(Engine::Redis, "DBMS_TEST_REDIS").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let run = |req: Value| {
+        let s = s.clone();
+        async move {
+            let request: RedisRequest = serde_json::from_value(req).unwrap();
+            s.redis_execute("tab", request, &opts()).await
+        }
+    };
+    let db = "15";
+    run(json!({ "op": "flush", "database": db })).await.unwrap();
+
+    // One key of every type, plus a binary key
+    run(json!({ "op": "set", "database": db, "key": "user:1:name", "value": "Ada", "ttlMs": 60000 })).await.unwrap();
+    run(json!({ "op": "hashSet", "database": db, "key": "user:1", "field": "email", "value": "ada@example.com" })).await.unwrap();
+    run(json!({ "op": "listPush", "database": db, "key": "queue", "values": ["a", "b", "c"] }))
+        .await
+        .unwrap();
+    run(json!({ "op": "setAdd", "database": db, "key": "tags", "members": ["x", "y"] }))
+        .await
+        .unwrap();
+    run(
+        json!({ "op": "zsetAdd", "database": db, "key": "scores", "member": "ada", "score": 42.5 }),
+    )
+    .await
+    .unwrap();
+    run(json!({ "op": "streamAdd", "database": db, "key": "events", "fields": [["kind", "login"]] })).await.unwrap();
+    run(json!({ "op": "set", "database": db, "key": { "$hex": "00ff" }, "value": { "$hex": "deadbeef" } })).await.unwrap();
+
+    let page = run(json!({ "op": "scan", "database": db })).await.unwrap();
+    assert_eq!(page.keys.len(), 7);
+    assert!(page.cursor.is_none());
+    let name = page
+        .keys
+        .iter()
+        .find(|k| k.key == json!("user:1:name"))
+        .unwrap();
+    assert_eq!(name.kind, "string");
+    assert!(name.ttl > 0 && name.ttl <= 60000);
+    let hashes = run(json!({ "op": "scan", "database": db, "keyType": "hash" }))
+        .await
+        .unwrap();
+    assert_eq!(hashes.keys.len(), 1);
+    let users = run(json!({ "op": "scan", "database": db, "pattern": "user:*" }))
+        .await
+        .unwrap();
+    assert_eq!(users.keys.len(), 2);
+
+    let get = |key: Value| run(json!({ "op": "get", "database": db, "key": key }));
+    let v = get(json!("user:1:name")).await.unwrap();
+    assert_eq!(v.value, Some(json!("Ada")));
+    assert_eq!(v.length, Some(3));
+    let v = get(json!({ "$hex": "00ff" })).await.unwrap();
+    assert_eq!(v.value, Some(json!({ "$hex": "deadbeef" })));
+    let v = get(json!("user:1")).await.unwrap();
+    assert_eq!(
+        v.entries,
+        vec![json!({ "field": "email", "value": "ada@example.com" })]
+    );
+    let v = get(json!("scores")).await.unwrap();
+    assert_eq!(v.entries[0]["score"], json!(42.5));
+    let v = get(json!("events")).await.unwrap();
+    assert_eq!(v.entries[0]["fields"], json!([["kind", "login"]]));
+
+    // Lists remove by index, and page by offset
+    run(json!({ "op": "listRemove", "database": db, "key": "queue", "index": 1 }))
+        .await
+        .unwrap();
+    let v = run(json!({ "op": "get", "database": db, "key": "queue", "count": 1 }))
+        .await
+        .unwrap();
+    assert_eq!(v.length, Some(2));
+    assert_eq!(v.entries, vec![json!({ "index": 0, "value": "a" })]);
+    assert_eq!(v.cursor.as_deref(), Some("1"));
+
+    // TTL, rename and refusing to clobber
+    run(json!({ "op": "expire", "database": db, "key": "user:1:name" }))
+        .await
+        .unwrap();
+    assert_eq!(get(json!("user:1:name")).await.unwrap().ttl, Some(-1));
+    run(json!({ "op": "rename", "database": db, "key": "tags", "newKey": "labels" }))
+        .await
+        .unwrap();
+    assert!(
+        run(json!({ "op": "rename", "database": db, "key": "labels", "newKey": "queue" }))
+            .await
+            .is_err()
+    );
+    assert!(
+        run(json!({ "op": "set", "database": db, "key": "queue", "value": "x", "onlyNew": true }))
+            .await
+            .is_err()
+    );
+
+    // Console replies, including server errors
+    let reply = |args: &[&str]| run(json!({ "op": "command", "database": db, "args": args }));
+    assert_eq!(
+        reply(&["DBSIZE"]).await.unwrap().reply,
+        Some(json!({ "t": "int", "v": 7 }))
+    );
+    assert_eq!(
+        reply(&["HINCRBY", "user:1", "email", "1"])
+            .await
+            .unwrap()
+            .reply
+            .unwrap()["t"],
+        json!("error")
+    );
+    assert!(reply(&["SELECT", "1"]).await.is_err());
+
+    // Keyspace listing counts keys
+    let dbs = s.list_databases().await.unwrap();
+    assert_eq!(dbs.iter().find(|d| d.name == db).unwrap().keys, Some(7));
+
+    // Cancelling a blocking command leaves the session usable
+    let blocked = {
+        let s = s.clone();
+        tokio::spawn(async move {
+            let request: RedisRequest = serde_json::from_value(
+                json!({ "op": "command", "database": db, "args": ["BLPOP", "nothing", "0"] }),
+            )
+            .unwrap();
+            s.redis_execute("blocker", request, &opts()).await.unwrap()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.cancel("blocker");
+    assert!(blocked.await.unwrap().cancelled);
+    let request: RedisRequest =
+        serde_json::from_value(json!({ "op": "command", "database": db, "args": ["PING"] }))
+            .unwrap();
+    let pong = s.redis_execute("blocker", request, &opts()).await.unwrap();
+    assert_eq!(pong.reply, Some(json!({ "t": "status", "v": "PONG" })));
+
+    // Pub/Sub forwards published messages
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    s.redis_subscribe(
+        "sub".into(),
+        vec!["news".into()],
+        vec!["alerts:*".into()],
+        move |b| {
+            let _ = tx.send(b);
+        },
+    )
+    .await
+    .unwrap();
+    reply(&["PUBLISH", "news", "hello"]).await.unwrap();
+    reply(&["PUBLISH", "alerts:disk", "full"]).await.unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        got.extend(batch.messages);
+    }
+    assert_eq!(got[0].payload, json!("hello"));
+    assert_eq!(got[1].pattern.as_deref(), Some("alerts:*"));
+    s.redis_unsubscribe("sub");
+
+    // Pattern deletes and read-only connections
+    let n = run(json!({ "op": "deleteMatching", "database": db, "pattern": "user:*" }))
+        .await
+        .unwrap();
+    assert_eq!(n.reply, Some(json!({ "t": "int", "v": 2 })));
+    let (mut c, _) = config(Engine::Redis, "DBMS_TEST_REDIS").unwrap();
+    c.read_only = true;
+    c.id = "ro".into();
+    m.open(c, None).await.unwrap();
+    let ro = m.get("ro").unwrap();
+    let write: RedisRequest = serde_json::from_value(
+        json!({ "op": "command", "database": db, "args": ["DEL", "queue"] }),
+    )
+    .unwrap();
+    assert!(ro.redis_execute("tab", write, &opts()).await.is_err());
+    let read: RedisRequest = serde_json::from_value(
+        json!({ "op": "command", "database": db, "args": ["LLEN", "queue"] }),
+    )
+    .unwrap();
+    assert!(ro.redis_execute("tab", read, &opts()).await.is_ok());
+
+    // Pipelines report rejected commands without failing the batch
+    let piped = run(json!({ "op": "pipeline", "database": db, "commands": [
+        ["SET", "p:1", "a"], ["HSET", "p:1", "f", "v"], ["RPUSH", "p:list", "x", "y"]
+    ]}))
+    .await
+    .unwrap();
+    assert_eq!(piped.reply, Some(json!({ "t": "int", "v": 2 })));
+    assert_eq!(piped.entries.len(), 1);
+    assert_eq!(piped.entries[0]["index"], json!(1));
+    assert!(
+        piped.entries[0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("WRONGTYPE")
+    );
+    let refused =
+        run(json!({ "op": "pipeline", "database": db, "commands": [["SELECT", "2"]] })).await;
+    assert!(refused.is_err());
+
+    run(json!({ "op": "flush", "database": db })).await.unwrap();
 }
 
 /// A sharded cluster through the host-list form: `DBMS_TEST_MONGOS=host:port` of a mongos.

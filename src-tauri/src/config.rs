@@ -20,6 +20,8 @@ pub enum Engine {
     Mongo,
     /// Local database files and Cloudflare D1
     Sqlite,
+    /// Redis and compatible servers (Valkey, KeyDB, Dragonfly)
+    Redis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -133,7 +135,7 @@ pub struct ConnectionConfig {
     /// Private key for `ssl_client_cert` (PEM, PKCS#8)
     #[serde(default)]
     pub ssl_client_key: String,
-    /// MongoDB connection string; when set it takes precedence over host/port
+    /// MongoDB or Redis connection string; when set it takes precedence over host/port
     #[serde(default)]
     pub uri: String,
     /// MongoDB authentication database

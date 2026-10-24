@@ -51,7 +51,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "Database client for PostgreSQL, MySQL, SQL Server, Babelfish and MongoDB",
+    "shortDescription": "Database client for PostgreSQL, MySQL, SQL Server, Babelfish, MongoDB and Redis",
     "category": "DeveloperTool",
     "copyright": "MIT License",
     "createUpdaterArtifacts": true,

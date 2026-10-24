@@ -335,6 +335,7 @@ impl PgSession {
                 name: r.get(0),
                 is_system: r.get(1),
                 size_bytes: r.get(2),
+                keys: None,
             })
             .collect())
     }

@@ -452,6 +452,7 @@ impl MySession {
                         .and_then(|s| s.parse::<f64>().ok())
                         .map(|n| n as i64),
                     name,
+                    keys: None,
                 }
             })
             .collect())

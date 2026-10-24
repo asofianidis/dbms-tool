@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Square } from 'lucide-react'
+import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } from 'lucide-react'
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { formatBytes } from '@/lib/format'
 import { queries } from '@/lib/queries'
+import { parseClientList, parseSlowlog, recordsToSet, dataText } from '@/lib/redis'
 import { dashboardFor } from '@/lib/server-metrics'
 import { LOCK_COLUMNS, type RefreshInterval } from '@/lib/server-perf'
 import {
@@ -41,7 +42,7 @@ import {
   SlowQueriesSection,
   useLocks
 } from './PerformancePanels'
-import { useSqlPanel } from './useSqlPanel'
+import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
   postgres: `SELECT pid, usename AS "user", datname AS "database", application_name AS app, client_addr AS client,
@@ -61,6 +62,54 @@ OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
 WHERE s.is_user_process = 1
 ORDER BY r.total_elapsed_time DESC`,
   babelfish: `SELECT * FROM sys.sysprocesses`
+}
+
+const CLIENT_COLUMNS = [
+  'id',
+  'addr',
+  'name',
+  'db',
+  'cmd',
+  'age',
+  'idle',
+  'flags',
+  'lib-name',
+  'user'
+]
+
+/** A Redis command whose reply becomes a grid, e.g. CLIENT LIST. */
+function useRedisPanel(
+  connection: ConnectionConfig,
+  args: string[] | null,
+  toSet: (out: Awaited<ReturnType<typeof api.redis>>) => ResultSet
+): SqlPanel {
+  const [set, setSet] = useState<ResultSet | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const key = args?.join(' ')
+  const reload = useCallback(async () => {
+    if (!key) return
+    setLoading(true)
+    try {
+      const out = await api.redis(connection.id, '__meta', {
+        op: 'command',
+        database: '0',
+        args: key.split(' ')
+      })
+      if (out.reply?.t === 'error') throw new Error(out.reply.v)
+      setSet(toSet(out))
+      setError(null)
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setLoading(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection.id, key])
+  useEffect(() => {
+    void reload()
+  }, [reload])
+  return { set, error, loading, reload: () => void reload() }
 }
 
 export function ServerTab({ tab }: { tab: TabOf<'server'> }): React.JSX.Element {
@@ -142,7 +191,12 @@ function ServerDashboard({
   }, [refresh, active, visible])
 
   const act = async (action: SessionAction, id: Cell): Promise<void> => {
-    const what = engineKey === 'mongo' ? `operation ${id}` : `session ${id}`
+    const what =
+      engineKey === 'mongo'
+        ? `operation ${id}`
+        : engineKey === 'redis'
+          ? `client ${id}`
+          : `session ${id}`
     const ok = await confirm({
       title: action === 'cancel' ? `Cancel the query in ${what}?` : `Kill ${what}?`,
       message:
@@ -150,13 +204,22 @@ function ServerDashboard({
           ? 'The running statement stops with an error; the session stays connected.'
           : engineKey === 'mongo'
             ? 'The operation is interrupted. Writes it already made stay.'
-            : 'The session is disconnected and its open transaction is rolled back.',
+            : engineKey === 'redis'
+              ? 'The client is disconnected; a queued MULTI transaction is discarded.'
+              : 'The session is disconnected and its open transaction is rolled back.',
       confirmLabel: action === 'cancel' ? 'Cancel query' : 'Kill',
       danger: true
     })
     if (!ok) return
     try {
-      if (engineKey === 'mongo') {
+      if (engineKey === 'redis') {
+        if (typeof id !== 'string') return
+        await api.redis(connection.id, '__meta', {
+          op: 'command',
+          database: '0',
+          args: ['CLIENT', 'KILL', 'ID', id]
+        })
+      } else if (engineKey === 'mongo') {
         const op = mongoOpId(id)
         if (op === null) return
         await api.mongo(connection.id, '__meta', {
@@ -197,7 +260,9 @@ function ServerDashboard({
             ? 'Cancel query'
             : engineKey === 'mongo'
               ? 'Kill operation'
-              : 'Kill session',
+              : engineKey === 'redis'
+                ? 'Kill client'
+                : 'Kill session',
         icon: action === 'cancel' ? <Square /> : <OctagonX />,
         danger: action === 'kill',
         onSelect: () => void act(action, id)
@@ -248,17 +313,27 @@ function ServerDashboard({
             <Database className="size-3.5" /> Databases
           </h2>
           <div className="flex flex-wrap gap-2">
-            {dbs.data?.map((d) => (
-              <span
-                key={d.name}
-                className="flex items-center gap-2 rounded-md border border-line bg-panel/70 px-2.5 py-1 text-[12px]"
-              >
-                <span className={d.isSystem ? 'text-muted' : 'text-bright'}>{d.name}</span>
-                {d.sizeBytes != null && (
-                  <span className="text-[11px] text-faint">{formatBytes(d.sizeBytes)}</span>
-                )}
-              </span>
-            ))}
+            {dbs.data
+              // Redis lists 16 numbered keyspaces; the empty ones are noise
+              ?.filter(
+                (d) => d.keys === undefined || d.keys > 0 || d.name === info?.currentDatabase
+              )
+              .map((d) => (
+                <span
+                  key={d.name}
+                  className="flex items-center gap-2 rounded-md border border-line bg-panel/70 px-2.5 py-1 text-[12px]"
+                >
+                  <span className={d.isSystem ? 'text-muted' : 'text-bright'}>
+                    {d.keys !== undefined ? `db${d.name}` : d.name}
+                  </span>
+                  {d.sizeBytes != null && (
+                    <span className="text-[11px] text-faint">{formatBytes(d.sizeBytes)}</span>
+                  )}
+                  {d.keys !== undefined && (
+                    <span className="text-[11px] text-faint">{d.keys.toLocaleString()} keys</span>
+                  )}
+                </span>
+              ))}
           </div>
         </section>
 
@@ -304,6 +379,8 @@ function ServerDashboard({
           </div>
         </section>
 
+        {connection.engine === 'redis' && <SlowLog connection={connection} />}
+
         {forest.length > 0 && (
           <BlockingTree
             forest={forest}
@@ -325,14 +402,59 @@ function ServerDashboard({
   )
 }
 
+function SlowLog({ connection }: { connection: ConnectionConfig }): React.JSX.Element {
+  const panel = useRedisPanel(connection, ['SLOWLOG', 'GET', '100'], (out) =>
+    recordsToSet(parseSlowlog(out.reply), ['id', 'at', 'duration_ms', 'command', 'client', 'name'])
+  )
+  return (
+    <section>
+      <h2 className="mb-2 flex items-center gap-2 text-[11px] font-semibold tracking-wider text-muted uppercase">
+        <Snail className="size-3.5" /> Slow log
+        <Button size="icon-sm" variant="ghost" onClick={panel.reload} title="Refresh">
+          <RefreshCw className={panel.loading ? 'size-3.5 animate-spin' : 'size-3.5'} />
+        </Button>
+        <span className="ml-auto text-[11px] font-normal tracking-normal text-faint normal-case">
+          Commands slower than slowlog-log-slower-than, newest first
+        </span>
+      </h2>
+      <div className="h-64 overflow-hidden rounded-lg border border-line">
+        {panel.error ? (
+          <div className="p-4">
+            <ErrorText error={panel.error} />
+          </div>
+        ) : panel.set ? (
+          panel.set.rows.length ? (
+            <ResultGrid columns={panel.set.columns} rows={panel.set.rows} />
+          ) : (
+            <EmptyState title="No slow commands logged" />
+          )
+        ) : (
+          <EmptyState title="Loading…" />
+        )}
+      </div>
+    </section>
+  )
+}
+
 function useActivity(
   connection: ConnectionConfig,
   engineKey: string
 ): ReturnType<typeof useSqlPanel> {
   // SQLite runs in-process, so there are no sessions to list
   const sql =
-    connection.engine === 'mongo' || connection.engine === 'sqlite' ? null : ACTIVITY_SQL[engineKey]
+    connection.engine === 'mongo' || connection.engine === 'sqlite' || connection.engine === 'redis'
+      ? null
+      : ACTIVITY_SQL[engineKey]
   const sqlPanel = useSqlPanel(connection, sql)
+  const redisPanel = useRedisPanel(
+    connection,
+    connection.engine === 'redis' ? ['CLIENT', 'LIST'] : null,
+    (out) =>
+      recordsToSet(
+        parseClientList(out.reply?.t === 'bulk' ? dataText(out.reply.v) : ''),
+        CLIENT_COLUMNS
+      )
+  )
   const [mongo, setMongo] = useState<ResultSet | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -377,6 +499,7 @@ function useActivity(
   }, [reloadMongo])
   if (connection.engine === 'mongo')
     return { set: mongo, error, loading, reload: () => void reloadMongo() }
+  if (connection.engine === 'redis') return redisPanel
   return sqlPanel
 }
 

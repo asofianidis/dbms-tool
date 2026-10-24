@@ -44,7 +44,7 @@ export function TitleBar(): React.JSX.Element {
   }, [])
 
   const context =
-    tab?.kind === 'query' || tab?.kind === 'mongo'
+    tab?.kind === 'query' || tab?.kind === 'mongo' || tab?.kind === 'redis'
       ? tab.title
       : tab?.kind === 'table'
         ? tab.name

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::config::{ConnectionConfig, Engine};
-use crate::drivers::{Session, mongo};
+use crate::drivers::{Session, mongo, redis};
 use crate::error::{AppError, AppResult};
 use crate::guard;
 use crate::model::*;
@@ -60,6 +60,7 @@ pub struct Server {
     pub config: ConnectionConfig,
     password: Option<String>,
     mongo: Option<mongodb::Client>,
+    redis: Option<redis::RedisClient>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
     running: parking_lot::Mutex<HashMap<String, Arc<CancelSignal>>>,
 }
@@ -83,6 +84,12 @@ impl Server {
         self.mongo
             .as_ref()
             .ok_or_else(|| AppError::Unsupported("Not a MongoDB connection".into()))
+    }
+
+    fn redis(&self) -> AppResult<&redis::RedisClient> {
+        self.redis
+            .as_ref()
+            .ok_or_else(|| AppError::Unsupported("Not a Redis connection".into()))
     }
 
     /// Gets (or opens) the session `key`, switched to `database`.
@@ -138,6 +145,10 @@ impl Server {
 
     pub async fn close_session(&self, key: &str) {
         self.sessions.lock().await.remove(key);
+        if let Some(client) = &self.redis {
+            client.close_session(key).await;
+            client.unsubscribe(key);
+        }
     }
 
     fn begin(&self, key: &str) -> Arc<CancelSignal> {
@@ -246,6 +257,46 @@ impl Server {
         }
     }
 
+    pub async fn redis_execute(
+        &self,
+        key: &str,
+        request: redis::RedisRequest,
+        opts: &ExecOptions,
+    ) -> AppResult<redis::RedisOutput> {
+        if self.config.read_only && request.is_write() {
+            return Err(AppError::msg(
+                "This connection is read-only, so commands that change data are blocked. \
+                 Turn off \"Read-only\" in the connection settings to run them.",
+            ));
+        }
+        let client = self.redis()?;
+        let signal = self.begin(key);
+        let deadline = Deadline::arm(opts, &signal);
+        let result = redis::execute(client, key, request, &signal).await;
+        self.end(key, &signal);
+        match deadline.and_then(Deadline::disarm) {
+            Some(secs) => Err(AppError::msg(timed_out_message(secs))),
+            None => result,
+        }
+    }
+
+    /// Starts forwarding Pub/Sub messages to `emit` under subscription `id`.
+    pub async fn redis_subscribe(
+        &self,
+        id: String,
+        channels: Vec<String>,
+        patterns: Vec<String>,
+        emit: impl Fn(redis::PubSubBatch) + Send + 'static,
+    ) -> AppResult<()> {
+        redis::subscribe(self.redis()?, id, channels, patterns, emit).await
+    }
+
+    pub fn redis_unsubscribe(&self, id: &str) {
+        if let Some(client) = &self.redis {
+            client.unsubscribe(id);
+        }
+    }
+
     /// Streams a whole find or pipeline result to `path`; cancelled like a query on `key`.
     pub async fn mongo_export(
         &self,
@@ -263,6 +314,9 @@ impl Server {
     pub async fn list_databases(&self) -> AppResult<Vec<DatabaseInfo>> {
         if let Some(client) = &self.mongo {
             return mongo::list_databases(client).await;
+        }
+        if let Some(client) = &self.redis {
+            return redis::list_databases(client).await;
         }
         let slot = self.session(META, "").await?;
         let mut guard = slot.lock().await;
@@ -291,6 +345,10 @@ impl Server {
     ) -> AppResult<Vec<DbObject>> {
         if let Some(client) = &self.mongo {
             return mongo::list_collections(client, database).await;
+        }
+        // Keys are browsed in the key browser, a page at a time
+        if self.redis.is_some() {
+            return Ok(Vec::new());
         }
         let slot = self.session(META, database).await?;
         let mut guard = slot.lock().await;
@@ -394,7 +452,16 @@ pub struct Manager {
     servers: parking_lot::Mutex<HashMap<String, Arc<Server>>>,
 }
 
-type Probed = (ServerInfo, Option<mongodb::Client>, Option<Session>);
+/// What connecting produced: a client for MongoDB or Redis, a session for SQL engines.
+// Opened once per connection, so variant size doesn't matter
+#[allow(clippy::large_enum_variant)]
+pub enum Opened {
+    Mongo(mongodb::Client),
+    Redis(redis::RedisClient),
+    Sql(Session),
+}
+
+type Probed = (ServerInfo, Opened);
 
 /// Connects without registering anything; used by "Test connection". A tunnel
 /// the connection needs only lives for the test.
@@ -414,14 +481,23 @@ pub async fn probe(
 }
 
 async fn probe_direct(config: &ConnectionConfig, password: Option<&str>) -> AppResult<Probed> {
-    if config.engine == Engine::Mongo {
-        let client = mongo::connect(config, password).await?;
-        let info = mongo::server_info(&client).await?;
-        return Ok((info, Some(client), None));
+    match config.engine {
+        Engine::Mongo => {
+            let client = mongo::connect(config, password).await?;
+            let info = mongo::server_info(&client).await?;
+            Ok((info, Opened::Mongo(client)))
+        }
+        Engine::Redis => {
+            let client = redis::connect(config, password).await?;
+            let info = redis::server_info(&client).await?;
+            Ok((info, Opened::Redis(client)))
+        }
+        _ => {
+            let mut session = Session::connect(config, password, &config.database).await?;
+            let info = session.server_info().await?;
+            Ok((info, Opened::Sql(session)))
+        }
     }
-    let mut session = Session::connect(config, password, &config.database).await?;
-    let info = session.server_info().await?;
-    Ok((info, None, Some(session)))
 }
 
 impl Manager {
@@ -433,27 +509,32 @@ impl Manager {
         // A tunnel (Fly.io, SSH) stays up while the connection is open
         let id = config.id.clone();
         let config = tunnel::prepare(&id, config, None).await?;
-        let (info, mongo, session) = match probe_direct(&config, password.as_deref()).await {
+        let (info, opened) = match probe_direct(&config, password.as_deref()).await {
             Ok(probed) => probed,
             Err(e) => {
                 tunnel::close(&id).await;
                 return Err(e);
             }
         };
+        let (mut mongo, mut redis) = (None, None);
         let mut sessions = HashMap::new();
-        if let Some(session) = session {
-            let key = if config.engine == Engine::Postgres {
-                format!("{META}:{}", session.database())
-            } else {
-                META.to_string()
-            };
-            sessions.insert(
-                key,
-                Arc::new(Mutex::new(Slot {
-                    session,
-                    last_used: Instant::now(),
-                })),
-            );
+        match opened {
+            Opened::Mongo(client) => mongo = Some(client),
+            Opened::Redis(client) => redis = Some(client),
+            Opened::Sql(session) => {
+                let key = if config.engine == Engine::Postgres {
+                    format!("{META}:{}", session.database())
+                } else {
+                    META.to_string()
+                };
+                sessions.insert(
+                    key,
+                    Arc::new(Mutex::new(Slot {
+                        session,
+                        last_used: Instant::now(),
+                    })),
+                );
+            }
         }
         let mut config = config;
         // Remember where the server put us so new tabs open in the same database
@@ -464,6 +545,7 @@ impl Manager {
             config,
             password,
             mongo,
+            redis,
             sessions: Mutex::new(sessions),
             running: parking_lot::Mutex::new(HashMap::new()),
         });
