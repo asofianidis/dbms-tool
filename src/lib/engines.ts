@@ -144,6 +144,7 @@ export function newConnection(engine: Engine): ConnectionConfig {
     authSource: '',
     savePassword: true,
     readOnly: false,
+    production: false,
     color: '',
     group: ''
   }

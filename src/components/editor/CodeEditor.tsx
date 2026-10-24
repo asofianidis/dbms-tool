@@ -117,11 +117,11 @@ const theme = EditorView.theme(
   {
     '&': { color: 'var(--color-fg)', backgroundColor: 'transparent' },
     '.cm-content': {
-      fontFamily: 'var(--font-mono)',
+      fontFamily: 'var(--font-editor, var(--font-mono))',
       caretColor: 'var(--color-accent)',
       padding: '8px 0'
     },
-    '.cm-scroller': { fontFamily: 'var(--font-mono)', lineHeight: '1.6' },
+    '.cm-scroller': { fontFamily: 'var(--font-editor, var(--font-mono))', lineHeight: '1.6' },
     '.cm-cursor, .cm-dropCursor': {
       borderLeftColor: 'var(--color-accent)',
       borderLeftWidth: '2px'

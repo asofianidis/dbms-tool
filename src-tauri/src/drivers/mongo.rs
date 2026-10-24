@@ -2,7 +2,7 @@
 //! Extended JSON, typed precisely enough that editing a document and saving it
 //! back never changes a field's BSON type.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::TryStreamExt;
 use mongodb::Client;
@@ -114,8 +114,8 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         opts
     };
     opts.app_name = Some("dbms-tool".into());
-    opts.server_selection_timeout = Some(Duration::from_secs(10));
-    opts.connect_timeout = Some(Duration::from_secs(10));
+    opts.server_selection_timeout = Some(crate::limits::connect_timeout());
+    opts.connect_timeout = Some(crate::limits::connect_timeout());
     let client = Client::with_options(opts)?;
     client
         .database("admin")

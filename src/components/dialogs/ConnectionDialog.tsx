@@ -672,6 +672,15 @@ function ConnectionDialog({
             label="Read-only"
             description="Block writes from editors and grids"
           />
+          <Toggle
+            checked={!!config.production}
+            onChange={(production) =>
+              // A production connection without a colour gets red, so it stands out in tabs
+              patch(production && !config.color ? { production, color: '#ff6e61' } : { production })
+            }
+            label="Production"
+            description="Confirm every write; type the name for destructive ones"
+          />
           <Field label="Group">
             <Input
               value={config.group}

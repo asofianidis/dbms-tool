@@ -1,5 +1,12 @@
 import { useMemo, useState } from 'react'
-import type { Cell, ColumnMeta, ExecOptions, ExecOutput, TableInfo } from '@/lib/api'
+import type {
+  Cell,
+  ColumnMeta,
+  ConnectionConfig,
+  ExecOptions,
+  ExecOutput,
+  TableInfo
+} from '@/lib/api'
 import type { Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
 import {
@@ -11,6 +18,7 @@ import {
   toRowEdits,
   type PendingChange
 } from '@/lib/pending'
+import { confirmProductionWrite, isProduction } from '@/lib/production'
 import {
   editStatements,
   literal,
@@ -125,7 +133,8 @@ export function usePendingEdits({
 
 /**
  * Runs pending changes as one transaction, after a confirmation when they
- * delete rows or the user asked to confirm. Returns whether they committed.
+ * delete rows, the user asked to confirm, or the connection is production.
+ * Returns whether they committed.
  */
 export async function commitPendingChanges({
   changes,
@@ -133,6 +142,7 @@ export async function commitPendingChanges({
   tableRef,
   info,
   confirmDangerous,
+  connection,
   execute,
   busy
 }: {
@@ -141,7 +151,8 @@ export async function commitPendingChanges({
   tableRef: TableRef
   info: TableInfo
   confirmDangerous: boolean
-  execute: (sql: string) => Promise<ExecOutput>
+  connection?: ConnectionConfig
+  execute: (sql: string, options?: ExecOptions) => Promise<ExecOutput>
   /** Told when the statements start and stop running */
   busy?: (running: boolean) => void
 }): Promise<boolean> {
@@ -149,7 +160,15 @@ export async function commitPendingChanges({
   if (!statements.length) return true
   const script = wrapInTransaction(dialect, statements)
   const deletes = changes.some((c) => c.kind === 'delete')
-  if (confirmDangerous || deletes) {
+  if (isProduction(connection)) {
+    const deleted = changes.filter((c) => c.kind === 'delete').length
+    const ok = await confirmProductionWrite(connection, {
+      action: `This commits ${plural(statements.length, 'change')} in one transaction`,
+      dangers: deleted ? [`deleting ${plural(deleted, 'row')}`] : [],
+      code: script
+    })
+    if (!ok) return false
+  } else if (confirmDangerous || deletes) {
     const ok = await confirm({
       title: `Commit ${plural(statements.length, 'change')}?`,
       message: 'These statements run in one transaction; if any fails, none are applied.',
@@ -161,7 +180,7 @@ export async function commitPendingChanges({
   }
   busy?.(true)
   try {
-    const out = await execute(script)
+    const out = await execute(script, { confirmed: true })
     if (out.error) {
       await execute(
         dialect === 'tsql' ? 'IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION' : 'ROLLBACK'

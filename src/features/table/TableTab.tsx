@@ -58,6 +58,7 @@ import { errorMessage, toastError } from '@/lib/toast'
 import {
   connect,
   connectionsStore,
+  getConnection,
   newQueryTab,
   openTable,
   setRunning,
@@ -330,7 +331,8 @@ function DataView({
       tableRef,
       info: info.data,
       confirmDangerous,
-      execute: (sql) => api.execute(tab.connectionId, tab.id, tab.database, sql),
+      connection: getConnection(tab.connectionId),
+      execute: (sql, options) => api.execute(tab.connectionId, tab.id, tab.database, sql, options),
       busy: setLoading
     })
     if (!ok) return

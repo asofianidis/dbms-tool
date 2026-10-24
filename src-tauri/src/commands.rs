@@ -199,6 +199,12 @@ pub fn connection_close(state: State<'_, AppState>, id: String) {
     state.manager.close(&id);
 }
 
+/// Applies the connect timeout from Settings to connections opened from now on.
+#[tauri::command]
+pub fn limits_set(connect_timeout_secs: u64) {
+    crate::limits::set_connect_timeout(connect_timeout_secs);
+}
+
 #[tauri::command]
 pub async fn db_databases(state: State<'_, AppState>, id: String) -> AppResult<Vec<DatabaseInfo>> {
     let result = async { state.manager.get(&id)?.list_databases().await }.await;
@@ -422,6 +428,7 @@ pub async fn query_export(
         let opts = ExecOptions {
             // Sets other than the exported one keep a few rows, for the messages
             max_rows: 100,
+            timeout_secs: None,
             max_binary_bytes: usize::MAX,
             sink: Some(handle.clone()),
         };

@@ -552,6 +552,8 @@ export interface ConfirmRequest {
   danger?: boolean
   /** Shown in a code block, e.g. the SQL about to run */
   code?: string
+  /** Text the user has to type before the confirm button enables, e.g. a connection name */
+  typeToConfirm?: string
   resolve: (ok: boolean) => void
 }
 

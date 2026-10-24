@@ -19,7 +19,16 @@ import {
   Workflow,
   X
 } from 'lucide-react'
-import type { Cell, ColumnMeta, ExecOutput, ResultSet, StreamFormat, TableInfo } from '@/lib/api'
+import type {
+  Cell,
+  ColumnMeta,
+  ConnectionConfig,
+  ExecOptions,
+  ExecOutput,
+  ResultSet,
+  StreamFormat,
+  TableInfo
+} from '@/lib/api'
 import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
 import { copyText, exportRows, serialize, type ExportFormat, type FileFormat } from '@/lib/export'
@@ -81,11 +90,10 @@ export interface ResultEditTarget {
   /** Result columns that don't map onto a table column */
   readOnly: Set<number>
   /** Runs SQL on the tab's session */
-  execute: (
-    sql: string,
-    options?: { maxRows?: number; maxBinaryBytes?: number }
-  ) => Promise<ExecOutput>
+  execute: (sql: string, options?: ExecOptions) => Promise<ExecOutput>
   confirmDangerous: boolean
+  /** Production connections confirm every commit */
+  connection?: ConnectionConfig
   /** Why committing is held back, e.g. an open transaction */
   blocked?: string
   /** Re-runs the query once changes are committed */
@@ -747,7 +755,8 @@ function EditableResult({
       tableRef: edit.tableRef,
       info: edit.info,
       confirmDangerous: edit.confirmDangerous,
-      execute: (sql) => edit.execute(sql),
+      connection: edit.connection,
+      execute: (sql, options) => edit.execute(sql, options),
       busy: setBusy
     })
     if (!ok) return
