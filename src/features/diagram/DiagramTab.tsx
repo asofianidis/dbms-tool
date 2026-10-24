@@ -5,6 +5,9 @@ import {
   Copy,
   Download,
   EyeOff,
+  FileDown,
+  FileUp,
+  FolderInput,
   LayoutGrid,
   ListChecks,
   Maximize,
@@ -16,7 +19,8 @@ import {
   Table2,
   Wrench
 } from 'lucide-react'
-import type { ConnectionConfig, DbObject } from '@/lib/api'
+import { open as openDialog, save } from '@tauri-apps/plugin-dialog'
+import { api, type ConnectionConfig, type DbObject } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import {
   FONTS,
@@ -31,11 +35,12 @@ import {
   type Point,
   type Rect
 } from '@/lib/diagram'
+import { parseLayout, serializeLayout, toDbml, toMermaid } from '@/lib/diagram-text'
 import { copyText } from '@/lib/export'
 import { queries, queryClient } from '@/lib/queries'
 import { createPersistentStore } from '@/lib/store'
 import { TOKENS, type ThemeColors } from '@/lib/themes'
-import { errorMessage, toastError } from '@/lib/toast'
+import { errorMessage, toast, toastError } from '@/lib/toast'
 import { connect, connectionsStore, openTable, statusStore, type TabOf } from '@/lib/workspace'
 import { showContextMenu } from '@/components/ContextMenu'
 import {
@@ -56,12 +61,16 @@ import {
   copyPng,
   exportPalette,
   saveExport,
+  saveText,
   type ExportFormat,
   type ExportJob,
-  type ExportStyle
+  type ExportStyle,
+  type TextFormat
 } from './exportDiagram'
 
 /* ---------- Saved per-diagram state ---------- */
+
+// Kept per connection in the app's state files (see persist.ts); layout files share them
 
 interface DiagramPrefs {
   /** Positions of tables the user moved; the rest are laid out automatically */
@@ -484,6 +493,68 @@ function DiagramView({
   const screenshot = (): void =>
     void copyPng(job('visible', 'theme', window.devicePixelRatio || 1)).catch(toastError)
 
+  const text = (format: TextFormat): string =>
+    format === 'dbml' ? toDbml(tables, edges) : toMermaid(tables, edges)
+
+  /* ----- Layout files ----- */
+
+  const saveLayout = async (): Promise<void> => {
+    const path = await save({
+      defaultPath: `${title.replace(/[^\w.-]+/g, '_')}-layout.json`,
+      filters: [{ name: 'Diagram layout', extensions: ['json'] }]
+    })
+    if (!path) return
+    // Pin every table where it is now, so the file looks the same wherever it's opened
+    const pinned: Record<string, Point> = {}
+    for (const t of allTables) if (positions[t.key]) pinned[t.key] = positions[t.key]
+    await api.writeText(
+      path,
+      serializeLayout(
+        { ...prefs, positions: pinned },
+        { database: tab.database, schema: tab.schema }
+      )
+    )
+    toast(`Saved ${path.split(/[\\/]/).pop()}`)
+  }
+
+  const openLayout = async (): Promise<void> => {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: 'Diagram layout', extensions: ['json'] }]
+    })
+    if (typeof path !== 'string') return
+    const layout = parseLayout(await api.readText(path))
+    // Tables this schema doesn't have are ignored when the diagram is drawn
+    const known = new Set(allTables.map((t) => t.key))
+    const listed = Object.keys(layout.positions)
+    const matched = listed.filter((k) => known.has(k)).length
+    setPrefs(() => ({
+      positions: layout.positions,
+      hidden: layout.hidden,
+      mode: layout.mode,
+      showTypes: layout.showTypes,
+      views: layout.views
+    }))
+    fitted.current = false
+    if (listed.length && !matched) toast("None of the layout's tables are in this diagram", 'info')
+    else toast(`Loaded the layout for ${matched} ${matched === 1 ? 'table' : 'tables'}`)
+  }
+
+  const layoutMenu = (e: React.MouseEvent): void =>
+    showContextMenu(e, [
+      {
+        label: 'Save layout to file…',
+        icon: <FileDown />,
+        disabled: !allTables.length,
+        onSelect: () => void saveLayout().catch(toastError)
+      },
+      {
+        label: 'Open layout file…',
+        icon: <FileUp />,
+        onSelect: () => void openLayout().catch(toastError)
+      }
+    ])
+
   /* ----- Render ----- */
 
   const refresh = (): void => {
@@ -561,6 +632,9 @@ function DiagramView({
           }}
         >
           <LayoutGrid className="size-4" />
+        </Button>
+        <Button size="icon" variant="ghost" title="Share layout" onClick={layoutMenu}>
+          <FolderInput className="size-4" />
         </Button>
         <Button size="icon" variant="ghost" title="Refresh" onClick={refresh}>
           <RefreshCw className="size-4" />
@@ -687,7 +761,9 @@ function DiagramView({
           />
         )}
       </div>
-      {exporting && <ExportDialog name={title} onClose={() => setExporting(false)} job={job} />}
+      {exporting && (
+        <ExportDialog name={title} onClose={() => setExporting(false)} job={job} text={text} />
+      )}
     </div>
   )
 }
@@ -770,13 +846,17 @@ function Option({
 function ExportDialog({
   name,
   job,
+  text,
   onClose
 }: {
   name: string
   job: (area: 'all' | 'visible', style: ExportStyle, scale: number) => ExportJob
+  /** The shown tables as a DBML or Mermaid document */
+  text: (format: TextFormat) => string
   onClose: () => void
 }): React.JSX.Element {
-  const [format, setFormat] = useState<ExportFormat>('png')
+  const [format, setFormat] = useState<ExportFormat | TextFormat>('png')
+  const textFormat = format === 'dbml' || format === 'mermaid' ? format : null
   const [area, setArea] = useState<'all' | 'visible'>('all')
   const [style, setStyle] = useState<ExportStyle>('theme')
   const [scale, setScale] = useState<'1' | '2' | '3'>('2')
@@ -799,7 +879,7 @@ function ExportDialog({
   return (
     <Modal
       title="Export diagram"
-      description="Save the diagram as an image or PDF, or copy it to the clipboard."
+      description="Save the diagram as an image, PDF, DBML or Mermaid, or copy it to the clipboard."
       onClose={onClose}
       icon={<Download className="mt-0.5 size-4 text-accent" />}
       footer={
@@ -808,10 +888,18 @@ function ExportDialog({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          {format === 'png' && (
+          {(format === 'png' || textFormat) && (
             <Button
               disabled={busy}
-              onClick={() => void run(() => copyPng(job(area, style, +scale)))}
+              onClick={() =>
+                void run(() =>
+                  textFormat
+                    ? navigator.clipboard
+                        .writeText(text(textFormat))
+                        .then(() => toast('Copied to the clipboard'))
+                    : copyPng(job(area, style, +scale))
+                )
+              }
             >
               <Copy className="size-3.5" />
               Copy
@@ -820,7 +908,13 @@ function ExportDialog({
           <Button
             variant="primary"
             disabled={busy}
-            onClick={() => void run(() => saveExport(job(area, style, +scale), format, fileName))}
+            onClick={() =>
+              void run(() =>
+                textFormat
+                  ? saveText(text(textFormat), textFormat, fileName)
+                  : saveExport(job(area, style, +scale), format as ExportFormat, fileName)
+              )
+            }
           >
             Save…
           </Button>
@@ -835,46 +929,65 @@ function ExportDialog({
             options={[
               { value: 'png', label: 'PNG' },
               { value: 'svg', label: 'SVG', title: 'Vector image, scales without blurring' },
-              { value: 'pdf', label: 'PDF' }
-            ]}
-          />
-        </Option>
-        <Option label="Area">
-          <Segmented
-            value={area}
-            onChange={setArea}
-            options={[
-              { value: 'all', label: 'Whole diagram' },
-              { value: 'visible', label: 'Visible area' }
-            ]}
-          />
-        </Option>
-        <Option label="Colours">
-          <Segmented
-            value={style}
-            onChange={setStyle}
-            options={[
-              { value: 'theme', label: 'Current theme' },
+              { value: 'pdf', label: 'PDF' },
               {
-                value: 'light',
-                label: 'Light',
-                title: 'Dark text on white, for documents and print'
+                value: 'dbml',
+                label: 'DBML',
+                title: 'Schema as code, for dbdiagram.io and dbdocs'
+              },
+              {
+                value: 'mermaid',
+                label: 'Mermaid',
+                title: 'An erDiagram for Markdown on GitHub, GitLab and Notion'
               }
             ]}
           />
         </Option>
-        {format !== 'svg' && (
-          <Option label="Resolution">
-            <Segmented
-              value={scale}
-              onChange={setScale}
-              options={[
-                { value: '1', label: '1×' },
-                { value: '2', label: '2×' },
-                { value: '3', label: '3×' }
-              ]}
-            />
-          </Option>
+        {textFormat ? (
+          <p className="text-xs text-muted">
+            The tables, columns{textFormat === 'dbml' ? ', indexes' : ''} and relationships shown in
+            the diagram; hidden tables are left out.
+          </p>
+        ) : (
+          <>
+            <Option label="Area">
+              <Segmented
+                value={area}
+                onChange={setArea}
+                options={[
+                  { value: 'all', label: 'Whole diagram' },
+                  { value: 'visible', label: 'Visible area' }
+                ]}
+              />
+            </Option>
+            <Option label="Colours">
+              <Segmented
+                value={style}
+                onChange={setStyle}
+                options={[
+                  { value: 'theme', label: 'Current theme' },
+                  {
+                    value: 'light',
+                    label: 'Light',
+                    title: 'Dark text on white, for documents and print'
+                  }
+                ]}
+              />
+            </Option>
+            {format !== 'svg' && (
+              <Option label="Resolution">
+                <Segmented
+                  value={scale}
+                  onChange={setScale}
+                  options={[
+                    { value: '1', label: '1×' },
+                    { value: '2', label: '2×' },
+                    { value: '3', label: '3×' }
+                  ]}
+                />
+              </Option>
+            )}
+          </>
         )}
         {error && <p className="text-xs text-danger">{error}</p>}
       </div>
