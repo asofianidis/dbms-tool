@@ -1,5 +1,15 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
+import {
+  Fragment,
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   ArrowDownUp,
   ArrowLeft,
@@ -32,36 +42,44 @@ import {
   Network,
   Pencil,
   Plug,
+  Puzzle,
   PlugZap,
   Plus,
   RefreshCw,
   Search,
   Sprout,
   Server,
+  Shapes,
   ShieldCheck,
   Table2,
   Terminal,
   Trash2,
   Unplug,
+  UserRound,
+  Users,
   X,
   Zap,
   GitCompareArrows
 } from 'lucide-react'
 import type { ConnectionConfig, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
+import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
+import { principalKey, principalLabel, type Principal } from '@/lib/grants'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
+import { quoteIdent } from '@/lib/sql'
 import { canHaveTriggers } from '@/lib/triggers'
 import { toast, toastError, errorMessage } from '@/lib/toast'
 import {
   confirm,
   connect,
   connectionsStore,
+  defaultDatabase,
   disconnect,
   loadConnections,
   newQueryTab,
@@ -224,6 +242,95 @@ function matches(filter: string, ...values: (string | null | undefined)[]): bool
   if (!filter) return true
   const f = filter.toLowerCase()
   return values.some((v) => v?.toLowerCase().includes(f))
+}
+
+/* ---------- Long lists ---------- */
+
+/** The tree's scroll container and the content inside it, for virtualized lists. */
+const ScrollContext = createContext<{
+  scroller: React.RefObject<HTMLDivElement | null>
+  content: React.RefObject<HTMLDivElement | null>
+} | null>(null)
+
+/** Lists longer than this only render the rows in view. */
+const VIRTUALIZE_AFTER = 150
+const ROW_HEIGHT = 26
+
+function LongList<T>({
+  items,
+  itemKey,
+  render
+}: {
+  items: T[]
+  itemKey: (item: T) => string
+  render: (item: T) => ReactNode
+}): React.JSX.Element {
+  if (items.length <= VIRTUALIZE_AFTER)
+    return (
+      <>
+        {items.map((item) => (
+          <Fragment key={itemKey(item)}>{render(item)}</Fragment>
+        ))}
+      </>
+    )
+  return <VirtualList items={items} itemKey={itemKey} render={render} />
+}
+
+/**
+ * Renders the visible slice of a list that sits somewhere inside the tree's
+ * scroll container. Rows can grow (an expanded table), so each one is measured.
+ */
+function VirtualList<T>({
+  items,
+  itemKey,
+  render
+}: {
+  items: T[]
+  itemKey: (item: T) => string
+  render: (item: T) => ReactNode
+}): React.JSX.Element {
+  const scroll = useContext(ScrollContext)
+  const listRef = useRef<HTMLDivElement>(null)
+  // Where the list starts within the scrolled content
+  const [margin, setMargin] = useState(0)
+  useEffect(() => {
+    const list = listRef.current
+    const scroller = scroll?.scroller.current
+    const content = scroll?.content.current
+    if (!list || !scroller || !content) return
+    const measure = (): void =>
+      setMargin(
+        list.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop
+      )
+    measure()
+    // Folders opening or closing above the list move it
+    const observer = new ResizeObserver(measure)
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [scroll])
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => scroll?.scroller.current ?? null,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 20,
+    scrollMargin: margin,
+    getItemKey: (i) => itemKey(items[i])
+  })
+  return (
+    <div ref={listRef} className="relative" style={{ height: virtualizer.getTotalSize() }}>
+      {virtualizer.getVirtualItems().map((row) => (
+        <div
+          key={row.key}
+          data-index={row.index}
+          ref={virtualizer.measureElement}
+          className="absolute top-0 left-0 w-full"
+          style={{ transform: `translateY(${row.start - margin}px)` }}
+        >
+          {render(items[row.index])}
+        </div>
+      ))}
+    </div>
+  )
 }
 
 /* ---------- Connections ---------- */
@@ -469,6 +576,13 @@ function DatabaseList({ connection }: { connection: ConnectionConfig }): React.J
         </>
       )}
       {!q.data.length && <EmptyRow depth={1}>No databases visible to this user</EmptyRow>}
+      {(connection.engine === 'postgres' || connection.engine === 'mysql') && (
+        <PrincipalsFolder
+          connection={connection}
+          database={connection.engine === 'mysql' ? '' : defaultDatabase(connection.id)}
+          depth={1}
+        />
+      )}
     </>
   )
 }
@@ -516,6 +630,9 @@ function DatabaseNode({
           })
           void queryClient.invalidateQueries({
             queryKey: ['conn', connection.id, 'schemas', database]
+          })
+          void queryClient.invalidateQueries({
+            queryKey: ['conn', connection.id, 'catalog', database]
           })
         }
       }
@@ -643,14 +760,22 @@ function DatabaseNode({
         (isMongo ? (
           <CollectionList connection={connection} database={database} depth={depth + 1} />
         ) : connection.engine === 'postgres' ? (
-          <SchemaList connection={connection} database={database} depth={depth + 1} />
+          <>
+            <SchemaList connection={connection} database={database} depth={depth + 1} />
+            <ExtensionsFolder connection={connection} database={database} depth={depth + 1} />
+          </>
         ) : (
-          <ObjectFolders
-            connection={connection}
-            database={database}
-            schema={null}
-            depth={depth + 1}
-          />
+          <>
+            <ObjectFolders
+              connection={connection}
+              database={database}
+              schema={null}
+              depth={depth + 1}
+            />
+            {ENGINES[connection.engine].dialect === 'tsql' && (
+              <PrincipalsFolder connection={connection} database={database} depth={depth + 1} />
+            )}
+          </>
         ))}
     </>
   )
@@ -834,6 +959,9 @@ function ObjectFolders({
           />
         )
       })}
+      {(connection.engine === 'postgres' || ENGINES[connection.engine].dialect === 'tsql') && (
+        <TypesFolder connection={connection} database={database} schema={schema} depth={depth} />
+      )}
     </>
   )
 }
@@ -888,7 +1016,7 @@ function ObjectFolder({
                   }
                 ]
               : []),
-            ...(newTable && supports(connection.engine, 'designers')
+            ...(newTable && supports(connection.engine, 'tableDesigner')
               ? [
                   {
                     label: 'New table…',
@@ -918,7 +1046,8 @@ function ObjectFolder({
               <Plus className="size-3.5" />
             </Button>
           ) : (
-            newTable && (
+            newTable &&
+            supports(connection.engine, 'tableDesigner') && (
               <Button
                 size="icon-sm"
                 variant="ghost"
@@ -931,16 +1060,15 @@ function ObjectFolder({
           )
         }
       />
-      {isOpen &&
-        visible.map((obj) => (
-          <ObjectNode
-            key={`${obj.schema}.${obj.name}.${obj.detail ?? ''}`}
-            connection={connection}
-            database={database}
-            obj={obj}
-            depth={depth + 1}
-          />
-        ))}
+      {isOpen && (
+        <LongList
+          items={visible}
+          itemKey={(obj) => `${obj.schema}.${obj.name}.${obj.detail ?? ''}`}
+          render={(obj) => (
+            <ObjectNode connection={connection} database={database} obj={obj} depth={depth + 1} />
+          )}
+        />
+      )}
       {isOpen && !objects.length && <EmptyRow depth={depth + 1}>None</EmptyRow>}
     </>
   )
@@ -1255,6 +1383,10 @@ function TableChildren({
             ))}
         </>
       )}
+      {obj.kind === 'table' &&
+        (connection.engine === 'postgres' || connection.engine === 'mysql') && (
+          <PartitionsFolder connection={connection} database={database} obj={obj} depth={depth} />
+        )}
     </>
   )
 }
@@ -1337,10 +1469,11 @@ function CollectionList({
   const visible = q.data.filter((o) => matches(filter, o.name))
   if (!q.data.length) return <EmptyRow depth={depth}>No collections</EmptyRow>
   return (
-    <>
-      {visible.map((obj) => (
+    <LongList
+      items={visible}
+      itemKey={(obj) => obj.name}
+      render={(obj) => (
         <Row
-          key={obj.name}
           id={`c:${connection.id}/d:${database}/col:${obj.name}`}
           depth={depth}
           icon={
@@ -1377,7 +1510,317 @@ function CollectionList({
             </Button>
           }
         />
-      ))}
+      )}
+    />
+  )
+}
+
+/* ---------- Types, extensions, partitions, users and roles ---------- */
+
+/** A folder of catalog objects, loaded the first time it opens. */
+function CatalogFolder<T>({
+  id,
+  depth,
+  label,
+  options,
+  itemKey,
+  searchText,
+  render
+}: {
+  id: string
+  depth: number
+  label: string
+  options: { queryKey: readonly unknown[]; queryFn: () => Promise<T[]> }
+  itemKey: (item: T) => string
+  searchText: (item: T) => (string | null)[]
+  render: (item: T) => ReactNode
+}): React.JSX.Element {
+  const filter = useContext(FilterContext)
+  const [open, setOpen] = useExpanded(id)
+  const q = useQuery({ queryKey: options.queryKey, queryFn: options.queryFn, enabled: open })
+  const visible = (q.data ?? []).filter((item) => matches(filter, ...searchText(item)))
+  return (
+    <>
+      <Row
+        id={id}
+        depth={depth}
+        expandable
+        open={open}
+        onToggle={() => setOpen()}
+        muted
+        icon={open ? <FolderOpen className="text-faint" /> : <Folder className="text-faint" />}
+        label={label}
+        detail={q.data && (filter ? `${visible.length}/${q.data.length}` : q.data.length)}
+        onMenu={(e) =>
+          showContextMenu(e, [
+            { heading: label },
+            {
+              label: 'Refresh',
+              icon: <RefreshCw />,
+              onSelect: () => void queryClient.invalidateQueries({ queryKey: options.queryKey })
+            }
+          ])
+        }
+      />
+      {open &&
+        (q.isPending ? (
+          <EmptyRow depth={depth + 1}>Loading…</EmptyRow>
+        ) : q.isError ? (
+          <ErrorRow depth={depth + 1} error={q.error} onRetry={() => void q.refetch()} />
+        ) : !q.data.length ? (
+          <EmptyRow depth={depth + 1}>None</EmptyRow>
+        ) : (
+          <LongList items={visible} itemKey={itemKey} render={render} />
+        ))}
+    </>
+  )
+}
+
+const copyName = (name: string): MenuItem => ({
+  label: 'Copy name',
+  icon: <Copy />,
+  onSelect: () => void navigator.clipboard.writeText(name).then(() => toast('Copied'))
+})
+
+const scriptItem = (
+  label: string,
+  connectionId: string,
+  database: string,
+  sql: string | null
+): MenuItem[] =>
+  sql ? [{ label, icon: <Code2 />, onSelect: () => newQueryTab(connectionId, database, sql) }] : []
+
+/** PostgreSQL domains, enums, composite and range types; SQL Server alias and table types. */
+function TypesFolder({
+  connection,
+  database,
+  schema,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  schema: string | null
+  depth: number
+}): React.JSX.Element {
+  const dialect = ENGINES[connection.engine].dialect ?? 'postgres'
+  const tsql = dialect === 'tsql'
+  const id = `c:${connection.id}/d:${database}/s:${schema ?? ''}/f:Types`
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label="Types"
+      options={catalogQueries.types(connection.id, dialect, database, schema)}
+      itemKey={(t: CatalogItem) => `${t.schema}.${t.name}`}
+      searchText={(t) => [t.name, t.schema]}
+      render={(t) => (
+        <Row
+          id={`${id}/${t.schema}.${t.name}`}
+          depth={depth + 1}
+          icon={<Shapes className="text-syn-type" />}
+          label={
+            <>
+              {tsql && <span className="text-muted">{t.schema}.</span>}
+              {t.name}
+            </>
+          }
+          detail={[t.kind.replace('_', ' '), t.detail].filter(Boolean).join(' · ')}
+          title={[t.comment, t.definition].filter(Boolean).join('\n') || undefined}
+          onOpen={
+            t.definition
+              ? () => newQueryTab(connection.id, database, t.definition ?? '')
+              : undefined
+          }
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: t.name },
+              ...scriptItem('Open definition in editor', connection.id, database, t.definition),
+              copyName(t.name)
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/** PostgreSQL extensions installed in the database. */
+function ExtensionsFolder({
+  connection,
+  database,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  depth: number
+}): React.JSX.Element {
+  const id = `c:${connection.id}/d:${database}/extensions`
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label="Extensions"
+      options={catalogQueries.extensions(connection.id, 'postgres', database)}
+      itemKey={(x: CatalogItem) => x.name}
+      searchText={(x) => [x.name]}
+      render={(x) => (
+        <Row
+          id={`${id}/${x.name}`}
+          depth={depth + 1}
+          icon={<Puzzle className="text-syn-fn" />}
+          label={x.name}
+          detail={[x.detail, x.schema].filter(Boolean).join(' · ')}
+          title={x.comment ?? undefined}
+          onOpen={() => newQueryTab(connection.id, database, x.definition ?? '')}
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: x.name },
+              ...scriptItem('Script CREATE', connection.id, database, x.definition),
+              ...scriptItem(
+                'Script DROP',
+                connection.id,
+                database,
+                `DROP EXTENSION ${quoteIdent('postgres', x.name)};`
+              ),
+              copyName(x.name)
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/**
+ * Users and roles: server-wide on PostgreSQL (roles) and MySQL (accounts), the
+ * database's principals on SQL Server. Each opens the permissions designer.
+ */
+function PrincipalsFolder({
+  connection,
+  database,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  depth: number
+}): React.JSX.Element {
+  const { showSystemObjects } = settingsStore.use()
+  const dialect = ENGINES[connection.engine].dialect ?? 'postgres'
+  const id = `c:${connection.id}/d:${database}/principals`
+  const permissions = supports(connection.engine, 'permissions')
+  const designer = (p: Principal): void =>
+    openPermissionsDesigner(connection.id, database, null, principalKey(p))
+  const options = catalogQueries.principals(connection.id, dialect, database)
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label={dialect === 'postgres' ? 'Roles' : 'Users and roles'}
+      options={{
+        queryKey: [...options.queryKey, showSystemObjects],
+        queryFn: async () => {
+          const all = await queryClient.fetchQuery(options)
+          return showSystemObjects ? all : all.filter((p) => !p.builtin)
+        }
+      }}
+      itemKey={principalKey}
+      searchText={(p) => [p.name, p.host]}
+      render={(p) => (
+        <Row
+          id={`${id}/${principalKey(p)}`}
+          depth={depth + 1}
+          muted={p.builtin}
+          icon={
+            p.kind === 'user' ? (
+              <UserRound className="text-syn-prop" />
+            ) : (
+              <Users className="text-syn-keyword" />
+            )
+          }
+          label={principalLabel(p)}
+          detail={p.kind}
+          onOpen={permissions ? () => designer(p) : undefined}
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: principalLabel(p) },
+              ...(permissions
+                ? [{ label: 'Permissions…', icon: <ShieldCheck />, onSelect: () => designer(p) }]
+                : []),
+              copyName(p.name)
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/** A table's partitions; shown only when it has some. PostgreSQL partitions open as tables. */
+function PartitionsFolder({
+  connection,
+  database,
+  obj,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  obj: DbObject
+  depth: number
+}): React.JSX.Element | null {
+  const dialect = ENGINES[connection.engine].dialect ?? 'postgres'
+  const schema = dialect === 'mysql' ? database : obj.schema
+  const id = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}/partitions`
+  const [open, setOpen] = useExpanded(id)
+  const q = useQuery(catalogQueries.partitions(connection.id, dialect, database, schema, obj.name))
+  if (!q.data?.length) return null
+  const asTable = (p: CatalogItem): DbObject => ({
+    schema: p.schema,
+    name: p.name,
+    kind: 'table',
+    detail: null,
+    comment: null,
+    rowEstimate: p.rowEstimate
+  })
+  return (
+    <>
+      <Row
+        id={id}
+        depth={depth}
+        expandable
+        open={open}
+        onToggle={() => setOpen()}
+        muted
+        icon={<Layers className="text-faint" />}
+        label="Partitions"
+        detail={q.data.length}
+      />
+      {open && (
+        <LongList
+          items={q.data}
+          itemKey={(p) => `${p.schema}.${p.name}`}
+          render={(p) =>
+            dialect === 'postgres' ? (
+              <ObjectNode
+                connection={connection}
+                database={database}
+                obj={asTable(p)}
+                depth={depth + 1}
+              />
+            ) : (
+              <Row
+                id={`${id}/${p.name}`}
+                depth={depth + 1}
+                icon={<Table2 className="text-faint" />}
+                label={p.name}
+                title={p.detail ?? undefined}
+                detail={[p.detail, p.rowEstimate !== null && `${compactCount(p.rowEstimate)} rows`]
+                  .filter(Boolean)
+                  .join(' · ')}
+              />
+            )
+          }
+        />
+      )}
     </>
   )
 }
@@ -1387,6 +1830,9 @@ function CollectionList({
 export function Explorer(): React.JSX.Element {
   const connections = connectionsStore.use()
   const [filter, setFilter] = useState('')
+  const scrollerRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const scroll = useMemo(() => ({ scroller: scrollerRef, content: contentRef }), [])
   const groups = useMemo(() => {
     const map = new Map<string, ConnectionConfig[]>()
     const sorted = [...connections].sort((a, b) =>
@@ -1481,22 +1927,30 @@ export function Explorer(): React.JSX.Element {
         </div>
       </div>
       <FilterContext.Provider value={filter}>
-        <div role="tree" className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-4">
-          {groups.map(([group, list]) => (
-            <ConnectionGroup key={group || '__none'} group={group} connections={list} />
-          ))}
-          {!connections.length && (
-            <div className="space-y-3 px-4 py-6 text-center text-xs text-muted">
-              <p>No connections yet.</p>
-              <Button size="sm" variant="primary" onClick={() => openConnectionDialog()}>
-                <Plus className="size-3.5" /> New connection
-              </Button>
-              <Button size="sm" variant="ghost" onClick={openImportConnections}>
-                <FileInput className="size-3.5" /> Import from another client
-              </Button>
+        <ScrollContext.Provider value={scroll}>
+          <div
+            ref={scrollerRef}
+            role="tree"
+            className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-4"
+          >
+            <div ref={contentRef}>
+              {groups.map(([group, list]) => (
+                <ConnectionGroup key={group || '__none'} group={group} connections={list} />
+              ))}
             </div>
-          )}
-        </div>
+            {!connections.length && (
+              <div className="space-y-3 px-4 py-6 text-center text-xs text-muted">
+                <p>No connections yet.</p>
+                <Button size="sm" variant="primary" onClick={() => openConnectionDialog()}>
+                  <Plus className="size-3.5" /> New connection
+                </Button>
+                <Button size="sm" variant="ghost" onClick={openImportConnections}>
+                  <FileInput className="size-3.5" /> Import from another client
+                </Button>
+              </div>
+            )}
+          </div>
+        </ScrollContext.Provider>
       </FilterContext.Provider>
     </div>
   )

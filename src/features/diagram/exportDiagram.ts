@@ -202,3 +202,23 @@ export async function saveExport(
   toast(`Saved ${path.split(/[\\/]/).pop()}`)
   return true
 }
+
+export type TextFormat = 'dbml' | 'mermaid'
+
+const TEXT_FILES: Record<TextFormat, { name: string; extension: string }> = {
+  dbml: { name: 'DBML schema', extension: 'dbml' },
+  mermaid: { name: 'Mermaid diagram', extension: 'mmd' }
+}
+
+/** Asks where to save, then writes a text export. Returns false if the user cancelled. */
+export async function saveText(text: string, format: TextFormat, name: string): Promise<boolean> {
+  const { name: filter, extension } = TEXT_FILES[format]
+  const path = await save({
+    defaultPath: `${name}.${extension}`,
+    filters: [{ name: filter, extensions: [extension] }]
+  })
+  if (!path) return false
+  await api.writeText(path, text)
+  toast(`Saved ${path.split(/[\/]/).pop()}`)
+  return true
+}

@@ -21,8 +21,10 @@ export interface EngineInfo {
 }
 
 export interface EngineFeatures {
-  /** Table, schema and trigger designers */
+  /** Schema and trigger designers */
   designers: boolean
+  /** The table designer */
+  tableDesigner: boolean
   /** Users, roles and grants */
   permissions: boolean
   /** Stored procedures and functions */
@@ -108,7 +110,13 @@ export const ENGINES: Record<Engine, EngineInfo> = {
     dialect: 'sqlite',
     tone: 'bg-sqlite/15 text-sqlite',
     hasSchemas: false,
-    features: { designers: false, permissions: false, routines: false, databases: false }
+    features: {
+      designers: false,
+      tableDesigner: true,
+      permissions: false,
+      routines: false,
+      databases: false
+    }
   }
 }
 

@@ -386,6 +386,8 @@ export function createTableStatements(
     primaryKey: [],
     indexes: [],
     foreignKeys: [],
+    checks: [],
+    uniques: [],
     original: null
   }
   return tableStatements(dialect, draft)

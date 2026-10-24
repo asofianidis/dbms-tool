@@ -8,6 +8,8 @@ import {
   dropSchemaStatement,
   mysqlDefaultExpr,
   newColumn,
+  newForeignKey,
+  newIndex,
   newSchemaDraft,
   newTableDraft,
   schemaDraftFrom,
@@ -99,26 +101,15 @@ describe('create table', () => {
     })
     const customer = newColumn(dialect, { name: 'customer_id', dataType: 'bigint' })
     d.columns.push(total, customer)
-    d.indexes.push({
-      id: 'ix',
-      original: null,
-      name: '',
-      columns: [customer.id],
-      unique: false,
-      dropped: false
-    })
-    d.foreignKeys.push({
-      id: 'fk',
-      original: null,
-      name: '',
-      columns: [customer.id],
-      refSchema: null,
-      refTable: 'customers',
-      refColumns: ['id'],
-      onDelete: 'CASCADE',
-      onUpdate: 'NO ACTION',
-      dropped: false
-    })
+    d.indexes.push(newIndex({ columns: [customer.id] }))
+    d.foreignKeys.push(
+      newForeignKey({
+        columns: [customer.id],
+        refTable: 'customers',
+        refColumns: ['id'],
+        onDelete: 'CASCADE'
+      })
+    )
     return d
   }
 
@@ -344,18 +335,9 @@ describe('validateDraft', () => {
   it('requires matching foreign key columns', () => {
     const d = newTableDraft('mysql', 'app')
     d.name = 't'
-    d.foreignKeys.push({
-      id: 'fk',
-      original: null,
-      name: 'fk_t',
-      columns: [d.columns[0].id],
-      refSchema: null,
-      refTable: 'other',
-      refColumns: [],
-      onDelete: 'NO ACTION',
-      onUpdate: 'NO ACTION',
-      dropped: false
-    })
+    d.foreignKeys.push(
+      newForeignKey({ name: 'fk_t', columns: [d.columns[0].id], refTable: 'other' })
+    )
     expect(validateDraft('mysql', d)).toBe(
       'Foreign key fk_t needs as many referenced columns as columns'
     )
