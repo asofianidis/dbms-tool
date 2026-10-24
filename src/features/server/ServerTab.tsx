@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } from 'lucide-react'
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
@@ -7,9 +7,13 @@ import { formatBytes } from '@/lib/format'
 import { queries } from '@/lib/queries'
 import { parseClientList, parseSlowlog, recordsToSet, dataText } from '@/lib/redis'
 import { dashboardFor } from '@/lib/server-metrics'
+import { LOCK_COLUMNS, type RefreshInterval } from '@/lib/server-perf'
 import {
+  BLOCKED_BY_COLUMN,
   blockedCount,
+  blockingEdges,
   blockingIds,
+  blockingTree,
   mongoOpId,
   sessionActionSql,
   sessionActions,
@@ -28,8 +32,17 @@ import {
 import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
+import { ClusterPanel } from '../mongo/ClusterPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
-import { LiveMetrics } from './LiveMetrics'
+import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
+import {
+  BlockingTree,
+  LocksSection,
+  RefreshSelect,
+  SlowQueriesSection,
+  useLocks
+} from './PerformancePanels'
+import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
   postgres: `SELECT pid, usename AS "user", datname AS "database", application_name AS app, client_addr AS client,
@@ -51,39 +64,6 @@ ORDER BY r.total_elapsed_time DESC`,
   babelfish: `SELECT * FROM sys.sysprocesses`
 }
 
-function useSqlPanel(
-  connection: ConnectionConfig,
-  sql: string | null
-): {
-  set: ResultSet | null
-  error: string | null
-  loading: boolean
-  reload: () => void
-} {
-  const [set, setSet] = useState<ResultSet | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const reload = useCallback(async () => {
-    if (!sql) return
-    setLoading(true)
-    setError(null)
-    try {
-      // Listings only; `EXEC sp_babelfish_configure` reads settings, so no production prompt
-      const out = await api.execute(connection.id, '__meta', '', sql, { confirmed: true })
-      if (out.error) setError(out.error.message)
-      else setSet(out.results[out.results.length - 1] ?? null)
-    } catch (e) {
-      setError(errorMessage(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [connection.id, sql])
-  useEffect(() => {
-    void reload()
-  }, [reload])
-  return { set, error, loading, reload: () => void reload() }
-}
-
 const CLIENT_COLUMNS = [
   'id',
   'addr',
@@ -102,7 +82,7 @@ function useRedisPanel(
   connection: ConnectionConfig,
   args: string[] | null,
   toSet: (out: Awaited<ReturnType<typeof api.redis>>) => ResultSet
-): ReturnType<typeof useSqlPanel> {
+): SqlPanel {
   const [set, setSet] = useState<ResultSet | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -168,6 +148,47 @@ function ServerDashboard({
   const blockers = activity.set
     ? [...blockingIds(engineKey, activity.set.columns, activity.set.rows)]
     : []
+  const locks = useLocks(connection, engineKey)
+  const [refresh, setRefresh] = useState<RefreshInterval>(5)
+  const visible = useDocumentVisible()
+
+  // Blocking chains from the activity list's blocked-by column and the lock list's
+  const forest = useMemo(() => {
+    const edges: [string, string][] = []
+    const blockedBy = BLOCKED_BY_COLUMN[engineKey]
+    if (activity.set && blockedBy)
+      edges.push(
+        ...blockingEdges(
+          activity.set.columns,
+          activity.set.rows,
+          SESSION_ID_COLUMN[engineKey],
+          blockedBy
+        )
+      )
+    const lockCols = LOCK_COLUMNS[engineKey]
+    if (locks?.set && lockCols)
+      edges.push(
+        ...blockingEdges(locks.set.columns, locks.set.rows, lockCols.id, lockCols.blockedBy)
+      )
+    return blockingTree(edges)
+  }, [activity.set, locks?.set, engineKey])
+
+  // Auto-refresh runs only while the tab is in front and the window is visible
+  const reloads = useRef<() => void>(() => {})
+  reloads.current = () => {
+    activity.reload()
+    locks?.reload()
+  }
+  // A tick that finds the last refresh still running is skipped
+  const busy = useRef(false)
+  busy.current = activity.loading || !!locks?.loading
+  useEffect(() => {
+    if (!refresh || !active || !visible) return
+    const timer = setInterval(() => {
+      if (!busy.current) reloads.current()
+    }, refresh * 1000)
+    return () => clearInterval(timer)
+  }, [refresh, active, visible])
 
   const act = async (action: SessionAction, id: Cell): Promise<void> => {
     const what =
@@ -222,7 +243,7 @@ function ServerDashboard({
     } catch (e) {
       toastError(e)
     }
-    activity.reload()
+    reloads.current()
   }
 
   const activityMenu = (row: number): MenuItem[] => {
@@ -285,6 +306,8 @@ function ServerDashboard({
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
         )}
 
+        {connection.engine === 'mongo' && <ClusterPanel connection={connection} />}
+
         <section>
           <h2 className="mb-2 flex items-center gap-2 text-[11px] font-semibold tracking-wider text-muted uppercase">
             <Database className="size-3.5" /> Databases
@@ -317,9 +340,10 @@ function ServerDashboard({
         <section>
           <h2 className="mb-2 flex items-center gap-2 text-[11px] font-semibold tracking-wider text-muted uppercase">
             <Activity className="size-3.5" /> Activity
-            <Button size="icon-sm" variant="ghost" onClick={activity.reload} title="Refresh">
+            <Button size="icon-sm" variant="ghost" onClick={reloads.current} title="Refresh">
               <RefreshCw className={activity.loading ? 'size-3.5 animate-spin' : 'size-3.5'} />
             </Button>
+            {engineKey !== 'sqlite' && <RefreshSelect value={refresh} onChange={setRefresh} />}
             {blocked > 0 && (
               <Badge
                 tone="danger"
@@ -329,12 +353,14 @@ function ServerDashboard({
                 {blocked} blocked{blockers.length > 0 && ` by ${blockers.join(', ')}`}
               </Badge>
             )}
-            {actions.length > 0 && (
-              <span className="ml-auto text-[11px] font-normal tracking-normal text-faint normal-case">
-                Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}kill
-                it
-              </span>
-            )}
+            <span className="ml-auto flex items-center gap-2 text-[11px] font-normal tracking-normal normal-case">
+              {actions.length > 0 && (
+                <span className="text-faint">
+                  Right-click a row to {actions.includes('cancel') ? 'cancel its query or ' : ''}
+                  kill it
+                </span>
+              )}
+            </span>
           </h2>
           <div className="h-80 overflow-hidden rounded-lg border border-line">
             {activity.error ? (
@@ -354,6 +380,23 @@ function ServerDashboard({
         </section>
 
         {connection.engine === 'redis' && <SlowLog connection={connection} />}
+
+        {forest.length > 0 && (
+          <BlockingTree
+            forest={forest}
+            engineKey={engineKey}
+            activity={activity.set}
+            onKill={actions.includes('kill') ? (id) => void act('kill', id) : undefined}
+          />
+        )}
+
+        {locks && <LocksSection locks={locks} engineKey={engineKey} />}
+
+        <SlowQueriesSection
+          connection={connection}
+          engineKey={engineKey}
+          databases={dbs.data?.filter((d) => !d.isSystem).map((d) => d.name) ?? []}
+        />
       </div>
     </div>
   )

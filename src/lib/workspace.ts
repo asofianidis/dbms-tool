@@ -11,7 +11,7 @@ import { clearTransactionState, openTransactionsStore } from './transactions'
 /* ---------- Tabs ---------- */
 
 export type TableView = 'data' | 'structure' | 'definition'
-export type CollectionView = 'documents' | 'aggregation' | 'schema' | 'indexes'
+export type CollectionView = 'documents' | 'aggregation' | 'schema' | 'indexes' | 'validation'
 
 export type Tab =
   | { id: string; kind: 'welcome' }
@@ -110,6 +110,12 @@ export type Tab =
       /** Database to back up or restore into; empty to choose in the wizard */
       database: string
       mode: 'backup' | 'restore'
+    }
+  | {
+      id: string
+      kind: 'maintenance'
+      connectionId: string
+      database: string
     }
   | {
       id: string
@@ -289,6 +295,26 @@ function askPassword(
 
 const pending = new Map<string, Promise<boolean>>()
 
+/**
+ * For a 'host_key_unknown' error: shows the SSH server's key fingerprint and,
+ * if the user trusts it, adds it to known_hosts. Resolves `true` when the
+ * caller should retry; `false` for other errors or when the user declines.
+ */
+export async function confirmSshHostKey(e: unknown): Promise<boolean> {
+  if (!isAppError(e, 'host_key_unknown') || !e.hostKey) return false
+  const key = e.hostKey
+  const ok = await confirm({
+    title: 'Trust this SSH server?',
+    message: `This is the first connection to ${key.host}, so its identity can't be checked yet. Trust it only if this fingerprint matches the one the server's administrator gave you (ssh-keygen -lf on the server's host key).`,
+    code: `${key.keyType} key fingerprint
+${key.fingerprint}`,
+    confirmLabel: 'Trust and connect'
+  })
+  if (!ok) return false
+  await api.sshTrustHostKey(key.token)
+  return true
+}
+
 /** Opens a connection, prompting for a password if needed. Resolves `false` if cancelled or failed. */
 export function connect(id: string): Promise<boolean> {
   if (statusOf(id).state === 'connected') return Promise.resolve(true)
@@ -308,6 +334,15 @@ export function connect(id: string): Promise<boolean> {
         if (remember) void loadConnections()
         return true
       } catch (e) {
+        if (isAppError(e, 'host_key_unknown')) {
+          const trusted = await confirmSshHostKey(e).catch((err: unknown) => {
+            toast(errorMessage(err), 'error')
+            return false
+          })
+          if (trusted) continue
+          setStatus(id, { state: 'idle' })
+          return false
+        }
         const authFailed =
           password !== undefined &&
           /password|authentication|login failed|access denied/i.test(errorMessage(e))
@@ -513,6 +548,14 @@ export function openBackup(
       t.connectionId === connectionId &&
       t.database === database &&
       t.mode === mode
+  )
+}
+
+/** Opens maintenance tasks (vacuum, analyze, integrity checks…) for `database`. */
+export function openMaintenance(connectionId: string, database: string): void {
+  openTab(
+    { id: tabId(), kind: 'maintenance', connectionId, database },
+    (t) => t.kind === 'maintenance' && t.connectionId === connectionId && t.database === database
   )
 }
 

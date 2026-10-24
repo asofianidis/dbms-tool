@@ -89,3 +89,70 @@ export function blockedCount(engineKey: string, columns: ColumnMeta[], rows: Cel
   return rows.filter((r) => typeof r[col] === 'string' && !/^[\s0{},]*$/.test(r[col] as string))
     .length
 }
+
+/** Who waits on whom: `[waiter, blocker]` pairs read from a `blocked_by` style column. */
+export function blockingEdges(
+  columns: ColumnMeta[],
+  rows: Cell[][],
+  idColumn: string,
+  blockedByColumn: string
+): [string, string][] {
+  const idCol = columns.findIndex((c) => c.name === idColumn)
+  const byCol = columns.findIndex((c) => c.name === blockedByColumn)
+  if (idCol < 0 || byCol < 0) return []
+  const seen = new Set<string>()
+  const edges: [string, string][] = []
+  for (const row of rows) {
+    const waiter = row[idCol]
+    const by = row[byCol]
+    if (typeof waiter !== 'string' || typeof by !== 'string') continue
+    for (const blocker of by.split(/[,\s{}]+/)) {
+      const key = `${waiter} ${blocker}`
+      if (!blocker || blocker === '0' || blocker === waiter || seen.has(key)) continue
+      seen.add(key)
+      edges.push([waiter, blocker])
+    }
+  }
+  return edges
+}
+
+export interface BlockingNode {
+  id: string
+  /** Sessions waiting on this one */
+  children: BlockingNode[]
+  /** This session is also somewhere above itself: a deadlock the server hasn't broken yet */
+  cycle: boolean
+}
+
+/**
+ * Blocking chains as a forest: each root holds locks without waiting on anyone,
+ * and its children wait on it. A waiter blocked by several sessions shows under each.
+ * Sessions that only block each other (a cycle) start a tree from their lowest id.
+ */
+export function blockingTree(edges: [string, string][]): BlockingNode[] {
+  const waiters = new Map<string, string[]>()
+  const blocked = new Set<string>()
+  const seen = new Set<string>()
+  for (const [waiter, blocker] of edges) {
+    if (seen.has(`${waiter} ${blocker}`)) continue
+    seen.add(`${waiter} ${blocker}`)
+    if (!waiters.has(blocker)) waiters.set(blocker, [])
+    waiters.get(blocker)!.push(waiter)
+    blocked.add(waiter)
+  }
+  const byId = (a: string, b: string): number => a.localeCompare(b, undefined, { numeric: true })
+  const reached = new Set<string>()
+  const build = (id: string, path: Set<string>): BlockingNode => {
+    reached.add(id)
+    if (path.has(id)) return { id, children: [], cycle: true }
+    const next = new Set(path).add(id)
+    const children = (waiters.get(id) ?? []).sort(byId).map((w) => build(w, next))
+    return { id, children, cycle: false }
+  }
+  const roots = [...waiters.keys()].filter((id) => !blocked.has(id)).sort(byId)
+  const forest = roots.map((id) => build(id, new Set()))
+  // Whatever no root reaches is part of a cycle
+  for (const id of [...waiters.keys()].sort(byId))
+    if (!reached.has(id)) forest.push(build(id, new Set()))
+  return forest
+}

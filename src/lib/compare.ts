@@ -436,6 +436,7 @@ function newForeignKey(draft: TableDraft, fk: ForeignKey): ForeignKeyDraft {
   return {
     id: draftId(),
     original: null,
+    initial: null,
     name: fk.name,
     columns: columnIds(draft, fk.columns),
     refSchema: fk.refSchema,
@@ -454,6 +455,11 @@ function newIndex(draft: TableDraft, ix: IndexInfo): IndexDraft {
     name: ix.name,
     columns: columnIds(draft, ix.columns),
     unique: ix.unique,
+    include: [],
+    where: '',
+    method: '',
+    initial: null,
+    locked: null,
     dropped: false
   }
 }

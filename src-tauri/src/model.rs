@@ -261,6 +261,10 @@ pub struct ExecOutput {
 pub struct ExecOptions {
     #[serde(default = "default_max_rows")]
     pub max_rows: usize,
+    /// Apply the read-only check to this call even on a writable connection,
+    /// for dashboards and export re-runs
+    #[serde(default)]
+    pub read_only: bool,
     /// Cancels the statement after this many seconds; `None` or 0 never times out
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -284,6 +288,7 @@ impl Default for ExecOptions {
     fn default() -> Self {
         Self {
             max_rows: default_max_rows(),
+            read_only: false,
             timeout_secs: None,
             max_binary_bytes: default_max_binary(),
             sink: None,

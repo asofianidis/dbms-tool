@@ -11,6 +11,7 @@ import { TabBar } from './components/shell/TabBar'
 import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
+import { CreateCollectionHost } from './features/mongo/CreateCollectionDialog'
 import { Explorer } from './features/explorer/Explorer'
 import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
@@ -21,6 +22,7 @@ import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner
 import { SeedHost } from './features/seed/SeedDialog'
 import { BackupTab } from './features/backup/BackupTab'
 import { CompareTab } from './features/compare/CompareTab'
+import { MaintenanceTab } from './features/maintenance/MaintenanceTab'
 import { ImportTab } from './features/import/ImportTab'
 import { CloudTab } from './features/cloud/CloudTab'
 import { CollectionTab } from './features/mongo/CollectionTab'
@@ -90,6 +92,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <CloudTab />
     case 'backup':
       return <BackupTab tab={tab} />
+    case 'maintenance':
+      return <MaintenanceTab tab={tab} />
     case 'compare':
       return <CompareTab tab={tab} />
     case 'import':
@@ -252,6 +256,7 @@ export function App(): React.JSX.Element {
       <ConfirmHost />
       <PromptHost />
       <ExecuteRoutineHost />
+      <CreateCollectionHost />
       <TableDesignerHost />
       <SchemaDesignerHost />
       <TriggerDesignerHost />

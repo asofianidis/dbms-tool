@@ -2,6 +2,7 @@ import {
   Braces,
   ClipboardCopy,
   Code2,
+  Eye,
   FileCode2,
   FilePlus2,
   FileUp,
@@ -16,6 +17,7 @@ import {
   ScrollText,
   ShieldCheck,
   Table2,
+  TextCursorInput,
   Trash2,
   Zap
 } from 'lucide-react'
@@ -24,6 +26,7 @@ import { modifyScript, routineTemplate } from '@/lib/routines'
 import { ENGINES, supports, type Dialect } from '@/lib/engines'
 import { copyText } from '@/lib/export'
 import { securableFor } from '@/lib/grants'
+import { renameCommand } from '@/lib/mongo-collections'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import {
@@ -47,9 +50,13 @@ import {
   openCompare,
   openImport,
   openTable,
-  refreshConnection
+  promptText,
+  refreshConnection,
+  tabsStore,
+  updateTab
 } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
+import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
@@ -154,8 +161,9 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   const isRoutine = obj.kind === 'function' || obj.kind === 'procedure'
   const dialect = dialectOf(connectionId)
   const engine = getConnection(connectionId)?.engine
-  // SQLite browses and edits data, but has no table or trigger designer
+  // SQLite has a table designer, but no trigger designer
   const designers = !engine || supports(engine, 'designers')
+  const tableDesigner = !engine || supports(engine, 'tableDesigner')
   const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
   const items: MenuItem[] = [{ heading: label }]
   if (isTable || isView) {
@@ -173,7 +181,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
       },
       ...(obj.kind === 'table'
         ? [
-            ...(designers
+            ...(tableDesigner
               ? [
                   {
                     label: 'Design table…',
@@ -390,12 +398,32 @@ export function collectionMenu(connectionId: string, database: string, obj: DbOb
       ? []
       : [
           {
+            label: 'Validation rules',
+            icon: <ShieldCheck />,
+            onSelect: () => openCollection(connectionId, database, name, 'validation')
+          },
+          {
             label: 'Import documents…',
             icon: <FileUp />,
             onSelect: () => openImport(connectionId, database, null, name)
           }
         ]),
     'separator',
+    {
+      label: 'Create view from this…',
+      icon: <Eye />,
+      onSelect: () => openCreateCollection({ connectionId, database, kind: 'view', viewOn: name })
+    },
+    // Views and time series collections can't be renamed
+    ...(obj.kind === 'collection'
+      ? [
+          {
+            label: 'Rename…',
+            icon: <TextCursorInput />,
+            onSelect: () => void renameCollection(connectionId, database, name)
+          }
+        ]
+      : []),
     {
       label: 'New shell',
       icon: <Code2 />,
@@ -437,16 +465,36 @@ export async function dropCollection(
   }
 }
 
-export async function createCollection(
+export async function renameCollection(
   connectionId: string,
   database: string,
   name: string
 ): Promise<void> {
+  const input = await promptText({
+    title: `Rename ${name}`,
+    label: `New name in ${database}`,
+    initial: name,
+    confirmLabel: 'Rename'
+  })
+  const to = input?.trim()
+  if (!to || to === name) return
   try {
-    await api.mongo(connectionId, '__meta', { op: 'createCollection', database, collection: name })
-    toast(`Created ${name}`)
+    await api.mongo(connectionId, '__meta', {
+      op: 'runCommand',
+      database: 'admin',
+      command: renameCommand(database, name, to)
+    })
+    // Open tabs follow the collection to its new name
+    for (const tab of tabsStore.get().tabs)
+      if (
+        tab.kind === 'collection' &&
+        tab.connectionId === connectionId &&
+        tab.database === database &&
+        tab.collection === name
+      )
+        updateTab(tab.id, { collection: to })
+    toast(`Renamed ${name} to ${to}`)
     refreshConnection(connectionId)
-    openCollection(connectionId, database, name)
   } catch (e) {
     toastError(e)
   }

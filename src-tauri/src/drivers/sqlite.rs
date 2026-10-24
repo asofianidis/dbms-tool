@@ -1005,6 +1005,7 @@ DELETE FROM t WHERE b = 2"
                 Box::new(Collect(std::sync::Arc::clone(&written))),
                 1,
             )),
+            read_only: false,
         };
         let out = s
             .execute(

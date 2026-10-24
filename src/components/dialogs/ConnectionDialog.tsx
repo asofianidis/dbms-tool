@@ -20,11 +20,14 @@ import {
   ENGINE_ORDER,
   ENGINES,
   newConnection,
-  parseConnectionString
+  parseConnectionString,
+  sslRequired,
+  sslVerifies
 } from '@/lib/engines'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import {
   closeConnectionDialog,
+  confirmSshHostKey,
   connect,
   connectionDialogStore,
   connectionsStore,
@@ -35,6 +38,7 @@ import {
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
 import { SshFields } from './SshFields'
+import { TlsFields } from './TlsFields'
 
 export function ConnectionDialogHost(): React.JSX.Element | null {
   const state = connectionDialogStore.use()
@@ -237,6 +241,10 @@ function ConnectionDialog({
     }
   }
   const cloudAuth = config.auth === 'cloud'
+  const tlsCanBeOn =
+    cloudAuth ||
+    // Prefer means off for MongoDB's host form
+    (config.engine === 'mongo' && !usesUri ? sslRequired(config.ssl) : config.ssl !== 'disable')
   // Babelfish's TDS endpoint has no IAM sign-in
   const iamCapable =
     config.engine === 'postgres' || config.engine === 'mysql' || config.engine === 'mssql'
@@ -262,11 +270,21 @@ function ConnectionDialog({
 
   const runTest = async (): Promise<void> => {
     setTest({ state: 'testing' })
-    try {
-      const info = await api.connectionTest(effective(), password || null, sshSecret)
-      setTest({ state: 'ok', info })
-    } catch (e) {
-      setTest({ state: 'error', error: errorMessage(e) })
+    for (;;) {
+      try {
+        const info = await api.connectionTest(effective(), password || null, sshSecret)
+        setTest({ state: 'ok', info })
+      } catch (e) {
+        // First connection to an SSH server: confirm its key, then test again
+        let error = errorMessage(e)
+        try {
+          if (await confirmSshHostKey(e)) continue
+        } catch (err) {
+          error = errorMessage(err)
+        }
+        setTest({ state: 'error', error })
+      }
+      return
     }
   }
 
@@ -483,7 +501,11 @@ function ConnectionDialog({
             <Field
               label="Host"
               hint={
-                tds ? 'Use host\\INSTANCE for a named instance (leave the port empty).' : undefined
+                tds
+                  ? 'Use host\\INSTANCE for a named instance (leave the port empty).'
+                  : config.engine === 'mongo'
+                    ? 'For a replica set or sharded cluster, list members or mongos routers: host1,host2:27018'
+                    : undefined
               }
             >
               <Input
@@ -629,6 +651,16 @@ function ConnectionDialog({
               />
             </Field>
           )}
+          {config.engine === 'mongo' && !usesUri && (
+            <Field label="Replica set" hint="Optional; checks the members belong to this set">
+              <Input
+                value={config.replicaSet ?? ''}
+                onChange={(e) => patch({ replicaSet: e.target.value })}
+                placeholder="rs0"
+              />
+            </Field>
+          )}
+          {config.engine === 'mongo' && <MongoReadPreference config={config} patch={patch} />}
           {!sqlite && (
             <Field
               label={tds ? 'Encryption' : 'SSL / TLS'}
@@ -637,12 +669,13 @@ function ConnectionDialog({
               }
             >
               <Select
-                value={cloudAuth ? 'require' : config.ssl}
-                disabled={cloudAuth}
+                value={cloudAuth && !sslRequired(config.ssl) ? 'require' : config.ssl}
                 onChange={(e) => patch({ ssl: e.target.value as ConnectionConfig['ssl'] })}
               >
-                <option value="disable">{tds ? 'Off' : 'Disable'}</option>
-                <option value="prefer">
+                <option value="disable" disabled={cloudAuth}>
+                  {tds ? 'Off' : 'Disable'}
+                </option>
+                <option value="prefer" disabled={cloudAuth}>
                   {tds
                     ? 'Login only (default)'
                     : usesUri
@@ -652,10 +685,17 @@ function ConnectionDialog({
                         : 'Prefer'}
                 </option>
                 <option value="require">{tds ? 'Mandatory' : 'Require'}</option>
+                {/* SQL Server's and MongoDB's drivers check the host name whenever they check the chain */}
+                {!tds && config.engine !== 'mongo' && (
+                  <option value="verify-ca">Verify CA (chain, not host name)</option>
+                )}
+                <option value="verify-full">Verify full (chain and host name)</option>
               </Select>
             </Field>
           )}
         </div>
+
+        {!sqlite && tlsCanBeOn && <TlsFields config={config} onChange={(files) => patch(files)} />}
 
         {!sqlite && config.cloud?.provider !== 'fly' && (
           <SshFields
@@ -687,10 +727,15 @@ function ConnectionDialog({
           />
           {!sqlite && (
             <Toggle
-              checked={config.trustServerCertificate}
+              checked={config.trustServerCertificate && !sslVerifies(config.ssl)}
               onChange={(trustServerCertificate) => patch({ trustServerCertificate })}
               label="Trust server certificate"
-              description="Accept self-signed TLS certificates"
+              description={
+                sslVerifies(config.ssl)
+                  ? 'Off: the verify modes always check it'
+                  : 'Accept self-signed TLS certificates'
+              }
+              disabled={sslVerifies(config.ssl)}
             />
           )}
           <Toggle
@@ -768,4 +813,31 @@ const IAM_HINTS: Record<MajorCloud, string> = {
   gcp: 'Signs in with a token from "gcloud sql generate-login-token". The user is your Google account added to the instance as an IAM user (for MySQL, the part before the @), with the cloudsql.iam_authentication flag on.',
   azure:
     'Signs in with a Microsoft Entra token from "az account get-access-token". The user is your Entra user principal name (e.g. you@contoso.com), set up as an Entra admin or database user.'
+}
+
+function MongoReadPreference({
+  config,
+  patch
+}: {
+  config: ConnectionConfig
+  patch: (p: Partial<ConnectionConfig>) => void
+}): React.JSX.Element {
+  return (
+    <Field
+      label="Read preference"
+      hint="Which replica set members finds and aggregations read from"
+    >
+      <Select
+        value={config.readPreference ?? ''}
+        onChange={(e) => patch({ readPreference: e.target.value })}
+      >
+        <option value="">Default{config.uri ? ' (from the string)' : ' (primary)'}</option>
+        <option value="primary">Primary</option>
+        <option value="primaryPreferred">Primary preferred</option>
+        <option value="secondary">Secondary</option>
+        <option value="secondaryPreferred">Secondary preferred</option>
+        <option value="nearest">Nearest</option>
+      </Select>
+    </Field>
+  )
 }

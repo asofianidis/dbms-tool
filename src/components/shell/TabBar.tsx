@@ -21,6 +21,7 @@ import {
   RadioTower,
   SquareTerminal,
   Table2,
+  Wrench,
   X
 } from 'lucide-react'
 import { cn } from '@/lib/cn'
@@ -71,6 +72,8 @@ export function tabTitle(tab: Tab): string {
       return tab.mode === 'backup'
         ? `Back up ${tab.database || 'database'}`
         : `Restore${tab.database ? ` ${tab.database}` : ''}`
+    case 'maintenance':
+      return `Maintain ${tab.database}`
     case 'compare':
       return `Compare ${tab.table ?? tab.schema ?? tab.database}`
     case 'import':
@@ -123,6 +126,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       ) : (
         <ArchiveRestore className={cn(c, 'text-warn')} />
       )
+    case 'maintenance':
+      return <Wrench className={cn(c, 'text-info')} />
     case 'compare':
       return <GitCompareArrows className={cn(c, 'text-info')} />
     case 'import':

@@ -31,8 +31,17 @@ import type {
 } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
-import { copyText, exportRows, serialize, type ExportFormat, type FileFormat } from '@/lib/export'
+import {
+  copyText,
+  exportAll,
+  exportRows,
+  serialize,
+  type ExportFormat,
+  type FetchedRows,
+  type FileFormat
+} from '@/lib/export'
 import { formatDuration, plural } from '@/lib/format'
+import type { Substitution } from '@/lib/params'
 import { addInsert } from '@/lib/pending'
 import type { Plan } from '@/lib/plan'
 import { diffResults } from '@/lib/result-diff'
@@ -54,6 +63,8 @@ export interface RunResult {
   /** Offset of the executed text within the editor, for error positions */
   offset: number
   sql: string
+  /** Filled-in parameters, so error positions map back onto the editor text */
+  spans?: Substitution[]
   /** Set when the run was an Explain whose output could be read as a plan */
   plan?: Plan
   /** A re-run of the same text (more rows, refresh after edits): keep the open view */
@@ -100,6 +111,15 @@ export interface ResultEditTarget {
   onCommitted: () => void
 }
 
+/** How "Save as" gets every row when the loaded ones are only part of the result. */
+export interface WholeResult {
+  /** Whether the loaded rows are missing some of the result */
+  partial: boolean
+  fetch: () => Promise<FetchedRows>
+  /** What to save instead when the fetch fails; null saves nothing */
+  onFetchError?: (error: unknown) => Promise<FetchedRows | null>
+}
+
 export function exportMenu(
   anchor: HTMLElement,
   set: Pick<ResultSet, 'columns' | 'rows'>,
@@ -107,17 +127,25 @@ export function exportMenu(
   dialect?: Dialect,
   table?: string,
   /** Runs the query again, streaming every row to a file */
-  full?: { run: (format: StreamFormat) => void; disabled?: string }
+  full?: { run: (format: StreamFormat) => void; disabled?: string },
+  whole?: WholeResult
 ): void {
+  const partial = !!whole?.partial
   const run = (format: FileFormat) => () =>
-    void exportRows(format, set.columns, set.rows, name, { dialect, table })
+    void (whole?.partial
+      ? exportAll(format, name, whole.fetch, {
+          dialect,
+          table,
+          onFetchError: whole.onFetchError
+        })
+      : exportRows(format, set.columns, set.rows, name, { dialect, table }))
   const copy = (format: ExportFormat, label: string) => () =>
     void copyText(
       serialize(format, set.columns, set.rows, { dialect, table }),
-      `Copied ${set.rows.length} rows as ${label}`
+      `Copied ${plural(set.rows.length, 'row')} as ${label}`
     )
   const items: MenuItem[] = [
-    { heading: `Save ${plural(set.rows.length, 'loaded row')} as` },
+    { heading: partial ? 'Save all rows as' : `Save ${plural(set.rows.length, 'loaded row')} as` },
     { label: 'CSV', icon: <Download />, onSelect: run('csv') },
     { label: 'Excel (XLSX)', icon: <FileSpreadsheet />, onSelect: run('xlsx') },
     { label: 'JSON', icon: <Download />, onSelect: run('json') },
@@ -146,7 +174,9 @@ export function exportMenu(
   }
   items.push(
     'separator',
-    { heading: 'Copy all rows as' },
+    {
+      heading: partial ? `Copy the ${plural(set.rows.length, 'loaded row')} as` : 'Copy all rows as'
+    },
     { label: 'TSV (spreadsheet)', icon: <ClipboardCopy />, onSelect: copy('tsv', 'TSV') },
     { label: 'JSON', icon: <ClipboardCopy />, onSelect: copy('json', 'JSON') },
     { label: 'Markdown', icon: <ClipboardCopy />, onSelect: copy('markdown', 'Markdown') },
@@ -479,6 +509,7 @@ export function ResultsPanel({
                 size="xs"
                 variant="ghost"
                 onClick={(e) =>
+                  typeof active === 'number' &&
                   exportMenu(
                     e.currentTarget,
                     set,

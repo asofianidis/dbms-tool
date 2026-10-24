@@ -35,8 +35,13 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         auth: AuthMode::Password,
         ssl: SslMode::Prefer,
         trust_server_certificate: true,
+        ssl_root_cert: String::new(),
+        ssl_client_cert: String::new(),
+        ssl_client_key: String::new(),
         uri: String::new(),
         auth_source: String::new(),
+        replica_set: String::new(),
+        read_preference: String::new(),
         save_password: false,
         read_only: false,
         production: false,
@@ -663,6 +668,40 @@ async fn redis_end_to_end() {
     assert!(refused.is_err());
 
     run(json!({ "op": "flush", "database": db })).await.unwrap();
+}
+
+/// A sharded cluster through the host-list form: `DBMS_TEST_MONGOS=host:port` of a mongos.
+#[tokio::test]
+async fn mongo_sharded_cluster() {
+    let Ok(raw) = std::env::var("DBMS_TEST_MONGOS") else {
+        return;
+    };
+    let (mut c, _) = config(Engine::Mongo, "DBMS_TEST_MONGOS").unwrap();
+    let (host, port) = raw.rsplit_once(':').unwrap();
+    c.uri = String::new();
+    // The same router twice, as a seed list
+    c.host = format!("{host},127.0.0.1");
+    c.port = port.parse().unwrap();
+    c.read_preference = "secondaryPreferred".into();
+    c.read_only = true;
+    let m = Manager::default();
+    let info = m.open(c.clone(), None).await.expect("connect");
+    assert!(info.product.ends_with("(sharded)"), "{}", info.product);
+    // Cluster status commands still work on a read-only connection
+    let s = m.get(&c.id).unwrap();
+    for command in [json!({ "listShards": 1 }), json!({ "balancerStatus": 1 })] {
+        let req: MongoRequest = serde_json::from_value(
+            json!({ "op": "runCommand", "database": "admin", "command": command }),
+        )
+        .unwrap();
+        let out = s.mongo_execute("tab", req, &opts()).await.unwrap();
+        assert_eq!(out.value.unwrap()["ok"], json!({ "$numberDouble": "1.0" }));
+    }
+    let req: MongoRequest = serde_json::from_value(
+        json!({ "op": "runCommand", "database": "admin", "command": { "balancerStop": 1 } }),
+    )
+    .unwrap();
+    assert!(s.mongo_execute("tab", req, &opts()).await.is_err());
 }
 
 /// Procedures and functions are listed and described on every SQL engine.

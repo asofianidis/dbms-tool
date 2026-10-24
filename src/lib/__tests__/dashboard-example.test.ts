@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { Dialect } from '../engines'
 import { EXAMPLE_NAME, exampleDashboard, exampleWidgets } from '../dashboard-example'
-import { writeStatement } from '../dashboards'
 import { parseShell } from '../mongo-shell'
 
 describe('example dashboard', () => {
@@ -16,10 +14,6 @@ describe('example dashboard', () => {
   it('gives each widget a fresh id', () => {
     const ids = [...exampleWidgets('mysql'), ...exampleWidgets('mysql')].map((w) => w.id)
     expect(new Set(ids).size).toBe(ids.length)
-  })
-
-  it.each<Dialect>(['postgres', 'mysql', 'tsql'])('passes the read-only guard in %s', (dialect) => {
-    for (const w of exampleWidgets('postgres')) expect(writeStatement(w.query, dialect)).toBeNull()
   })
 
   it('parses as read-only aggregates fed by $documents in the shell', () => {

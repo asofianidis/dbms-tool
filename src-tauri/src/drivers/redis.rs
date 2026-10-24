@@ -186,11 +186,12 @@ fn connection_info(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<
         } else {
             cfg.port
         };
-        let addr = if cfg.ssl == SslMode::Require {
+        // Redis has no opportunistic TLS, so Prefer means plain text here
+        let addr = if cfg.ssl.required() {
             ConnectionAddr::TcpTls {
                 host,
                 port,
-                insecure: cfg.trust_server_certificate,
+                insecure: !cfg.verify_certificate(),
                 tls_params: None,
             }
         } else {
@@ -213,15 +214,17 @@ fn connection_info(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<
         {
             redis = redis.set_password(p);
         }
-        // Prefer leaves TLS to the scheme (rediss://); Require upgrades redis://
+        // Prefer leaves TLS to the scheme (rediss://); Disable turns it off and the
+        // stricter modes turn it on
         let addr = match info.addr().clone() {
-            ConnectionAddr::Tcp(host, port) if cfg.ssl == SslMode::Require => {
-                ConnectionAddr::TcpTls {
-                    host,
-                    port,
-                    insecure: cfg.trust_server_certificate,
-                    tls_params: None,
-                }
+            ConnectionAddr::Tcp(host, port) if cfg.ssl.required() => ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure: !cfg.verify_certificate(),
+                tls_params: None,
+            },
+            ConnectionAddr::TcpTls { host, port, .. } if cfg.ssl == SslMode::Disable => {
+                ConnectionAddr::Tcp(host, port)
             }
             ConnectionAddr::TcpTls {
                 host,
@@ -231,20 +234,70 @@ fn connection_info(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<
             } => ConnectionAddr::TcpTls {
                 host,
                 port,
-                insecure: insecure || cfg.trust_server_certificate,
+                // The verify modes override a URI's #insecure
+                insecure: !cfg.ssl.verifies() && (insecure || cfg.trust_server_certificate),
                 tls_params,
             },
             other => other,
         };
         info.set_addr(addr).set_redis_settings(redis)
     };
-    // Through a tunnel the certificate names the real host, not 127.0.0.1
-    if cfg.tunneled.is_some() {
+    let tls = matches!(info.addr(), ConnectionAddr::TcpTls { .. });
+    if !tls {
+        if cfg.root_cert().is_some() || cfg.client_cert().is_some() {
+            return Err(AppError::msg(
+                "Certificate files only apply over TLS; choose Require or a verify mode, or use rediss://",
+            ));
+        }
+        return Ok(info);
+    }
+    if cfg.tunneled.is_some() && cfg.verify_hostname() {
+        return Err(AppError::msg(
+            "Redis can't verify the certificate's host name through an SSH tunnel (it would be checked against 127.0.0.1); use Verify CA or Require instead",
+        ));
+    }
+    let info = with_certificates(cfg, info)?;
+    // Verify CA checks the chain only; through a tunnel the certificate names the
+    // real host, not 127.0.0.1
+    if cfg.ssl == SslMode::VerifyCa || cfg.tunneled.is_some() {
         let mut addr = info.addr().clone();
         addr.set_danger_accept_invalid_hostnames(true);
         return Ok(info.set_addr(addr));
     }
     Ok(info)
+}
+
+/// Attaches the connection's CA and client certificate files, when it names any.
+fn with_certificates(cfg: &ConnectionConfig, info: ConnectionInfo) -> AppResult<ConnectionInfo> {
+    let root_cert = cfg
+        .root_cert()
+        .map(|path| super::tls::read_file(path, "CA certificate"))
+        .transpose()?;
+    let client_tls = match super::tls::client_cert(cfg)? {
+        None => None,
+        Some(super::tls::ClientCert::Pkcs12(_)) => {
+            return Err(AppError::msg(
+                "Redis needs the client certificate and its key as PEM files, not a .p12/.pfx bundle",
+            ));
+        }
+        Some(super::tls::ClientCert::Pem { cert, key }) => Some(::redis::ClientTlsConfig {
+            client_cert: super::tls::read_file(cert, "client certificate")?,
+            client_key: super::tls::read_file(key, "client key")?,
+        }),
+    };
+    if root_cert.is_none() && client_tls.is_none() {
+        return Ok(info);
+    }
+    // The client keeps the parsed certificates in its connection info, which every
+    // per-keyspace client is built from
+    let client = Client::build_with_tls(
+        info,
+        ::redis::TlsCertificates {
+            client_tls,
+            root_cert,
+        },
+    )?;
+    Ok(client.get_connection_info().clone())
 }
 
 pub struct RedisClient {
@@ -1769,6 +1822,65 @@ mod tests {
             ])),
             json!({ "t": "array", "v": [{ "t": "int", "v": 1 }, { "t": "bulk", "v": "x" }] })
         );
+    }
+
+    fn cfg(extra: Value) -> ConnectionConfig {
+        let mut base = json!({ "id": "x", "name": "x", "engine": "redis", "host": "cache.local" });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn insecure(info: &ConnectionInfo) -> Option<bool> {
+        match info.addr() {
+            ConnectionAddr::TcpTls { insecure, .. } => Some(*insecure),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn maps_tls_modes() {
+        // The verify modes encrypt and verify, whatever Trust server certificate says
+        for mode in ["verify-full", "verify-ca"] {
+            let c = cfg(json!({ "ssl": mode, "trustServerCertificate": true }));
+            assert_eq!(
+                insecure(&connection_info(&c, None).unwrap()),
+                Some(false),
+                "{mode}"
+            );
+        }
+        let c = cfg(json!({ "ssl": "require", "trustServerCertificate": true }));
+        assert_eq!(insecure(&connection_info(&c, None).unwrap()), Some(true));
+        // Prefer has no opportunistic TLS on Redis; Disable overrides rediss://
+        assert_eq!(
+            insecure(&connection_info(&cfg(json!({})), None).unwrap()),
+            None
+        );
+        let c = cfg(json!({ "ssl": "disable", "uri": "rediss://cache.local:6380" }));
+        assert_eq!(insecure(&connection_info(&c, None).unwrap()), None);
+        let c = cfg(json!({ "ssl": "verify-full", "uri": "rediss://cache.local:6380/#insecure" }));
+        assert_eq!(insecure(&connection_info(&c, None).unwrap()), Some(false));
+    }
+
+    #[test]
+    fn refuses_tls_settings_it_cannot_honour() {
+        let c = cfg(json!({ "sslRootCert": "ca.pem" }));
+        assert!(
+            connection_info(&c, None).is_err(),
+            "certificates without TLS"
+        );
+        let c = cfg(json!({ "ssl": "require", "sslClientCert": "me.p12" }));
+        let err = connection_info(&c, None).unwrap_err().to_string();
+        assert!(err.contains("PEM"), "{err}");
+        let mut c = cfg(json!({ "ssl": "verify-full" }));
+        c.tunneled = Some(("cache.local".into(), 6380));
+        assert!(
+            connection_info(&c, None).is_err(),
+            "host name check through a tunnel"
+        );
+        c.ssl = SslMode::VerifyCa;
+        assert!(connection_info(&c, None).is_ok());
     }
 
     #[test]

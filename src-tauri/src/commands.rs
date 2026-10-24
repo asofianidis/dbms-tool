@@ -199,6 +199,12 @@ pub async fn connection_open(
     Ok(info)
 }
 
+/// Trusts the SSH host key a `host_key_unknown` error showed the user
+#[tauri::command]
+pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
+    crate::tunnel::trust_host_key(&token).await
+}
+
 #[tauri::command]
 pub fn connection_close(state: State<'_, AppState>, id: String) {
     state.manager.close(&id);
@@ -436,6 +442,8 @@ pub async fn query_export(
             timeout_secs: None,
             max_binary_bytes: usize::MAX,
             sink: Some(handle.clone()),
+            // Only offered for text that just reads; the backend check backs that up
+            read_only: true,
         };
         let server = state.manager.get(&id)?;
         let output = server.execute(&session, &database, &sql, &opts).await?;
@@ -493,6 +501,29 @@ pub async fn mongo_execute(
             "MongoDB command on {} failed",
             connection_label(&state, &id)
         )
+    })
+}
+
+/// Writes a whole collection or query result to a file the user picked.
+#[tauri::command]
+pub async fn mongo_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    session: String,
+    request: crate::drivers::mongo::ExportRequest,
+    path: String,
+) -> AppResult<crate::drivers::mongo::ExportSummary> {
+    crate::file_scope::check(&app, &path)?;
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .mongo_export(&session, request, std::path::Path::new(&path))
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!("MongoDB export on {} failed", connection_label(&state, &id))
     })
 }
 

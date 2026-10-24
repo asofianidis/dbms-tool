@@ -15,6 +15,22 @@ pub enum AppError {
     Unsupported(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// The SSH server's host key isn't in known_hosts yet; the user confirms
+    /// the fingerprint and the frontend calls `ssh_trust_host_key`
+    #[error("The SSH server {} isn't a known host yet", .0.host)]
+    HostKeyUnknown(Box<HostKeyPrompt>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyPrompt {
+    /// Hands the scanned key to `ssh_trust_host_key`
+    pub token: String,
+    pub host: String,
+    /// e.g. `SHA256:...`
+    pub fingerprint: String,
+    /// e.g. `ED25519`
+    pub key_type: String,
 }
 
 impl AppError {
@@ -30,6 +46,7 @@ impl AppError {
             AppError::UnknownConnection => "unknown_connection",
             AppError::Unsupported(_) => "unsupported",
             AppError::Io(_) => "io",
+            AppError::HostKeyUnknown(_) => "host_key_unknown",
         }
     }
 }
@@ -37,9 +54,12 @@ impl AppError {
 impl Serialize for AppError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("AppError", 2)?;
+        let mut s = serializer.serialize_struct("AppError", 3)?;
         s.serialize_field("code", self.code())?;
         s.serialize_field("message", &self.to_string())?;
+        if let AppError::HostKeyUnknown(prompt) = self {
+            s.serialize_field("hostKey", prompt)?;
+        }
         s.end()
     }
 }

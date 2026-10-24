@@ -156,16 +156,20 @@ export function Toggle({
   onChange,
   label,
   description,
-  disabled
+  disabled,
+  title
 }: {
   checked: boolean
   onChange: (checked: boolean) => void
   label: ReactNode
   description?: ReactNode
   disabled?: boolean
+  /** Tooltip with more detail than the description */
+  title?: string
 }): React.JSX.Element {
   return (
     <label
+      title={title}
       className={cn(
         'flex cursor-default items-start gap-3',
         disabled && 'pointer-events-none opacity-40'

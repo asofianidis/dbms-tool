@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { findParams, paramNames, substituteParams } from '../params'
+import { fillParams, findParams, paramNames, sourceOffset, substituteParams } from '../params'
 import { beginSql, commitSql, rollbackSql } from '../transactions'
 
 describe('findParams', () => {
@@ -70,5 +70,23 @@ describe('transaction statements', () => {
     expect(beginSql('postgres')).toBe('BEGIN')
     expect(commitSql('tsql')).toBe('COMMIT TRANSACTION')
     expect(rollbackSql('sqlite')).toBe('ROLLBACK')
+  })
+})
+
+describe('fillParams', () => {
+  it('maps error offsets in the filled text back to the editor text', () => {
+    const sql = 'SELECT * FROM t WHERE name = :name AND id = :id AND oops'
+    const { sql: filled, spans } = fillParams(sql, 'postgres', {
+      name: { value: 'a much longer value', mode: 'text' },
+      id: { value: '7', mode: 'auto' }
+    })
+    expect(filled).toBe("SELECT * FROM t WHERE name = 'a much longer value' AND id = 7 AND oops")
+    // Text after the values lines up with the original
+    expect(sourceOffset(filled.indexOf('oops'), spans)).toBe(sql.indexOf('oops'))
+    expect(sourceOffset(filled.indexOf('WHERE'), spans)).toBe(sql.indexOf('WHERE'))
+    // A position inside a value covers its whole placeholder
+    const inside = filled.indexOf('longer')
+    expect(sourceOffset(inside, spans)).toBe(sql.indexOf(':name'))
+    expect(sourceOffset(inside + 3, spans, 'end')).toBe(sql.indexOf(':name') + ':name'.length)
   })
 })

@@ -350,9 +350,9 @@ export const ResultGrid = memo(function ResultGrid({
   const copySelection = (withHeaders: boolean): void => {
     const { cols, data } = selectedData()
     if (!cols.length) return
-    const nullAsText = data.map((r) => r.map((v) => (v === null ? 'NULL' : v)))
+    // Same rule as CSV files: NULL is an empty field, an empty string is ""
     void copyText(
-      toTsv(cols, nullAsText, withHeaders),
+      toTsv(cols, data, withHeaders),
       `Copied ${data.length === 1 && cols.length === 1 ? 'value' : `${data.length} × ${cols.length}`}`
     )
   }
@@ -1108,7 +1108,9 @@ function CellEditor({
   onDone: (value: Cell | undefined, move?: Pos) => void
 }): React.JSX.Element {
   const [value, setValue] = useState(initial === null ? '' : String(initial))
-  const [isNull, setIsNull] = useState(initial === null)
+  // What an empty input means; Backspace or Delete on an empty input switches it
+  const [emptyIsNull, setEmptyIsNull] = useState(initial === null)
+  const result = (): Cell => (value === '' && emptyIsNull ? null : value)
   const done = useRef(false)
   const finish = (v: Cell | undefined, move?: Pos): void => {
     if (done.current) return
@@ -1120,20 +1122,22 @@ function CellEditor({
       <input
         autoFocus
         value={value}
-        placeholder={isNull ? 'NULL' : ''}
-        onChange={(e) => {
-          setValue(e.target.value)
-          setIsNull(false)
-        }}
+        placeholder={emptyIsNull ? 'NULL' : 'empty string'}
+        title="Backspace on an empty value switches between NULL and empty string"
+        onChange={(e) => setValue(e.target.value)}
         onFocus={(e) => e.target.select()}
-        onBlur={() => finish(isNull ? null : value)}
+        onBlur={() => finish(result())}
         onKeyDown={(e) => {
           e.stopPropagation()
-          if (e.key === 'Enter') finish(isNull ? null : value, { r: 1, c: 0 })
+          if (e.key === 'Enter') finish(result(), { r: 1, c: 0 })
           else if (e.key === 'Tab') {
             e.preventDefault()
-            finish(isNull ? null : value, { r: 0, c: e.shiftKey ? -1 : 1 })
+            finish(result(), { r: 0, c: e.shiftKey ? -1 : 1 })
           } else if (e.key === 'Escape') finish(undefined)
+          else if ((e.key === 'Backspace' || e.key === 'Delete') && value === '') {
+            e.preventDefault()
+            setEmptyIsNull((n) => !n)
+          }
         }}
         className="absolute inset-0 z-10 h-full w-full bg-raised px-2 font-mono text-[12px] text-bright outline outline-2 -outline-offset-2 outline-accent placeholder:text-faint placeholder:italic"
       />

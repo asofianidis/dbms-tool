@@ -25,6 +25,7 @@ import {
   Settings,
   Table2,
   Unplug,
+  Wrench,
   WrapText
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
@@ -46,6 +47,7 @@ import {
   layoutStore,
   newQueryTab,
   openBackup,
+  openMaintenance,
   openCompare,
   openCloud,
   openCollection,
@@ -74,7 +76,8 @@ import {
   exportConnectionsToFile,
   openImportConnections
 } from '@/features/connections/ImportConnections'
-import { EngineMark, Kbd } from './ui'
+import { useServerObjects } from './palette-search'
+import { EngineMark, Kbd, Spinner } from './ui'
 
 interface Item {
   id: string
@@ -109,7 +112,7 @@ function objectIcon(kind: DbObject['kind']): ReactNode {
   return <Table2 className="text-syn-prop" />
 }
 
-/** Back up / restore for the active tab's connection and database. */
+/** Back up, restore and maintenance for the active tab's connection and database. */
 function backupCommands(): Item[] {
   const tab = activeTab()
   if (!tab || !('connectionId' in tab)) return []
@@ -137,7 +140,19 @@ function backupCommands(): Item[] {
             icon: <ArchiveRestore />,
             run: () => openBackup(connection.id, database, 'restore')
           }
-        ])
+        ]),
+    ...(database
+      ? [
+          {
+            id: 'maintenance',
+            group: 'Commands',
+            label: `Maintenance on ${database}…`,
+            detail: name,
+            icon: <Wrench />,
+            run: () => openMaintenance(connection.id, database)
+          }
+        ]
+      : [])
   ]
 }
 
@@ -178,6 +193,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
   const dashboards = dashboardsStore.use()
   const commandMode = query.startsWith('>')
   const term = (commandMode ? query.slice(1) : query).trim().toLowerCase()
+  const found = useServerObjects(term, !commandMode)
 
   const items = useMemo((): Item[] => {
     const commands: Item[] = [
@@ -392,42 +408,46 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       weight: 1,
       run: () => openDashboard(d.id)
     }))
-    // Objects from every list the explorer has loaded
+    // Objects from every list the explorer has loaded, then what the servers found
     const objectItems: Item[] = []
+    const seen = new Set<string>()
+    const addObject = (connectionId: string, database: string, obj: DbObject): void => {
+      const connection = connections.find((c) => c.id === connectionId)
+      if (!connection) return
+      const name =
+        obj.schema && connection.engine !== 'mysql' ? `${obj.schema}.${obj.name}` : obj.name
+      const id = `obj:${connectionId}:${database}:${name}:${obj.detail ?? ''}`
+      if (seen.has(id)) return
+      seen.add(id)
+      objectItems.push({
+        id,
+        group: 'Objects',
+        label: name,
+        detail: `${obj.kind.replace('_', ' ')} · ${connectionLabel(connection)} / ${database}`,
+        icon: objectIcon(obj.kind),
+        weight: ['table', 'collection', 'view'].includes(obj.kind) ? 1 : 0,
+        run: () =>
+          connection.engine === 'mongo'
+            ? openCollection(connectionId, database, obj.name)
+            : openTable(
+                connectionId,
+                database,
+                obj.schema,
+                obj.name,
+                obj.kind,
+                ['function', 'procedure', 'sequence', 'synonym'].includes(obj.kind)
+                  ? 'definition'
+                  : 'data',
+                obj.detail
+              )
+      })
+    }
     if (!commandMode) {
       for (const [key, data] of queryClient.getQueriesData<DbObject[]>({ queryKey: ['conn'] })) {
         if (key[2] !== 'objects' || !Array.isArray(data)) continue
-        const connectionId = key[1] as string
-        const database = key[3] as string
-        const connection = connections.find((c) => c.id === connectionId)
-        if (!connection) continue
-        for (const obj of data) {
-          const name =
-            obj.schema && connection.engine !== 'mysql' ? `${obj.schema}.${obj.name}` : obj.name
-          objectItems.push({
-            id: `obj:${connectionId}:${database}:${name}:${obj.detail ?? ''}`,
-            group: 'Objects',
-            label: name,
-            detail: `${obj.kind.replace('_', ' ')} · ${connectionLabel(connection)} / ${database}`,
-            icon: objectIcon(obj.kind),
-            weight: ['table', 'collection', 'view'].includes(obj.kind) ? 1 : 0,
-            run: () =>
-              connection.engine === 'mongo'
-                ? openCollection(connectionId, database, obj.name)
-                : openTable(
-                    connectionId,
-                    database,
-                    obj.schema,
-                    obj.name,
-                    obj.kind,
-                    ['function', 'procedure', 'sequence', 'synonym'].includes(obj.kind)
-                      ? 'definition'
-                      : 'data',
-                    obj.detail
-                  )
-          })
-        }
+        for (const obj of data) addObject(key[1] as string, key[3] as string, obj)
       }
+      for (const f of found.objects) addObject(f.connectionId, f.database, f.obj)
     }
     const pool = commandMode
       ? commands
@@ -446,7 +466,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       )
       .slice(0, 80)
       .map((m) => m.item)
-  }, [connections, statuses, saved, dashboards, term, commandMode])
+  }, [connections, statuses, saved, dashboards, term, commandMode, found.objects])
 
   useEffect(() => setIndex(0), [term])
   useEffect(() => {
@@ -492,6 +512,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
             spellCheck={false}
             className="h-11 flex-1 bg-transparent text-[14px] text-bright placeholder:text-faint focus:outline-none"
           />
+          {found.searching && <Spinner className="size-3.5 shrink-0" />}
         </div>
         <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto p-1.5">
           {items.map((item, i) => (

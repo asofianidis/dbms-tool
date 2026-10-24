@@ -90,10 +90,39 @@ fn build_config(
     config.encryption(match cfg.ssl {
         SslMode::Disable => EncryptionLevel::NotSupported,
         SslMode::Prefer => EncryptionLevel::Off,
-        SslMode::Require => EncryptionLevel::Required,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => EncryptionLevel::Required,
     });
-    if cfg.trust_server_certificate {
+    if cfg.ssl == SslMode::VerifyCa {
+        // tiberius checks the chain and the name together or not at all
+        return Err(AppError::Unsupported(
+            "SQL Server connections can't verify the certificate without its host name;              use Verify full (set the host name the certificate was issued for)"
+                .into(),
+        ));
+    }
+    // Through a tunnel the certificate names the real server, not 127.0.0.1
+    if let Some((origin, _)) = &cfg.tunneled {
+        config.hostname_in_certificate(origin);
+    }
+    // The verify modes ignore "trust server certificate"; tiberius panics if
+    // the bypass is combined with a CA file
+    if cfg.trust_server_certificate && !cfg.ssl.verifies() {
         config.trust_cert();
+    } else if let Some(ca) = cfg.root_cert() {
+        super::tls::read_file(ca, "CA certificate")?;
+        config.trust_cert_ca(ca);
+    }
+    match super::tls::client_cert(cfg)? {
+        None => {}
+        Some(super::tls::ClientCert::Pem { cert, key }) => config.client_certificate(cert, key),
+        #[cfg(windows)]
+        Some(super::tls::ClientCert::Pkcs12(path)) => config.client_certificate_pkcs12(path, ""),
+        #[cfg(not(windows))]
+        Some(super::tls::ClientCert::Pkcs12(_)) => {
+            return Err(AppError::Unsupported(
+                "On this platform SQL Server client certificates must be PEM files:                  choose the certificate and its private key separately"
+                    .into(),
+            ));
+        }
     }
     Ok(config)
 }
@@ -130,7 +159,9 @@ pub async fn connect(
         // Certificate checks are already off, so the handshake itself failed: usually a
         // server that only speaks TLS 1.0/1.1, which neither rustls nor current Windows allows
         Err(AppError::Message(m))
-            if cfg.trust_server_certificate && m.starts_with("TLS error:") =>
+            if cfg.trust_server_certificate
+                && !cfg.ssl.verifies()
+                && m.starts_with("TLS error:") =>
         {
             let reason = m
                 .split_once(". If the server")

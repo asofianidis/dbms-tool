@@ -1,4 +1,4 @@
-import type { ConnectionConfig, Engine } from './api'
+import type { ConnectionConfig, Engine, SslMode } from './api'
 
 export type Dialect = 'postgres' | 'mysql' | 'tsql' | 'sqlite'
 
@@ -21,8 +21,10 @@ export interface EngineInfo {
 }
 
 export interface EngineFeatures {
-  /** Table, schema and trigger designers */
+  /** Schema and trigger designers */
   designers: boolean
+  /** The table designer */
+  tableDesigner: boolean
   /** Users, roles and grants */
   permissions: boolean
   /** Stored procedures and functions */
@@ -108,7 +110,13 @@ export const ENGINES: Record<Engine, EngineInfo> = {
     dialect: 'sqlite',
     tone: 'bg-sqlite/15 text-sqlite',
     hasSchemas: false,
-    features: { designers: false, permissions: false, routines: false, databases: false }
+    features: {
+      designers: false,
+      tableDesigner: true,
+      permissions: false,
+      routines: false,
+      databases: false
+    }
   },
   redis: {
     id: 'redis',
@@ -122,7 +130,13 @@ export const ENGINES: Record<Engine, EngineInfo> = {
     dialect: null,
     tone: 'bg-redis/15 text-redis',
     hasSchemas: false,
-    features: { designers: false, permissions: false, routines: false, databases: false }
+    features: {
+      designers: false,
+      tableDesigner: false,
+      permissions: false,
+      routines: false,
+      databases: false
+    }
   }
 }
 
@@ -208,6 +222,26 @@ export function redactUri(uri: string): string {
   return uri.replace(/(\/\/[^:/@]*:)([^@]*)@/, '$1••••@')
 }
 
+/** TLS must succeed (no plain-text fallback) */
+export function sslRequired(ssl: SslMode): boolean {
+  return ssl === 'require' || ssl === 'verify-ca' || ssl === 'verify-full'
+}
+
+/** The verify modes, which ignore "Trust server certificate" */
+export function sslVerifies(ssl: SslMode): boolean {
+  return ssl === 'verify-ca' || ssl === 'verify-full'
+}
+
+/** libpq `sslmode` or MySQL `ssl-mode` → SslMode */
+export function sslModeFromParam(value: string): SslMode {
+  const v = value.trim().toLowerCase().replace(/_/g, '-')
+  if (v.startsWith('disable')) return 'disable'
+  if (v === 'verify-full' || v === 'verify-identity') return 'verify-full'
+  if (v === 'verify-ca') return 'verify-ca'
+  if (v.startsWith('require')) return 'require'
+  return 'prefer'
+}
+
 /**
  * Parses a pasted connection string into connection fields. Understands
  * postgres://, mysql://, mongodb(+srv)://, redis(s):// URIs and SQL Server ADO strings.
@@ -246,7 +280,12 @@ export function parseConnectionString(
         : 'mssql'
     try {
       const url = new URL(s.replace(/^[a-z]+:/i, 'http:'))
-      const sslmode = url.searchParams.get('sslmode') ?? url.searchParams.get('ssl-mode')
+      const param = (...names: string[]): string | undefined =>
+        names.map((n) => url.searchParams.get(n)).find((v) => v != null && v !== '') ?? undefined
+      const sslmode = param('sslmode', 'ssl-mode', 'sslMode')
+      const sslRootCert = param('sslrootcert', 'ssl-ca', 'sslca')
+      const sslClientCert = param('sslcert', 'ssl-cert')
+      const sslClientKey = param('sslkey', 'ssl-key')
       return {
         engine,
         patch: {
@@ -254,13 +293,10 @@ export function parseConnectionString(
           port: url.port ? Number(url.port) : ENGINES[engine].defaultPort,
           user: decodeURIComponent(url.username),
           database: decodeURIComponent(url.pathname.replace(/^\//, '')),
-          ...(sslmode && {
-            ssl: /disable/i.test(sslmode)
-              ? 'disable'
-              : /require|verify|required/i.test(sslmode)
-                ? 'require'
-                : 'prefer'
-          })
+          ...(sslmode && { ssl: sslModeFromParam(sslmode) }),
+          ...(sslRootCert && { sslRootCert }),
+          ...(sslClientCert && { sslClientCert }),
+          ...(sslClientKey && { sslClientKey })
         },
         password: url.password ? decodeURIComponent(url.password) : undefined
       }
