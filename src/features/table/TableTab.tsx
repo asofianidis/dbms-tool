@@ -332,8 +332,7 @@ function DataView({
       info: info.data,
       confirmDangerous,
       connection: getConnection(tab.connectionId),
-      execute: (sql, options) =>
-        api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+      execute: (sql, options) => api.execute(tab.connectionId, tab.id, tab.database, sql, options),
       busy: setLoading
     })
     if (!ok) return
