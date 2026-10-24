@@ -17,6 +17,7 @@ import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
+import { SeedHost } from './features/seed/SeedDialog'
 import { BackupTab } from './features/backup/BackupTab'
 import { CompareTab } from './features/compare/CompareTab'
 import { ImportTab } from './features/import/ImportTab'
@@ -238,6 +239,7 @@ export function App(): React.JSX.Element {
       <SchemaDesignerHost />
       <TriggerDesignerHost />
       <PermissionsDesignerHost />
+      <SeedHost />
       <ContextMenuHost />
       <Toaster />
     </div>

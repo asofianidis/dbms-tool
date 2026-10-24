@@ -33,6 +33,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Sprout,
   Server,
   ShieldCheck,
   Table2,
@@ -77,6 +78,7 @@ import { showContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, createCollection, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
@@ -275,6 +277,18 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <ShieldCheck />,
               disabled: !connected,
               onSelect: () => openPermissionsDesigner(connection.id, '')
+            }
+          ]
+        : []),
+      // Babelfish's T-SQL lacks the columnstore and identity reseeding the SQL Server DDL uses;
+      // D1 enforces foreign keys during the load
+      ...(connection.engine !== 'babelfish' && connection.cloud?.provider !== 'cloudflare'
+        ? [
+            {
+              label: 'Seed sample database…',
+              icon: <Sprout />,
+              disabled: !connected || connection.readOnly,
+              onSelect: () => openSeed(connection.id)
             }
           ]
         : []),
