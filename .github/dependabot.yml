@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor bumps arrive as one PR; majors stay separate
+      npm-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    ignore:
+      # Vendored with patches (src-tauri/vendor/tiberius/PATCHES.md); update by hand
+      - dependency-name: tiberius
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]

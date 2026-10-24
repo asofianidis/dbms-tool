@@ -57,6 +57,9 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   profiles, SSO and MFA apply; passwords reach the CLI in a temporary file, never on the command
   line. Render and Cloudflare use an API token kept in the OS credential manager and only ever
   sent to that provider's API.
+- "This machine" network access looks up your public IP with
+  [ipify](https://www.ipify.org/) (`api.ipify.org`), only when you choose that option. The app has
+  no telemetry and sends nothing else to third parties.
 
 **SQLite**
 
@@ -184,14 +187,11 @@ Install or update to the latest release with one command:
 curl -fsSL https://raw.githubusercontent.com/asofianidis/dbms-tool/main/scripts/install-mac.sh | bash
 ```
 
-It downloads the universal build (Apple Silicon and Intel), quits the app if it's running,
-replaces `/Applications/dbms-tool.app` and opens it. From a clone, `bash scripts/install-mac.sh`
-does the same. Because the script downloads with `curl`, macOS doesn't mark the app as
-quarantined, so Gatekeeper doesn't block it even when the build isn't notarized.
-
-If you download the `.dmg` in a browser instead and macOS says it can't verify the developer, open
-**System Settings → Privacy & Security** and click **Open Anyway** (or run
-`xattr -dr com.apple.quarantine /Applications/dbms-tool.app`).
+It downloads the universal build (Apple Silicon and Intel), checks it against the release's
+`SHA256SUMS.txt` and, for signed builds, verifies the code signature and notarization. Then it
+quits the app if it's running, replaces `/Applications/dbms-tool.app` and opens it. From a clone,
+`bash scripts/install-mac.sh` does the same. You can also download the `.dmg` from
+[Releases](https://github.com/asofianidis/dbms-tool/releases/latest).
 
 ### Windows and Linux
 
@@ -256,6 +256,10 @@ src-tauri/src/
   backup.rs              backup and restore, with external tools or the built-in engine
 src-tauri/vendor/tiberius  tiberius 0.13 with small patches (see PATCHES.md)
 ```
+
+## Security
+
+Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 
