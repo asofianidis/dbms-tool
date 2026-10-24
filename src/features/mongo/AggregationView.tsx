@@ -8,7 +8,9 @@ import {
   ChevronRight,
   ClipboardPaste,
   Code2,
+  Download,
   Eye,
+  Gauge,
   Play,
   Plus,
   Trash2
@@ -23,15 +25,17 @@ import {
   type StageCategory,
   type StageForm
 } from '@/lib/aggregation'
-import { api, type MongoOutput } from '@/lib/api'
+import { api, type MongoExportFormat, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { parseShellValue, toShell } from '@/lib/ejson'
 import { shellCollection } from '@/lib/mongo-shell'
+import type { Plan } from '@/lib/plan'
+import { parseMongoExplain } from '@/lib/plan-mongo'
 import { formatDuration } from '@/lib/format'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
-import { errorMessage } from '@/lib/toast'
+import { errorMessage, toastError } from '@/lib/toast'
 import { confirm, newQueryTab, type TabOf } from '@/lib/workspace'
 import { showMenuAt, type MenuItem } from '@/components/ContextMenu'
 import { CodeEditor } from '@/components/editor/CodeEditor'
@@ -47,6 +51,7 @@ import {
   Textarea
 } from '@/components/ui'
 import { DocumentsView, type DocumentsMode } from './DocumentsView'
+import { ExplainDialog, exportFormatItems, exportResult } from './exportResult'
 import { StageFormEditor, type FieldLists } from './StageFormEditor'
 
 interface Stage {
@@ -128,6 +133,8 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
   const [previews, setPreviews] = useState<Record<string, StagePreview>>({})
   const [inputFields, setInputFields] = useState<string[]>([])
   const [pasting, setPasting] = useState(false)
+  const [plan, setPlan] = useState<Plan | null>(null)
+  const [exporting, setExporting] = useState(false)
   const collections = useQuery(queries.objects(tab.connectionId, tab.database, null))
 
   const parsed = useMemo(
@@ -269,6 +276,55 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
     }
   }
 
+  /** The full pipeline, refusing $out and $merge, which explain and export mustn't run. */
+  const readPipeline = (what: string): unknown[] => {
+    if (stages.some((s) => s.enabled && WRITE_STAGES.has(s.operator)))
+      throw new Error(`Disable the $out or $merge stage to ${what} the pipeline`)
+    return pipelineUpTo(stages.length - 1, false)
+  }
+
+  const explain = async (): Promise<void> => {
+    try {
+      const pipeline = readPipeline('explain')
+      const out = await api.mongo(tab.connectionId, tab.id, {
+        op: 'runCommand',
+        database: tab.database,
+        command: {
+          explain: { aggregate: tab.collection, pipeline, cursor: {} },
+          verbosity: 'executionStats'
+        }
+      })
+      const first = pipeline[0] as Record<string, unknown> | undefined
+      const parsed = parseMongoExplain(out.value, {
+        collection: tab.collection,
+        filter: first?.$match,
+        sort: (pipeline.find((s) => '$sort' in (s as object)) as { $sort?: unknown })?.$sort
+      })
+      if (!parsed) throw new Error("The server's explain output has no plan to show")
+      setPlan(parsed)
+    } catch (e) {
+      toastError(e)
+    }
+  }
+
+  const exportAll = (format: MongoExportFormat): void => {
+    let pipeline: unknown[]
+    try {
+      pipeline = readPipeline('export')
+    } catch (e) {
+      toastError(e)
+      return
+    }
+    void exportResult(
+      tab.connectionId,
+      `${tab.id}:export`,
+      { database: tab.database, collection: tab.collection, pipeline },
+      format,
+      `${tab.collection}-pipeline`,
+      () => setExporting(true)
+    ).finally(() => setExporting(false))
+  }
+
   const exportToShell = (): void => {
     const body = stages
       .filter((s) => s.enabled)
@@ -345,6 +401,29 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
               title="Open as db.collection.aggregate([...]) in a shell tab"
             >
               <Code2 className="size-3.5" /> Shell
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => void explain()}
+              title="Explain the pipeline (execution stats)"
+            >
+              <Gauge className="size-3.5" />
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={(e) =>
+                exporting
+                  ? void api.cancel(tab.connectionId, `${tab.id}:export`)
+                  : showMenuAt(e.currentTarget, [
+                      { heading: "Export the pipeline's full output" },
+                      ...exportFormatItems(exportAll)
+                    ])
+              }
+              title={exporting ? 'Exporting… click to stop' : "Export the pipeline's full output"}
+            >
+              <Download className={cn('size-3.5', exporting && 'animate-pulse')} />
             </Button>
             <Button
               size="sm"
@@ -429,6 +508,13 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
           </div>
         </div>
       </Panel>
+      {plan && (
+        <ExplainDialog
+          plan={plan}
+          title={`${tab.database}.${tab.collection} · full pipeline`}
+          onClose={() => setPlan(null)}
+        />
+      )}
       {pasting && (
         <PastePipeline
           onClose={() => setPasting(false)}

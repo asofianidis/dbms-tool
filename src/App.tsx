@@ -10,6 +10,7 @@ import { TabBar } from './components/shell/TabBar'
 import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
+import { CreateCollectionHost } from './features/mongo/CreateCollectionDialog'
 import { Explorer } from './features/explorer/Explorer'
 import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
@@ -234,6 +235,7 @@ export function App(): React.JSX.Element {
       <ConfirmHost />
       <PromptHost />
       <ExecuteRoutineHost />
+      <CreateCollectionHost />
       <TableDesignerHost />
       <SchemaDesignerHost />
       <TriggerDesignerHost />

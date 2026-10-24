@@ -412,6 +412,28 @@ export interface MongoOutput {
   cancelled: boolean
 }
 
+export type MongoExportFormat = 'json' | 'jsonl' | 'csv'
+
+/** A whole find (or, with `pipeline`, aggregation) result written to a file. */
+export interface MongoExportRequest {
+  database: string
+  collection: string
+  filter?: Ejson
+  projection?: Ejson
+  sort?: Ejson
+  pipeline?: Ejson[]
+  format: MongoExportFormat
+}
+
+export interface MongoExportSummary {
+  documents: number
+  bytes: number
+  elapsedMs: number
+  cancelled: boolean
+  /** CSV only: fields first seen after the header was written */
+  droppedFields: string[]
+}
+
 export interface AppError {
   code:
     'error' | 'password_required' | 'not_connected' | 'unknown_connection' | 'unsupported' | 'io'
@@ -489,6 +511,8 @@ export const api = {
 
   mongo: (id: string, session: string, request: MongoRequest, options?: ExecOptions) =>
     invoke<MongoOutput>('mongo_execute', { id, session, request, options }),
+  mongoExport: (id: string, session: string, request: MongoExportRequest, path: string) =>
+    invoke<MongoExportSummary>('mongo_export', { id, session, request, path }),
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),

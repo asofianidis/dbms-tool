@@ -10,15 +10,18 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Square
 } from 'lucide-react'
-import { api, type Cell, type MongoOutput } from '@/lib/api'
+import { api, type Cell, type MongoExportFormat, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { exportRows } from '@/lib/export'
-import { parseShellValue, scalarText, toShell } from '@/lib/ejson'
+import { parseShellValue, toShell } from '@/lib/ejson'
 import { emptyQuery, newCondition, type QueryState } from '@/lib/filters'
 import { andFilters, buildMongoFilter, buildMongoSort, sampleFields } from '@/lib/mongo-filters'
 import { shellCollection } from '@/lib/mongo-shell'
+import type { Plan } from '@/lib/plan'
+import { parseMongoExplain } from '@/lib/plan-mongo'
 import { formatDuration, plural } from '@/lib/format'
 import { settingsStore } from '@/lib/settings'
 import { errorMessage, toast, toastError } from '@/lib/toast'
@@ -41,11 +44,14 @@ import {
   Segmented,
   Spinner
 } from '@/components/ui'
+import { showMenuAt } from '@/components/ContextMenu'
 import { DocumentEditor, type DocumentEditorRequest } from './DocumentEditor'
 import { DocumentsView, documentsToGrid, type DocumentsMode } from './DocumentsView'
 import { AggregationView } from './AggregationView'
 import { SchemaView } from './SchemaView'
 import { IndexesView } from './IndexesView'
+import { ValidationView } from './ValidationView'
+import { ExplainDialog, exportFormatItems, exportResult } from './exportResult'
 import { QueryBuilder, QuerySummary } from '../table/QueryBuilder'
 
 export function CollectionTab({ tab }: { tab: TabOf<'collection'> }): React.JSX.Element {
@@ -78,7 +84,8 @@ export function CollectionTab({ tab }: { tab: TabOf<'collection'> }): React.JSX.
             { value: 'documents', label: 'Documents' },
             { value: 'aggregation', label: 'Aggregations' },
             { value: 'schema', label: 'Schema' },
-            { value: 'indexes', label: 'Indexes' }
+            { value: 'indexes', label: 'Indexes' },
+            { value: 'validation', label: 'Validation' }
           ]}
         />
       </div>
@@ -90,8 +97,10 @@ export function CollectionTab({ tab }: { tab: TabOf<'collection'> }): React.JSX.
         <AggregationView tab={tab} />
       ) : tab.view === 'schema' ? (
         <SchemaView tab={tab} />
-      ) : (
+      ) : tab.view === 'indexes' ? (
         <IndexesView tab={tab} readOnly={connection.readOnly} />
+      ) : (
+        <ValidationView tab={tab} readOnly={connection.readOnly} />
       )}
     </div>
   )
@@ -155,6 +164,8 @@ function DocumentsBrowser({
   const [editor, setEditor] = useState<DocumentEditorRequest | null>(null)
   const [query, setQuery] = useState<QueryState>(emptyQuery)
   const [builderOpen, setBuilderOpen] = useState(false)
+  const [plan, setPlan] = useState<Plan | null>(null)
+  const [exporting, setExporting] = useState(false)
   // Field paths and types sampled from every page loaded so far, for the builder
   const [fields, setFields] = useState<Record<string, string>>({})
   const fieldsRef = useRef(fields)
@@ -257,30 +268,45 @@ function DocumentsBrowser({
     }
   }
 
+  /** Explains the page query as it runs: filter, sort, projection, skip and limit. */
   const explain = async (): Promise<void> => {
     try {
       const { filter, sort } = findQuery()
       const find: Record<string, unknown> = { find: tab.collection, filter }
       if (sort) find.sort = sort
+      const projection = parse(applied.projection, 'Project')
+      if (projection) find.projection = projection
+      if (page) find.skip = page * pageSize
+      find.limit = pageSize
       const out = await api.mongo(tab.connectionId, tab.id, {
         op: 'runCommand',
         database: tab.database,
         command: { explain: find, verbosity: 'executionStats' }
       })
-      const value = out.value as Record<string, unknown>
-      const stats = value.executionStats as Record<string, unknown> | undefined
-      const plan = JSON.stringify(
-        (value.queryPlanner as Record<string, unknown>)?.winningPlan ?? {}
-      )
-      const stages = [...plan.matchAll(/"stage":"(\w+)"/g)].map((m) => m[1])
-      const indexName = /"indexName":"([^"]+)"/.exec(plan)?.[1]
-      toast(
-        `${stages.join(' → ') || 'plan'}${indexName ? ` using ${indexName}` : ''}${stats ? ` · examined ${scalarText(stats.totalDocsExamined)} docs, returned ${scalarText(stats.nReturned)} in ${scalarText(stats.executionTimeMillis)} ms` : ''}`,
-        stages.includes('COLLSCAN') ? 'error' : 'info'
-      )
+      const parsed = parseMongoExplain(out.value, { collection: tab.collection, filter, sort })
+      if (!parsed) throw new Error("The server's explain output has no plan to show")
+      setPlan(parsed)
     } catch (e) {
       toastError(e)
     }
+  }
+
+  const exportAll = (format: MongoExportFormat): void => {
+    let query: { filter: Doc; sort: Doc | undefined; projection: unknown }
+    try {
+      query = { ...findQuery(), projection: parse(applied.projection, 'Project') }
+    } catch (e) {
+      toastError(e)
+      return
+    }
+    void exportResult(
+      tab.connectionId,
+      `${tab.id}:export`,
+      { database: tab.database, collection: tab.collection, ...query },
+      format,
+      tab.collection,
+      () => setExporting(true)
+    ).finally(() => setExporting(false))
   }
 
   const remove = async (doc: Record<string, unknown>): Promise<void> => {
@@ -447,22 +473,48 @@ function DocumentsBrowser({
                 >
                   <Code2 className="size-3.5" /> Shell
                 </Button>
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  title="Export this page"
-                  onClick={() => {
-                    const grid = documentsToGrid(output.documents)
-                    void exportRows(
-                      mode === 'table' ? 'csv' : 'json',
-                      grid.columns,
-                      grid.rows,
-                      tab.collection
-                    )
-                  }}
-                >
-                  <Download className="size-3.5" />
-                </Button>
+                {exporting ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    title="Stop the export"
+                    onClick={() => void api.cancel(tab.connectionId, `${tab.id}:export`)}
+                  >
+                    <Spinner className="size-3" /> Exporting…
+                    <Square className="size-3 fill-current" />
+                  </Button>
+                ) : (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    title="Export this page or every matching document"
+                    onClick={(e) => {
+                      const page = documentsToGrid(output.documents)
+                      showMenuAt(e.currentTarget, [
+                        { heading: 'This page' },
+                        {
+                          label: 'JSON',
+                          onSelect: () =>
+                            void exportRows('json', page.columns, page.rows, tab.collection)
+                        },
+                        {
+                          label: 'CSV',
+                          onSelect: () =>
+                            void exportRows('csv', page.columns, page.rows, tab.collection)
+                        },
+                        {
+                          heading:
+                            total != null
+                              ? `All ${plural(total, 'matching document')}`
+                              : 'All matching documents'
+                        },
+                        ...exportFormatItems(exportAll)
+                      ])
+                    }}
+                  >
+                    <Download className="size-3.5" />
+                  </Button>
+                )}
                 <span className="ml-1 tabular-nums">
                   {shown
                     ? `${(from + 1).toLocaleString()}–${(from + shown).toLocaleString()}`
@@ -501,6 +553,13 @@ function DocumentsBrowser({
           <span className="text-faint">{formatDuration(output.elapsedMs)}</span>
           {!readOnly && <span className="text-faint">Double-click a document to edit it</span>}
         </div>
+      )}
+      {plan && (
+        <ExplainDialog
+          plan={plan}
+          title={`${tab.database}.${tab.collection} · current filter and sort, page ${page + 1}`}
+          onClose={() => setPlan(null)}
+        />
       )}
       {editor && (
         <DocumentEditor
