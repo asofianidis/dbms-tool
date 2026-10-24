@@ -116,6 +116,11 @@ fn ssh_command(
             "SSH tunnels need the host and port form of a MongoDB connection, not a connection string",
         ));
     }
+    if config.engine == Engine::Mongo && config.host.contains(',') {
+        return Err(AppError::msg(
+            "An SSH tunnel reaches one MongoDB host; enter a single replica set member or mongos instead of a list",
+        ));
+    }
     if matches!(config.engine, Engine::Mssql | Engine::Babelfish) && config.host.contains('\\') {
         return Err(AppError::msg(
             "Named SQL Server instances can't be reached through an SSH tunnel; enter the instance's port instead",
