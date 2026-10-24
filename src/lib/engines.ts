@@ -136,7 +136,7 @@ export const ENGINE_ORDER: Engine[] = [
   'sqlite'
 ]
 
-/** Engines whose data isn't SQL: no query editor, designers, compare, import or seeding. */
+/** Engines whose data isn't SQL or documents: no query editor, designers, compare, import or dashboards. */
 export function isKeyValue(engine: Engine): boolean {
   return engine === 'redis'
 }

@@ -505,6 +505,8 @@ export type RedisRequest =
   | { op: 'deleteMatching'; database: string; pattern: string }
   | { op: 'flush'; database: string }
   | { op: 'command'; database: string; args: string[] }
+  /** Many commands in one round trip; rejected ones come back in `entries` as { index, error } */
+  | { op: 'pipeline'; database: string; commands: RData[][] }
 
 /** A server reply, tagged the way redis-cli prints it. */
 export type RedisReply =

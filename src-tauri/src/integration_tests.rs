@@ -643,6 +643,25 @@ async fn redis_end_to_end() {
     .unwrap();
     assert!(ro.redis_execute("tab", read, &opts()).await.is_ok());
 
+    // Pipelines report rejected commands without failing the batch
+    let piped = run(json!({ "op": "pipeline", "database": db, "commands": [
+        ["SET", "p:1", "a"], ["HSET", "p:1", "f", "v"], ["RPUSH", "p:list", "x", "y"]
+    ]}))
+    .await
+    .unwrap();
+    assert_eq!(piped.reply, Some(json!({ "t": "int", "v": 2 })));
+    assert_eq!(piped.entries.len(), 1);
+    assert_eq!(piped.entries[0]["index"], json!(1));
+    assert!(
+        piped.entries[0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("WRONGTYPE")
+    );
+    let refused =
+        run(json!({ "op": "pipeline", "database": db, "commands": [["SELECT", "2"]] })).await;
+    assert!(refused.is_err());
+
     run(json!({ "op": "flush", "database": db })).await.unwrap();
 }
 

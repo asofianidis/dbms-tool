@@ -52,7 +52,7 @@ import {
 import type { ConnectionConfig, DatabaseInfo, DbObject, ObjectKind } from '@/lib/api'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { ENGINES, connectionLabel, connectionSubtitle, isKeyValue, supports } from '@/lib/engines'
+import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
@@ -300,9 +300,7 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
         : []),
       // Babelfish's T-SQL lacks the columnstore and identity reseeding the SQL Server DDL uses;
       // D1 enforces foreign keys during the load
-      ...(connection.engine !== 'babelfish' &&
-      !isKeyValue(connection.engine) &&
-      connection.cloud?.provider !== 'cloudflare'
+      ...(connection.engine !== 'babelfish' && connection.cloud?.provider !== 'cloudflare'
         ? [
             {
               label: 'Seed sample database…',

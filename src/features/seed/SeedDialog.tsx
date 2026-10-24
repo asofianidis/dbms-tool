@@ -9,14 +9,17 @@ import { queries } from '@/lib/queries'
 import {
   DEFAULT_SEED_DATABASE,
   MONGO_TIMESERIES,
+  REDIS_SEED_HINTS,
   SEED_SIZES,
   SEED_TABLES,
   SEED_VIEWS,
   dropSeedObjectsSql,
   mongoSeedBatches,
   mongoSeedIndexes,
+  defaultRedisSeedDatabase,
   postStatements,
   recreateDatabaseSql,
+  redisSeedBatches,
   schemaStatements,
   sqlSeedBatches,
   validDatabaseName,
@@ -25,7 +28,7 @@ import {
 import { createStore } from '@/lib/store'
 import { toast, errorMessage } from '@/lib/toast'
 import { connect, connectionsStore, refreshConnection } from '@/lib/workspace'
-import { Button, ErrorText, Field, Input, Modal, Segmented } from '@/components/ui'
+import { Button, ErrorText, Field, Input, Modal, Segmented, Select } from '@/components/ui'
 
 const seedStore = createStore<string | null>(null)
 
@@ -58,8 +61,12 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
   const engine = connection?.engine
   const isMongo = engine === 'mongo'
   const isSqlite = engine === 'sqlite'
+  const isRedis = engine === 'redis'
+  const noun = isMongo ? 'documents' : isRedis ? 'records' : 'rows'
   const dialect = engine ? ENGINES[engine].dialect : null
   const [name, setName] = useState(DEFAULT_SEED_DATABASE)
+  // Redis databases are numbered keyspaces; null until the user picks one
+  const [redisDb, setRedisDb] = useState<string | null>(null)
   const [size, setSize] = useState<SeedSize>('small')
   const [job, setJob] = useState<Job | null>(null)
   const cancelled = useRef(false)
@@ -73,19 +80,31 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
     ...queries.objects(connectionId, sqliteDb, null),
     enabled: isSqlite && databases.isSuccess
   })
-  const target = isSqlite ? sqliteDb : name.trim()
+  const target = isSqlite
+    ? sqliteDb
+    : isRedis
+      ? (redisDb ?? defaultRedisSeedDatabase(databases.data ?? []))
+      : name.trim()
   const exists = isSqlite
     ? (objects.data ?? []).some((o) =>
         [...SEED_TABLES, ...SEED_VIEWS].includes(o.name.toLowerCase())
       )
-    : (databases.data ?? []).some((d) => d.name.toLowerCase() === target.toLowerCase())
+    : isRedis
+      ? (databases.data?.find((d) => d.name === target)?.keys ?? 0) > 0
+      : (databases.data ?? []).some((d) => d.name.toLowerCase() === target.toLowerCase())
+  const sizes = (Object.keys(SEED_SIZES) as SeedSize[]).filter(
+    (s) => !isRedis || REDIS_SEED_HINTS[s]
+  )
 
   const close = (): void => {
     if (!running) seedStore.set(null)
   }
   if (!connection) return null
 
-  const problem = isSqlite || validDatabaseName(target) ? null : 'Use letters, digits and _'
+  const problem =
+    isSqlite || (isRedis ? /^\d+$/.test(target) : validDatabaseName(target))
+      ? null
+      : 'Use letters, digits and _'
 
   const update = (patch: Partial<Job>): void =>
     setJob((j) => (j ? { ...j, ...patch, elapsedMs: Date.now() - j.startedAt } : j))
@@ -180,13 +199,45 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
     return rows
   }
 
+  const runRedis = async (key: string, warnings: string[]): Promise<number> => {
+    const { scale, metricDays } = SEED_SIZES[size]
+    const redis = async (request: Parameters<typeof api.redis>[2]) => {
+      if (cancelled.current) throw new Cancelled()
+      const out = await api.redis(connectionId, key, request, { confirmed: true })
+      if (out.cancelled || cancelled.current) throw new Cancelled()
+      return out
+    }
+    if (exists) {
+      update({ phase: `Emptying database ${target}` })
+      await redis({ op: 'flush', database: target })
+    }
+    let rows = 0
+    for (const batch of redisSeedBatches(scale, metricDays)) {
+      const out = await redis({ op: 'pipeline', database: target, commands: batch.commands })
+      for (const e of out.entries as { index: number; error: string }[])
+        if (warnings.length < 50)
+          warnings.push(`${(batch.commands[e.index] ?? []).slice(0, 2).join(' ')}: ${e.error}`)
+      rows += batch.rows
+      update({ phase: `Loading ${batch.entity}`, progress: batch.progress, rows })
+    }
+    return rows
+  }
+
   const start = async (): Promise<void> => {
     if (running || problem || !target) return
     // Asked once here; the statements below skip the per-statement production check
-    const allowed = await confirmProductionWrite(connection, {
-      action: `This creates the sample database ${target}`,
-      dangers: exists ? [`replacing the existing ${target}`] : []
-    })
+    const allowed = await confirmProductionWrite(
+      connection,
+      isRedis
+        ? {
+            action: `This loads the sample dataset into database ${target}`,
+            dangers: exists ? [`emptying database ${target} first (FLUSHDB)`] : []
+          }
+        : {
+            action: `This creates the sample database ${target}`,
+            dangers: exists ? [`replacing the existing ${target}`] : []
+          }
+    )
     if (!allowed || !(await connect(connectionId))) return
     const key = `seed:${crypto.randomUUID()}`
     sessions.current = [key]
@@ -202,10 +253,14 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
       warnings
     })
     try {
-      const rows = isMongo ? await runMongo(key, warnings) : await runSql(key, warnings)
+      const rows = isMongo
+        ? await runMongo(key, warnings)
+        : isRedis
+          ? await runRedis(key, warnings)
+          : await runSql(key, warnings)
       update({ state: 'done', phase: 'Done', warnings: [...warnings] })
       toast(
-        `Seeded ${target} with ${rows.toLocaleString()} ${isMongo ? 'documents' : 'rows'}`,
+        `Seeded ${isRedis ? `database ${target}` : target} with ${rows.toLocaleString()} ${noun}`,
         warnings.length ? 'error' : 'success'
       )
     } catch (e) {
@@ -228,7 +283,6 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
     for (const s of sessions.current) void api.cancel(connectionId, s).catch(() => {})
   }
 
-  const noun = isMongo ? 'documents' : 'rows'
   const finished = job && job.state !== 'running'
 
   return (
@@ -257,7 +311,13 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
               disabled={!!problem || !target}
               onClick={() => void start()}
             >
-              {exists ? (isSqlite ? 'Replace sample tables' : `Replace ${target}`) : 'Seed'}
+              {exists
+                ? isSqlite
+                  ? 'Replace sample tables'
+                  : isRedis
+                    ? `Replace database ${target}`
+                    : `Replace ${target}`
+                : 'Seed'}
             </Button>
           </>
         )
@@ -286,7 +346,8 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
           {job.warnings.length > 0 && (
             <div className="space-y-1">
               <p className="text-[11px] font-medium text-muted">
-                {job.warnings.length} statement{job.warnings.length === 1 ? '' : 's'} failed
+                {job.warnings.length} {isRedis ? 'command' : 'statement'}
+                {job.warnings.length === 1 ? '' : 's'} failed
               </p>
               <ul className="max-h-40 space-y-1 overflow-y-auto text-[11.5px] text-danger select-text">
                 {job.warnings.map((w, i) => (
@@ -298,13 +359,34 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
         </div>
       ) : (
         <div className="space-y-4">
-          <p className="text-[12.5px] leading-relaxed text-muted">
-            Fills a database with a realistic e-commerce dataset: customers, products, orders,
-            reviews, clickstream events, support tickets, inventory and per-minute host metrics. The
-            data is skewed and seasonal, and reruns produce the same rows. It's the same dataset
-            scripts/{isMongo ? 'seed-mongo.sh' : 'seed-sql'} loads at full size.
-          </p>
-          {!isSqlite && (
+          {isRedis ? (
+            <p className="text-[12.5px] leading-relaxed text-muted">
+              Fills a database with the realistic e-commerce dataset the other engines get, kept the
+              way an app would keep it in Redis: hashes for customers, products and orders, lists of
+              line items, sorted-set leaderboards, streams of clickstream events with consumer
+              groups, a geo index of warehouses, HyperLogLog visitor counts, and sessions and carts
+              that expire. It's the same data scripts/seed-redis.sh loads.
+            </p>
+          ) : (
+            <p className="text-[12.5px] leading-relaxed text-muted">
+              Fills a database with a realistic e-commerce dataset: customers, products, orders,
+              reviews, clickstream events, support tickets, inventory and per-minute host metrics.
+              The data is skewed and seasonal, and reruns produce the same rows. It's the same
+              dataset scripts/{isMongo ? 'seed-mongo.sh' : 'seed-sql'} loads at full size.
+            </p>
+          )}
+          {isRedis && (
+            <Field label="Database">
+              <Select value={target} onChange={(e) => setRedisDb(e.target.value)}>
+                {(databases.data ?? [{ name: target, keys: 0 }]).map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {`db${d.name}${d.keys ? ` · ${d.keys.toLocaleString()} keys` : ' · empty'}`}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          )}
+          {!isSqlite && !isRedis && (
             <Field label="Database" hint={problem ?? undefined}>
               <Input
                 mono
@@ -314,12 +396,12 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
               />
             </Field>
           )}
-          <Field label="Size" hint={SEED_SIZES[size].hint}>
+          <Field label="Size" hint={(isRedis && REDIS_SEED_HINTS[size]) || SEED_SIZES[size].hint}>
             <div>
               <Segmented
                 value={size}
                 onChange={setSize}
-                options={(Object.keys(SEED_SIZES) as SeedSize[]).map((s) => ({
+                options={sizes.map((s) => ({
                   value: s,
                   label: SEED_SIZES[s].label
                 }))}
@@ -331,7 +413,9 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
               <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
               {isSqlite
                 ? `${sqliteDb} already has sample tables; they're dropped and recreated. Other tables are left alone.`
-                : `${target} already exists. It's dropped and recreated, and everything in it is lost.`}
+                : isRedis
+                  ? `Database ${target} isn't empty. It's flushed first, and every key in it is lost.`
+                  : `${target} already exists. It's dropped and recreated, and everything in it is lost.`}
             </p>
           )}
         </div>

@@ -111,6 +111,10 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   multi-line scripts, and replies printed the way redis-cli prints them.
 - Pub/Sub: subscribe to channels and patterns, watch every key change through keyspace
   notifications, and publish messages.
+- Seed sample database: the same e-commerce dataset as the other engines, kept the way an app
+  would keep it in Redis (hashes, lists, sorted-set leaderboards, event streams with consumer
+  groups, a geo index, HyperLogLogs, expiring sessions). `scripts/seed-redis.sh [container] [db]
+  [scale]` loads it into a Docker container with `redis-cli --pipe`.
 - Server page with live ops/sec, hit rate, memory, clients and evictions, a client list you can
   kill from, and the slow log.
 - Read-only connections only allow read commands; production connections confirm writes and need

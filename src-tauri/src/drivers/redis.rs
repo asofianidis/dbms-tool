@@ -562,6 +562,12 @@ pub enum RedisRequest {
         database: String,
         args: Vec<String>,
     },
+    /// Many commands in one round trip, e.g. seeding; a command the server rejects is
+    /// reported, not fatal
+    Pipeline {
+        database: String,
+        commands: Vec<Vec<Data>>,
+    },
 }
 
 impl RedisRequest {
@@ -588,7 +594,8 @@ impl RedisRequest {
             | Delete { database, .. }
             | DeleteMatching { database, .. }
             | Flush { database }
-            | Command { database, .. } => database,
+            | Command { database, .. }
+            | Pipeline { database, .. } => database,
         }
     }
 
@@ -596,6 +603,17 @@ impl RedisRequest {
         match self {
             RedisRequest::Scan { .. } | RedisRequest::Get { .. } => false,
             RedisRequest::Command { args, .. } => !is_read_command(args),
+            RedisRequest::Pipeline { commands, .. } => commands.iter().any(|c| {
+                let name: Vec<String> = c
+                    .iter()
+                    .take(2)
+                    .map(|a| match a {
+                        Data::Text(t) => t.clone(),
+                        Data::Hex { .. } => String::new(),
+                    })
+                    .collect();
+                !is_read_command(&name)
+            }),
             _ => true,
         }
     }
@@ -1169,6 +1187,7 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
             query(conn, &cmd("FLUSHDB")).await?;
             ok()
         }
+        Pipeline { commands, .. } => pipeline(conn, commands).await?,
         Command { args, .. } => {
             let Some(name) = args.first() else {
                 return Err(AppError::msg("Enter a command"));
@@ -1185,6 +1204,46 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
             RedisOutput::reply(reply_json(reply))
         }
     })
+}
+
+/// Most rejected commands a pipeline reports back.
+const MAX_PIPELINE_ERRORS: usize = 20;
+
+async fn pipeline(
+    conn: &mut MultiplexedConnection,
+    commands: Vec<Vec<Data>>,
+) -> AppResult<RedisOutput> {
+    let mut p = ::redis::pipe();
+    p.ignore_errors();
+    for command in &commands {
+        let Some((name, args)) = command.split_first() else {
+            return Err(AppError::msg("A pipeline command is empty"));
+        };
+        let Data::Text(name) = name else {
+            return Err(AppError::msg("A command name must be text"));
+        };
+        if let Some(reason) = refused_command(std::slice::from_ref(name)) {
+            return Err(AppError::msg(reason));
+        }
+        p.cmd(name);
+        for a in args {
+            p.arg(a.bytes()?);
+        }
+    }
+    let results: Vec<::redis::RedisResult<RValue>> = p.query_async(conn).await?;
+    let mut failed = 0i64;
+    let mut errors = Vec::new();
+    for (index, result) in results.into_iter().enumerate() {
+        if let Err(e) = result {
+            failed += 1;
+            if errors.len() < MAX_PIPELINE_ERRORS {
+                errors.push(json!({ "index": index, "error": describe_error(&e) }));
+            }
+        }
+    }
+    let mut out = affected(commands.len() as i64 - failed);
+    out.entries = errors;
+    Ok(out)
 }
 
 /// UNLINK frees memory in the background; servers before 4.0 only have DEL.

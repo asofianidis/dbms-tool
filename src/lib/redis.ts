@@ -318,6 +318,8 @@ export function redisIsWrite(request: RedisRequest): boolean {
       return false
     case 'command':
       return !isReadCommand(request.args)
+    case 'pipeline':
+      return request.commands.some((c) => !isReadCommand(c.slice(0, 2).map((a) => dataText(a))))
     default:
       return true
   }
@@ -382,6 +384,8 @@ const OP_COMMANDS: Partial<Record<RedisRequest['op'], string>> = {
 export function redisSummary(request: RedisRequest): string {
   if (request.op === 'command')
     return `This runs ${request.args.map(quoteArg).join(' ').slice(0, 200)} on database ${request.database}`
+  if (request.op === 'pipeline')
+    return `This runs ${request.commands.length} commands in database ${request.database}`
   if (request.op === 'deleteMatching')
     return `This deletes keys matching ${request.pattern} in database ${request.database}`
   if (request.op === 'listPush')
