@@ -140,8 +140,17 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
   const parsed = useMemo(
     () =>
       stages.map((s) => {
+        // The operator box is free text, so it can be empty mid-edit
+        if (!/^\$[A-Za-z]+$/.test(s.operator.trim()))
+          return {
+            stage: null,
+            error: s.operator.trim() ? `${s.operator} isn't a stage name` : 'Choose a stage'
+          }
         try {
-          return { stage: { [s.operator]: parseShellValue(s.body) }, error: null as string | null }
+          return {
+            stage: { [s.operator.trim()]: parseShellValue(s.body) },
+            error: null as string | null
+          }
         } catch (e) {
           return { stage: null, error: errorMessage(e) }
         }
