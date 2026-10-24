@@ -337,19 +337,26 @@ impl SqSession {
     }
 
     pub async fn server_info(&mut self) -> AppResult<ServerInfo> {
+        // D1's authorizer rejects sqlite_version(), so a trivial query proves the
+        // credentials instead and the version stays unknown
+        if self.is_d1() {
+            self.query("SELECT 1").await?;
+            return Ok(ServerInfo {
+                product: "Cloudflare D1".into(),
+                version: "Cloudflare D1".into(),
+                current_database: MAIN.into(),
+                user: String::new(),
+                babelfish_version: None,
+            });
+        }
         let version = self
             .query("SELECT sqlite_version()")
             .await?
             .first()
             .and_then(|r| text(r, 0))
             .unwrap_or_default();
-        let product = if self.is_d1() {
-            "Cloudflare D1".to_string()
-        } else {
-            format!("SQLite {version}")
-        };
         Ok(ServerInfo {
-            product,
+            product: format!("SQLite {version}"),
             version: format!("SQLite {version}"),
             current_database: MAIN.into(),
             user: String::new(),
