@@ -4,6 +4,7 @@ import { Sprout, TriangleAlert } from 'lucide-react'
 import { api } from '@/lib/api'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { formatDuration } from '@/lib/format'
+import { confirmProductionWrite } from '@/lib/production'
 import { queries } from '@/lib/queries'
 import {
   DEFAULT_SEED_DATABASE,
@@ -91,7 +92,10 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
 
   const exec = async (session: string, database: string, sql: string): Promise<void> => {
     if (cancelled.current) throw new Cancelled()
-    const out = await api.execute(connectionId, session, database, sql, { maxRows: 1 })
+    const out = await api.execute(connectionId, session, database, sql, {
+      maxRows: 1,
+      confirmed: true
+    })
     if (out.cancelled || cancelled.current) throw new Cancelled()
     if (out.error) throw new Error(out.error.message)
   }
@@ -141,7 +145,7 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
     const { scale, metricDays } = SEED_SIZES[size]
     const mongo = async (request: Parameters<typeof api.mongo>[2]): Promise<void> => {
       if (cancelled.current) throw new Cancelled()
-      const out = await api.mongo(connectionId, key, request)
+      const out = await api.mongo(connectionId, key, request, { confirmed: true })
       if (out.cancelled || cancelled.current) throw new Cancelled()
     }
     update({ phase: exists ? `Recreating ${target}` : `Creating ${target}` })
@@ -178,7 +182,12 @@ function SeedDialog({ connectionId }: { connectionId: string }): React.JSX.Eleme
 
   const start = async (): Promise<void> => {
     if (running || problem || !target) return
-    if (!(await connect(connectionId))) return
+    // Asked once here; the statements below skip the per-statement production check
+    const allowed = await confirmProductionWrite(connection, {
+      action: `This creates the sample database ${target}`,
+      dangers: exists ? [`replacing the existing ${target}`] : []
+    })
+    if (!allowed || !(await connect(connectionId))) return
     const key = `seed:${crypto.randomUUID()}`
     sessions.current = [key]
     cancelled.current = false

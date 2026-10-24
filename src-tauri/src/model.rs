@@ -198,6 +198,9 @@ pub struct ExecOutput {
 pub struct ExecOptions {
     #[serde(default = "default_max_rows")]
     pub max_rows: usize,
+    /// Cancels the statement after this many seconds; `None` or 0 never times out
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_max_rows() -> usize {
@@ -208,6 +211,7 @@ impl Default for ExecOptions {
     fn default() -> Self {
         Self {
             max_rows: default_max_rows(),
+            timeout_secs: None,
         }
     }
 }

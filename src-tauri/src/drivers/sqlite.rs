@@ -788,7 +788,10 @@ mod tests {
     #[tokio::test]
     async fn executes_scripts_with_results_and_errors() {
         let (mut s, _path) = session(SCHEMA).await;
-        let opts = ExecOptions { max_rows: 1 };
+        let opts = ExecOptions {
+            max_rows: 1,
+            ..Default::default()
+        };
         let out = s
             .execute(
                 "UPDATE authors SET name = upper(name); SELECT id, name FROM authors; SELECT cover FROM books;",

@@ -85,7 +85,7 @@ pub async fn connect(
             database
         })
         .application_name("dbms-tool")
-        .connect_timeout(Duration::from_secs(15))
+        .connect_timeout(crate::limits::connect_timeout())
         .ssl_mode(match cfg.ssl {
             SslMode::Disable => PgSslMode::Disable,
             SslMode::Prefer => PgSslMode::Prefer,
@@ -106,12 +106,14 @@ pub async fn connect(
 
     // connect_timeout only bounds the TCP connect; a server that accepts and then stalls
     // during startup would otherwise hang forever
-    let (client, mut connection) =
-        tokio::time::timeout(Duration::from_secs(20), pg.connect(tls.clone()))
-            .await
-            .map_err(|_| {
-                AppError::msg("Timed out waiting for the server to finish the connection handshake")
-            })??;
+    let (client, mut connection) = tokio::time::timeout(
+        crate::limits::connect_timeout() + Duration::from_secs(5),
+        pg.connect(tls.clone()),
+    )
+    .await
+    .map_err(|_| {
+        AppError::msg("Timed out waiting for the server to finish the connection handshake")
+    })??;
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = notices.clone();
     let task = tokio::spawn(async move {

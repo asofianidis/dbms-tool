@@ -20,11 +20,12 @@ import {
   Undo2
 } from 'lucide-react'
 import { api, type CompletionTable } from '@/lib/api'
-import { ENGINES } from '@/lib/engines'
+import { ENGINES, connectionLabel } from '@/lib/engines'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
 import { paramNames, substituteParams, type ParamValue } from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
+import { confirmProductionWrite, isProduction } from '@/lib/production'
 import { queries } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
@@ -34,6 +35,7 @@ import { errorMessage, toast, toastError } from '@/lib/toast'
 import {
   beginSql,
   commitSql,
+  isManualCommit,
   manualCommitStore,
   openTransactionsStore,
   rollbackSql,
@@ -94,7 +96,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     (status?.state === 'connected' && !!status.info.babelfishVersion)
   const layout = useDefaultLayout({ id: 'query-split', storage: localStorage })
   const inTransaction = !!openTransactionsStore.use()[tab.id]
-  const manualCommit = !!manualCommitStore.use()[tab.id]
+  const manualCommit = isManualCommit(tab.id, manualCommitStore.use(), settings.defaultCommitMode)
   const [paramPrompt, setParamPrompt] = useState<{
     names: string[]
     resolve: (values: Record<string, ParamValue> | null) => void
@@ -141,7 +143,8 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         sql = text
       }
       if (!sql.trim()) return
-      if (settings.confirmDangerous && !transform) {
+      // Production connections confirm every write below instead
+      if (settings.confirmDangerous && !transform && !isProduction(connection)) {
         const reasons = dangerousStatements(sql, dialect)
         if (reasons.length) {
           const ok = await confirm({
@@ -166,8 +169,10 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         if (!values) return
         filled = substituteParams(sql, dialect, values)
       }
-      if (!(await connect(tab.connectionId))) return
       const toRun = transform ? transform(filled) : filled
+      // Asked before a manual-commit BEGIN, so declining leaves no transaction behind
+      if (!(await confirmProductionWrite(connection, { sql: toRun }))) return
+      if (!(await connect(tab.connectionId))) return
       // Error positions only map back onto the editor when the text ran unchanged
       const runOffset = transform || names.length ? -1 : offset
       ed.clearErrors()
@@ -175,7 +180,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       if (resultsPanel.current?.isCollapsed()) resultsPanel.current.expand()
       try {
         // Manual commit: the first run after a COMMIT or ROLLBACK opens a new transaction
-        if (manualCommitStore.get()[tab.id] && !explain && !openTransactionsStore.get()[tab.id]) {
+        if (isManualCommit(tab.id) && !explain && !openTransactionsStore.get()[tab.id]) {
           const begin = beginSql(dialect)
           const begun = await api.execute(tab.connectionId, tab.id, tab.database, begin)
           if (begun.error) {
@@ -187,7 +192,9 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           }
         }
         const output = await api.execute(tab.connectionId, tab.id, tab.database, toRun, {
-          maxRows: settings.maxRows
+          maxRows: settings.maxRows,
+          timeoutSecs: settings.queryTimeoutSecs,
+          confirmed: true
         })
         if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
         const plan =
@@ -234,6 +241,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       dialect,
       babelfish,
       settings.maxRows,
+      settings.queryTimeoutSecs,
       settings.confirmDangerous
     ]
   )
@@ -266,6 +274,18 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
 
   const endTransaction = async (commit: boolean): Promise<void> => {
     const sql = commit ? commitSql(dialect) : rollbackSql(dialect)
+    if (
+      commit &&
+      connection &&
+      isProduction(connection) &&
+      !(await confirm({
+        title: `Commit to production database ${connectionLabel(connection)}?`,
+        message: "The transaction's changes become permanent.",
+        confirmLabel: 'Commit',
+        danger: true
+      }))
+    )
+      return
     setRunning(tab.id, true)
     try {
       const output = await api.execute(tab.connectionId, tab.id, tab.database, sql)

@@ -3,6 +3,7 @@ import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-re
 import { CommandPalette } from './components/CommandPalette'
 import { ContextMenuHost } from './components/ContextMenu'
 import { ConnectionDialogHost } from './components/dialogs/ConnectionDialog'
+import { ImportConnectionsHost } from './features/connections/ImportConnections'
 import { ConfirmHost, PasswordPromptHost, PromptHost } from './components/dialogs/Dialogs'
 import { ActivityRail } from './components/shell/ActivityRail'
 import { StatusBar } from './components/shell/StatusBar'
@@ -37,6 +38,8 @@ import { isMod } from './lib/keys'
 import { queryClient } from './lib/queries'
 import { toastError } from './lib/toast'
 import { migrateAccentSetting, startThemeSync } from './lib/themes'
+import { startSettingsSync } from './lib/app-settings'
+import { startProductionGuard } from './lib/production'
 import { startUpdateChecks } from './lib/updater'
 import {
   activateTab,
@@ -142,6 +145,8 @@ export function App(): React.JSX.Element {
     bindQueryClient(queryClient)
     migrateAccentSetting()
     const stopThemes = startThemeSync()
+    const stopSettings = startSettingsSync()
+    const stopGuard = startProductionGuard()
     loadConnections().catch(toastError)
     if (!tabsStore.get().tabs.length) openWelcome()
     // Native menus on right-click make the app feel like a web page
@@ -155,6 +160,8 @@ export function App(): React.JSX.Element {
       window.removeEventListener('contextmenu', onContextMenu)
       stopUpdates()
       stopThemes()
+      stopSettings()
+      stopGuard()
     }
   }, [])
 
@@ -231,6 +238,7 @@ export function App(): React.JSX.Element {
       <StatusBar />
       <CommandPalette />
       <ConnectionDialogHost />
+      <ImportConnectionsHost />
       <PasswordPromptHost />
       <ConfirmHost />
       <PromptHost />

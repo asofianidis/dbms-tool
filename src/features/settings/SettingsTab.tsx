@@ -4,6 +4,8 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FileInput,
+  FileOutput,
   Moon,
   Pencil,
   Plus,
@@ -11,6 +13,7 @@ import {
   Sun
 } from 'lucide-react'
 import { getVersion } from '@tauri-apps/api/app'
+import { EDITOR_FONTS } from '@/lib/app-settings'
 import { cn } from '@/lib/cn'
 import { timeAgo } from '@/lib/format'
 import { historyStore } from '@/lib/history'
@@ -27,6 +30,7 @@ import {
 import { toast } from '@/lib/toast'
 import { confirm, promptText } from '@/lib/workspace'
 import { Badge, Button, Input, Segmented, Select, Switch } from '@/components/ui'
+import { exportConnectionsToFile, openImportConnections } from '../connections/ImportConnections'
 import { ThemeEditor } from './ThemeEditor'
 
 function Row({
@@ -330,6 +334,24 @@ export function SettingsTab(): React.JSX.Element {
         </section>
 
         <Section title="Editor">
+          <Row
+            title="Font family"
+            description="Any installed monospace font; falls back to JetBrains Mono"
+          >
+            <Input
+              value={settings.editorFontFamily}
+              onChange={(e) => set('editorFontFamily', e.target.value)}
+              placeholder="JetBrains Mono"
+              list="editor-fonts"
+              spellCheck={false}
+              className="w-44"
+            />
+            <datalist id="editor-fonts">
+              {EDITOR_FONTS.map((f) => (
+                <option key={f} value={f} />
+              ))}
+            </datalist>
+          </Row>
           <Row title="Font size">
             <Select
               value={String(settings.editorFontSize)}
@@ -377,6 +399,72 @@ export function SettingsTab(): React.JSX.Element {
                 </option>
               ))}
             </Select>
+          </Row>
+          <Row
+            title="Query timeout"
+            description="Cancels a query or shell command run from an editor after this long"
+          >
+            <Select
+              value={String(settings.queryTimeoutSecs)}
+              onChange={(e) => set('queryTimeoutSecs', Number(e.target.value))}
+              className="w-32"
+            >
+              {[
+                [0, 'No limit'],
+                [30, '30 seconds'],
+                [60, '1 minute'],
+                [300, '5 minutes'],
+                [900, '15 minutes'],
+                [1800, '30 minutes'],
+                [3600, '1 hour']
+              ].map(([n, label]) => (
+                <option key={n} value={n}>
+                  {label}
+                </option>
+              ))}
+            </Select>
+          </Row>
+          <Row
+            title="Default commit mode"
+            description="For query tabs that haven't picked one; manual commit keeps a transaction open until you commit"
+          >
+            <Segmented
+              value={settings.defaultCommitMode}
+              onChange={(mode) => set('defaultCommitMode', mode)}
+              options={[
+                { value: 'auto', label: 'Auto-commit' },
+                { value: 'manual', label: 'Manual' }
+              ]}
+            />
+          </Row>
+        </Section>
+
+        <Section title="Connections">
+          <Row title="Connect timeout" description="How long to wait for a server before giving up">
+            <Select
+              value={String(settings.connectTimeoutSecs)}
+              onChange={(e) => set('connectTimeoutSecs', Number(e.target.value))}
+              className="w-32"
+            >
+              {[5, 10, 15, 30, 60, 120].map((n) => (
+                <option key={n} value={n}>
+                  {n} seconds
+                </option>
+              ))}
+            </Select>
+          </Row>
+          <Row
+            title="Import and export"
+            description="Bring connections over from pgpass, DBeaver or DataGrip, or export yours without passwords"
+          >
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="ghost" onClick={openImportConnections}>
+                <FileInput className="size-3.5" /> Import
+              </Button>
+              <Button size="sm" variant="secondary" onClick={() => void exportConnectionsToFile()}>
+                <FileOutput className="size-3.5" /> Export
+              </Button>
+            </div>
           </Row>
         </Section>
 

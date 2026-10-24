@@ -8,6 +8,7 @@ mod file_scope;
 mod guard;
 #[cfg(test)]
 mod integration_tests;
+mod limits;
 mod manager;
 mod model;
 mod tunnel;
@@ -54,6 +55,7 @@ pub fn run() {
             commands::connection_test,
             commands::connection_open,
             commands::connection_close,
+            commands::limits_set,
             commands::db_databases,
             commands::db_schemas,
             commands::db_objects,

@@ -52,6 +52,7 @@ import {
   toRowEdits,
   type PendingChange
 } from '@/lib/pending'
+import { confirmProductionWrite, isProduction } from '@/lib/production'
 import { queries } from '@/lib/queries'
 import { canHaveTriggers } from '@/lib/triggers'
 import { settingsStore } from '@/lib/settings'
@@ -70,6 +71,7 @@ import {
   confirm,
   connect,
   connectionsStore,
+  getConnection,
   newQueryTab,
   openTable,
   setRunning,
@@ -360,7 +362,16 @@ function DataView({
     if (!statements.length) return setChanges((all) => all.filter((c) => !done.has(c.id)))
     const script = wrapInTransaction(dialect, statements)
     const deletes = subset.some((c) => c.kind === 'delete')
-    if (confirmDangerous || deletes) {
+    const connection = getConnection(tab.connectionId)
+    if (isProduction(connection)) {
+      const deleted = subset.filter((c) => c.kind === 'delete').length
+      const ok = await confirmProductionWrite(connection, {
+        action: `This commits ${plural(statements.length, 'change')} in one transaction`,
+        dangers: deleted ? [`deleting ${plural(deleted, 'row')}`] : [],
+        code: script
+      })
+      if (!ok) return
+    } else if (confirmDangerous || deletes) {
       const ok = await confirm({
         title: `Commit ${plural(statements.length, 'change')}?`,
         message: 'These statements run in one transaction; if any fails, none are applied.',
@@ -372,7 +383,9 @@ function DataView({
     }
     setLoading(true)
     try {
-      const out = await api.execute(tab.connectionId, tab.id, tab.database, script)
+      const out = await api.execute(tab.connectionId, tab.id, tab.database, script, {
+        confirmed: true
+      })
       if (out.error) {
         await api
           .execute(

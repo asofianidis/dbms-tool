@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, FileUp, Square, Table2, XCircle } from 'lucide-react'
 import { api, type Cell, type ColumnInfo, type ConnectionConfig } from '@/lib/api'
 import { ENGINES, type Dialect } from '@/lib/engines'
-import { formatBytes, formatDuration } from '@/lib/format'
+import { formatBytes, formatDuration, plural } from '@/lib/format'
+import { confirmProductionWrite } from '@/lib/production'
 import {
   autoMap,
   batchLimits,
@@ -376,7 +377,10 @@ function ImportWizard({
     const rows = file.rows.map((r) => plan.map((p) => r[p.source]))
     const columns = plan.map((p) => p.column)
     const exec = async (sql: string): Promise<void> => {
-      const out = await api.execute(connection.id, key, database, sql, { maxRows: 1 })
+      const out = await api.execute(connection.id, key, database, sql, {
+        maxRows: 1,
+        confirmed: true
+      })
       if (out.cancelled || cancelled.current) throw new Cancelled()
       if (out.error) throw new Error(out.error.message)
     }
@@ -448,12 +452,12 @@ function ImportWizard({
     try {
       for (const batch of documentBatches(docs)) {
         if (cancelled.current) throw new Cancelled()
-        const out = await api.mongo(connection.id, key, {
-          op: 'insertMany',
-          database,
-          collection: targetName,
-          documents: batch
-        })
+        const out = await api.mongo(
+          connection.id,
+          key,
+          { op: 'insertMany', database, collection: targetName, documents: batch },
+          { confirmed: true }
+        )
         if (out.cancelled) throw new Cancelled()
         done += batch.length
         setJob((j) => (j ? { ...j, done } : j))
@@ -472,7 +476,12 @@ function ImportWizard({
 
   const start = async (): Promise<void> => {
     if (!file || running) return
-    if (!(await connect(connection.id))) return
+    // Asked once here; the batches below skip the per-statement production check
+    const allowed = await confirmProductionWrite(connection, {
+      action: `This imports ${plural(file.rows.length, 'row')} into ${targetName}`,
+      dangers: []
+    })
+    if (!allowed || !(await connect(connection.id))) return
     const key = `import:${crypto.randomUUID()}`
     session.current = key
     cancelled.current = false

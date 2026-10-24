@@ -19,6 +19,8 @@ export interface ConnectionConfig {
   authSource: string
   savePassword: boolean
   readOnly: boolean
+  /** Writes need an extra confirmation, and destructive ones the connection's name typed */
+  production?: boolean
   color: string
   group: string
   lastUsed?: number | null
@@ -352,6 +354,36 @@ export interface ExecOutput {
 
 export interface ExecOptions {
   maxRows?: number
+  /** Cancels the statement after this many seconds; 0 or absent never times out */
+  timeoutSecs?: number
+  /** The caller already confirmed this write, so the production guard skips it (not sent) */
+  confirmed?: boolean
+}
+
+/** What a write guard is asked about: SQL text or a MongoDB request. */
+export type GuardedWrite = { sql: string } | { request: MongoRequest }
+
+type WriteGuard = (id: string, write: GuardedWrite) => Promise<boolean>
+
+let writeGuard: WriteGuard | null = null
+
+/** Installs the check every `execute` and `mongo` call passes through (see production.ts). */
+export function setWriteGuard(guard: WriteGuard | null): void {
+  writeGuard = guard
+}
+
+async function guarded(id: string, write: GuardedWrite, options?: ExecOptions): Promise<void> {
+  if (!writeGuard || options?.confirmed) return
+  if (!(await writeGuard(id, write))) {
+    const declined: AppError = { code: 'error', message: 'Not run: the change was not confirmed' }
+    throw declined
+  }
+}
+
+function wireOptions(options?: ExecOptions): ExecOptions | undefined {
+  if (!options) return undefined
+  const { confirmed: _, ...rest } = options
+  return rest
 }
 
 /** Extended JSON value as produced by the backend. */
@@ -443,6 +475,8 @@ export const api = {
   connectionOpen: (id: string, password?: string | null, remember?: boolean) =>
     invoke<ServerInfo>('connection_open', { id, password: password ?? null, remember }),
   connectionClose: (id: string) => invoke<void>('connection_close', { id }),
+  /** Applies Settings' connect timeout to connections opened from now on */
+  limitsSet: (connectTimeoutSecs: number) => invoke<void>('limits_set', { connectTimeoutSecs }),
 
   databases: (id: string) => invoke<DatabaseInfo[]>('db_databases', { id }),
   schemas: (id: string, database: string) => invoke<SchemaInfo[]>('db_schemas', { id, database }),
@@ -478,13 +512,39 @@ export const api = {
   completion: (id: string, database: string) =>
     invoke<CompletionTable[]>('db_completion', { id, database }),
 
-  execute: (id: string, session: string, database: string, sql: string, options?: ExecOptions) =>
-    invoke<ExecOutput>('query_execute', { id, session, database, sql, options }),
+  execute: async (
+    id: string,
+    session: string,
+    database: string,
+    sql: string,
+    options?: ExecOptions
+  ): Promise<ExecOutput> => {
+    await guarded(id, { sql }, options)
+    return invoke<ExecOutput>('query_execute', {
+      id,
+      session,
+      database,
+      sql,
+      options: wireOptions(options)
+    })
+  },
   cancel: (id: string, session: string) => invoke<void>('query_cancel', { id, session }),
   closeSession: (id: string, session: string) => invoke<void>('session_close', { id, session }),
 
-  mongo: (id: string, session: string, request: MongoRequest, options?: ExecOptions) =>
-    invoke<MongoOutput>('mongo_execute', { id, session, request, options }),
+  mongo: async (
+    id: string,
+    session: string,
+    request: MongoRequest,
+    options?: ExecOptions
+  ): Promise<MongoOutput> => {
+    await guarded(id, { request }, options)
+    return invoke<MongoOutput>('mongo_execute', {
+      id,
+      session,
+      request,
+      options: wireOptions(options)
+    })
+  },
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),
