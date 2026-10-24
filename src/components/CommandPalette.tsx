@@ -25,6 +25,7 @@ import {
   Settings,
   Table2,
   Unplug,
+  Wrench,
   WrapText
 } from 'lucide-react'
 import { api, type DbObject } from '@/lib/api'
@@ -46,6 +47,7 @@ import {
   layoutStore,
   newQueryTab,
   openBackup,
+  openMaintenance,
   openCompare,
   openCloud,
   openCollection,
@@ -110,7 +112,7 @@ function objectIcon(kind: DbObject['kind']): ReactNode {
   return <Table2 className="text-syn-prop" />
 }
 
-/** Back up / restore for the active tab's connection and database. */
+/** Back up, restore and maintenance for the active tab's connection and database. */
 function backupCommands(): Item[] {
   const tab = activeTab()
   if (!tab || !('connectionId' in tab)) return []
@@ -138,7 +140,19 @@ function backupCommands(): Item[] {
             icon: <ArchiveRestore />,
             run: () => openBackup(connection.id, database, 'restore')
           }
-        ])
+        ]),
+    ...(database
+      ? [
+          {
+            id: 'maintenance',
+            group: 'Commands',
+            label: `Maintenance on ${database}…`,
+            detail: name,
+            icon: <Wrench />,
+            run: () => openMaintenance(connection.id, database)
+          }
+        ]
+      : [])
   ]
 }
 

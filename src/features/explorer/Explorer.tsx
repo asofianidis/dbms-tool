@@ -57,6 +57,7 @@ import {
   Unplug,
   UserRound,
   Users,
+  Wrench,
   X,
   Zap,
   GitCompareArrows
@@ -86,6 +87,7 @@ import {
   openCollection,
   openConnectionDialog,
   openBackup,
+  openMaintenance,
   openCompare,
   openDiagram,
   openImport,
@@ -652,6 +654,14 @@ function DatabaseNode({
           onSelect: () => openBackup(connection.id, database, 'restore')
         }
       )
+    }
+    if (connection.engine !== 'babelfish') {
+      if (!supports(connection.engine, 'databases')) items.push('separator')
+      items.push({
+        label: 'Maintenance…',
+        icon: <Wrench />,
+        onSelect: () => openMaintenance(connection.id, database)
+      })
     }
     if (isMongo) {
       items.push(
