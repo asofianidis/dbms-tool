@@ -154,8 +154,9 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   const isRoutine = obj.kind === 'function' || obj.kind === 'procedure'
   const dialect = dialectOf(connectionId)
   const engine = getConnection(connectionId)?.engine
-  // SQLite browses and edits data, but has no table or trigger designer
+  // SQLite has a table designer, but no trigger designer
   const designers = !engine || supports(engine, 'designers')
+  const tableDesigner = !engine || supports(engine, 'tableDesigner')
   const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
   const items: MenuItem[] = [{ heading: label }]
   if (isTable || isView) {
@@ -173,7 +174,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
       },
       ...(obj.kind === 'table'
         ? [
-            ...(designers
+            ...(tableDesigner
               ? [
                   {
                     label: 'Design table…',
