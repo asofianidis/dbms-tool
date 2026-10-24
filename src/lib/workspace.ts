@@ -84,6 +84,12 @@ export type Tab =
     }
   | {
       id: string
+      kind: 'maintenance'
+      connectionId: string
+      database: string
+    }
+  | {
+      id: string
       kind: 'compare'
       /** The source: the side the target is changed to match */
       connectionId: string
@@ -497,6 +503,14 @@ export function openBackup(
       t.connectionId === connectionId &&
       t.database === database &&
       t.mode === mode
+  )
+}
+
+/** Opens maintenance tasks (vacuum, analyze, integrity checks…) for `database`. */
+export function openMaintenance(connectionId: string, database: string): void {
+  openTab(
+    { id: tabId(), kind: 'maintenance', connectionId, database },
+    (t) => t.kind === 'maintenance' && t.connectionId === connectionId && t.database === database
   )
 }
 

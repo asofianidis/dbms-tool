@@ -240,6 +240,8 @@ export function Choice<T extends string>({
     description?: ReactNode
     disabled?: boolean
     badge?: string
+    /** Tooltip with more detail than the description */
+    title?: string
   }[]
   onChange: (value: T) => void
   columns?: 1 | 2 | 3
@@ -262,6 +264,7 @@ export function Choice<T extends string>({
             role="radio"
             aria-checked={selected}
             disabled={o.disabled}
+            title={o.title}
             onClick={() => onChange(o.value)}
             className={cn(
               'flex items-start gap-2.5 rounded-lg px-3 py-2.5 text-left ring-1 transition-colors ring-inset disabled:opacity-40',
