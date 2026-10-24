@@ -136,13 +136,13 @@ fn sqlite_error(e: rusqlite::Error) -> AppError {
     })
 }
 
-fn cell(value: ValueRef<'_>) -> Value {
+fn cell(value: ValueRef<'_>, max_binary: usize) -> Value {
     match value {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(i) => Value::String(i.to_string()),
         ValueRef::Real(f) => Value::String(f.to_string()),
         ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => Value::String(hex_bytes(b)),
+        ValueRef::Blob(b) => Value::String(hex_bytes_max(b, max_binary)),
     }
 }
 
@@ -157,13 +157,33 @@ fn is_dml(sql: &str) -> bool {
     matches!(first.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE")
 }
 
+/// Row limits for one run, and the export sink that takes a result set's rows instead.
+#[derive(Clone)]
+struct RunLimits {
+    max_rows: usize,
+    max_binary: usize,
+    sink: Option<SinkHandle>,
+}
+
+impl RunLimits {
+    fn all() -> Self {
+        Self {
+            max_rows: usize::MAX,
+            max_binary: usize::MAX,
+            sink: None,
+        }
+    }
+}
+
 /// Runs every statement in `sql` on a local file, stopping at the first error.
 fn run_file(
     conn: &rusqlite::Connection,
     sql: &str,
-    max_rows: usize,
+    limits: &RunLimits,
     out: &mut Vec<StatementResult>,
 ) -> rusqlite::Result<()> {
+    let max_rows = limits.max_rows;
+    let mut sets = 0;
     let mut batch = rusqlite::Batch::new(conn, sql);
     while let Some(mut stmt) = batch.next()? {
         if stmt.column_count() == 0 {
@@ -184,6 +204,12 @@ fn run_file(
             })
             .collect();
         let width = columns.len();
+        // An export's rows go straight to the file rather than through memory
+        let sink = limits.sink.as_ref().filter(|s| s.set == sets);
+        sets += 1;
+        if let Some(sink) = sink {
+            sink.begin(&columns);
+        }
         let mut result = StatementResult {
             columns,
             ..Default::default()
@@ -191,13 +217,20 @@ fn run_file(
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             result.total += 1;
-            if result.rows.len() < max_rows {
+            if sink.is_some() || result.rows.len() < max_rows {
                 let mut values = Vec::with_capacity(width);
                 for i in 0..width {
-                    values.push(cell(row.get_ref(i)?));
+                    values.push(cell(row.get_ref(i)?, limits.max_binary));
                 }
-                result.rows.push(values);
+                match sink {
+                    Some(sink) if sink.failed() => break,
+                    Some(sink) => sink.row(&values),
+                    None => result.rows.push(values),
+                }
             }
+        }
+        if let Some(sink) = sink {
+            sink.finish();
         }
         out.push(result);
     }
@@ -205,7 +238,7 @@ fn run_file(
 }
 
 /// D1 returns BLOBs as arrays of byte values.
-fn d1_cell(value: &Value) -> Value {
+fn d1_cell(value: &Value, max_binary: usize) -> Value {
     match value {
         Value::Null => Value::Null,
         Value::String(s) => Value::String(s.clone()),
@@ -217,14 +250,14 @@ fn d1_cell(value: &Value) -> Value {
                 .filter_map(|i| i.as_u64())
                 .map(|b| b as u8)
                 .collect();
-            Value::String(hex_bytes(&bytes))
+            Value::String(hex_bytes_max(&bytes, max_binary))
         }
         other => Value::String(other.to_string()),
     }
 }
 
 /// The `/raw` response: per statement, `results: { columns, rows }` and `meta`.
-fn parse_d1(response: &Value, max_rows: usize) -> Vec<StatementResult> {
+fn parse_d1(response: &Value, max_rows: usize, max_binary: usize) -> Vec<StatementResult> {
     let statements = response["result"].as_array().cloned().unwrap_or_default();
     statements
         .iter()
@@ -249,7 +282,7 @@ fn parse_d1(response: &Value, max_rows: usize) -> Vec<StatementResult> {
                 .take(max_rows)
                 .map(|r| {
                     r.as_array()
-                        .map(|r| r.iter().map(d1_cell).collect())
+                        .map(|r| r.iter().map(|v| d1_cell(v, max_binary)).collect())
                         .unwrap_or_default()
                 })
                 .collect();
@@ -270,7 +303,7 @@ fn parse_d1(response: &Value, max_rows: usize) -> Vec<StatementResult> {
 }
 
 impl Backend {
-    async fn run(&self, sql: &str, max_rows: usize) -> (Vec<StatementResult>, Option<AppError>) {
+    async fn run(&self, sql: &str, limits: RunLimits) -> (Vec<StatementResult>, Option<AppError>) {
         match self {
             Backend::File { conn, .. } => {
                 let conn = conn.clone();
@@ -278,7 +311,7 @@ impl Backend {
                 let joined = tokio::task::spawn_blocking(move || {
                     let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
                     let mut out = Vec::new();
-                    let error = run_file(&guard, &sql, max_rows, &mut out).err();
+                    let error = run_file(&guard, &sql, &limits, &mut out).err();
                     (out, error)
                 })
                 .await;
@@ -302,7 +335,10 @@ impl Backend {
                 )
                 .await
                 {
-                    Ok(response) => (parse_d1(&response, max_rows), None),
+                    Ok(response) => (
+                        parse_d1(&response, limits.max_rows, limits.max_binary),
+                        None,
+                    ),
                     Err(e) => (Vec::new(), Some(e)),
                 }
             }
@@ -325,7 +361,7 @@ impl SqSession {
 
     /// The first result set of a metadata query.
     async fn query(&self, sql: &str) -> AppResult<Vec<Vec<Value>>> {
-        let (mut results, error) = self.backend.run(sql, usize::MAX).await;
+        let (mut results, error) = self.backend.run(sql, RunLimits::all()).await;
         if let Some(e) = error {
             return Err(e);
         }
@@ -563,6 +599,7 @@ impl SqSession {
                         schema: None,
                         name: object.name,
                         columns,
+                        foreign_keys: Vec::new(),
                     });
                 }
             }
@@ -579,9 +616,34 @@ impl SqSession {
                         schema: None,
                         name: object.name,
                         columns,
+                        foreign_keys: Vec::new(),
                     });
                 }
             }
+        }
+        // Join suggestions are a bonus; a key naming no column means the parent's primary key, skipped
+        if let Ok(keys) = self
+            .query(
+                "SELECT m.name, f.id, f.\"from\", f.\"table\", f.\"to\" \
+                 FROM sqlite_master m, pragma_foreign_key_list(m.name) f \
+                 WHERE m.type = 'table' AND f.\"to\" IS NOT NULL ORDER BY m.name, f.id, f.seq",
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .map(|r| KeyColumn {
+                        schema: None,
+                        table: text(r, 0).unwrap_or_default(),
+                        key: text(r, 1).unwrap_or_default(),
+                        column: text(r, 2).unwrap_or_default(),
+                        ref_schema: None,
+                        ref_table: text(r, 3).unwrap_or_default(),
+                        ref_column: text(r, 4).unwrap_or_default(),
+                    })
+                    .collect(),
+            );
         }
         Ok(tables)
     }
@@ -592,9 +654,27 @@ impl SqSession {
         opts: &ExecOptions,
         cancel: &CancelSignal,
     ) -> ExecOutput {
-        let mut out = OutputBuilder::new(opts);
-        let max_rows = opts.max_rows.max(1);
-        let run = self.backend.run(sql, max_rows);
+        // A local file streams the export's rows itself (see run_file); D1 answers
+        // in one response, which goes through the builder like any other
+        let file_sink = !self.is_d1() && opts.sink.is_some();
+        let mut out = if file_sink {
+            OutputBuilder::new(&ExecOptions {
+                sink: None,
+                ..opts.clone()
+            })
+        } else {
+            OutputBuilder::new(opts)
+        };
+        let limits = RunLimits {
+            max_rows: if opts.sink.is_some() && self.is_d1() {
+                usize::MAX
+            } else {
+                opts.max_rows.max(1)
+            },
+            max_binary: opts.max_binary_bytes.max(1),
+            sink: opts.sink.clone().filter(|_| file_sink),
+        };
+        let run = self.backend.run(sql, limits);
         let (results, error) = tokio::select! {
             r = run => r,
             _ = cancel.wait() => {
@@ -783,12 +863,16 @@ mod tests {
         assert!(ddl.starts_with("CREATE VIEW titles"));
         let completion = s.completion().await.unwrap();
         assert_eq!(completion[0].columns, ["id", "name"]);
+        let books = completion.iter().find(|t| t.name == "books").unwrap();
+        assert_eq!(books.foreign_keys[0].ref_table, "authors");
+        assert_eq!(books.foreign_keys[0].columns, ["author_id"]);
+        assert_eq!(books.foreign_keys[0].ref_columns, ["id"]);
     }
 
     #[tokio::test]
     async fn executes_scripts_with_results_and_errors() {
         let (mut s, _path) = session(SCHEMA).await;
-        let opts = ExecOptions { max_rows: 1 };
+        let opts = ExecOptions::with_max_rows(1);
         let out = s
             .execute(
                 "UPDATE authors SET name = upper(name); SELECT id, name FROM authors; SELECT cover FROM books;",
@@ -842,7 +926,7 @@ mod tests {
                   "meta": { "changed_db": true, "changes": 3 }, "success": true }
             ]
         });
-        let results = parse_d1(&response, 1);
+        let results = parse_d1(&response, 1, 4096);
         assert_eq!(results[0].total, 2);
         assert_eq!(
             results[0].rows,
@@ -884,6 +968,68 @@ DELETE FROM t WHERE b = 2"
         assert_eq!(
             trigger_shape("create trigger t after insert on x begin update x set a = 1; end"),
             ("AFTER".into(), vec!["INSERT".into()])
+        );
+    }
+
+    /// Collects what an export would write.
+    struct Collect(std::sync::Arc<parking_lot::Mutex<Vec<Vec<Value>>>>);
+
+    impl RowSink for Collect {
+        fn begin(&mut self, columns: &[ColumnMeta]) -> std::io::Result<()> {
+            let names = columns
+                .iter()
+                .map(|c| Value::String(c.name.clone()))
+                .collect();
+            self.0.lock().push(names);
+            Ok(())
+        }
+        fn row(&mut self, row: &[Value]) -> std::io::Result<()> {
+            self.0.lock().push(row.to_vec());
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_one_result_set_past_the_row_limit() {
+        let (mut s, _path) = session(SCHEMA).await;
+        let written = std::sync::Arc::default();
+        let opts = ExecOptions {
+            max_rows: 1,
+            timeout_secs: None,
+            max_binary_bytes: 1,
+            sink: Some(SinkHandle::new(
+                Box::new(Collect(std::sync::Arc::clone(&written))),
+                1,
+            )),
+            read_only: false,
+        };
+        let out = s
+            .execute(
+                "SELECT 1; SELECT id, name FROM authors ORDER BY id; SELECT cover FROM books;",
+                &opts,
+                &CancelSignal::default(),
+            )
+            .await;
+        assert!(out.error.is_none());
+        assert_eq!(out.results.len(), 3);
+        // The exported set went to the sink, not the output
+        assert!(out.results[1].rows.is_empty());
+        assert_eq!(out.results[1].row_count, 2);
+        assert_eq!(
+            *written.lock(),
+            vec![
+                vec![Value::String("id".into()), Value::String("name".into())],
+                vec![Value::String("1".into()), Value::String("Le Guin".into())],
+                vec![Value::String("2".into()), Value::String("Herbert".into())],
+            ]
+        );
+        // Other sets keep the grid's limits
+        assert_eq!(
+            out.results[2].rows[0][0],
+            Value::String("0xCA… (2 bytes)".into())
         );
     }
 }

@@ -32,7 +32,7 @@ import {
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { ENGINES, type Dialect } from '@/lib/engines'
-import { copyText } from '@/lib/export'
+import { copyText, EXPORT_MAX_ROWS, type FetchedRows } from '@/lib/export'
 import {
   buildOrderBy,
   buildWhere,
@@ -42,34 +42,23 @@ import {
   type QueryState
 } from '@/lib/filters'
 import { formatDuration, plural } from '@/lib/format'
-import {
-  addInsert,
-  deleteRow,
-  editInsert,
-  editRow,
-  removeChange,
-  rowKeyOf,
-  toRowEdits,
-  type PendingChange
-} from '@/lib/pending'
+import { addInsert } from '@/lib/pending'
 import { queries } from '@/lib/queries'
 import { canHaveTriggers } from '@/lib/triggers'
 import { settingsStore } from '@/lib/settings'
 import {
   countRows,
-  editStatements,
   qualified,
   quoteIdent,
   scriptCreateTable,
   selectRows,
-  wrapInTransaction,
   type TableRef
 } from '@/lib/sql'
-import { errorMessage, toast, toastError } from '@/lib/toast'
+import { errorMessage, toastError } from '@/lib/toast'
 import {
-  confirm,
   connect,
   connectionsStore,
+  getConnection,
   newQueryTab,
   openTable,
   setRunning,
@@ -96,6 +85,7 @@ import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
+import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { openTableDesigner } from './TableDesigner'
 import { openTriggerDesigner } from './TriggerDesigner'
@@ -213,9 +203,9 @@ function DataView({
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [total, setTotal] = useState<number | null>(null)
-  const [changes, setChanges] = useState<PendingChange[]>([])
   const [panelOpen, setPanelOpen] = useState(false)
   const [filter, setFilter] = useState('')
+  const [exporting, setExporting] = useState(false)
 
   const set = output?.results[0]
   const columns: ColumnMeta[] = set?.columns ?? []
@@ -231,6 +221,9 @@ function DataView({
     [dialect, query, info.data]
   )
   const appliedOrder = useMemo(() => buildOrderBy(dialect, query.sorts), [dialect, query.sorts])
+  // Default to primary-key order so rows don't move around after an edit
+  const orderBy =
+    appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
 
   /** Applies a new filter / sort from the builder, chips or grid header. */
   const applyQuery = (next: QueryState): void => {
@@ -252,18 +245,16 @@ function DataView({
     setError(null)
     setRunning(tab.id, true)
     try {
-      // Default to primary-key order so rows don't move around after an edit
-      const orderBy =
-        appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
+      // One row past the page tells whether there's a next page
       const sql = selectRows(dialect, tableRef, {
         where: appliedWhere,
         orderBy,
-        limit: pageSize,
+        limit: pageSize + 1,
         offset: page * pageSize,
         keyColumns: pk
       })
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
-        maxRows: pageSize
+        maxRows: pageSize + 1
       })
       // Pending changes are keyed by primary key, so they survive reloads and paging
       if (out.error) setError(out.error.message)
@@ -308,33 +299,22 @@ function DataView({
     }
   }
 
-  const baseRows = set?.rows ?? []
-  // The loaded rows as records, with the primary key that ties them to pending changes
-  const baseRecords = useMemo(
-    () =>
-      baseRows.map((r) => {
-        const record = Object.fromEntries(columns.map((c, i) => [c.name, r[i]]))
-        return { record, key: rowKeyOf(pk, record) }
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseRows, columns, pk.join(',')]
-  )
-  const byKey = useMemo(
-    () => new Map(changes.filter((c) => c.rowKey).map((c) => [c.rowKey!, c])),
-    [changes]
-  )
-  const inserts = useMemo(() => changes.filter((c) => c.kind === 'insert'), [changes])
-  const rows = useMemo(
-    () => [
-      ...baseRows.map((r, i) => {
-        const change = byKey.get(baseRecords[i].key)
-        if (change?.kind !== 'update') return r
-        return columns.map((c, ci) => (c.name in change.values ? change.values[c.name] : r[ci]))
-      }),
-      ...inserts.map((c) => columns.map((col) => c.values[col.name] ?? null))
-    ],
-    [baseRows, baseRecords, byKey, inserts, columns]
-  )
+  // The page shown, without the extra row fetched to detect a next page
+  const baseRows = useMemo(() => set?.rows.slice(0, pageSize) ?? [], [set, pageSize])
+  const generatedColumns = useMemo(() => {
+    const generated = new Set<number>()
+    columns.forEach((c, i) => {
+      if (info.data?.columns.find((col) => col.name === c.name)?.isGenerated) generated.add(i)
+    })
+    return generated
+  }, [columns, info.data])
+  const { changes, setChanges, rows, editing, visibleKeys } = usePendingEdits({
+    columns,
+    baseRows,
+    primaryKey: pk,
+    enabled: canEdit,
+    readOnlyColumns: generatedColumns
+  })
 
   // Open the panel when the first change is made
   const hadChanges = useRef(false)
@@ -343,98 +323,26 @@ function DataView({
     hadChanges.current = changes.length > 0
   }, [changes.length])
 
-  const generatedColumns = useMemo(() => {
-    const generated = new Set<number>()
-    columns.forEach((c, i) => {
-      if (info.data?.columns.find((col) => col.name === c.name)?.isGenerated) generated.add(i)
-    })
-    return generated
-  }, [columns, info.data])
-
   /** Commits the given pending changes (all by default) in one transaction. */
   const commit = async (ids?: string[]): Promise<void> => {
     if (!info.data) return
     const subset = ids ? changes.filter((c) => ids.includes(c.id)) : changes
-    const statements = editStatements(dialect, tableRef, info.data, toRowEdits(subset))
     const done = new Set(subset.map((c) => c.id))
-    if (!statements.length) return setChanges((all) => all.filter((c) => !done.has(c.id)))
-    const script = wrapInTransaction(dialect, statements)
-    const deletes = subset.some((c) => c.kind === 'delete')
-    if (confirmDangerous || deletes) {
-      const ok = await confirm({
-        title: `Commit ${plural(statements.length, 'change')}?`,
-        message: 'These statements run in one transaction; if any fails, none are applied.',
-        code: script,
-        confirmLabel: 'Commit',
-        danger: deletes
-      })
-      if (!ok) return
-    }
-    setLoading(true)
-    try {
-      const out = await api.execute(tab.connectionId, tab.id, tab.database, script)
-      if (out.error) {
-        await api
-          .execute(
-            tab.connectionId,
-            tab.id,
-            tab.database,
-            dialect === 'tsql' ? 'IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION' : 'ROLLBACK'
-          )
-          .catch(() => {})
-        toast(`Changes not committed: ${out.error.message}`, 'error')
-      } else {
-        // Functional update keeps changes edited while the commit ran
-        setChanges((all) => all.filter((c) => !done.has(c.id)))
-        toast(`Committed ${plural(statements.length, 'change')}`)
-        await load()
-      }
-    } catch (e) {
-      toastError(e)
-    } finally {
-      setLoading(false)
-    }
+    const ok = await commitPendingChanges({
+      changes: subset,
+      dialect,
+      tableRef,
+      info: info.data,
+      confirmDangerous,
+      connection: getConnection(tab.connectionId),
+      execute: (sql, options) => api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+      busy: setLoading
+    })
+    if (!ok) return
+    // Functional update keeps changes edited while the commit ran
+    setChanges((all) => all.filter((c) => !done.has(c.id)))
+    await load()
   }
-
-  const insertAt = (row: number): PendingChange | undefined => inserts[row - baseRows.length]
-  const editing = canEdit
-    ? {
-        onEdit: (row: number, col: number, value: Cell) =>
-          setChanges((all) =>
-            row >= baseRows.length
-              ? editInsert(all, insertAt(row)!.id, columns[col].name, value)
-              : editRow(all, pk, baseRecords[row].record, columns[col].name, value)
-          ),
-        rowStatus: (row: number) =>
-          row >= baseRows.length
-            ? ('inserted' as const)
-            : byKey.get(baseRecords[row].key)?.kind === 'delete'
-              ? ('deleted' as const)
-              : undefined,
-        isModified: (row: number, col: number) => {
-          const change = row < baseRows.length ? byKey.get(baseRecords[row].key) : undefined
-          return change?.kind === 'update' && columns[col].name in change.values
-        },
-        onDeleteRows: (list: number[]) =>
-          setChanges((all) =>
-            list.reduce(
-              // Deleting a new row just drops it
-              (acc, row) =>
-                row >= baseRows.length
-                  ? removeChange(acc, insertAt(row)!.id)
-                  : deleteRow(acc, pk, baseRecords[row].record),
-              all
-            )
-          ),
-        onRevertRows: (list: number[]) => {
-          const keys = new Set(
-            list.filter((r) => r < baseRows.length).map((r) => baseRecords[r].key)
-          )
-          setChanges((all) => all.filter((c) => !c.rowKey || !keys.has(c.rowKey)))
-        },
-        readOnlyColumns: generatedColumns
-      }
-    : undefined
 
   const filterByValue = (column: string, value: Cell): void => {
     const condition = valueCondition(column, value)
@@ -488,7 +396,34 @@ function DataView({
       : null
 
   const from = page * pageSize
-  const hasNext = (set?.rowCount ?? 0) >= pageSize
+  const hasNext = (set?.rows.length ?? 0) > pageSize
+
+  /** Every row matching the filter, in the same order, for "Save as". */
+  const fetchAllRows = async (): Promise<FetchedRows> => {
+    // A separate session leaves the tab free to page and commit during a long fetch
+    const session = `${tab.id}:export`
+    setExporting(true)
+    try {
+      const sql = selectRows(dialect, tableRef, {
+        where: appliedWhere,
+        orderBy,
+        limit: EXPORT_MAX_ROWS + 1,
+        keyColumns: pk
+      })
+      const out = await api.execute(tab.connectionId, session, tab.database, sql, {
+        maxRows: EXPORT_MAX_ROWS,
+        readOnly: true
+      })
+      if (out.error) throw new Error(out.error.message)
+      if (out.cancelled) throw new Error('The fetch was cancelled.')
+      const all = out.results[0]
+      if (!all) throw new Error('The query returned no rows.')
+      return { columns: all.columns, rows: all.rows, truncated: all.truncated }
+    } finally {
+      void api.closeSession(tab.connectionId, session).catch(() => {})
+      setExporting(false)
+    }
+  }
 
   return (
     <>
@@ -521,7 +456,7 @@ function DataView({
           </Button>
           <span className="px-1 tabular-nums">
             {set
-              ? `${(from + (set.rows.length ? 1 : 0)).toLocaleString()}–${(from + set.rows.length).toLocaleString()}`
+              ? `${(from + (baseRows.length ? 1 : 0)).toLocaleString()}–${(from + baseRows.length).toLocaleString()}`
               : '—'}
           </span>
           <Button
@@ -582,13 +517,17 @@ function DataView({
           <Button
             size="xs"
             variant="ghost"
+            disabled={exporting}
             onClick={(e) =>
               exportMenu(
                 e.currentTarget,
                 { columns, rows },
                 tab.name,
                 dialect,
-                qualified(dialect, tableRef)
+                qualified(dialect, tableRef),
+                undefined,
+                // A single complete page saves what's shown, pending edits included
+                { partial: page > 0 || hasNext, fetch: fetchAllRows }
               )
             }
           >
@@ -605,7 +544,7 @@ function DataView({
           onClose={() => setBuilderOpen(false)}
         />
       )}
-      <ProgressBar active={loading} />
+      <ProgressBar active={loading || exporting} />
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
           {error ? (
@@ -630,6 +569,23 @@ function DataView({
               tableName={qualified(dialect, tableRef)}
               onFilterByValue={filterByValue}
               cellMenuItems={referenceItems}
+              layoutKey={`table:${tab.connectionId}:${tab.database}:${tab.schema ?? ''}.${tab.name}`}
+              onLoadValue={
+                pk.length && info.data
+                  ? (row, col) =>
+                      fetchCellValue({
+                        execute: (sql, options) =>
+                          api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+                        dialect,
+                        tableRef,
+                        info: info.data!,
+                        columns,
+                        // As loaded: pending edits may change the key
+                        row: baseRows[row],
+                        column: col
+                      })
+                  : undefined
+              }
               rowOffset={from}
               onSelectionSummary={selectionSummaryStore.set}
             />
@@ -645,7 +601,7 @@ function DataView({
             info={info.data}
             dialect={dialect}
             tableRef={tableRef}
-            visibleKeys={new Set(baseRecords.map((r) => r.key))}
+            visibleKeys={visibleKeys}
             readOnlyColumns={
               new Set(info.data.columns.filter((c) => c.isGenerated).map((c) => c.name))
             }
@@ -659,7 +615,7 @@ function DataView({
       </div>
       {output && (
         <div className="flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 text-[11px] text-muted">
-          <span>{plural(set?.rows.length ?? 0, 'row')}</span>
+          <span>{plural(baseRows.length, 'row')}</span>
           <span className="text-faint">{formatDuration(output.elapsedMs)}</span>
           {canEdit && (
             <span className="text-faint">

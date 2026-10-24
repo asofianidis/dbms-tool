@@ -121,19 +121,58 @@ export function paramSql(dialect: Dialect, param: ParamValue): string {
   return literal(dialect, param.value)
 }
 
+/** Where a placeholder was (`from`–`to`) and where its value ended up (`outFrom`–`outTo`). */
+export interface Substitution {
+  from: number
+  to: number
+  outFrom: number
+  outTo: number
+}
+
 /** `sql` with every placeholder replaced by its value's SQL. */
 export function substituteParams(
   sql: string,
   dialect: Dialect,
   values: Record<string, ParamValue>
 ): string {
+  return fillParams(sql, dialect, values).sql
+}
+
+/** Like `substituteParams`, plus the spans needed to map error positions back. */
+export function fillParams(
+  sql: string,
+  dialect: Dialect,
+  values: Record<string, ParamValue>
+): { sql: string; spans: Substitution[] } {
   let out = ''
   let last = 0
+  const spans: Substitution[] = []
   for (const p of findParams(sql, dialect)) {
     const value = values[p.name]
     if (!value) continue
-    out += sql.slice(last, p.from) + paramSql(dialect, value)
+    out += sql.slice(last, p.from)
+    const outFrom = out.length
+    out += paramSql(dialect, value)
+    spans.push({ from: p.from, to: p.to, outFrom, outTo: out.length })
     last = p.to
   }
-  return out + sql.slice(last)
+  return { sql: out + sql.slice(last), spans }
+}
+
+/**
+ * Maps an offset in the filled-in text back to the text as written. An offset
+ * inside a value maps to its placeholder's start, or its end with `edge: 'end'`.
+ */
+export function sourceOffset(
+  pos: number,
+  spans: Substitution[],
+  edge: 'start' | 'end' = 'start'
+): number {
+  let delta = 0
+  for (const s of spans) {
+    if (pos < s.outFrom) break
+    if (pos < s.outTo || (edge === 'end' && pos === s.outTo)) return edge === 'end' ? s.to : s.from
+    delta = s.to - s.outTo
+  }
+  return pos + delta
 }

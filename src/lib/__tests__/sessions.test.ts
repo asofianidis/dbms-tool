@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { blockedCount, blockingIds, mongoOpId, sessionActionSql, sessionActions } from '../sessions'
+import {
+  blockedCount,
+  blockingEdges,
+  blockingIds,
+  blockingTree,
+  mongoOpId,
+  sessionActionSql,
+  sessionActions,
+  type BlockingNode
+} from '../sessions'
 
 describe('session actions', () => {
   it('offers cancel only where the engine has it', () => {
@@ -56,5 +65,57 @@ describe('blocking', () => {
         ['6', '5']
       ])
     ).toBe(1)
+  })
+})
+
+describe('blocking tree', () => {
+  const shape = (nodes: BlockingNode[]): unknown =>
+    nodes.map((n) =>
+      n.children.length ? { [n.id]: shape(n.children) } : n.cycle ? `${n.id}*` : n.id
+    )
+
+  it('reads waiter and blocker pairs, skipping self and empty blockers', () => {
+    const columns = [
+      { name: 'pid', typeName: 'int4' },
+      { name: 'blocked_by', typeName: 'text' }
+    ]
+    expect(
+      blockingEdges(
+        columns,
+        [
+          ['1', ''],
+          ['2', '1'],
+          ['3', '{1,2}'],
+          ['3', '1'],
+          ['4', '4'],
+          ['5', '0']
+        ],
+        'pid',
+        'blocked_by'
+      )
+    ).toEqual([
+      ['2', '1'],
+      ['3', '1'],
+      ['3', '2']
+    ])
+  })
+
+  it('roots chains at sessions that wait on no one', () => {
+    const forest = blockingTree([
+      ['2', '1'],
+      ['3', '2'],
+      ['10', '1'],
+      ['7', '6']
+    ])
+    expect(shape(forest)).toEqual([{ 1: [{ 2: ['3'] }, '10'] }, { 6: ['7'] }])
+  })
+
+  it('shows a deadlock cycle once, marked', () => {
+    const forest = blockingTree([
+      ['1', '2'],
+      ['2', '1']
+    ])
+    expect(shape(forest)).toEqual([{ 1: [{ 2: ['1*'] }] }])
+    expect(forest[0].children[0].children[0].cycle).toBe(true)
   })
 })

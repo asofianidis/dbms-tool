@@ -194,9 +194,21 @@ pub async fn connection_open(
     Ok(info)
 }
 
+/// Trusts the SSH host key a `host_key_unknown` error showed the user
+#[tauri::command]
+pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
+    crate::tunnel::trust_host_key(&token).await
+}
+
 #[tauri::command]
 pub fn connection_close(state: State<'_, AppState>, id: String) {
     state.manager.close(&id);
+}
+
+/// Applies the connect timeout from Settings to connections opened from now on.
+#[tauri::command]
+pub fn limits_set(connect_timeout_secs: u64) {
+    crate::limits::set_connect_timeout(connect_timeout_secs);
 }
 
 #[tauri::command]
@@ -399,6 +411,53 @@ pub async fn query_execute(
     })
 }
 
+/// Runs `sql` on the tab's session and writes every row of result set `set`
+/// to `path` as it arrives, past the grid's row limit. Other result sets are
+/// only counted. The file must have been picked in a save dialog.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn query_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    session: String,
+    database: String,
+    sql: String,
+    format: crate::export::ExportFormat,
+    path: String,
+    set: Option<usize>,
+) -> AppResult<ExecOutput> {
+    crate::file_scope::check(&app, &path)?;
+    let result = async {
+        let sink = crate::export::sink(format, &path)?;
+        let handle = SinkHandle::new(sink, set.unwrap_or(0));
+        let opts = ExecOptions {
+            // Sets other than the exported one keep a few rows, for the messages
+            max_rows: 100,
+            timeout_secs: None,
+            max_binary_bytes: usize::MAX,
+            sink: Some(handle.clone()),
+            // Only offered for text that just reads; the backend check backs that up
+            read_only: true,
+        };
+        let server = state.manager.get(&id)?;
+        let output = server.execute(&session, &database, &sql, &opts).await?;
+        if let Some(e) = handle.error.lock().take() {
+            return Err(AppError::msg(format!("Couldn't write {path}: {e}")));
+        }
+        Ok(output)
+    }
+    .await;
+    logged(result, || {
+        format!(
+            "Export from {} ({database}) failed
+  SQL: {}",
+            connection_label(&state, &id),
+            snippet(&sql)
+        )
+    })
+}
+
 #[tauri::command]
 pub fn query_cancel(state: State<'_, AppState>, id: String, session: String) -> AppResult<()> {
     state.manager.get(&id)?.cancel(&session);
@@ -440,6 +499,29 @@ pub async fn mongo_execute(
     })
 }
 
+/// Writes a whole collection or query result to a file the user picked.
+#[tauri::command]
+pub async fn mongo_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    session: String,
+    request: crate::drivers::mongo::ExportRequest,
+    path: String,
+) -> AppResult<crate::drivers::mongo::ExportSummary> {
+    crate::file_scope::check(&app, &path)?;
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .mongo_export(&session, request, std::path::Path::new(&path))
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!("MongoDB export on {} failed", connection_label(&state, &id))
+    })
+}
+
 #[tauri::command]
 pub async fn file_write_text(
     app: tauri::AppHandle,
@@ -469,6 +551,21 @@ pub async fn file_write_bytes(
     let path = percent_decode(path)?;
     crate::file_scope::check(&app, &path)?;
     tokio::fs::write(&path, bytes).await?;
+    Ok(())
+}
+
+/// Writes rows the grid holds as a one-sheet Excel workbook.
+#[tauri::command]
+pub async fn file_write_xlsx(
+    app: tauri::AppHandle,
+    path: String,
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> AppResult<()> {
+    crate::file_scope::check(&app, &path)?;
+    tokio::task::spawn_blocking(move || crate::export::write_xlsx(&path, &columns, &rows))
+        .await
+        .map_err(|e| AppError::msg(e.to_string()))??;
     Ok(())
 }
 

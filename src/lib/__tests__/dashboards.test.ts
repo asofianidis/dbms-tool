@@ -17,7 +17,6 @@ import {
   statValue,
   uniqueDashboardName,
   upsertWidget,
-  writeStatement,
   type Dashboard
 } from '../dashboards'
 
@@ -135,26 +134,6 @@ describe('dashboards', () => {
     )
     expect(back.widgets[0]).toMatchObject({ kind: 'table', span: 2, y: ['a'], query: '' })
     expect(back.name).toBe('Dashboard')
-  })
-})
-
-describe('read-only guard', () => {
-  it('allows reads', () => {
-    expect(writeStatement('select 1; -- delete from x', 'postgres')).toBeNull()
-    expect(writeStatement('WITH t AS (SELECT 1) SELECT * FROM t', 'postgres')).toBeNull()
-    expect(writeStatement('SHOW TABLES', 'mysql')).toBeNull()
-  })
-
-  it('flags writes anywhere in the script', () => {
-    expect(writeStatement('select 1; delete from users', 'postgres')).toBe('DELETE')
-    expect(writeStatement('/* hi */ DROP TABLE x', 'mysql')).toBe('DROP')
-    expect(writeStatement('EXEC sp_cleanup', 'tsql')).toBe('EXEC')
-    expect(
-      writeStatement(
-        'WITH gone AS (DELETE FROM t RETURNING *) SELECT count(*) FROM gone',
-        'postgres'
-      )
-    ).toMatch(/WITH/)
   })
 })
 

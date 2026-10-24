@@ -4,10 +4,12 @@ mod commands;
 mod config;
 mod drivers;
 mod error;
+mod export;
 mod file_scope;
 mod guard;
 #[cfg(test)]
 mod integration_tests;
+mod limits;
 mod manager;
 mod model;
 mod tunnel;
@@ -54,6 +56,8 @@ pub fn run() {
             commands::connection_test,
             commands::connection_open,
             commands::connection_close,
+            commands::ssh_trust_host_key,
+            commands::limits_set,
             commands::db_databases,
             commands::db_schemas,
             commands::db_objects,
@@ -63,10 +67,13 @@ pub fn run() {
             commands::db_completion,
             commands::query_execute,
             commands::query_cancel,
+            commands::query_export,
             commands::session_close,
             commands::mongo_execute,
+            commands::mongo_export,
             commands::file_write_text,
             commands::file_write_bytes,
+            commands::file_write_xlsx,
             commands::file_read_text,
             commands::state_load_all,
             commands::state_save,

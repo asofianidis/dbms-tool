@@ -68,6 +68,14 @@ function PasswordPrompt(): React.JSX.Element | null {
 export function ConfirmHost(): React.JSX.Element | null {
   const request = confirmStore.use()
   if (!request) return null
+  return <ConfirmDialog key={request.title + (request.code ?? '')} />
+}
+
+function ConfirmDialog(): React.JSX.Element | null {
+  const request = confirmStore.get()
+  const [typed, setTyped] = useState('')
+  if (!request) return null
+  const blocked = !!request.typeToConfirm && typed.trim() !== request.typeToConfirm
   const finish = (ok: boolean): void => {
     confirmStore.set(null)
     request.resolve(ok)
@@ -91,6 +99,7 @@ export function ConfirmHost(): React.JSX.Element | null {
           </Button>
           <Button
             variant={request.danger ? 'danger' : 'primary'}
+            disabled={blocked}
             onClick={() => finish(true)}
             data-autofocus
           >
@@ -105,6 +114,25 @@ export function ConfirmHost(): React.JSX.Element | null {
           <pre className="max-h-[40vh] overflow-auto rounded-lg border border-line bg-canvas p-3 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap text-fg select-text">
             {request.code}
           </pre>
+        )}
+        {request.typeToConfirm && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (!blocked) finish(true)
+            }}
+          >
+            <Field label={`Type ${request.typeToConfirm} to confirm`}>
+              <Input
+                value={typed}
+                onChange={(e) => setTyped(e.target.value)}
+                placeholder={request.typeToConfirm}
+                spellCheck={false}
+                autoComplete="off"
+                mono
+              />
+            </Field>
+          </form>
         )}
       </div>
     </Modal>

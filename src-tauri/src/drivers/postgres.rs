@@ -85,33 +85,32 @@ pub async fn connect(
             database
         })
         .application_name("dbms-tool")
-        .connect_timeout(Duration::from_secs(15))
+        .connect_timeout(crate::limits::connect_timeout())
         .ssl_mode(match cfg.ssl {
             SslMode::Disable => PgSslMode::Disable,
             SslMode::Prefer => PgSslMode::Prefer,
-            SslMode::Require => PgSslMode::Require,
+            // Certificate checks are the TLS connector's job
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => PgSslMode::Require,
         });
     if let Some(p) = password {
         pg.password(p);
     }
 
-    // Like libpq, only verify certificates when TLS is required and the user hasn't opted out
-    let verify = cfg.ssl == SslMode::Require && !cfg.trust_server_certificate;
-    let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(!verify)
-        .danger_accept_invalid_hostnames(!verify)
-        .build()
-        .map_err(|e| AppError::msg(format!("TLS setup failed: {e}")))?;
+    // Like libpq, Prefer never verifies; Require does unless the user opted out.
+    // Through a tunnel the name checked is the real server's (`pg.host` above).
+    let connector = super::tls::native_connector(cfg)?;
     let tls = MakeTlsConnector::new(connector);
 
     // connect_timeout only bounds the TCP connect; a server that accepts and then stalls
     // during startup would otherwise hang forever
-    let (client, mut connection) =
-        tokio::time::timeout(Duration::from_secs(20), pg.connect(tls.clone()))
-            .await
-            .map_err(|_| {
-                AppError::msg("Timed out waiting for the server to finish the connection handshake")
-            })??;
+    let (client, mut connection) = tokio::time::timeout(
+        crate::limits::connect_timeout() + Duration::from_secs(5),
+        pg.connect(tls.clone()),
+    )
+    .await
+    .map_err(|_| {
+        AppError::msg("Timed out waiting for the server to finish the connection handshake")
+    })??;
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = notices.clone();
     let task = tokio::spawn(async move {
@@ -635,13 +634,49 @@ impl PgSession {
                 &[],
             )
             .await?;
-        Ok(rows
+        let mut tables: Vec<CompletionTable> = rows
             .iter()
             .map(|r| CompletionTable {
                 schema: r.get(0),
                 name: r.get(1),
                 columns: r.get(2),
+                foreign_keys: Vec::new(),
             })
-            .collect())
+            .collect();
+        // Join suggestions are a bonus; completion works without them
+        if let Ok(keys) = self
+            .strings(
+                "SELECT ns.nspname::text, cl.relname::text, co.oid::text, a.attname::text, \
+                 rns.nspname::text, rcl.relname::text, ra.attname::text \
+                 FROM pg_constraint co \
+                 JOIN pg_class cl ON cl.oid = co.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = cl.relnamespace \
+                 JOIN pg_class rcl ON rcl.oid = co.confrelid \
+                 JOIN pg_namespace rns ON rns.oid = rcl.relnamespace \
+                 CROSS JOIN LATERAL unnest(co.conkey, co.confkey) WITH ORDINALITY k(col, ref, i) \
+                 JOIN pg_attribute a ON a.attrelid = co.conrelid AND a.attnum = k.col \
+                 JOIN pg_attribute ra ON ra.attrelid = co.confrelid AND ra.attnum = k.ref \
+                 WHERE co.contype = 'f' AND ns.nspname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY 1, 2, 3, k.i LIMIT 20000",
+                &[],
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .map(|r| KeyColumn {
+                        schema: r.get(0),
+                        table: r.get(1),
+                        key: r.get(2),
+                        column: r.get(3),
+                        ref_schema: r.get(4),
+                        ref_table: r.get(5),
+                        ref_column: r.get(6),
+                    })
+                    .collect(),
+            );
+        }
+        Ok(tables)
     }
 }

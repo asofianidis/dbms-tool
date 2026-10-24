@@ -16,6 +16,9 @@ use crate::cloud::{self, Provider};
 use crate::config::{self, ConnectionConfig, Engine, SshAuth, SshConfig, SslMode};
 use crate::error::{AppError, AppResult};
 
+mod host_keys;
+pub use host_keys::trust as trust_host_key;
+
 /// How long a tunnel gets to start listening (the Fly proxy signs in to Fly's
 /// network first; SSH may go through a jump host).
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -116,6 +119,11 @@ fn ssh_command(
             "SSH tunnels need the host and port form of a MongoDB connection, not a connection string",
         ));
     }
+    if config.engine == Engine::Mongo && config.host.contains(',') {
+        return Err(AppError::msg(
+            "An SSH tunnel reaches one MongoDB host; enter a single replica set member or mongos instead of a list",
+        ));
+    }
     if matches!(config.engine, Engine::Mssql | Engine::Babelfish) && config.host.contains('\\') {
         return Err(AppError::msg(
             "Named SQL Server instances can't be reached through an SSH tunnel; enter the instance's port instead",
@@ -151,17 +159,10 @@ fn ssh_command(
         "ServerAliveCountMax=3",
     ])
     .args(["-o", "ConnectTimeout=15"])
-    // There's no terminal to confirm a new host key on; a changed key still fails
-    .args(["-o", "StrictHostKeyChecking=accept-new"]);
-    if ssh.port != 0 {
-        cmd.args(["-p", &ssh.port.to_string()]);
-    }
-    if !ssh.user.trim().is_empty() {
-        cmd.args(["-l", ssh_arg(ssh.user.trim(), "user")?]);
-    }
-    if !ssh.jump_host.trim().is_empty() {
-        cmd.args(["-J", ssh_arg(ssh.jump_host.trim(), "jump host")?]);
-    }
+    // Never trust a host key silently: an unknown one fails, and `start` asks
+    // the user to confirm its fingerprint (see `probe_host_key`)
+    .args(["-o", "StrictHostKeyChecking=yes"]);
+    destination_options(&mut cmd, ssh)?;
     match ssh.auth {
         SshAuth::Agent => {}
         SshAuth::Key => {
@@ -205,6 +206,30 @@ fn ssh_command(
     Ok(cmd)
 }
 
+/// `-p`, `-l` and `-J`: how to reach the server, short of its name
+fn destination_options(cmd: &mut Command, ssh: &SshConfig) -> AppResult<()> {
+    if ssh.port != 0 {
+        cmd.args(["-p", &ssh.port.to_string()]);
+    }
+    if !ssh.user.trim().is_empty() {
+        cmd.args(["-l", ssh_arg(ssh.user.trim(), "user")?]);
+    }
+    if !ssh.jump_host.trim().is_empty() {
+        cmd.args(["-J", ssh_arg(ssh.jump_host.trim(), "jump host")?]);
+    }
+    Ok(())
+}
+
+fn hide_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// When this process was started by `ssh` as its askpass helper, prints the
 /// secret and returns `true`; the caller should then exit without starting the app.
 pub fn answer_askpass() -> bool {
@@ -233,11 +258,7 @@ fn command(
         Target::Ssh(ssh) => ssh_command(ssh, config, secret, port)?,
     };
     cmd.kill_on_drop(true).stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    hide_window(&mut cmd);
     Ok((cmd, "SSH tunnel"))
 }
 
@@ -266,6 +287,11 @@ async fn start(
                 let _ = pipe.read_to_string(&mut stderr).await;
             }
             let detail = stderr.trim();
+            if let Target::Ssh(ssh) = &target
+                && host_keys::is_unknown_host_key(detail)
+            {
+                return Err(host_keys::probe(ssh).await);
+            }
             return Err(AppError::msg(if detail.is_empty() {
                 format!("{label} exited ({status})")
             } else {
@@ -343,8 +369,9 @@ pub async fn prepare(
         port,
         ssl: if fly { SslMode::Prefer } else { config.ssl },
         // The certificate names the server, not 127.0.0.1. The PostgreSQL and
-        // MySQL drivers check it against `tunneled`; the SQL Server and MongoDB
-        // drivers can only check the name they connect to, so they skip the check.
+        // MySQL drivers check it against `tunneled`; for SQL Server and MongoDB
+        // Prefer/Require skip the check. The verify modes ignore this flag: SQL
+        // Server then checks `tunneled` too, and MongoDB refuses (see its driver).
         trust_server_certificate: config.trust_server_certificate
             || !matches!(config.engine, Engine::Postgres | Engine::Mysql),
         tunneled: Some(origin),
@@ -437,6 +464,8 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["-i", "/k/id_ed25519"]));
         // No passphrase: never wait for a prompt
         assert!(a.contains(&"BatchMode=yes".to_string()));
+        // Unknown host keys fail and go to the user (host_keys.rs)
+        assert!(a.contains(&"StrictHostKeyChecking=yes".to_string()));
         assert_eq!(a.last().map(String::as_str), Some("bastion"));
     }
 

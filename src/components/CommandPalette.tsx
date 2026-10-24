@@ -11,6 +11,8 @@ import {
   GitCompareArrows,
   Eye,
   FileCode2,
+  FileInput,
+  FileOutput,
   FileText,
   FunctionSquare,
   History,
@@ -68,6 +70,10 @@ import {
   openExampleDashboard,
   showDashboards
 } from '@/features/dashboard/actions'
+import {
+  exportConnectionsToFile,
+  openImportConnections
+} from '@/features/connections/ImportConnections'
 import { useServerObjects } from './palette-search'
 import { EngineMark, Kbd, Spinner } from './ui'
 
@@ -190,6 +196,20 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
         label: 'Cloud databases (AWS, Google Cloud, Azure)',
         icon: <Cloud />,
         run: openCloud
+      },
+      {
+        id: 'import-connections',
+        group: 'Commands',
+        label: 'Import connections (pgpass, DBeaver, DataGrip)',
+        icon: <FileInput />,
+        run: openImportConnections
+      },
+      {
+        id: 'export-connections',
+        group: 'Commands',
+        label: 'Export connections (without passwords)',
+        icon: <FileOutput />,
+        run: () => void exportConnectionsToFile()
       },
       ...backupCommands(),
       ...compareCommands(),

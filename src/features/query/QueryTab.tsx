@@ -19,13 +19,23 @@ import {
   TextCursorInput,
   Undo2
 } from 'lucide-react'
-import { api, type CompletionTable } from '@/lib/api'
-import { ENGINES } from '@/lib/engines'
+import { api, type CompletionTable, type StreamFormat } from '@/lib/api'
+import { ENGINES, connectionLabel } from '@/lib/engines'
+import { EXTENSIONS, pickSavePath } from '@/lib/export'
+import { plural } from '@/lib/format'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
-import { paramNames, substituteParams, type ParamValue } from '@/lib/params'
+import {
+  fillParams,
+  paramNames,
+  sourceOffset,
+  type ParamValue,
+  type Substitution
+} from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
-import { queries } from '@/lib/queries'
+import { confirmProductionWrite, isProduction } from '@/lib/production'
+import { queries, queryClient } from '@/lib/queries'
+import { isReadOnlyQuery, resolveTable, singleTableSource } from '@/lib/result-source'
 import { settingsStore } from '@/lib/settings'
 import { dangerousStatements, explainSql, formatSql, statementAt } from '@/lib/sql'
 import { createStore } from '@/lib/store'
@@ -34,6 +44,7 @@ import { errorMessage, toast, toastError } from '@/lib/toast'
 import {
   beginSql,
   commitSql,
+  isManualCommit,
   manualCommitStore,
   openTransactionsStore,
   rollbackSql,
@@ -58,10 +69,13 @@ import { showMenuAt } from '@/components/ContextMenu'
 import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
 import { SavedButton } from '../saved/SavedButton'
 import { ParamsDialog } from './ParamsDialog'
-import { ResultsPanel, type RunResult } from './ResultsPanel'
+import { ResultsPanel, type ResultEditTarget, type RunResult } from './ResultsPanel'
 import { ConnectionPicker, DatabasePicker } from './pickers'
 
 export const sqlResultsStore = createStore<Record<string, RunResult>>({})
+
+/** Excel's sheet holds this many rows below the header */
+const XLSX_ROWS = 1_048_575
 
 function completionNamespace(tables: CompletionTable[] | undefined): SQLNamespace | undefined {
   if (!tables) return undefined
@@ -94,7 +108,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     (status?.state === 'connected' && !!status.info.babelfishVersion)
   const layout = useDefaultLayout({ id: 'query-split', storage: localStorage })
   const inTransaction = !!openTransactionsStore.use()[tab.id]
-  const manualCommit = !!manualCommitStore.use()[tab.id]
+  const manualCommit = isManualCommit(tab.id, manualCommitStore.use(), settings.defaultCommitMode)
   const [paramPrompt, setParamPrompt] = useState<{
     names: string[]
     resolve: (values: Record<string, ParamValue> | null) => void
@@ -141,7 +155,8 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         sql = text
       }
       if (!sql.trim()) return
-      if (settings.confirmDangerous && !transform) {
+      // Production connections confirm every write below instead
+      if (settings.confirmDangerous && !transform && !isProduction(connection)) {
         const reasons = dangerousStatements(sql, dialect)
         if (reasons.length) {
           const ok = await confirm({
@@ -161,21 +176,24 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       }
       const names = paramNames(sql, dialect)
       let filled = sql
+      let spans: Substitution[] | undefined
       if (names.length) {
         const values = await askParams(names)
         if (!values) return
-        filled = substituteParams(sql, dialect, values)
+        ;({ sql: filled, spans } = fillParams(sql, dialect, values))
       }
-      if (!(await connect(tab.connectionId))) return
       const toRun = transform ? transform(filled) : filled
-      // Error positions only map back onto the editor when the text ran unchanged
-      const runOffset = transform || names.length ? -1 : offset
+      // Asked before a manual-commit BEGIN, so declining leaves no transaction behind
+      if (!(await confirmProductionWrite(connection, { sql: toRun }))) return
+      if (!(await connect(tab.connectionId))) return
+      // Error positions map back onto the editor unless the text was rewritten (Explain)
+      const runOffset = transform ? -1 : offset
       ed.clearErrors()
       setRunning(tab.id, true)
       if (resultsPanel.current?.isCollapsed()) resultsPanel.current.expand()
       try {
         // Manual commit: the first run after a COMMIT or ROLLBACK opens a new transaction
-        if (manualCommitStore.get()[tab.id] && !explain && !openTransactionsStore.get()[tab.id]) {
+        if (isManualCommit(tab.id) && !explain && !openTransactionsStore.get()[tab.id]) {
           const begin = beginSql(dialect)
           const begun = await api.execute(tab.connectionId, tab.id, tab.database, begin)
           if (begun.error) {
@@ -187,7 +205,9 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           }
         }
         const output = await api.execute(tab.connectionId, tab.id, tab.database, toRun, {
-          maxRows: settings.maxRows
+          maxRows: settings.maxRows,
+          timeoutSecs: settings.queryTimeoutSecs,
+          confirmed: true
         })
         if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
         const plan =
@@ -196,7 +216,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             : undefined
         sqlResultsStore.set((r) => ({
           ...r,
-          [tab.id]: { output, offset: runOffset, sql: toRun, plan }
+          [tab.id]: { output, offset: runOffset, sql: toRun, spans, plan }
         }))
         if (output.database && output.database !== tab.database)
           updateTab(tab.id, { database: output.database })
@@ -214,11 +234,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           ok: !output.error,
           kind: 'sql'
         })
-        if (output.error && runOffset >= 0) showError(output.error, runOffset, toRun)
+        if (output.error && runOffset >= 0) showError(output.error, runOffset, toRun, spans)
       } catch (e) {
         sqlResultsStore.set((r) => ({
           ...r,
-          [tab.id]: { error: errorMessage(e), offset: runOffset, sql: toRun }
+          [tab.id]: { error: errorMessage(e), offset: runOffset, sql: toRun, spans }
         }))
         lastRunStore.set((l) => ({ ...l, [tab.id]: { rows: 0, elapsedMs: 0, ok: false } }))
       } finally {
@@ -234,6 +254,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       dialect,
       babelfish,
       settings.maxRows,
+      settings.queryTimeoutSecs,
       settings.confirmDangerous
     ]
   )
@@ -241,31 +262,193 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const showError = (
     error: { message: string; position: number | null; line: number | null },
     offset: number,
-    sql: string
+    sql: string,
+    spans: Substitution[] = []
   ): void => {
     const ed = editor.current
     if (!ed) return
     const firstLine = error.message.split('\n')[0]
     if (error.position != null) {
       // PostgreSQL positions are 1-based character offsets into the submitted text
-      const at = offset + Math.max(0, error.position - 1)
-      const rest = sql.slice(error.position - 1)
-      const word = /^\S+/.exec(rest)?.[0].length ?? 1
-      ed.showError(at, at + word, firstLine)
+      const start = Math.max(0, error.position - 1)
+      const word = /^\S+/.exec(sql.slice(start))?.[0].length ?? 1
+      ed.showError(
+        offset + sourceOffset(start, spans),
+        offset + sourceOffset(start + word, spans, 'end'),
+        firstLine
+      )
     } else if (error.line != null) {
       const view = ed.view()
       if (!view) return
-      const base = view.state.doc.lineAt(offset).number
-      const lineNo = Math.min(view.state.doc.lines, base + error.line - 1)
-      const line = view.state.doc.line(lineNo)
+      // Values can span lines, so find the line in the submitted text first
+      let lineStart = 0
+      for (let n = 1; n < error.line; n++) {
+        const next = sql.indexOf('\n', lineStart)
+        if (next < 0) break
+        lineStart = next + 1
+      }
+      const at = Math.min(view.state.doc.length, offset + sourceOffset(lineStart, spans))
+      const line = view.state.doc.lineAt(at)
       ed.showError(line.from, line.to, firstLine)
     }
   }
 
   const cancel = (): void => void api.cancel(tab.connectionId, tab.id).catch(toastError)
 
+  /** Runs the last result's text again, keeping the open view: more rows, or a refresh after edits. */
+  const rerun = async (maxRows: number): Promise<void> => {
+    const last = sqlResultsStore.get()[tab.id]
+    if (!last || runsStore.get()[tab.id]?.running) return
+    if (!(await connect(tab.connectionId))) return
+    setRunning(tab.id, true)
+    try {
+      const output = await api.execute(tab.connectionId, tab.id, tab.database, last.sql, {
+        maxRows,
+        readOnly: true,
+        timeoutSecs: settings.queryTimeoutSecs
+      })
+      if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
+      sqlResultsStore.set((r) => ({ ...r, [tab.id]: { ...last, output, keepView: true } }))
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setRunning(tab.id, false)
+    }
+  }
+
+  const rerunnable = !!result?.output && isReadOnlyQuery(result.sql, dialect)
+  const notRerunnable = 'Only for queries that just read: running this text again could change data'
+
+  const loadMore = (set: number): void => {
+    const shown = result?.output?.results[set]?.rows.length ?? 0
+    void rerun(shown + settings.maxRows)
+  }
+
+  const exportFull = async (set: number, format: StreamFormat): Promise<void> => {
+    if (!result || runsStore.get()[tab.id]?.running) return
+    const path = await pickSavePath(
+      `${tab.title.replace(/[\\/:*?"<>|]+/g, '_')}${set ? `-${set + 1}` : ''}`,
+      EXTENSIONS[format]
+    )
+    if (!path || !(await connect(tab.connectionId))) return
+    setRunning(tab.id, true)
+    try {
+      const output = await api.exportQuery(
+        tab.connectionId,
+        tab.id,
+        tab.database,
+        result.sql,
+        format,
+        path,
+        set
+      )
+      if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
+      const rows = output.results[set]?.rowCount ?? 0
+      const file = path.split(/[\\/]/).pop()
+      if (output.error) toast(`Export stopped: ${output.error.message}`, 'error')
+      else if (output.cancelled) toast(`Export cancelled after ${plural(rows, 'row')}`, 'error')
+      else if (!output.results[set]) toast('The query returned no result set to export', 'error')
+      else if (format === 'xlsx' && rows > XLSX_ROWS)
+        toast(
+          `Saved ${XLSX_ROWS.toLocaleString()} of ${rows.toLocaleString()} rows to ${file}: that's all an Excel sheet holds`,
+          'error'
+        )
+      else toast(`Exported ${plural(rows, 'row')} to ${file}`)
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setRunning(tab.id, false)
+    }
+  }
+
+  // Results read straight from one table with a primary key can be edited in place
+  const [editSource, setEditSource] = useState<Omit<
+    ResultEditTarget,
+    'execute' | 'confirmDangerous' | 'blocked' | 'onCommitted'
+  > | null>(null)
+  useEffect(() => {
+    const output = result?.output
+    const set = output?.results[0]
+    const source = result && singleTableSource(result.sql, dialect)
+    const table =
+      source && resolveTable(source.parts, completion.data ?? [], defaultSchema, dialect)
+    if (!set || output.error || output.results.length !== 1 || connection?.readOnly || !table) {
+      setEditSource(null)
+      return
+    }
+    let stale = false
+    queryClient
+      .fetchQuery(queries.table(tab.connectionId, tab.database, table.schema, table.name))
+      .then((info) => {
+        if (stale) return
+        const names = set.columns.map((c) => c.name)
+        const unique = (name: string): boolean => names.indexOf(name) === names.lastIndexOf(name)
+        const keyed =
+          info.primaryKey.length > 0 && info.primaryKey.every((k) => names.includes(k) && unique(k))
+        if (!keyed) return setEditSource(null)
+        const readOnly = new Set<number>()
+        set.columns.forEach((c, i) => {
+          const column = info.columns.find((col) => col.name === c.name)
+          const passedThrough = source.star || source.columns.has(c.name)
+          if (!column || column.isGenerated || !passedThrough || !unique(c.name)) readOnly.add(i)
+        })
+        setEditSource({ tableRef: { schema: table.schema, name: table.name }, info, readOnly })
+      })
+      .catch(() => !stale && setEditSource(null))
+    return () => {
+      stale = true
+    }
+    // Recomputed per run; completions arriving later only matter for the next run
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result])
+  const edit = useMemo<ResultEditTarget | undefined>(
+    () =>
+      editSource
+        ? {
+            ...editSource,
+            execute: (sql, options) =>
+              api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+            confirmDangerous: settings.confirmDangerous,
+            connection,
+            blocked: inTransaction
+              ? "This tab's transaction is open. Commit or roll back before committing edits, which run in their own transaction."
+              : undefined,
+            onCommitted: () =>
+              void rerun(
+                Math.max(
+                  settings.maxRows,
+                  sqlResultsStore.get()[tab.id]?.output?.results[0]?.rows.length ?? 0
+                )
+              )
+          }
+        : undefined,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      editSource,
+      tab.connectionId,
+      tab.id,
+      tab.database,
+      settings.confirmDangerous,
+      settings.maxRows,
+      inTransaction,
+      connection
+    ]
+  )
+
   const endTransaction = async (commit: boolean): Promise<void> => {
     const sql = commit ? commitSql(dialect) : rollbackSql(dialect)
+    if (
+      commit &&
+      connection &&
+      isProduction(connection) &&
+      !(await confirm({
+        title: `Commit to production database ${connectionLabel(connection)}?`,
+        message: "The transaction's changes become permanent.",
+        confirmLabel: 'Commit',
+        danger: true
+      }))
+    )
+      return
     setRunning(tab.id, true)
     try {
       const output = await api.execute(tab.connectionId, tab.id, tab.database, sql)
@@ -548,6 +731,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             language={{ kind: 'sql', dialect }}
             completion={namespace}
             defaultSchema={defaultSchema}
+            sqlTables={completion.data}
             keys={keys}
             fontSize={settings.editorFontSize}
             wordWrap={settings.wordWrap}
@@ -571,9 +755,16 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             running={running}
             startedAt={run?.startedAt}
             dialect={dialect}
+            tabId={tab.id}
+            loadMore={{ run: loadMore, disabled: rerunnable ? undefined : notRerunnable }}
+            exportFull={{
+              run: (set, format) => void exportFull(set, format),
+              disabled: rerunnable ? undefined : notRerunnable
+            }}
+            edit={edit}
             onJumpToError={() => {
               if (result?.output?.error && result.offset >= 0)
-                showError(result.output.error, result.offset, result.sql)
+                showError(result.output.error, result.offset, result.sql, result.spans)
             }}
             emptyHint={
               !connected ? (

@@ -90,10 +90,39 @@ fn build_config(
     config.encryption(match cfg.ssl {
         SslMode::Disable => EncryptionLevel::NotSupported,
         SslMode::Prefer => EncryptionLevel::Off,
-        SslMode::Require => EncryptionLevel::Required,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => EncryptionLevel::Required,
     });
-    if cfg.trust_server_certificate {
+    if cfg.ssl == SslMode::VerifyCa {
+        // tiberius checks the chain and the name together or not at all
+        return Err(AppError::Unsupported(
+            "SQL Server connections can't verify the certificate without its host name;              use Verify full (set the host name the certificate was issued for)"
+                .into(),
+        ));
+    }
+    // Through a tunnel the certificate names the real server, not 127.0.0.1
+    if let Some((origin, _)) = &cfg.tunneled {
+        config.hostname_in_certificate(origin);
+    }
+    // The verify modes ignore "trust server certificate"; tiberius panics if
+    // the bypass is combined with a CA file
+    if cfg.trust_server_certificate && !cfg.ssl.verifies() {
         config.trust_cert();
+    } else if let Some(ca) = cfg.root_cert() {
+        super::tls::read_file(ca, "CA certificate")?;
+        config.trust_cert_ca(ca);
+    }
+    match super::tls::client_cert(cfg)? {
+        None => {}
+        Some(super::tls::ClientCert::Pem { cert, key }) => config.client_certificate(cert, key),
+        #[cfg(windows)]
+        Some(super::tls::ClientCert::Pkcs12(path)) => config.client_certificate_pkcs12(path, ""),
+        #[cfg(not(windows))]
+        Some(super::tls::ClientCert::Pkcs12(_)) => {
+            return Err(AppError::Unsupported(
+                "On this platform SQL Server client certificates must be PEM files:                  choose the certificate and its private key separately"
+                    .into(),
+            ));
+        }
     }
     Ok(config)
 }
@@ -101,9 +130,12 @@ fn build_config(
 async fn open(mut config: Config) -> AppResult<Client<Compat<TcpStream>>> {
     // Azure SQL may redirect the login to another node; follow it once
     for _ in 0..2 {
-        let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect_named(&config))
-            .await
-            .map_err(|_| AppError::msg("Timed out connecting to the server"))??;
+        let tcp = tokio::time::timeout(
+            crate::limits::connect_timeout(),
+            TcpStream::connect_named(&config),
+        )
+        .await
+        .map_err(|_| AppError::msg("Timed out connecting to the server"))??;
         tcp.set_nodelay(true)?;
         match Client::connect(config.clone(), tcp.compat_write()).await {
             Ok(client) => return Ok(client),
@@ -127,7 +159,9 @@ pub async fn connect(
         // Certificate checks are already off, so the handshake itself failed: usually a
         // server that only speaks TLS 1.0/1.1, which neither rustls nor current Windows allows
         Err(AppError::Message(m))
-            if cfg.trust_server_certificate && m.starts_with("TLS error:") =>
+            if cfg.trust_server_certificate
+                && !cfg.ssl.verifies()
+                && m.starts_with("TLS error:") =>
         {
             let reason = m
                 .split_once(". If the server")
@@ -202,7 +236,7 @@ fn type_name(ty: ColumnType) -> &'static str {
     }
 }
 
-fn cell(data: &ColumnData<'static>) -> Value {
+fn cell(data: &ColumnData<'static>, max_binary: usize) -> Value {
     let s = |v: String| Value::String(v);
     match data {
         ColumnData::U8(v) => v.map_or(Value::Null, |n| s(n.to_string())),
@@ -214,7 +248,9 @@ fn cell(data: &ColumnData<'static>) -> Value {
         ColumnData::Bit(v) => v.map_or(Value::Null, |b| s(if b { "1" } else { "0" }.into())),
         ColumnData::String(v) => v.as_ref().map_or(Value::Null, |t| s(t.to_string())),
         ColumnData::Guid(v) => v.map_or(Value::Null, |g| s(g.to_string().to_uppercase())),
-        ColumnData::Binary(v) => v.as_ref().map_or(Value::Null, |b| s(hex_bytes(b))),
+        ColumnData::Binary(v) => v
+            .as_ref()
+            .map_or(Value::Null, |b| s(hex_bytes_max(b, max_binary))),
         ColumnData::Numeric(v) => v.map_or(Value::Null, |n| s(n.to_string())),
         ColumnData::Xml(v) => v.as_ref().map_or(Value::Null, |x| s(x.to_string())),
         ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
@@ -242,7 +278,7 @@ fn cell(data: &ColumnData<'static>) -> Value {
 
 fn text(row: &Row, i: usize) -> Option<String> {
     let (_, data) = row.cells().nth(i)?;
-    match cell(data) {
+    match cell(data, usize::MAX) {
         Value::String(s) => Some(s),
         _ => None,
     }
@@ -443,7 +479,8 @@ impl MsSession {
                     ),
                     QueryItem::Row(row) => {
                         if out.wants_rows() {
-                            out.push_row(row.cells().map(|(_, data)| cell(data)).collect());
+                            let max = out.max_binary();
+                            out.push_row(row.cells().map(|(_, data)| cell(data, max)).collect());
                         } else {
                             out.skip_row();
                         }
@@ -910,8 +947,45 @@ impl MsSession {
                     schema,
                     name: table,
                     columns: vec![column],
+                    foreign_keys: Vec::new(),
                 }),
             }
+        }
+        // Join suggestions are a bonus; completion works without them
+        if let Ok(keys) = self
+            .rows_in(
+                database,
+                "SELECT s.name, t.name, CAST(fk.object_id AS varchar(20)), c.name, \
+                 rs.name, rt.name, rc.name \
+                 FROM sys.foreign_key_columns fkc \
+                 JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id \
+                 JOIN sys.tables t ON t.object_id = fkc.parent_object_id \
+                 JOIN sys.schemas s ON s.schema_id = t.schema_id \
+                 JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id \
+                 JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id \
+                 JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+                 JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+                 ORDER BY s.name, t.name, fk.object_id, fkc.constraint_column_id",
+                None,
+                &[],
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .take(20_000)
+                    .map(|r| KeyColumn {
+                        schema: text(r, 0),
+                        table: text(r, 1).unwrap_or_default(),
+                        key: text(r, 2).unwrap_or_default(),
+                        column: text(r, 3).unwrap_or_default(),
+                        ref_schema: text(r, 4),
+                        ref_table: text(r, 5).unwrap_or_default(),
+                        ref_column: text(r, 6).unwrap_or_default(),
+                    })
+                    .collect(),
+            );
         }
         Ok(tables)
     }

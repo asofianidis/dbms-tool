@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { findByName, queryKindOf, sortQueries, upsertQuery, type SavedQuery } from '../saved'
+import {
+  allFolders,
+  findByName,
+  matchesSearch,
+  parseTags,
+  queryKindOf,
+  renameFolder,
+  sortQueries,
+  splitFolder,
+  upsertQuery,
+  type SavedQuery
+} from '../saved'
 
 function query(patch: Partial<SavedQuery>): SavedQuery {
   return {
@@ -61,5 +72,54 @@ describe('saved queries', () => {
     expect(queryKindOf('postgres')).toBe('sql')
     expect(queryKindOf('babelfish')).toBe('sql')
     expect(queryKindOf('mongo')).toBe('mongo')
+  })
+})
+
+describe('saved query folders and tags', () => {
+  it('splits a folder path off the name', () => {
+    expect(splitFolder('Reports / Daily/ Active users ')).toEqual({
+      folder: 'Reports/Daily',
+      name: 'Active users'
+    })
+    expect(splitFolder('Users')).toEqual({ folder: '', name: 'Users' })
+  })
+
+  it('reads tags from commas, spaces and hashes', () => {
+    expect(parseTags('Billing, #daily  billing ops')).toEqual(['billing', 'daily', 'ops'])
+  })
+
+  it('lists folders with their parents', () => {
+    const list = [query({ folder: 'Reports/Daily' }), query({ id: 'q2', folder: 'Ops' })]
+    expect(allFolders(list)).toEqual(['Ops', 'Reports', 'Reports/Daily'])
+  })
+
+  it('searches by words, #tags and @folders', () => {
+    const q = query({ tags: ['billing'], folder: 'Reports/Daily' })
+    expect(matchesSearch(q, 'users')).toBe(true)
+    expect(matchesSearch(q, '#bill users')).toBe(true)
+    expect(matchesSearch(q, '#ops')).toBe(false)
+    expect(matchesSearch(q, '@reports')).toBe(true)
+    expect(matchesSearch(q, '@report')).toBe(false)
+  })
+
+  it('renames a folder and the folders inside it', () => {
+    const list = renameFolder(
+      [
+        query({ folder: 'Reports' }),
+        query({ id: 'q2', folder: 'Reports/Daily' }),
+        query({ id: 'q3', folder: 'Reporting' })
+      ],
+      'Reports',
+      'Archive'
+    )
+    expect(list.map((q) => q.folder)).toEqual(['Archive', 'Archive/Daily', 'Reporting'])
+    expect(renameFolder([query({ folder: 'A/B' })], 'A', '')[0].folder).toBe('B')
+  })
+
+  it('keeps a folder only when one is given', () => {
+    const { saved } = upsertQuery([], { name: 'x', text: 'y', kind: 'sql', folder: 'Ops' }, 1)
+    expect(saved.folder).toBe('Ops')
+    const updated = upsertQuery([saved], { id: saved.id, name: 'x', text: 'z', kind: 'sql' }, 2)
+    expect(updated.saved.folder).toBe('Ops')
   })
 })

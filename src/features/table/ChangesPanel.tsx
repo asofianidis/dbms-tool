@@ -22,7 +22,9 @@ export function ChangesPanel({
   onChange,
   onCommit,
   onCancelAll,
-  onClose
+  onClose,
+  onAddRow,
+  notice
 }: {
   changes: PendingChange[]
   columns: ColumnMeta[]
@@ -40,6 +42,10 @@ export function ChangesPanel({
   onCommit: (ids?: string[]) => void
   onCancelAll: () => void
   onClose: () => void
+  /** Shows an add-row button in the header (the table tab has its own) */
+  onAddRow?: () => void
+  /** Shown above the changes, e.g. why committing is held back */
+  notice?: string
 }): React.JSX.Element {
   const [showSql, setShowSql] = useState(false)
   const script = useMemo(() => {
@@ -53,6 +59,11 @@ export function ChangesPanel({
         <span className="text-[12px] font-medium text-bright">Pending changes</span>
         <Badge tone={changes.length ? 'accent' : 'neutral'}>{changes.length}</Badge>
         <div className="flex-1" />
+        {onAddRow && (
+          <Button size="icon-sm" variant="ghost" title="Add row" onClick={onAddRow}>
+            <Plus className="size-3.5" />
+          </Button>
+        )}
         <Button
           size="icon-sm"
           variant="ghost"
@@ -66,6 +77,11 @@ export function ChangesPanel({
           <PanelRightClose className="size-3.5" />
         </Button>
       </div>
+      {notice && (
+        <p className="border-b border-line bg-warn/[0.07] px-3 py-2 text-[11.5px] text-warn">
+          {notice}
+        </p>
+      )}
       <div className="min-h-0 flex-1 overflow-y-auto">
         {!changes.length ? (
           <p className="p-4 text-xs text-faint">
