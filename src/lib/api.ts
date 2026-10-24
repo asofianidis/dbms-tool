@@ -17,10 +17,6 @@ export interface ConnectionConfig {
   trustServerCertificate: boolean
   uri: string
   authSource: string
-  /** MongoDB replica set name (host and port form) */
-  replicaSet?: string
-  /** MongoDB read preference; empty keeps the default */
-  readPreference?: string
   savePassword: boolean
   readOnly: boolean
   color: string
