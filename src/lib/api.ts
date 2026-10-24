@@ -311,6 +311,15 @@ export interface CompletionTable {
   schema: string | null
   name: string
   columns: string[]
+  /** Outgoing foreign keys, for join suggestions */
+  foreignKeys: CompletionKey[]
+}
+
+export interface CompletionKey {
+  columns: string[]
+  refSchema: string | null
+  refTable: string
+  refColumns: string[]
 }
 
 export interface ColumnMeta {
@@ -352,7 +361,12 @@ export interface ExecOutput {
 
 export interface ExecOptions {
   maxRows?: number
+  /** Bytes of each binary cell to send (default 4096); the rest is summarized */
+  maxBinaryBytes?: number
 }
+
+/** Formats `query_export` streams to disk */
+export type StreamFormat = 'csv' | 'tsv' | 'json' | 'xlsx'
 
 /** Extended JSON value as produced by the backend. */
 export type Ejson = unknown
@@ -481,6 +495,16 @@ export const api = {
   execute: (id: string, session: string, database: string, sql: string, options?: ExecOptions) =>
     invoke<ExecOutput>('query_execute', { id, session, database, sql, options }),
   cancel: (id: string, session: string) => invoke<void>('query_cancel', { id, session }),
+  /** Runs `sql` and writes every row of result set `set` to `path` (picked in a save dialog) */
+  exportQuery: (
+    id: string,
+    session: string,
+    database: string,
+    sql: string,
+    format: StreamFormat,
+    path: string,
+    set = 0
+  ) => invoke<ExecOutput>('query_export', { id, session, database, sql, format, path, set }),
   closeSession: (id: string, session: string) => invoke<void>('session_close', { id, session }),
 
   mongo: (id: string, session: string, request: MongoRequest, options?: ExecOptions) =>
@@ -492,6 +516,8 @@ export const api = {
     invoke<void>('file_write_bytes', contents, {
       headers: { 'x-path': encodeURIComponent(path) }
     }),
+  writeXlsx: (path: string, columns: ColumnMeta[], rows: Cell[][]) =>
+    invoke<void>('file_write_xlsx', { path, columns, rows }),
   readText: (path: string) => invoke<string>('file_read_text', { path }),
 
   cloudTools: () => invoke<CloudTool[]>('cloud_tools'),

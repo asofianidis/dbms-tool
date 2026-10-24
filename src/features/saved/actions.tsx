@@ -5,6 +5,7 @@ import {
   findByName,
   queryKindOf,
   savedQueriesStore,
+  splitFolder,
   updateSavedQuery,
   upsertQuery,
   type SavedQuery
@@ -36,8 +37,14 @@ export interface RunTarget {
 /** Most recently used saved queries shown directly in the toolbar menu. */
 const MENU_LIMIT = 10
 
-/** The active tab's connection and database, or else the first connection that can run the query. */
+/**
+ * The connection the query is tied to, else the active tab's connection and
+ * database, else the first connection that can run the query.
+ */
 export function defaultTarget(query: SavedQuery): RunTarget | undefined {
+  const tied = query.connectionId ? getConnection(query.connectionId) : undefined
+  if (tied && queryKindOf(tied.engine) === query.kind)
+    return { connectionId: tied.id, database: query.database || defaultDatabase(tied.id) }
   const tab = activeTab()
   if (tab && 'database' in tab) {
     const connection = getConnection(tab.connectionId)
@@ -130,6 +137,7 @@ export async function saveTabQuery(tab: EditorTab, text: string, asNew = false):
       : undefined
   let id = linked?.id
   let name = linked?.name
+  let folder: string | undefined
   if (!linked) {
     const fileName = tab.filePath
       ?.split(/[\\/]/)
@@ -138,12 +146,15 @@ export async function saveTabQuery(tab: EditorTab, text: string, asNew = false):
     const answer = await promptText({
       title: 'Save query',
       label: 'Name',
-      placeholder: 'e.g. Active users by plan',
+      placeholder: 'Name, or Folder/Name, e.g. Reports/Active users',
       initial: fileName ?? '',
       confirmLabel: 'Save'
     })
     if (!answer?.trim()) return
-    name = answer.trim()
+    const path = splitFolder(answer)
+    if (!path.name) return
+    name = path.name
+    folder = path.folder
     const clash = findByName(savedQueriesStore.get(), name, kind)
     if (clash) {
       const ok = await confirm({
@@ -156,7 +167,7 @@ export async function saveTabQuery(tab: EditorTab, text: string, asNew = false):
       id = clash.id
     }
   }
-  const result = upsertQuery(savedQueriesStore.get(), { id, name: name!, text, kind })
+  const result = upsertQuery(savedQueriesStore.get(), { id, name: name!, text, kind, folder })
   savedQueriesStore.set(result.list)
   updateTab(tab.id, { savedQueryId: result.saved.id, title: result.saved.name })
   toast(linked ? `Updated “${result.saved.name}”` : `Saved “${result.saved.name}”`)
