@@ -32,6 +32,8 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         ssl_client_key: String::new(),
         uri: String::new(),
         auth_source: String::new(),
+        replica_set: String::new(),
+        read_preference: String::new(),
         save_password: false,
         read_only: false,
         production: false,

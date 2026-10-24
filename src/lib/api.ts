@@ -24,6 +24,10 @@ export interface ConnectionConfig {
   sslClientKey?: string
   uri: string
   authSource: string
+  /** MongoDB replica set name (host and port form) */
+  replicaSet?: string
+  /** MongoDB read preference; empty keeps the default */
+  readPreference?: string
   savePassword: boolean
   readOnly: boolean
   /** Writes need an extra confirmation, and destructive ones the connection's name typed */

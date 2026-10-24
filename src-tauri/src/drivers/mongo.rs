@@ -55,6 +55,51 @@ fn server_selection_cause(message: &str) -> &str {
         .unwrap_or("no server responded")
 }
 
+/// The host field as a seed list: `a,b:27018` → `a:27017,b:27018`. A replica
+/// set or a group of mongos routers is entered as several comma-separated hosts.
+pub fn host_list(cfg: &ConnectionConfig) -> String {
+    let port = if cfg.port == 0 { 27017 } else { cfg.port };
+    let hosts: Vec<String> = cfg
+        .host
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            let has_port = if h.starts_with('[') {
+                h.contains("]:")
+            } else {
+                h.matches(':').count() == 1
+            };
+            if has_port {
+                h.to_string()
+            } else if h.contains(':') && !h.starts_with('[') {
+                format!("[{h}]:{port}")
+            } else {
+                format!("{h}:{port}")
+            }
+        })
+        .collect();
+    if hosts.is_empty() {
+        format!("localhost:{port}")
+    } else {
+        hosts.join(",")
+    }
+}
+
+fn read_preference(mode: &str) -> AppResult<Option<ReadPreference>> {
+    Ok(Some(match mode.trim() {
+        "" => return Ok(None),
+        "primary" => ReadPreference::Primary,
+        "primaryPreferred" => ReadPreference::PrimaryPreferred { options: None },
+        "secondary" => ReadPreference::Secondary { options: None },
+        "secondaryPreferred" => ReadPreference::SecondaryPreferred { options: None },
+        "nearest" => ReadPreference::Nearest { options: None },
+        other => {
+            return Err(AppError::msg(format!("Unknown read preference '{other}'")));
+        }
+    }))
+}
+
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<Client> {
     // The driver's TLS library (rustls) always checks the host name, and can
     // only check the one it connects to
@@ -73,13 +118,10 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     let client_cert = super::tls::combined_pem_cert(cfg)?;
     let uri = cfg.uri.trim();
     let mut opts = if uri.is_empty() {
-        let host = if cfg.host.is_empty() {
-            "localhost"
-        } else {
-            cfg.host.as_str()
-        };
-        let port = if cfg.port == 0 { 27017 } else { cfg.port };
-        let mut opts = ClientOptions::parse(format!("mongodb://{host}:{port}/")).await?;
+        let mut opts = ClientOptions::parse(format!("mongodb://{}/", host_list(cfg))).await?;
+        if !cfg.replica_set.trim().is_empty() {
+            opts.repl_set_name = Some(cfg.replica_set.trim().to_string());
+        }
         if !cfg.user.is_empty() {
             opts.credential = Some(
                 Credential::builder()
@@ -101,6 +143,7 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         // own (unreachable) names, so talk to the one the tunnel reaches
         if cfg.tunneled.is_some() {
             opts.direct_connection = Some(true);
+            opts.repl_set_name = None;
         }
         opts
     } else {
@@ -137,6 +180,9 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
             super::tls::read_file(cert, "client certificate")?;
             tls.cert_key_file_path = Some(cert.into());
         }
+    }
+    if let Some(pref) = read_preference(&cfg.read_preference)? {
+        opts.selection_criteria = Some(pref.into());
     }
     opts.app_name = Some("dbms-tool".into());
     opts.server_selection_timeout = Some(crate::limits::connect_timeout());
@@ -454,6 +500,9 @@ fn is_read_command(command: &Value) -> bool {
         "top",
         "validate",
         "replSetGetStatus",
+        "replSetGetConfig",
+        "listShards",
+        "balancerStatus",
         "getLog",
     ];
     command
@@ -962,6 +1011,22 @@ mod tests {
             cause,
             "No connection could be made because the target machine actively refused it"
         );
+    }
+
+    #[test]
+    fn builds_seed_lists_from_the_host_field() {
+        let cfg = |host: &str, port: u16| -> ConnectionConfig {
+            serde_json::from_value(json!({
+                "id": "", "name": "", "engine": "mongo", "host": host, "port": port
+            }))
+            .unwrap()
+        };
+        assert_eq!(host_list(&cfg("", 0)), "localhost:27017");
+        assert_eq!(
+            host_list(&cfg("a, b:27018 ,c", 27019)),
+            "a:27019,b:27018,c:27019"
+        );
+        assert_eq!(host_list(&cfg("::1,[::2]:5", 0)), "[::1]:27017,[::2]:5");
     }
 
     #[test]
