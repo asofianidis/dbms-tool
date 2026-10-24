@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { getVersion } from '@tauri-apps/api/app'
 import { cn } from '@/lib/cn'
+import { timeZones } from '@/lib/datetime'
 import { timeAgo } from '@/lib/format'
 import { historyStore } from '@/lib/history'
 import { checkForUpdates, installUpdate, openReleasePage, updateStore } from '@/lib/updater'
@@ -68,6 +69,8 @@ function Section({
 
 export function SettingsTab(): React.JSX.Element {
   const settings = settingsStore.use()
+  const [zones] = useState(timeZones)
+  const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone
   const history = historyStore.use()
   const update = updateStore.use()
   const [version, setVersion] = useState('')
@@ -378,6 +381,50 @@ export function SettingsTab(): React.JSX.Element {
               ))}
             </Select>
           </Row>
+          <Row
+            title="Time zone for timestamps"
+            description="Timestamps that carry an offset are shown in this zone; copies and exports keep the server's text"
+          >
+            <Select
+              value={settings.timeZone}
+              onChange={(e) => set('timeZone', e.target.value)}
+              className="w-56"
+            >
+              <option value="">As the server sends them</option>
+              <option value="local">This computer ({localZone})</option>
+              <option value="UTC">UTC</option>
+              {zones
+                .filter((z) => z !== 'UTC')
+                .map((z) => (
+                  <option key={z} value={z}>
+                    {z}
+                  </option>
+                ))}
+            </Select>
+          </Row>
+          {settings.timeZone && (
+            <>
+              <Row
+                title="Timestamp format"
+                description="ISO keeps the server's precision; the local format follows your system"
+              >
+                <Segmented
+                  value={settings.dateFormat}
+                  onChange={(v) => set('dateFormat', v)}
+                  options={[
+                    { value: 'iso', label: '2024-05-01 13:45:00' },
+                    { value: 'locale', label: 'Local format' }
+                  ]}
+                />
+              </Row>
+              <Row
+                title="Timestamps without a zone are UTC"
+                description="Convert timestamp / datetime values that carry no offset too, reading them as UTC"
+              >
+                <Switch checked={settings.assumeUtc} onChange={(v) => set('assumeUtc', v)} />
+              </Row>
+            </>
+          )}
         </Section>
 
         <Section title="Safety">

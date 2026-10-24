@@ -6,6 +6,8 @@ import { literal, quoteIdent } from './sql'
 import { errorMessage, toast, toastError } from './toast'
 
 export type ExportFormat = 'csv' | 'tsv' | 'json' | 'markdown' | 'sql'
+/** Text formats plus Excel, which only goes to a file */
+export type FileFormat = ExportFormat | 'xlsx'
 
 /** Most rows a "Save as" export fetches; the toast says when a result has more. */
 export const EXPORT_MAX_ROWS = 1_000_000
@@ -78,23 +80,24 @@ export function serialize(
   }
 }
 
-const EXTENSIONS: Record<ExportFormat, string> = {
+export const EXTENSIONS: Record<FileFormat, string> = {
   csv: 'csv',
   tsv: 'tsv',
   json: 'json',
   markdown: 'md',
-  sql: 'sql'
+  sql: 'sql',
+  xlsx: 'xlsx'
 }
 
-/** Asks where to save; null when the dialog was cancelled. */
-async function pickPath(defaultName: string, extension: string): Promise<string | null> {
+const fileName = (path: string): string => path.split(/[\\/]/).pop() ?? path
+
+/** Asks where to save; null when the dialog was dismissed. */
+export async function pickSavePath(defaultName: string, extension: string): Promise<string | null> {
   return save({
     defaultPath: defaultName.includes('.') ? defaultName : `${defaultName}.${extension}`,
     filters: [{ name: extension.toUpperCase(), extensions: [extension] }]
   })
 }
-
-const fileName = (path: string): string => path.split(/[\\/]/).pop() ?? path
 
 export async function saveToFile(
   contents: string,
@@ -102,7 +105,7 @@ export async function saveToFile(
   extension: string
 ): Promise<boolean> {
   try {
-    const path = await pickPath(defaultName, extension)
+    const path = await pickSavePath(defaultName, extension)
     if (!path) return false
     await api.writeText(path, contents)
     toast(`Saved ${fileName(path)}`)
@@ -113,14 +116,43 @@ export async function saveToFile(
   }
 }
 
+/** Saves raw bytes, e.g. a binary cell. */
+export async function saveBytesToFile(
+  bytes: Uint8Array,
+  defaultName: string,
+  extension: string
+): Promise<boolean> {
+  try {
+    const path = await pickSavePath(defaultName, extension)
+    if (!path) return false
+    await api.writeBytes(path, bytes)
+    toast(`Saved ${fileName(path)}`)
+    return true
+  } catch (e) {
+    toastError(e)
+    return false
+  }
+}
+
 export async function exportRows(
-  format: ExportFormat,
+  format: FileFormat,
   columns: ColumnMeta[],
   rows: Cell[][],
   name: string,
   options: { dialect?: Dialect; table?: string } = {}
 ): Promise<void> {
-  await saveToFile(serialize(format, columns, rows, options), name, EXTENSIONS[format])
+  if (format !== 'xlsx') {
+    await saveToFile(serialize(format, columns, rows, options), name, EXTENSIONS[format])
+    return
+  }
+  try {
+    const path = await pickSavePath(name, 'xlsx')
+    if (!path) return
+    await api.writeXlsx(path, columns, rows)
+    toast(`Saved ${fileName(path)}`)
+  } catch (e) {
+    toastError(e)
+  }
 }
 
 /** A whole result fetched for export; `truncated` when it still stopped short. */
@@ -131,7 +163,8 @@ export interface FetchedRows {
 }
 
 export interface FetchedFile {
-  contents: string
+  /** Text to write, or a writer for binary formats such as XLSX */
+  contents: string | ((path: string) => Promise<void>)
   rows: number
   truncated: boolean
 }
@@ -150,7 +183,7 @@ export async function saveFetched(
 ): Promise<boolean> {
   let path: string | null
   try {
-    path = await pickPath(defaultName, extension)
+    path = await pickSavePath(defaultName, extension)
   } catch (e) {
     toastError(e)
     return false
@@ -169,7 +202,8 @@ export async function saveFetched(
   }
   if (!file) return false
   try {
-    await api.writeText(path, file.contents)
+    if (typeof file.contents === 'string') await api.writeText(path, file.contents)
+    else await file.contents(path)
   } catch (e) {
     toastError(e)
     return false
@@ -183,7 +217,7 @@ export async function saveFetched(
 
 /** "Save as" for a whole result, fetched by `fetch` rather than taken from what's loaded. */
 export async function exportAll(
-  format: ExportFormat,
+  format: FileFormat,
   name: string,
   fetch: () => Promise<FetchedRows>,
   options: {
@@ -193,7 +227,10 @@ export async function exportAll(
   } = {}
 ): Promise<void> {
   const render = (set: FetchedRows): FetchedFile => ({
-    contents: serialize(format, set.columns, set.rows, options),
+    contents:
+      format === 'xlsx'
+        ? (path) => api.writeXlsx(path, set.columns, set.rows)
+        : serialize(format, set.columns, set.rows, options),
     rows: set.rows.length,
     truncated: set.truncated
   })

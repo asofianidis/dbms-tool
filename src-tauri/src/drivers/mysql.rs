@@ -188,7 +188,7 @@ fn type_name(col: &Column) -> &'static str {
     }
 }
 
-fn cell(value: &MyValue, col: &Column) -> Value {
+fn cell(value: &MyValue, col: &Column, max_binary: usize) -> Value {
     match value {
         MyValue::NULL => Value::Null,
         MyValue::Bytes(bytes) => match col.column_type() {
@@ -196,11 +196,11 @@ fn cell(value: &MyValue, col: &Column) -> Value {
                 let n = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
                 Value::String(n.to_string())
             }
-            ColumnType::MYSQL_TYPE_GEOMETRY => Value::String(hex_bytes(bytes)),
+            ColumnType::MYSQL_TYPE_GEOMETRY => Value::String(hex_bytes_max(bytes, max_binary)),
             _ if col.character_set() == 63
                 && matches!(type_name(col), "blob" | "varbinary" | "binary" | "vector") =>
             {
-                Value::String(hex_bytes(bytes))
+                Value::String(hex_bytes_max(bytes, max_binary))
             }
             _ => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         },
@@ -409,9 +409,10 @@ impl MySession {
                     };
                     let Some(row) = next else { break };
                     if out.wants_rows() {
+                        let max = out.max_binary();
                         let values = (0..row.len())
                             .map(|i| match row.as_ref(i) {
-                                Some(v) => cell(v, &columns[i]),
+                                Some(v) => cell(v, &columns[i], max),
                                 None => Value::Null,
                             })
                             .collect();
@@ -717,8 +718,39 @@ impl MySession {
                     schema: None,
                     name: table,
                     columns: vec![column],
+                    foreign_keys: Vec::new(),
                 }),
             }
+        }
+        // Join suggestions are a bonus; completion works without them
+        if let Ok(keys) = self
+            .rows(
+                "SELECT table_name, constraint_name, column_name, referenced_table_schema, \
+                 referenced_table_name, referenced_column_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE table_schema = ? AND referenced_table_name IS NOT NULL \
+                 ORDER BY table_name, constraint_name, ordinal_position LIMIT 20000",
+                vec![database.into()],
+            )
+            .await
+        {
+            attach_keys(
+                &mut tables,
+                keys.iter()
+                    .map(|r| {
+                        let ref_schema = text(r, 3).filter(|s| s != database);
+                        KeyColumn {
+                            schema: None,
+                            table: text(r, 0).unwrap_or_default(),
+                            key: text(r, 1).unwrap_or_default(),
+                            column: text(r, 2).unwrap_or_default(),
+                            ref_schema,
+                            ref_table: text(r, 4).unwrap_or_default(),
+                            ref_column: text(r, 5).unwrap_or_default(),
+                        }
+                    })
+                    .collect(),
+            );
         }
         Ok(tables)
     }

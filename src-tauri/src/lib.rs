@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod drivers;
 mod error;
+mod export;
 mod file_scope;
 mod guard;
 #[cfg(test)]
@@ -64,10 +65,12 @@ pub fn run() {
             commands::db_completion,
             commands::query_execute,
             commands::query_cancel,
+            commands::query_export,
             commands::session_close,
             commands::mongo_execute,
             commands::file_write_text,
             commands::file_write_bytes,
+            commands::file_write_xlsx,
             commands::file_read_text,
             commands::state_load_all,
             commands::state_save,

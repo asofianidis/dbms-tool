@@ -50,8 +50,10 @@ import {
   type KeyBinding
 } from '@codemirror/view'
 import { tags as t } from '@lezer/highlight'
+import type { CompletionTable } from '@/lib/api'
 import type { Dialect } from '@/lib/engines'
-import { tableAwareCompletion } from './sql-completion'
+import { allSnippets, snippetsStore, type Snippet } from '@/lib/snippets'
+import { signatureHelp, sqlAssistCompletion, tableAwareCompletion } from './sql-completion'
 
 export type EditorLanguage =
   { kind: 'sql'; dialect: Dialect } | { kind: 'mongo' } | { kind: 'json' } | { kind: 'text' }
@@ -76,6 +78,8 @@ interface Props {
   /** SQL completion schema or Mongo collection names */
   completion?: SQLNamespace
   defaultSchema?: string
+  /** Tables with columns and keys, for column, join and snippet completion in SQL */
+  sqlTables?: CompletionTable[]
   extraCompletion?: CompletionSource
   keys?: KeyBinding[]
   fontSize?: number
@@ -169,6 +173,26 @@ const theme = EditorView.theme(
       marginLeft: '12px'
     },
     '.cm-completionMatchedText': { color: 'var(--color-accent)', textDecoration: 'none' },
+    '.cm-completionIcon-join::after': { content: "'⋈'" },
+    '.cm-completionInfo': {
+      fontFamily: 'var(--font-sans)',
+      fontSize: '12px',
+      color: 'var(--color-muted)',
+      padding: '6px 10px'
+    },
+    '.cm-signature': {
+      fontFamily: 'var(--font-mono)',
+      fontSize: '12px',
+      color: 'var(--color-fg)',
+      padding: '5px 10px',
+      maxWidth: '36em'
+    },
+    '.cm-signature-active': { color: 'var(--color-accent)', fontWeight: '600' },
+    '.cm-signature-info': {
+      fontFamily: 'var(--font-sans)',
+      color: 'var(--color-muted)',
+      marginTop: '2px'
+    },
     '.cm-panels': { backgroundColor: 'var(--color-panel)', color: 'var(--color-fg)' },
     '.cm-panels-bottom': { borderTop: '1px solid var(--color-line)' },
     '.cm-panels-top': { borderBottom: '1px solid var(--color-line)' },
@@ -201,11 +225,14 @@ const theme = EditorView.theme(
 
 const DIALECTS = { postgres: PostgreSQL, mysql: MySQL, tsql: MSSQL, sqlite: SQLite }
 
+const snippets = (): Snippet[] => allSnippets(snippetsStore.get())
+
 function languageExtension(
   language: EditorLanguage,
   completion: SQLNamespace | undefined,
   defaultSchema: string | undefined,
-  extra: CompletionSource | undefined
+  extra: CompletionSource | undefined,
+  sqlTables: CompletionTable[] | undefined
 ): Extension {
   if (language.kind === 'sql') {
     const dialect = DIALECTS[language.dialect]
@@ -213,9 +240,17 @@ function languageExtension(
     const names = tableAwareCompletion(
       schemaCompletionSource({ dialect, schema: completion, defaultSchema })
     )
+    const assist = sqlAssistCompletion({
+      tables: sqlTables ?? [],
+      dialect: language.dialect,
+      defaultSchema,
+      snippets
+    })
     return [
       ext,
       ext.language.data.of({ autocomplete: names }),
+      ext.language.data.of({ autocomplete: assist }),
+      signatureHelp(language.dialect),
       ...(extra ? [ext.language.data.of({ autocomplete: extra })] : [])
     ]
   }
@@ -232,6 +267,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
     language,
     completion,
     defaultSchema,
+    sqlTables,
     extraCompletion,
     keys,
     fontSize = 13,
@@ -293,7 +329,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
             indentWithTab
           ]),
           langCompartment.current.of(
-            languageExtension(language, completion, defaultSchema, extraCompletion)
+            languageExtension(language, completion, defaultSchema, extraCompletion, sqlTables)
           ),
           optsCompartment.current.of([
             EditorView.editable.of(!readOnly),
@@ -333,7 +369,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
   useEffect(() => {
     viewRef.current?.dispatch({
       effects: langCompartment.current.reconfigure(
-        languageExtension(language, completion, defaultSchema, extraCompletion)
+        languageExtension(language, completion, defaultSchema, extraCompletion, sqlTables)
       )
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -342,7 +378,8 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
     language.kind === 'sql' ? language.dialect : '',
     completion,
     defaultSchema,
-    extraCompletion
+    extraCompletion,
+    sqlTables
   ])
 
   useEffect(() => {
