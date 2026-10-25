@@ -1020,9 +1020,10 @@ async fn routines_end_to_end() {
                 .await
                 .unwrap();
             let attrs = d.attributes.expect("attributes");
+            // Messages name the server only: CodeQL treats what this connection reads as secret
             assert!(
                 attrs.security_definer && attrs.strict && attrs.leakproof,
-                "{attrs:?}"
+                "{var}"
             );
             assert_eq!(attrs.volatility, "IMMUTABLE");
             assert_eq!(attrs.parallel, "SAFE");
@@ -1032,7 +1033,7 @@ async fn routines_end_to_end() {
                 .await
                 .unwrap();
         } else {
-            assert!(f.attributes.is_none(), "{var}: {f:?}");
+            assert!(f.attributes.is_none(), "{var}");
         }
         println!("{var}: fn {f:?}\n{var}: proc {p:?}");
 
