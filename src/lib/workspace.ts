@@ -74,6 +74,15 @@ export type Tab =
     }
   | {
       id: string
+      /** PostgreSQL LISTEN / NOTIFY on a session of its own */
+      kind: 'pgNotify'
+      connectionId: string
+      database: string
+      /** Channels to listen on again, as last listened */
+      channels?: string[]
+    }
+  | {
+      id: string
       kind: 'table'
       connectionId: string
       database: string
@@ -488,6 +497,14 @@ export function openRedisKeys(connectionId: string, database: string, pattern?: 
 
 export function openRedisPubsub(connectionId: string, channels?: string): void {
   openTab({ id: tabId(), kind: 'redisPubsub', connectionId, channels })
+}
+
+/** One Notifications tab per connection and database. */
+export function openPgNotify(connectionId: string, database = defaultDatabase(connectionId)): void {
+  openTab(
+    { id: tabId(), kind: 'pgNotify', connectionId, database },
+    (t) => t.kind === 'pgNotify' && t.connectionId === connectionId && t.database === database
+  )
 }
 
 export function openSettings(): void {

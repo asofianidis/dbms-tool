@@ -12,6 +12,13 @@ import {
   type Snapshot,
   type SnapshotObject
 } from '../compare'
+import {
+  parsePgTableExtras,
+  type PgConstraint,
+  type PgPartition,
+  type PgTableExtras,
+  type PgTypeDetail
+} from '../compare-pg'
 
 const column = (patch: Partial<ColumnInfo> & { name: string }): ColumnInfo => ({
   dataType: 'integer',
@@ -291,6 +298,314 @@ describe('compareSnapshots: other objects and schemas', () => {
       /^SET XACT_ABORT ON;\nBEGIN TRANSACTION;\nGO\nCREATE TABLE \[dbo\]\.\[t\]/
     )
     expect(script.endsWith('COMMIT TRANSACTION;')).toBe(true)
+  })
+})
+
+describe('compareSnapshots: PostgreSQL types, extensions, constraints and partitions', () => {
+  const constraint = (patch: Partial<PgConstraint> & { name: string }): PgConstraint => ({
+    type: 'check',
+    definition: 'CHECK ((qty > 0))',
+    index: null,
+    ...patch
+  })
+  const extras = (patch: Partial<PgTableExtras> = {}): PgTableExtras => ({
+    constraints: [],
+    partitionKey: null,
+    partitions: [],
+    ...patch
+  })
+  const enumType = (labels: string[]): SnapshotObject =>
+    obj('mood', {
+      kind: 'type',
+      detail: 'enum',
+      definition: `CREATE TYPE public.mood AS ENUM (${labels.map((l) => `'${l}'`).join(', ')});`,
+      pgType: { type: 'enum', labels }
+    })
+  const statementsOf = (items: ReturnType<typeof compareSnapshots>): string[] =>
+    migrationStatements(items, new Set(items.map((i) => i.id)))
+
+  it('adds enum labels in place and warns about ones it cannot remove', () => {
+    const [item] = compareSnapshots(
+      pg(
+        snapshot([enumType(['new', 'sad', 'ok', 'happy'])]),
+        snapshot([enumType(['sad', 'happy'])])
+      )
+    )
+    expect(item.action).toBe('alter')
+    expect(statementsOf([item])).toEqual([
+      "ALTER TYPE public.mood ADD VALUE 'new' BEFORE 'sad'",
+      "ALTER TYPE public.mood ADD VALUE 'ok' AFTER 'sad'"
+    ])
+    const [dropped] = compareSnapshots(
+      pg(snapshot([enumType(['happy', 'sad'])]), snapshot([enumType(['sad', 'happy', 'meh'])]))
+    )
+    expect(statementsOf([dropped])).toEqual([])
+    expect(dropped.warnings.join('\n')).toMatch(/can't drop enum labels \(meh\)/)
+    expect(dropped.warnings.join('\n')).toMatch(/can't reorder enum labels/)
+  })
+
+  it('alters domains with ALTER DOMAIN', () => {
+    const domain = (
+      detail: Omit<Extract<PgTypeDetail, { type: 'domain' }>, 'type'>
+    ): SnapshotObject =>
+      obj('qty', {
+        kind: 'type',
+        detail: 'domain',
+        definition: `CREATE DOMAIN public.qty AS ${detail.base} ${JSON.stringify(detail)}`,
+        pgType: { type: 'domain', ...detail }
+      })
+    const items = compareSnapshots(
+      pg(
+        snapshot([
+          domain({
+            base: 'integer',
+            default: '1',
+            notNull: true,
+            checks: [{ name: 'qty_positive', definition: 'CHECK ((VALUE > 0))' }]
+          })
+        ]),
+        snapshot([
+          domain({
+            base: 'integer',
+            default: null,
+            notNull: false,
+            checks: [
+              { name: 'qty_positive', definition: 'CHECK ((VALUE >= 0))' },
+              { name: 'qty_small', definition: 'CHECK ((VALUE < 10))' }
+            ]
+          })
+        ])
+      )
+    )
+    expect(statementsOf(items)).toEqual([
+      'ALTER DOMAIN public.qty SET DEFAULT 1',
+      'ALTER DOMAIN public.qty SET NOT NULL',
+      'ALTER DOMAIN public.qty DROP CONSTRAINT IF EXISTS qty_positive',
+      'ALTER DOMAIN public.qty ADD CONSTRAINT qty_positive CHECK ((VALUE > 0))',
+      'ALTER DOMAIN public.qty DROP CONSTRAINT IF EXISTS qty_small'
+    ])
+  })
+
+  it('creates extensions, then types, before the tables that use them, and drops them after', () => {
+    const ext = (version: string): SnapshotObject =>
+      obj('btree_gist', { kind: 'extension', detail: version, definition: 'x' })
+    const booking = obj('booking', {
+      table: table({
+        columns: [
+          column({ name: 'id', nullable: false, isPrimaryKey: true }),
+          column({ name: 'm', dataType: 'mood' })
+        ]
+      }),
+      pg: extras()
+    })
+    const items = compareSnapshots(
+      pg(
+        snapshot([booking, enumType(['a']), ext('1.7')]),
+        snapshot([obj('citext', { kind: 'extension', detail: '1.6', definition: 'x' })])
+      )
+    )
+    expect(items.map((i) => `${i.kind} ${i.action}`)).toEqual([
+      'extension create',
+      'extension drop',
+      'type create',
+      'table create'
+    ])
+    expect(statementsOf(items).map((s) => s.split('\n')[0])).toEqual([
+      'CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public',
+      "CREATE TYPE public.mood AS ENUM ('a')",
+      'CREATE TABLE public.booking (',
+      'DROP EXTENSION citext'
+    ])
+    const [updated] = compareSnapshots(pg(snapshot([ext('1.7')]), snapshot([ext('1.6')])))
+    expect(statementsOf([updated])).toEqual(["ALTER EXTENSION btree_gist UPDATE TO '1.7'"])
+  })
+
+  it('creates exclusion and unique constraints as constraints, not plain indexes', () => {
+    const backing = (name: string, definition: string, unique: boolean): IndexInfo => ({
+      name,
+      columns: ['room'],
+      unique,
+      primary: false,
+      method: 'gist',
+      definition
+    })
+    const source = obj('booking', {
+      table: table({
+        indexes: [
+          pk('booking_pkey', ['id']),
+          backing(
+            'booking_no_overlap',
+            'CREATE INDEX booking_no_overlap ON public.booking USING gist (room, during)',
+            false
+          ),
+          backing(
+            'booking_code_key',
+            'CREATE UNIQUE INDEX booking_code_key ON public.booking USING btree (code)',
+            true
+          )
+        ]
+      }),
+      pg: extras({
+        constraints: [
+          constraint({
+            name: 'booking_no_overlap',
+            type: 'exclude',
+            definition: 'EXCLUDE USING gist (room WITH =, during WITH &&)',
+            index: 'booking_no_overlap'
+          }),
+          constraint({
+            name: 'booking_code_key',
+            type: 'unique',
+            definition: 'UNIQUE (code)',
+            index: 'booking_code_key'
+          })
+        ]
+      })
+    })
+    const [created] = compareSnapshots(pg(snapshot([source]), snapshot([])))
+    expect(statementsOf([created]).slice(1)).toEqual([
+      'ALTER TABLE public.booking ADD CONSTRAINT booking_no_overlap EXCLUDE USING gist (room WITH =, during WITH &&)',
+      'ALTER TABLE public.booking ADD CONSTRAINT booking_code_key UNIQUE (code)'
+    ])
+    // Against a target without them: the constraints are added, and their indexes aren't
+    const target = obj('booking', {
+      table: table({ indexes: [pk('booking_pkey', ['id'])] }),
+      pg: extras()
+    })
+    const [altered] = compareSnapshots(pg(snapshot([source]), snapshot([target])))
+    expect(altered.changes.map((c) => `${c.action} ${c.what}`)).toEqual([
+      'add exclusion constraint',
+      'add unique constraint'
+    ])
+  })
+
+  it('adds, drops and changes CHECK constraints, suggesting NOT VALID', () => {
+    const source = obj('stock', {
+      table: table(),
+      pg: extras({
+        constraints: [
+          constraint({ name: 'stock_qty_check' }),
+          constraint({ name: 'stock_auto1', definition: 'CHECK ((id > 0))' })
+        ]
+      })
+    })
+    const target = obj('stock', {
+      table: table(),
+      pg: extras({
+        constraints: [
+          constraint({ name: 'stock_qty_check', definition: 'CHECK ((qty >= 0))' }),
+          constraint({ name: 'stock_auto2', definition: 'CHECK ((id > 0))' }),
+          constraint({ name: 'stock_old', definition: 'CHECK ((qty < 100))' })
+        ]
+      })
+    })
+    const [item] = compareSnapshots(pg(snapshot([source]), snapshot([target])))
+    expect(item.action).toBe('alter')
+    expect(statementsOf([item])).toEqual([
+      'ALTER TABLE public.stock DROP CONSTRAINT IF EXISTS stock_qty_check',
+      'ALTER TABLE public.stock DROP CONSTRAINT IF EXISTS stock_old',
+      'ALTER TABLE public.stock ADD CONSTRAINT stock_qty_check CHECK ((qty > 0))'
+    ])
+    expect(item.warnings.join('\n')).toMatch(/NOT VALID/)
+  })
+
+  it('creates partitioned tables with PARTITION BY and their partitions', () => {
+    const events = obj('events', {
+      table: table({
+        indexes: [
+          pk('events_pkey', ['id']),
+          {
+            name: 'events_at_idx',
+            columns: ['at'],
+            unique: false,
+            primary: false,
+            method: 'btree',
+            definition: 'CREATE INDEX events_at_idx ON ONLY public.events USING btree (at)'
+          }
+        ]
+      }),
+      pg: extras({
+        partitionKey: 'RANGE (at)',
+        partitions: [
+          {
+            schema: 'public',
+            name: 'events_2024',
+            parentSchema: 'public',
+            parent: 'events',
+            bound: "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+            key: 'HASH (id)'
+          },
+          {
+            schema: 'public',
+            name: 'events_2024_h0',
+            parentSchema: 'public',
+            parent: 'events_2024',
+            bound: 'FOR VALUES WITH (modulus 1, remainder 0)',
+            key: null
+          }
+        ]
+      })
+    })
+    const [item] = compareSnapshots(pg(snapshot([events]), snapshot([])))
+    const statements = statementsOf([item])
+    expect(statements[0]).toMatch(
+      /^CREATE TABLE public\.events \([\s\S]*\) PARTITION BY RANGE \(at\)$/
+    )
+    expect(statements.slice(1)).toEqual([
+      'CREATE INDEX events_at_idx ON public.events USING btree (at)',
+      "CREATE TABLE public.events_2024 PARTITION OF public.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01') PARTITION BY HASH (id)",
+      'CREATE TABLE public.events_2024_h0 PARTITION OF public.events_2024 FOR VALUES WITH (modulus 1, remainder 0)'
+    ])
+
+    // Partition key changes can't be scripted
+    const plain = obj('events', { table: events.table, pg: extras() })
+    const [rekeyed] = compareSnapshots(pg(snapshot([events]), snapshot([plain])))
+    expect(rekeyed.changes).toMatchObject([{ what: 'partition key', to: 'RANGE (at)' }])
+    expect(statementsOf([rekeyed])).toEqual([])
+    expect(rekeyed.warnings.join('\n')).toMatch(/can't change it in place/)
+  })
+
+  it('reattaches partitions whose bound changed and detaches extra ones', () => {
+    const partition = (name: string, bound: string): PgPartition => ({
+      schema: 'public',
+      name,
+      parentSchema: 'public',
+      parent: 'events',
+      bound,
+      key: null
+    })
+    const events = (partitions: PgPartition[]): SnapshotObject =>
+      obj('events', { table: table(), pg: extras({ partitionKey: 'LIST (kind)', partitions }) })
+    const [item] = compareSnapshots(
+      pg(
+        snapshot([events([partition('events_a', "FOR VALUES IN ('a', 'b')")])]),
+        snapshot([
+          events([partition('events_a', "FOR VALUES IN ('a')"), partition('events_x', 'DEFAULT')])
+        ])
+      )
+    )
+    expect(statementsOf([item])).toEqual([
+      'ALTER TABLE public.events DETACH PARTITION public.events_a',
+      'ALTER TABLE public.events DETACH PARTITION public.events_x',
+      "ALTER TABLE public.events ATTACH PARTITION public.events_a FOR VALUES IN ('a', 'b')"
+    ])
+  })
+})
+
+describe('parsePgTableExtras', () => {
+  it('groups constraints and nests partitions under their top-level table', () => {
+    const extras = parsePgTableExtras(
+      [['public', 't', 't_ck', 'c', 'CHECK ((a > 0))', null]],
+      [
+        ['public', 't', null, null, null, 'RANGE (a)'],
+        ['public', 't_1_h', 'public', 't_1', 'FOR VALUES WITH (modulus 1, remainder 0)', null],
+        ['public', 't_1', 'public', 't', 'FOR VALUES FROM (0) TO (10)', 'HASH (b)']
+      ]
+    )
+    const t = extras.get('public\u0000t')!
+    expect(t.constraints).toMatchObject([{ name: 't_ck', type: 'check' }])
+    expect(t.partitionKey).toBe('RANGE (a)')
+    expect(t.partitions.map((p) => p.name)).toEqual(['t_1', 't_1_h'])
   })
 })
 

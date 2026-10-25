@@ -19,14 +19,8 @@ import {
   type PendingChange
 } from '@/lib/pending'
 import { confirmProductionWrite, isProduction } from '@/lib/production'
-import {
-  editStatements,
-  literal,
-  qualified,
-  quoteIdent,
-  wrapInTransaction,
-  type TableRef
-} from '@/lib/sql'
+import { locatedEditStatements, type RowLocator } from '@/lib/row-locator'
+import { literal, qualified, quoteIdent, wrapInTransaction, type TableRef } from '@/lib/sql'
 import { toast, toastError } from '@/lib/toast'
 import { confirm } from '@/lib/workspace'
 import type { GridEditing } from '@/components/grid/ResultGrid'
@@ -42,7 +36,8 @@ export function usePendingEdits({
   baseRows,
   primaryKey,
   enabled,
-  readOnlyColumns
+  readOnlyColumns,
+  hidden
 }: {
   columns: ColumnMeta[]
   baseRows: Cell[][]
@@ -50,6 +45,8 @@ export function usePendingEdits({
   enabled: boolean
   /** Data columns that can't be edited */
   readOnlyColumns: Set<number>
+  /** Key columns loaded but not shown (PostgreSQL's ctid), one row per base row */
+  hidden?: { columns: ColumnMeta[]; rows: Cell[][] }
 }): {
   changes: PendingChange[]
   setChanges: React.Dispatch<React.SetStateAction<PendingChange[]>>
@@ -63,12 +60,15 @@ export function usePendingEdits({
   // The loaded rows as records, with the primary key that ties them to pending changes
   const baseRecords = useMemo(
     () =>
-      baseRows.map((r) => {
-        const record = Object.fromEntries(columns.map((c, i) => [c.name, r[i]]))
+      baseRows.map((r, ri) => {
+        const record = Object.fromEntries([
+          ...(hidden?.columns.map((c, i) => [c.name, hidden.rows[ri]?.[i] ?? null]) ?? []),
+          ...columns.map((c, i) => [c.name, r[i]])
+        ])
         return { record, key: rowKeyOf(primaryKey, record) }
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseRows, columns, pkKey]
+    [baseRows, columns, pkKey, hidden]
   )
   const byKey = useMemo(
     () => new Map(changes.filter((c) => c.rowKey).map((c) => [c.rowKey!, c])),
@@ -144,7 +144,8 @@ export async function commitPendingChanges({
   confirmDangerous,
   connection,
   execute,
-  busy
+  busy,
+  locator
 }: {
   changes: PendingChange[]
   dialect: Dialect
@@ -155,8 +156,10 @@ export async function commitPendingChanges({
   execute: (sql: string, options?: ExecOptions) => Promise<ExecOutput>
   /** Told when the statements start and stop running */
   busy?: (running: boolean) => void
+  /** How rows are found when the table has no primary key (PostgreSQL) */
+  locator?: RowLocator | null
 }): Promise<boolean> {
-  const statements = editStatements(dialect, tableRef, info, toRowEdits(changes))
+  const statements = locatedEditStatements(dialect, tableRef, info, toRowEdits(changes), locator)
   if (!statements.length) return true
   const script = wrapInTransaction(dialect, statements)
   const deletes = changes.some((c) => c.kind === 'delete')

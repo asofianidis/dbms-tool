@@ -5,7 +5,7 @@ import { literal, qualified } from './sql'
 
 /**
  * Table structure the table designer edits that `describe_table` doesn't
- * report: CHECK and UNIQUE constraints and index options. Read with catalog
+ * report: CHECK, UNIQUE and (PostgreSQL) EXCLUDE constraints and index options. Read with catalog
  * queries over the metadata session.
  */
 
@@ -30,10 +30,22 @@ export interface IndexDetail {
   where: string | null
 }
 
+export interface ExclusionInfo {
+  name: string
+  /** `EXCLUDE USING gist (room WITH =, during WITH &&)`, as pg_get_constraintdef spells it */
+  definition: string
+  /** Index that enforces the constraint, which isn't listed as a plain index */
+  index: string | null
+  /** Inherited from the partitioned parent, so it can't be dropped here */
+  inherited: boolean
+}
+
 export interface TableExtras {
   checks: CheckInfo[]
   uniques: UniqueInfo[]
   indexes: IndexDetail[]
+  /** PostgreSQL exclusion constraints */
+  exclusions?: ExclusionInfo[]
   /** SQLite only: what a table rebuild has to carry over */
   sqlite: SqliteTableShape | null
 }
@@ -42,10 +54,11 @@ export const emptyExtras = (): TableExtras => ({
   checks: [],
   uniques: [],
   indexes: [],
+  exclusions: [],
   sqlite: null
 })
 
-type Query = 'checks' | 'uniques' | 'indexes' | 'table'
+type Query = 'checks' | 'uniques' | 'indexes' | 'exclusions' | 'table'
 
 /** Catalog queries per kind of detail; kinds a dialect doesn't need are missing. */
 export function extrasQueries(
@@ -65,6 +78,10 @@ FROM pg_constraint WHERE conrelid = ${rel} AND contype = 'c' ORDER BY conname`,
   i.relname::text
 FROM pg_constraint con LEFT JOIN pg_class i ON i.oid = con.conindid
 WHERE con.conrelid = ${rel} AND con.contype = 'u' ORDER BY con.conname`,
+        exclusions: `SELECT con.conname::text, pg_get_constraintdef(con.oid, true), i.relname::text,
+  con.conparentid <> 0
+FROM pg_constraint con LEFT JOIN pg_class i ON i.oid = con.conindid
+WHERE con.conrelid = ${rel} AND con.contype = 'x' ORDER BY con.conname`,
         indexes: `SELECT i.relname::text,
   array_to_json(ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true)
     FROM generate_series(ix.indnkeyatts + 1, ix.indnatts) k))::text,
@@ -200,6 +217,12 @@ export function parseExtras(
       name: str(r[0]) ?? '',
       include: jsonList(r[1]),
       where: str(r[2])
+    }))
+    extras.exclusions = (rows.exclusions ?? []).map((r) => ({
+      name: str(r[0]) ?? '',
+      definition: str(r[1]) ?? '',
+      index: str(r[2]),
+      inherited: str(r[3]) === 't' || str(r[3]) === 'true'
     }))
   } else if (dialect === 'tsql') {
     for (const r of rows.uniques ?? []) {

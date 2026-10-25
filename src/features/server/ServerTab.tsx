@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } from 'lucide-react'
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
+import { withAuroraMetrics } from '@/lib/aurora'
 import { ENGINES } from '@/lib/engines'
 import { formatBytes } from '@/lib/format'
 import { withGaleraMetrics } from '@/lib/galera'
@@ -35,6 +36,7 @@ import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
+import { AuroraPanel, useAurora } from './AuroraPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
@@ -46,7 +48,9 @@ import {
   useLocks
 } from './PerformancePanels'
 import { PgHealthSection } from './PgHealthPanels'
+import { ReplicationPanel } from './ReplicationPanel'
 import { SlowLogPanel } from './SlowLogPanel'
+import { PgSettingsPanel } from './PgSettingsPanel'
 import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
@@ -157,6 +161,11 @@ function ServerDashboard({
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
+  const aurora = useAurora(
+    connection,
+    connection.engine === 'postgres' && !babelfish,
+    active && visible ? refresh : 0
+  )
 
   // Blocking chains from the activity list's blocked-by column and the lock list's
   const forest = useMemo(() => {
@@ -309,11 +318,19 @@ function ServerDashboard({
         <LiveMetrics
           connectionId={connection.id}
           session={session}
-          spec={galera.status ? withGaleraMetrics(spec) : spec}
+          spec={
+            galera.status
+              ? withGaleraMetrics(spec)
+              : aurora.status?.instances
+                ? withAuroraMetrics(spec)
+                : spec
+          }
           active={active}
         />
 
         <GaleraPanel galera={galera} />
+
+        <AuroraPanel aurora={aurora} />
 
         {babelfish && (
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
@@ -405,6 +422,15 @@ function ServerDashboard({
 
         {locks && <LocksSection locks={locks} engineKey={engineKey} />}
 
+        {connection.engine === 'mysql' && (
+          <ReplicationPanel
+            connection={connection}
+            info={info}
+            refresh={refresh}
+            active={active && visible}
+          />
+        )}
+
         <SlowQueriesSection
           connection={connection}
           engineKey={engineKey}
@@ -421,6 +447,10 @@ function ServerDashboard({
             active={active && visible}
             onSessionAction={act}
           />
+        )}
+
+        {connection.engine === 'postgres' && !babelfish && (
+          <PgSettingsPanel connection={connection} />
         )}
       </div>
     </div>

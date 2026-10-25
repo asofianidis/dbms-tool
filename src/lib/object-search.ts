@@ -72,9 +72,11 @@ LIMIT ${limit}`
   WHERE table_schema NOT IN ${system} AND lower(table_name) LIKE ${pattern}
   UNION ALL
   SELECT routine_schema, NULL, routine_name,
-    CASE routine_type WHEN 'PROCEDURE' THEN 'procedure' ELSE 'function' END, NULL
+    CASE routine_type WHEN 'PROCEDURE' THEN 'procedure' WHEN 'PACKAGE' THEN 'package'
+      ELSE 'function' END, NULL
   FROM information_schema.routines
   WHERE routine_schema NOT IN ${system} AND lower(routine_name) LIKE ${pattern}
+    AND routine_type <> 'PACKAGE BODY'
   UNION ALL
   SELECT event_schema, NULL, event_name, 'event', NULL
   FROM information_schema.events

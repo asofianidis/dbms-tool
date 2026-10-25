@@ -116,3 +116,26 @@ export function utf8Text(bytes: Uint8Array): string | null {
     return null
   }
 }
+
+/** Shortest decimal that reads back as the same 32-bit float. */
+function float32Text(x: number): string {
+  if (!Number.isFinite(x)) return String(x)
+  for (let p = 1; p < 9; p++) {
+    const s = Number(x.toPrecision(p))
+    if (Math.fround(s) === x) return String(s)
+  }
+  return String(Number(x.toPrecision(9)))
+}
+
+/**
+ * A VECTOR value (little-endian 32-bit floats, as MariaDB and MySQL store
+ * them) as the `[1,-2.5]` text VEC_FromText / STRING_TO_VECTOR take, or null
+ * when the bytes aren't whole floats.
+ */
+export function vectorText(bytes: Uint8Array): string | null {
+  if (bytes.length % 4) return null
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const values: string[] = []
+  for (let i = 0; i < bytes.length; i += 4) values.push(float32Text(view.getFloat32(i, true)))
+  return `[${values.join(',')}]`
+}
