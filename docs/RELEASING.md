@@ -37,6 +37,8 @@ Each release runs the full CI suite first (including the live database tests), t
 | Linux x64 | `ubuntu-22.04` | AppImage, `.deb`, `.rpm` |
 | Linux arm64 | `ubuntu-22.04-arm` | AppImage, `.deb`, `.rpm` |
 
+Nightlies skip the `.rpm`: RPM versions can't contain the `-` in a nightly version (`0.1.36-412`).
+
 The release stays a draft until every platform has uploaded. The publish job then adds
 `SHA256SUMS.txt`, a build-provenance attestation for every file, and `latest.json` for the
 auto-updater, and only then makes the release public.

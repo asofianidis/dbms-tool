@@ -246,6 +246,8 @@ export type ObjectKind =
   | 'synonym'
   | 'collection'
   | 'timeseries'
+  /** MySQL / MariaDB scheduled event */
+  | 'event'
 
 export interface DbObject {
   schema: string | null

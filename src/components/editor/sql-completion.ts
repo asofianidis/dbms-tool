@@ -9,6 +9,7 @@ import { StateEffect, StateField, type EditorState, type Extension } from '@code
 import { EditorView, showTooltip, type Tooltip } from '@codemirror/view'
 import type { CompletionTable } from '@/lib/api'
 import type { Dialect } from '@/lib/engines'
+import type { ServerVersion } from '@/lib/mariadb'
 import { resolveTable, unquoteIdent } from '@/lib/result-source'
 import type { Snippet } from '@/lib/snippets'
 import { quoteIdent, stripComments } from '@/lib/sql'
@@ -221,6 +222,8 @@ export interface AssistOptions {
   tables: CompletionTable[]
   dialect: Dialect
   defaultSchema?: string
+  /** The server's version when a MySQL-dialect connection is MariaDB */
+  mariaDb?: ServerVersion
   /** Read at completion time, so edits apply without rebuilding the editor */
   snippets?: () => Snippet[]
 }
@@ -244,7 +247,7 @@ function insertCall(name: string, params: number): Completion['apply'] {
 /** Columns, joins, functions and snippets for the statement at the cursor. */
 export function sqlAssistCompletion(options: AssistOptions): CompletionSource {
   const { dialect, defaultSchema } = options
-  const functions = functionsFor(dialect)
+  const functions = functionsFor(dialect, options.mariaDb)
   return (context: CompletionContext): CompletionResult | null => {
     const word = context.matchBefore(/[\w$]*/)
     if (!word) return null
@@ -309,14 +312,18 @@ export function sqlAssistCompletion(options: AssistOptions): CompletionSource {
       }
     }
     for (const f of functions) {
-      out.push({
+      const fn = {
         label: f.name,
         detail: `(${f.params.join(', ')})${f.returns ? ` → ${f.returns}` : ''}`,
         info: f.description,
         type: 'function',
-        apply: insertCall(f.name, f.params.length),
         boost: -1
-      })
+      }
+      out.push(
+        f.snippet
+          ? snippetCompletion(f.snippet, fn)
+          : { ...fn, apply: insertCall(f.name, f.params.length) }
+      )
     }
     for (const s of options.snippets?.() ?? []) {
       if (!s.prefix || !s.body) continue
@@ -403,8 +410,8 @@ export function callAt(
 }
 
 /** A tooltip with the signature of the function call the cursor is in. */
-export function signatureHelp(dialect: Dialect): Extension {
-  const byName = new Map(functionsFor(dialect).map((f) => [f.name, f]))
+export function signatureHelp(dialect: Dialect, mariaDb?: ServerVersion): Extension {
+  const byName = new Map(functionsFor(dialect, mariaDb).map((f) => [f.name, f]))
   const tooltip = (state: EditorState): Tooltip | null => {
     const sel = state.selection.main
     if (!sel.empty) return null
