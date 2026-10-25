@@ -211,9 +211,9 @@ async fn postgres_materialized_views() {
         .await
         .unwrap()
         .expect("definition");
-    println!("{ddl}");
+    // No DDL in the messages: CodeQL treats what this connection reads as secret
     assert!(ddl.starts_with("CREATE MATERIALIZED VIEW dbms_mv.totals WITH (fillfactor=80) AS\n"));
-    assert!(ddl.contains("\nWITH NO DATA;"), "{ddl}");
+    assert!(ddl.contains("\nWITH NO DATA;"));
     assert!(ddl.contains("CREATE UNIQUE INDEX totals_region ON dbms_mv.totals"));
     assert!(ddl.contains("COMMENT ON MATERIALIZED VIEW dbms_mv.totals IS 'per region';"));
     assert!(ddl.contains("COMMENT ON COLUMN dbms_mv.totals.total IS 'it''s a sum';"));
@@ -270,8 +270,8 @@ async fn postgres_materialized_views() {
         .await
         .unwrap()
         .unwrap();
-    assert!(!ddl.contains("WITH NO DATA"), "{ddl}");
-    assert!(ddl.contains("GROUP BY region;"), "{ddl}");
+    assert!(!ddl.contains("WITH NO DATA"));
+    assert!(ddl.contains("GROUP BY region;"));
 
     s.execute("mv", "", "DROP SCHEMA dbms_mv CASCADE", &opts())
         .await
