@@ -43,6 +43,7 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
             file_scope::init(app.handle())?;
+            cloud::set_workdir_base(app.path().app_cache_dir()?.join("cloud"));
             let dir = app.path().app_config_dir()?;
             app.manage(AppState {
                 store: config::ConnectionStore::load(dir),

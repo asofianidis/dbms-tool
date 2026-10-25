@@ -15,8 +15,10 @@ use super::{destination_options, hide_window, ssh_arg};
 use crate::config::SshConfig;
 use crate::error::{AppError, AppResult, HostKeyPrompt};
 
-/// What `ssh` prints when StrictHostKeyChecking=yes meets a server that isn't
-/// in known_hosts. A changed key prints something else and must keep failing.
+/// What `ssh` prints when StrictHostKeyChecking=yes meets a server key that
+/// isn't in known_hosts. A changed key prints something else and must keep
+/// failing. The same message comes when known_hosts has the server under
+/// another key type only; `probe` tells the two apart (`other_keys_known`).
 pub(super) fn is_unknown_host_key(stderr: &str) -> bool {
     stderr.contains("host key is known for") && !stderr.contains("IDENTIFICATION HAS CHANGED")
 }
@@ -118,6 +120,7 @@ async fn probe_inner(ssh: &SshConfig) -> AppResult<HostKeyPrompt> {
     let scanned = scan(ssh, &scratch).await;
     let _ = std::fs::remove_file(&scratch);
     let (lines, fingerprint, key_type) = scanned?;
+    let other_key_types_known = other_keys_known(ssh).await;
     let token = uuid::Uuid::new_v4().to_string();
     PENDING.lock().insert(
         token.clone(),
@@ -131,7 +134,83 @@ async fn probe_inner(ssh: &SshConfig) -> AppResult<HostKeyPrompt> {
         host: display_host(ssh),
         fingerprint,
         key_type,
+        other_key_types_known,
     })
+}
+
+/// `ssh -G`: the settings ssh would use for the server, ~/.ssh/config applied.
+async fn resolve(ssh: &SshConfig) -> AppResult<Option<String>> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-G");
+    destination_options(&mut cmd, ssh)?;
+    cmd.arg(ssh_arg(ssh.host.trim(), "server")?)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    hide_window(&mut cmd);
+    Ok(cmd
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()))
+}
+
+/// The name a server's keys are recorded under in known_hosts, from `ssh -G`
+/// output: its HostKeyAlias or host name, as `[name]:port` off port 22.
+fn known_hosts_name(resolved: &str) -> Option<String> {
+    let setting = |key: &str| {
+        resolved.lines().find_map(|l| {
+            l.trim_end()
+                .strip_prefix(key)
+                .and_then(|v| v.strip_prefix(' '))
+                .map(str::to_string)
+        })
+    };
+    let name = setting("hostkeyalias").or_else(|| setting("hostname"))?;
+    Some(match setting("port").as_deref() {
+        None | Some("22") => name,
+        Some(port) => format!("[{name}]:{port}"),
+    })
+}
+
+/// Whether known_hosts already has keys for the server (of another type than
+/// the one it offered, or ssh would have accepted it). That isn't a first
+/// contact: the server may have replaced its keys, or be an impostor.
+async fn other_keys_known(ssh: &SshConfig) -> bool {
+    let Ok(Some(resolved)) = resolve(ssh).await else {
+        return false;
+    };
+    let Some(name) = known_hosts_name(&resolved) else {
+        return false;
+    };
+    let home = std::env::home_dir().unwrap_or_default();
+    let mut files: Vec<PathBuf> = known_hosts_path(&resolved, &home).into_iter().collect();
+    if let Some(global) = resolved
+        .lines()
+        .find_map(|l| l.trim_end().strip_prefix("globalknownhostsfile "))
+        .and_then(|v| v.split_whitespace().next())
+    {
+        files.push(PathBuf::from(global));
+    }
+    for file in files.iter().filter(|f| f.is_file()) {
+        let mut keygen = Command::new("ssh-keygen");
+        keygen
+            .args(["-F", &name, "-f"])
+            .arg(file)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        hide_window(&mut keygen);
+        // Exits 0 with the matching lines (hashed entries included) when found
+        if let Ok(o) = keygen.output().await
+            && o.status.success()
+            && !o.stdout.trim_ascii().is_empty()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn scan(ssh: &SshConfig, scratch: &Path) -> AppResult<(String, String, String)> {
@@ -209,20 +288,7 @@ pub async fn trust(token: &str) -> AppResult<()> {
         .filter(|h| !h.as_os_str().is_empty())
         .ok_or_else(|| AppError::msg("Couldn't find the home folder for known_hosts"))?;
 
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-G");
-    destination_options(&mut cmd, &pending.ssh)?;
-    cmd.arg(ssh_arg(pending.ssh.host.trim(), "server")?)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    hide_window(&mut cmd);
-    let resolved = cmd
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve(&pending.ssh).await?;
     let path = resolved
         .as_deref()
         .and_then(|r| known_hosts_path(r, &home))
@@ -318,6 +384,23 @@ mod tests {
             ),
             Some(spaced.join(".ssh/known_hosts"))
         );
+    }
+
+    #[test]
+    fn names_the_server_like_known_hosts() {
+        assert_eq!(
+            known_hosts_name("hostname 10.0.0.5\nport 22\n").as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            known_hosts_name("hostname db.example.com\r\nport 2222\r\n").as_deref(),
+            Some("[db.example.com]:2222")
+        );
+        assert_eq!(
+            known_hosts_name("hostname h\nhostkeyalias bastion\nport 22\n").as_deref(),
+            Some("bastion")
+        );
+        assert_eq!(known_hosts_name("port 22\n"), None);
     }
 
     #[test]

@@ -683,6 +683,8 @@ export interface HostKeyPrompt {
   /** SHA256:... */
   fingerprint: string
   keyType: string
+  /** known_hosts already has a key of another type for this server: not a first contact */
+  otherKeyTypesKnown: boolean
 }
 
 export function isAppError(e: unknown, code?: AppError['code']): e is AppError {

@@ -31,6 +31,9 @@ pub struct HostKeyPrompt {
     pub fingerprint: String,
     /// e.g. `ED25519`
     pub key_type: String,
+    /// known_hosts has a key of another type for the server, which ssh
+    /// reports the same way as a server it has never seen
+    pub other_key_types_known: bool,
 }
 
 impl AppError {
