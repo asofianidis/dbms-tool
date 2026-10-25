@@ -507,7 +507,9 @@ export function dangerousStatements(sql: string, dialect: Dialect): string[] {
   const reasons: string[] = []
   for (const statement of splitStatements(sql, dialect)) {
     const s = stripComments(statement.text).trim()
-    if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
+    // MariaDB: removes old versions of a system-versioned table's rows
+    if (/^delete\s+history\b/i.test(s)) reasons.push('DELETE HISTORY')
+    else if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('DELETE without a WHERE clause')
     else if (/^(with\b[\s\S]*?\)\s*)?update\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('UPDATE without a WHERE clause')
