@@ -867,13 +867,19 @@ async fn tds_suite(engine: Engine, var: &str) {
         .await
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
+    // Babelfish stores times as PostgreSQL does, to the microsecond
+    let frac = if engine == Engine::Babelfish {
+        "1234570"
+    } else {
+        "1234567"
+    };
     let expected = [
-        json!("2024-01-01 12:00:00.1234567"),
+        json!(format!("2024-01-01 12:00:00.{frac}")),
         json!("2024-01-01 12:00:00.12"),
         json!("2024-01-01 12:00:00.123"),
-        json!("12:00:00.1234567"),
+        json!(format!("12:00:00.{frac}")),
         json!("12:00:00"),
-        json!("2024-01-01 12:00:00.1234567 +02:00"),
+        json!(format!("2024-01-01 12:00:00.{frac} +02:00")),
         json!("5"),
         json!("-0.05"),
         json!("922337203685477.5807"),
