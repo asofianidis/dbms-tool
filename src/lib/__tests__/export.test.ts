@@ -38,9 +38,16 @@ describe('serialize', () => {
     expect(
       serialize('markdown', columns, [
         ['1', null],
-        ['2', 'a|b']
+        ['2', 'a|b'],
+        ['3', 'C:\\x\\|']
       ]).split('\n')
-    ).toEqual(['| id | note |', '| --- | --- |', '| 1 | NULL |', '| 2 | a\\|b |'])
+    ).toEqual([
+      '| id | note |',
+      '| --- | --- |',
+      '| 1 | NULL |',
+      '| 2 | a\\|b |',
+      '| 3 | C:\\\\x\\\\\\| |'
+    ])
   })
 
   it('writes NULL as NULL in SQL', () => {

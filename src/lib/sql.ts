@@ -148,7 +148,7 @@ export function literal(dialect: Dialect, value: Cell, dataType = ''): string {
       ? value.replace(/\\/g, '\\\\').replace(/'/g, "''")
       : value.replace(/'/g, "''")
   const unicode =
-    dialect === 'tsql' && (/^n(var)?char|ntext/i.test(dataType) || /[^\x00-\x7f]/.test(value))
+    dialect === 'tsql' && (/^(n(var)?char|ntext)\b/i.test(dataType) || /[^\x00-\x7f]/.test(value))
   return `${unicode ? 'N' : ''}'${escaped}'`
 }
 

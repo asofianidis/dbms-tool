@@ -55,7 +55,7 @@ export function serialize(
         2
       )
     case 'markdown': {
-      const esc = (s: string): string => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
+      const esc = (s: string): string => s.replace(/[\\|]/g, '\\$&').replace(/\r?\n/g, ' ')
       return [
         `| ${columns.map((c) => esc(c.name)).join(' | ')} |`,
         `| ${columns.map(() => '---').join(' | ')} |`,

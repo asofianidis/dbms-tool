@@ -197,7 +197,7 @@ export function modifyScript(
 ): string {
   const body = definition.trim()
   if (dialect === 'tsql') {
-    return `${body.replace(/^(\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*)\s*create\b/i, '$1ALTER')}\nGO`
+    return `${body.replace(/^((?:\s|--[^\n]*\n|\/\*(?:[^*]|\*(?!\/))*\*\/)*)create\b/i, '$1ALTER')}\nGO`
   }
   if (dialect === 'mysql') {
     // MySQL can't replace routines in place

@@ -104,6 +104,21 @@ describe('routine scripts', () => {
     ).toBe('ALTER PROCEDURE dbo.p AS SELECT 1\nGO')
   })
 
+  it('keeps leading comments before the T-SQL CREATE', () => {
+    const ref = { schema: 'dbo', name: 'p' }
+    expect(
+      modifyScript(
+        'tsql',
+        '-- note\n/* a */ /* b */\nCREATE PROC dbo.p AS SELECT 1',
+        ref,
+        'procedure'
+      )
+    ).toBe('-- note\n/* a */ /* b */\nALTER PROC dbo.p AS SELECT 1\nGO')
+    // Linear on runs of comment delimiters (was exponential)
+    const odd = `/*${'*//*'.repeat(60)}`
+    expect(modifyScript('tsql', odd, ref, 'procedure')).toBe(`${odd}\nGO`)
+  })
+
   it('avoids CREATE OR ALTER on Babelfish', () => {
     expect(routineTemplate('tsql', 'procedure', 'dbo', true)).toMatch(/^CREATE PROCEDURE/)
     expect(routineTemplate('tsql', 'procedure', 'dbo', false)).toMatch(/^CREATE OR ALTER PROCEDURE/)
