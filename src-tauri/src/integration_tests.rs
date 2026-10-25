@@ -215,6 +215,71 @@ async fn mariadb_end_to_end() {
 }
 
 #[tokio::test]
+async fn mariadb_explain_json() {
+    // The plan viewer reads MariaDB's EXPLAIN/ANALYZE FORMAT=JSON out of a single text cell
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password.clone()).await.expect("connect");
+    let s = m.get(&c.id).unwrap();
+    let run = |sql: &'static str| {
+        let s = s.clone();
+        async move {
+            let out = s.execute("tab1", "", sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+            out
+        }
+    };
+    run(
+        "DROP DATABASE IF EXISTS mdb_explain; CREATE DATABASE mdb_explain; USE mdb_explain; \
+         CREATE TABLE t (id INT PRIMARY KEY, a INT); \
+         INSERT INTO t SELECT seq, seq % 10 FROM seq_1_to_100",
+    )
+    .await;
+    let plan = |out: &ExecOutput| -> Value {
+        let text = cell(out, 0, 0, 0);
+        serde_json::from_str(text.as_str().expect("plan is a text cell")).expect("plan is JSON")
+    };
+
+    let doc = plan(&run("EXPLAIN FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["access_type"], json!("ALL"), "{doc}");
+    assert!(table.get("r_rows").is_none(), "{doc}");
+
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["r_rows"].as_f64(), Some(100.0), "{doc}");
+    assert_eq!(table["r_filtered"].as_f64(), Some(10.0), "{doc}");
+
+    // ANALYZE runs the statement: a read-only connection refuses it for a write...
+    let (mut ro, _) = config(Engine::Mysql, "DBMS_TEST_MARIADB").unwrap();
+    ro.read_only = true;
+    ro.id = "ro".into();
+    m.open(ro, password).await.unwrap();
+    let blocked = m
+        .get("ro")
+        .unwrap()
+        .execute(
+            "tab",
+            "",
+            "ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t",
+            &opts(),
+        )
+        .await;
+    assert!(blocked.is_err());
+    // ...and a writable one really deletes the rows
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t WHERE a = 3").await);
+    assert_eq!(doc["query_block"]["table"]["delete"], json!(1), "{doc}");
+    let out = run("SELECT COUNT(*) FROM mdb_explain.t").await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("90"));
+
+    run("DROP DATABASE mdb_explain").await;
+    m.close("ro");
+    m.close(&c.id);
+}
+
+#[tokio::test]
 async fn mysql_end_to_end() {
     let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MYSQL").await else {
         return;

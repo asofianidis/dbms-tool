@@ -510,13 +510,16 @@ export function explainSql(
   sql: string,
   dialect: Dialect,
   analyze: boolean,
-  babelfish: boolean
+  babelfish: boolean,
+  mariadb = false
 ): string {
   const body = sql.trim().replace(/;\s*$/, '')
   switch (dialect) {
     case 'postgres':
       return `EXPLAIN (${analyze ? 'ANALYZE, BUFFERS, ' : ''}VERBOSE, FORMAT JSON)\n${body}`
     case 'mysql':
+      // MariaDB has neither FORMAT=TREE nor EXPLAIN ANALYZE; its ANALYZE runs the statement
+      if (mariadb) return `${analyze ? 'ANALYZE' : 'EXPLAIN'} FORMAT=JSON\n${body}`
       return analyze ? `EXPLAIN ANALYZE\n${body}` : `EXPLAIN FORMAT=TREE\n${body}`
     case 'tsql':
       if (babelfish) {

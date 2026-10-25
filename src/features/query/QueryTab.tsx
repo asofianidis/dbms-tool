@@ -25,6 +25,7 @@ import { EXTENSIONS, pickSavePath } from '@/lib/export'
 import { plural } from '@/lib/format'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
+import { connectedInfo, isMariaDb } from '@/lib/mariadb'
 import {
   fillParams,
   paramNames,
@@ -33,6 +34,7 @@ import {
   type Substitution
 } from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
+import { parseMariaDbPlan } from '@/lib/plan-mariadb'
 import { confirmProductionWrite, isProduction } from '@/lib/production'
 import { queries, queryClient } from '@/lib/queries'
 import { isReadOnlyQuery, resolveTable, singleTableSource } from '@/lib/result-source'
@@ -106,6 +108,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const babelfish =
     connection?.engine === 'babelfish' ||
     (status?.state === 'connected' && !!status.info.babelfishVersion)
+  const mariadb = dialect === 'mysql' && isMariaDb(connectedInfo(status))
   const layout = useDefaultLayout({ id: 'query-split', storage: localStorage })
   const inTransaction = !!openTransactionsStore.use()[tab.id]
   const manualCommit = isManualCommit(tab.id, manualCommitStore.use(), settings.defaultCommitMode)
@@ -210,9 +213,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           confirmed: true
         })
         if (output.inTransaction != null) setInTransaction(tab.id, output.inTransaction)
+        const format = planFormat(dialect, babelfish, mariadb)
         const plan =
           explain && !output.error
-            ? (parsePlan(output, planFormat(dialect, babelfish)) ?? undefined)
+            ? ((format === 'mariadb-json' ? parseMariaDbPlan(output) : parsePlan(output, format)) ??
+              undefined)
             : undefined
         sqlResultsStore.set((r) => ({
           ...r,
@@ -253,6 +258,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       tab.database,
       dialect,
       babelfish,
+      mariadb,
       settings.maxRows,
       settings.queryTimeoutSecs,
       settings.confirmDangerous
@@ -524,7 +530,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       {
         key: 'Mod-l',
         run: () => (
-          void execute('statement', (s) => explainSql(s, dialect, false, babelfish), true),
+          void execute('statement', (s) => explainSql(s, dialect, false, babelfish, mariadb), true),
           true
         )
       },
@@ -546,7 +552,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       { key: 'Mod-Pause', run: () => (cancel(), true) }
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [execute, dialect, babelfish, tab.filePath]
+    [execute, dialect, babelfish, mariadb, tab.filePath]
   )
 
   // Tabs opened by "Execute…" or a saved query run once, after the editor has the text
@@ -599,7 +605,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
                 label: 'Explain',
                 shortcut: `${MOD}L`,
                 onSelect: () =>
-                  void execute('statement', (s) => explainSql(s, dialect, false, babelfish), true)
+                  void execute(
+                    'statement',
+                    (s) => explainSql(s, dialect, false, babelfish, mariadb),
+                    true
+                  )
               },
               {
                 label:
@@ -607,7 +617,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
                     ? 'Actual execution plan (runs the query)'
                     : 'Explain analyze (runs the query)',
                 onSelect: () =>
-                  void execute('statement', (s) => explainSql(s, dialect, true, babelfish), true)
+                  void execute(
+                    'statement',
+                    (s) => explainSql(s, dialect, true, babelfish, mariadb),
+                    true
+                  )
               }
             ])
           }
