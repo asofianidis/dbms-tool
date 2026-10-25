@@ -3,12 +3,7 @@ import { History } from 'lucide-react'
 import type { ConnectionConfig, DbObject } from '@/lib/api'
 import { connectedInfo } from '@/lib/mariadb'
 import { queryClient } from '@/lib/queries'
-import {
-  nowTimestamp,
-  purgeHistoryScript,
-  supportsVersioning,
-  versionedTablesQuery
-} from '@/lib/versioning'
+import { purgeHistoryScript, supportsVersioning, versionedTablesQuery } from '@/lib/versioning'
 import { getConnection, newQueryTab, statusStore } from '@/lib/workspace'
 import type { MenuItem } from '@/components/ContextMenu'
 
@@ -62,7 +57,7 @@ export function versioningScriptItems(
         newQueryTab(
           connectionId,
           database,
-          purgeHistoryScript({ schema: database, name: obj.name }, nowTimestamp()),
+          purgeHistoryScript({ schema: database, name: obj.name }),
           { title: `purge history ${obj.name}` }
         )
     }

@@ -96,6 +96,19 @@ WHERE TABLE_SCHEMA = ${literal('mysql', database)} AND TABLE_TYPE = 'SYSTEM VERS
     }
   })
 
+/** The server's clock as `YYYY-MM-DD hh:mm:ss`, a starting value for the time fields. */
+export const serverNowQuery = (connectionId: string) =>
+  queryOptions({
+    queryKey: ['conn', connectionId, 'server-now'],
+    queryFn: async () => {
+      const out = await api.execute(connectionId, '__meta', '', 'SELECT CAST(NOW() AS CHAR)')
+      if (out.error) throw new Error(out.error.message)
+      return str(out.results[0]?.rows[0]?.[0])
+    },
+    staleTime: 0,
+    gcTime: 0
+  })
+
 /* ---------- Reading history ---------- */
 
 export type SystemTime =
@@ -225,17 +238,17 @@ export function rowHistoryQuery(
   }
 }
 
-/** Removes old row versions; runs through the usual destructive-statement confirmation. */
-export function purgeHistoryScript(ref: TableRef, before: string): string {
-  const at = normalizeTimestamp(before) ?? before.trim()
+/**
+ * Removes old row versions; runs through the usual destructive-statement confirmation.
+ * Without a time it purges up to the server's clock: a local time would be read in the
+ * server's time zone and can miss every version.
+ */
+export function purgeHistoryScript(ref: TableRef, before?: string): string {
+  const at = before?.trim()
+    ? literal('mysql', normalizeTimestamp(before) ?? before.trim())
+    : 'CURRENT_TIMESTAMP'
   return `-- Permanently deletes the row versions that stopped being current before this time
-DELETE HISTORY FROM ${qualified('mysql', ref)} BEFORE SYSTEM_TIME ${literal('mysql', at)};`
-}
-
-/** The local time as `YYYY-MM-DD hh:mm:ss`, a starting value for the time fields. */
-export function nowTimestamp(date = new Date()): string {
-  const p = (n: number): string => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`
+DELETE HISTORY FROM ${qualified('mysql', ref)} BEFORE SYSTEM_TIME ${at};`
 }
 
 /* ---------- Table designer ---------- */

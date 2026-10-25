@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Eraser, History, Lock } from 'lucide-react'
 import type { TableRef } from '@/lib/sql'
 import {
-  nowTimestamp,
   purgeHistoryScript,
+  serverNowQuery,
   systemTimeProblem,
   type SystemTime
 } from '@/lib/versioning'
@@ -49,9 +50,16 @@ export function SystemTimeBar({
   onPeriodsChange: (periods: boolean) => void
 }): React.JSX.Element {
   const [kind, setKind] = useState<Kind>(value.kind)
-  const [at, setAt] = useState(() => (value.kind === 'asOf' ? value.at : nowTimestamp()))
+  const [at, setAt] = useState(() => (value.kind === 'asOf' ? value.at : ''))
   const [from, setFrom] = useState(() => (value.kind === 'between' ? value.from : ''))
-  const [to, setTo] = useState(() => (value.kind === 'between' ? value.to : nowTimestamp()))
+  const [to, setTo] = useState(() => (value.kind === 'between' ? value.to : ''))
+  // Times are read in the server's time zone, so "now" comes from its clock, not this machine's
+  const serverNow = useQuery(serverNowQuery(connectionId)).data
+  useEffect(() => {
+    if (!serverNow) return
+    setAt((prev) => prev || serverNow)
+    setTo((prev) => prev || serverNow)
+  }, [serverNow])
   // Follow changes made elsewhere, such as "Show history" on a row
   useEffect(() => setKind(value.kind), [value])
 
@@ -155,7 +163,7 @@ export function SystemTimeBar({
           newQueryTab(
             connectionId,
             database,
-            purgeHistoryScript(tableRef, value.kind === 'asOf' ? value.at : nowTimestamp()),
+            purgeHistoryScript(tableRef, value.kind === 'asOf' ? value.at : undefined),
             { title: `purge history ${tableRef.name}` }
           )
         }

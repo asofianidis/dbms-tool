@@ -223,6 +223,8 @@ describe('row editing and history', () => {
       "DELETE HISTORY FROM `app`.`prices` BEFORE SYSTEM_TIME '2024-05-01 00:00:00';"
     )
     expect(dangerousStatements(script, 'mysql')).toEqual(['DELETE HISTORY'])
+    // No time chosen: the server's clock, since a local time is read in its time zone
+    expect(purgeHistoryScript(ref)).toContain('BEFORE SYSTEM_TIME CURRENT_TIMESTAMP;')
     expect(dangerousStatements('DELETE FROM t', 'mysql')).toEqual(['DELETE without a WHERE clause'])
   })
 })
