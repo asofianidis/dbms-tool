@@ -58,8 +58,11 @@ import { MariaDbSQL, mariaDbCompletion } from './mariadb-completion'
 import { signatureHelp, sqlAssistCompletion, tableAwareCompletion } from './sql-completion'
 
 export type EditorLanguage =
-  /** `mariaDb` is the server's version when a MySQL-dialect connection is MariaDB */
-  | { kind: 'sql'; dialect: Dialect; mariaDb?: ServerVersion }
+  /**
+   * `mariaDb` is the server's version when a MySQL-dialect connection is MariaDB;
+   * `pgExtensions` the PostgreSQL extensions installed (pgvector, PostGIS completion)
+   */
+  | { kind: 'sql'; dialect: Dialect; mariaDb?: ServerVersion; pgExtensions?: string[] }
   | { kind: 'mongo' }
   | { kind: 'json' }
   | { kind: 'text' }
@@ -252,13 +255,14 @@ function languageExtension(
       dialect: language.dialect,
       defaultSchema,
       mariaDb,
+      pgExtensions: language.pgExtensions,
       snippets
     })
     return [
       ext,
       ext.language.data.of({ autocomplete: names }),
       ext.language.data.of({ autocomplete: assist }),
-      signatureHelp(language.dialect, mariaDb),
+      signatureHelp(language.dialect, mariaDb, language.pgExtensions),
       ...(mariaDb ? [ext.language.data.of({ autocomplete: mariaDbCompletion(mariaDb) })] : []),
       ...(extra ? [ext.language.data.of({ autocomplete: extra })] : [])
     ]
@@ -386,6 +390,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
     language.kind,
     language.kind === 'sql' ? language.dialect : '',
     language.kind === 'sql' ? language.mariaDb?.join('.') : '',
+    language.kind === 'sql' ? language.pgExtensions?.join(',') : '',
     completion,
     defaultSchema,
     extraCompletion,

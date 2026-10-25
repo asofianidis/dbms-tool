@@ -26,6 +26,8 @@ import { plural } from '@/lib/format'
 import { recordHistory } from '@/lib/history'
 import { MOD, SHIFT } from '@/lib/keys'
 import { connectedInfo } from '@/lib/mariadb'
+import { installedExtensions } from '@/lib/pg-extensions-aware'
+import { usePgExtensions } from '@/lib/use-pg-extensions'
 import {
   fillParams,
   paramNames,
@@ -128,6 +130,10 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     enabled: connected && !!tab.database
   })
   const namespace = useMemo(() => completionNamespace(completion.data), [completion.data])
+  // pgvector / PostGIS functions complete only where installed
+  const pgExtensions = installedExtensions(
+    usePgExtensions(tab.connectionId, tab.database, connected && dialect === 'postgres')
+  )
   const defaultSchema = dialect === 'postgres' ? 'public' : dialect === 'tsql' ? 'dbo' : undefined
 
   const execute = useCallback(
@@ -734,7 +740,12 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             ref={editor}
             value={tab.text}
             onChange={(text) => updateTab(tab.id, { text })}
-            language={{ kind: 'sql', dialect, mariaDb: editorMariaDb(connectedInfo(status)) }}
+            language={{
+              kind: 'sql',
+              dialect,
+              mariaDb: editorMariaDb(connectedInfo(status)),
+              pgExtensions
+            }}
             completion={namespace}
             defaultSchema={defaultSchema}
             sqlTables={completion.data}

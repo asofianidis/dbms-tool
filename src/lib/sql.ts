@@ -1,5 +1,6 @@
 import type { Cell, ColumnInfo, TableInfo } from './api'
 import type { Dialect } from './engines'
+import { isSpatialType, spatialLiteral } from './pg-extensions-aware'
 
 export function quoteIdent(dialect: Dialect, name: string): string {
   switch (dialect) {
@@ -140,6 +141,8 @@ export function literal(dialect: Dialect, value: Cell, dataType = ''): string {
   if (dialect === 'postgres' && /^0x[0-9a-f]*$/i.test(value) && /bytea/i.test(dataType)) {
     return `'\\x${value.slice(2)}'`
   }
+  // PostGIS columns take WKT / EWKT / hex EWKB; the column's SRID and type are added
+  if (dialect === 'postgres' && isSpatialType(dataType)) return spatialLiteral(value, dataType)
   if (dialect === 'sqlite' && /^0x[0-9a-f]*$/i.test(value) && /blob/i.test(dataType)) {
     return `X'${value.slice(2)}'`
   }

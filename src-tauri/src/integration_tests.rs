@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! DBMS_TEST_PG=localhost:5432:postgres:password
+//! DBMS_TEST_PGVECTOR=localhost:55452:postgres:password   (pgvector/pgvector image)
+//! DBMS_TEST_POSTGIS=localhost:55453:postgres:password    (postgis/postgis image)
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
@@ -85,6 +87,60 @@ fn opts() -> ExecOptions {
 
 fn cell(out: &ExecOutput, set: usize, row: usize, col: usize) -> Value {
     out.results[set].rows[row][col].clone()
+}
+
+/// pgvector and PostGIS values as the grid gets them: the extension's type
+/// name from the prepare, and the types' text output (vector text, hex EWKB).
+#[tokio::test]
+async fn postgres_extension_types() {
+    if let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PGVECTOR").await {
+        let s = m.get(&id).unwrap();
+        let setup = "CREATE EXTENSION IF NOT EXISTS vector;             DROP TABLE IF EXISTS dbms_vec;             CREATE TABLE dbms_vec (id int PRIMARY KEY, e vector(3));             INSERT INTO dbms_vec VALUES (1, '[1,2.5,-3]');             CREATE INDEX dbms_vec_e ON dbms_vec USING hnsw (e vector_cosine_ops) WITH (m = 16, ef_construction = 64)";
+        let out = s.execute("tab1", "", setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = s
+            .execute("tab1", "", "SELECT * FROM dbms_vec", &opts())
+            .await
+            .unwrap();
+        assert_eq!(out.results[0].columns[1].type_name, "vector");
+        assert_eq!(cell(&out, 0, 0, 1), json!("[1,2.5,-3]"));
+        let out = s
+            .execute(
+                "tab1",
+                "",
+                "SELECT extname::text FROM pg_extension WHERE extname IN ('vector', 'postgis'); DROP TABLE dbms_vec",
+                &opts(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cell(&out, 0, 0, 0), json!("vector"));
+    }
+    if let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_POSTGIS").await {
+        let s = m.get(&id).unwrap();
+        let setup = "CREATE EXTENSION IF NOT EXISTS postgis;             DROP TABLE IF EXISTS dbms_geo;             CREATE TABLE dbms_geo (id int PRIMARY KEY, g geometry(Point,4326), gg geography(Point,4326));             INSERT INTO dbms_geo VALUES (1, 'SRID=4326;POINT(-71.064544 42.28787)', 'SRID=4326;POINT(-71.06 42.28)');             UPDATE dbms_geo SET g = 'SRID=4326;POINT(1 2)'::geometry(Point,4326) WHERE id = 1";
+        let out = s.execute("tab1", "", setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = s
+            .execute("tab1", "", "SELECT * FROM dbms_geo", &opts())
+            .await
+            .unwrap();
+        assert_eq!(out.results[0].columns[1].type_name, "geometry");
+        assert_eq!(out.results[0].columns[2].type_name, "geography");
+        // Hex EWKB, which the grid decodes to EWKT
+        assert_eq!(
+            cell(&out, 0, 0, 1),
+            json!("0101000020E6100000000000000000F03F0000000000000040")
+        );
+        assert_eq!(
+            cell(&out, 0, 0, 2),
+            json!("0101000020E6100000A4703D0AD7C351C0A4703D0AD7234540")
+        );
+        let out = s
+            .execute("tab1", "", "DROP TABLE dbms_geo", &opts())
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+    }
 }
 
 #[tokio::test]
