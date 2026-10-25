@@ -55,6 +55,8 @@ export function tabTitle(tab: Tab): string {
       return `Keys · db${tab.database}`
     case 'redisPubsub':
       return 'Pub/Sub'
+    case 'pgNotify':
+      return `Notifications · ${tab.database}`
     case 'table':
       return tab.schema && tab.schema !== 'dbo' && tab.schema !== 'public'
         ? `${tab.schema}.${tab.name}`
@@ -99,6 +101,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       return <KeyRound className={cn(c, 'text-redis')} />
     case 'redisPubsub':
       return <RadioTower className={cn(c, 'text-redis')} />
+    case 'pgNotify':
+      return <RadioTower className={cn(c, 'text-info')} />
     case 'table':
       if (tab.objectKind === 'view' || tab.objectKind === 'materialized_view') {
         return <Eye className={cn(c, 'text-syn-type')} />

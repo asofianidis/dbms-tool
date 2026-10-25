@@ -624,6 +624,24 @@ export interface PubSubBatch {
   error: string | null
 }
 
+/** A PostgreSQL `NOTIFY` received by a Notifications tab */
+export interface PgNotification {
+  channel: string
+  payload: string
+  /** The sending backend's process id */
+  pid: number
+  /** Unix time in milliseconds */
+  at: number
+}
+
+export interface PgNotifyBatch {
+  listener: string
+  notifications: PgNotification[]
+  dropped: number
+  /** Set once when the listening session ends on its own */
+  error: string | null
+}
+
 export interface AppError {
   code:
     | 'error'
@@ -782,6 +800,16 @@ export const api = {
     invoke<void>('redis_unsubscribe', { id, subscription }),
   onRedisMessages: (handler: (batch: PubSubBatch) => void): Promise<UnlistenFn> =>
     listen<PubSubBatch>('redis-pubsub', (e) => handler(e.payload)),
+  /** LISTENs from the listener's own session; returns every channel it listens on */
+  pgListen: (id: string, listener: string, database: string, channels: string[]) =>
+    invoke<string[]>('pg_listen', { id, listener, database, channels }),
+  /** UNLISTENs `channels`, or all of them when empty; returns the ones left */
+  pgUnlisten: (id: string, listener: string, channels: string[]) =>
+    invoke<string[]>('pg_unlisten', { id, listener, channels }),
+  pgNotify: (id: string, listener: string, database: string, channel: string, payload: string) =>
+    invoke<void>('pg_notify', { id, listener, database, channel, payload }),
+  onPgNotifications: (handler: (batch: PgNotifyBatch) => void): Promise<UnlistenFn> =>
+    listen<PgNotifyBatch>('pg-notify', (e) => handler(e.payload)),
 
   writeText: (path: string, contents: string) =>
     invoke<void>('file_write_text', { path, contents }),

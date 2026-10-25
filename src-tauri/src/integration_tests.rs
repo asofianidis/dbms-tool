@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::drivers::mongo::MongoRequest;
+use crate::drivers::pg_listen::NotifyBatch;
 use crate::drivers::redis::RedisRequest;
 use crate::manager::{META, Manager};
 use crate::model::*;
@@ -1172,4 +1173,166 @@ async fn mysql_events_end_to_end() {
         assert!(out.error.is_none(), "{var}: {:?}", out.error);
         m.close(&id);
     }
+}
+
+/// Notifications show in the messages of the tab that LISTENs, and the
+/// Notifications tab's own session streams them until it's closed.
+#[tokio::test]
+async fn postgres_listen_notify() {
+    let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let db = "pg_notify";
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        let out = s.execute(META, "", &sql, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+    }
+
+    // An editor tab sees what arrived since its last statement, like psql
+    let out = s
+        .execute("ed1", db, "LISTEN pg_notify_editor", &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    s.execute("ed2", db, "NOTIFY pg_notify_editor, 'hello'", &opts())
+        .await
+        .unwrap();
+    let pid = cell(
+        &s.execute("ed2", db, "SELECT pg_backend_pid()", &opts())
+            .await
+            .unwrap(),
+        0,
+        0,
+        0,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let out = s.execute("ed1", db, "SELECT 1", &opts()).await.unwrap();
+    let line = format!(
+        "NOTIFY pg_notify_editor (pid {}): hello",
+        pid.as_str().unwrap()
+    );
+    assert!(
+        out.messages.iter().any(|x| x.text == line),
+        "{:?}",
+        out.messages
+    );
+    // ...once
+    let out = s.execute("ed1", db, "SELECT 1", &opts()).await.unwrap();
+    assert!(!out.messages.iter().any(|x| x.text.starts_with("NOTIFY")));
+
+    // The Notifications tab
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit = move |batch: NotifyBatch| {
+        let _ = tx.send(batch);
+    };
+    let channels = s
+        .pg_listen(
+            "notify-tab",
+            db,
+            vec!["pg_notify_A".into(), "pg_notify b".into()],
+            emit.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(channels, vec!["pg_notify b", "pg_notify_A"]);
+    s.execute(
+        "ed2",
+        db,
+        "SELECT pg_notify('pg_notify_A', '{\"n\":1}')",
+        &opts(),
+    )
+    .await
+    .unwrap();
+    s.pg_notify("notify-tab", db, "pg_notify b", "", emit.clone())
+        .await
+        .unwrap();
+    // Unquoted NOTIFY folds case, so this one goes to a channel nobody listens on
+    s.execute("ed2", db, "NOTIFY pg_notify_A", &opts())
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("notifications")
+            .unwrap();
+        assert_eq!(batch.listener, "notify-tab");
+        assert!(batch.error.is_none(), "{:?}", batch.error);
+        got.extend(batch.notifications);
+    }
+    assert_eq!(got[0].channel, "pg_notify_A");
+    assert_eq!(got[0].payload, "{\"n\":1}");
+    assert_eq!(got[0].pid.to_string(), pid.as_str().unwrap());
+    assert_eq!(got[1].channel, "pg_notify b");
+    assert_eq!(got[1].payload, "");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "nothing more arrives"
+    );
+
+    let left = s
+        .pg_unlisten("notify-tab", vec!["pg_notify b".into()])
+        .await
+        .unwrap();
+    assert_eq!(left, vec!["pg_notify_A"]);
+
+    // Ending the listener's backend reports it, and listening again reconnects
+    let out = s
+        .execute(
+            META,
+            "",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = 'pg_notify' AND query LIKE 'UNLISTEN%'",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("disconnect reported")
+        .unwrap();
+    assert!(batch.error.is_some());
+    let channels = s
+        .pg_listen("notify-tab", db, vec!["pg_notify_A".into()], emit.clone())
+        .await
+        .unwrap();
+    assert_eq!(channels, vec!["pg_notify_A"]);
+    s.execute("ed2", db, "NOTIFY \"pg_notify_A\", 'again'", &opts())
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("notification after reconnect")
+        .unwrap();
+    assert_eq!(batch.notifications[0].payload, "again");
+
+    // Closing the tab ends its session
+    s.close_session("notify-tab").await;
+    assert!(
+        s.pg_unlisten("notify-tab", Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    for tab in ["ed1", "ed2"] {
+        s.close_session(tab).await;
+    }
+    let out = s
+        .execute(
+            META,
+            "",
+            &format!("DROP DATABASE {db} WITH (FORCE)"),
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
 }
