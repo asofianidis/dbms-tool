@@ -1,0 +1,55 @@
+{
+  "query_block": {
+    "union_result": {
+      "table_name": "<union1,2>",
+      "access_type": "ALL",
+      "query_specifications": [
+        {
+          "query_block": {
+            "select_id": 1,
+            "cost": 0.06031992,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "customers",
+                  "access_type": "ref",
+                  "possible_keys": ["idx_country"],
+                  "key": "idx_country",
+                  "key_length": "9",
+                  "used_key_parts": ["country"],
+                  "ref": ["const"],
+                  "loops": 1,
+                  "rows": 400,
+                  "cost": 0.06031992,
+                  "filtered": 100,
+                  "attached_condition": "customers.country = 'US'",
+                  "using_index": true
+                }
+              }
+            ]
+          }
+        },
+        {
+          "query_block": {
+            "select_id": 2,
+            "operation": "UNION",
+            "cost": 3.3279766,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "orders",
+                  "access_type": "ALL",
+                  "loops": 1,
+                  "rows": 19847,
+                  "cost": 3.3279766,
+                  "filtered": 100,
+                  "attached_condition": "orders.total > 995"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

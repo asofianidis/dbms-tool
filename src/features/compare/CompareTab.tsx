@@ -14,7 +14,9 @@ import {
   Minus,
   Pencil,
   Plus,
+  Puzzle,
   Save,
+  Shapes,
   Table2,
   TriangleAlert
 } from 'lucide-react'
@@ -474,13 +476,16 @@ const KIND_LABELS: Record<DiffItem['kind'], string> = {
   materialized_view: 'Materialized views',
   function: 'Functions',
   procedure: 'Procedures',
+  package: 'Packages',
   sequence: 'Sequences',
   synonym: 'Synonyms',
   collection: 'Collections',
   timeseries: 'Time series',
   event: 'Events',
   aggregate: 'Aggregates',
-  window_function: 'Window functions'
+  window_function: 'Window functions',
+  type: 'Types',
+  extension: 'Extensions'
 }
 
 function KindIcon({ kind }: { kind: DiffItem['kind'] }): React.JSX.Element {
@@ -491,6 +496,8 @@ function KindIcon({ kind }: { kind: DiffItem['kind'] }): React.JSX.Element {
   if (kind === 'function' || kind === 'procedure')
     return <FunctionSquare className={cn(c, 'text-syn-fn')} />
   if (kind === 'sequence') return <ListOrdered className={cn(c, 'text-syn-number')} />
+  if (kind === 'type') return <Shapes className={cn(c, 'text-syn-type')} />
+  if (kind === 'extension') return <Puzzle className={cn(c, 'text-syn-fn')} />
   return <Table2 className={cn(c, 'text-syn-prop')} />
 }
 

@@ -4,6 +4,7 @@ import { api, isAppError, type ConnectionConfig, type ObjectKind, type ServerInf
 import type { CompareScope } from './compare'
 import { ENGINES } from './engines'
 import type { QueryState } from './filters'
+import type { MaintenancePreset } from './maintenance'
 import { createPersistentStore, createStore } from './store'
 import { errorMessage, toast } from './toast'
 import { clearTransactionState, openTransactionsStore } from './transactions'
@@ -73,6 +74,15 @@ export type Tab =
     }
   | {
       id: string
+      /** PostgreSQL LISTEN / NOTIFY on a session of its own */
+      kind: 'pgNotify'
+      connectionId: string
+      database: string
+      /** Channels to listen on again, as last listened */
+      channels?: string[]
+    }
+  | {
+      id: string
       kind: 'table'
       connectionId: string
       database: string
@@ -116,6 +126,8 @@ export type Tab =
       kind: 'maintenance'
       connectionId: string
       database: string
+      /** Task and tables to start on, when opened for particular tables */
+      preset?: MaintenancePreset
     }
   | {
       id: string
@@ -487,6 +499,14 @@ export function openRedisPubsub(connectionId: string, channels?: string): void {
   openTab({ id: tabId(), kind: 'redisPubsub', connectionId, channels })
 }
 
+/** One Notifications tab per connection and database. */
+export function openPgNotify(connectionId: string, database = defaultDatabase(connectionId)): void {
+  openTab(
+    { id: tabId(), kind: 'pgNotify', connectionId, database },
+    (t) => t.kind === 'pgNotify' && t.connectionId === connectionId && t.database === database
+  )
+}
+
 export function openSettings(): void {
   openTab({ id: 'settings', kind: 'settings' }, (t) => t.kind === 'settings')
 }
@@ -552,11 +572,17 @@ export function openBackup(
 }
 
 /** Opens maintenance tasks (vacuum, analyze, integrity checks…) for `database`. */
-export function openMaintenance(connectionId: string, database: string): void {
-  openTab(
-    { id: tabId(), kind: 'maintenance', connectionId, database },
-    (t) => t.kind === 'maintenance' && t.connectionId === connectionId && t.database === database
-  )
+export function openMaintenance(
+  connectionId: string,
+  database: string,
+  preset?: Omit<MaintenancePreset, 'nonce'>
+): void {
+  const sameAs = (t: Tab): boolean =>
+    t.kind === 'maintenance' && t.connectionId === connectionId && t.database === database
+  const withNonce = preset && { ...preset, nonce: Date.now() }
+  const existing = tabsStore.get().tabs.find(sameAs)
+  if (existing && withNonce) updateTab(existing.id, { preset: withNonce } as Partial<Tab>)
+  openTab({ id: tabId(), kind: 'maintenance', connectionId, database, preset: withNonce }, sameAs)
 }
 
 /** Opens a comparison of a database, schema or table (`table` set) against one chosen in the tab. */
