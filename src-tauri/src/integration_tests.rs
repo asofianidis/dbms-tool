@@ -197,8 +197,9 @@ async fn mariadb_end_to_end() {
     };
     let m = Manager::default();
     let info = m.open(c.clone(), password).await.expect("connect");
-    assert!(info.product.starts_with("MariaDB "), "{}", info.product);
-    assert!(info.version.contains("MariaDB"), "{}", info.version);
+    // No message arguments: the info comes from a password-bearing connect
+    assert!(info.product.starts_with("MariaDB "));
+    assert!(info.version.contains("MariaDB"));
     let s = m.get(&c.id).unwrap();
     let out = s
         .execute(
@@ -212,6 +213,49 @@ async fn mariadb_end_to_end() {
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
     m.close(&c.id);
+}
+
+#[tokio::test]
+async fn mariadb_sequences() {
+    let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MARIADB").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "DROP DATABASE IF EXISTS mdb_sequences; CREATE DATABASE mdb_sequences; USE mdb_sequences;              CREATE SEQUENCE seq START WITH 10 INCREMENT BY 5 CACHE 20 CYCLE; CREATE TABLE t (id INT)",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let objects = s.list_objects("mdb_sequences", None).await.unwrap();
+    let seq = objects.iter().find(|o| o.name == "seq").unwrap();
+    assert_eq!(seq.kind, "sequence");
+    assert_eq!(seq.row_estimate, None);
+    assert!(objects.iter().any(|o| o.name == "t" && o.kind == "table"));
+    let ddl = s
+        .object_definition("mdb_sequences", None, "seq", "sequence", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ddl.starts_with("CREATE SEQUENCE `seq`"), "{ddl}");
+    assert!(
+        ddl.contains("increment by 5") && ddl.contains(" cycle"),
+        "{ddl}"
+    );
+    // The details view reads the sequence's single row
+    let out = s
+        .execute("tab1", "", "SELECT * FROM mdb_sequences.seq", &opts())
+        .await
+        .unwrap();
+    assert_eq!(out.results[0].columns[0].name, "next_not_cached_value");
+    assert_eq!(cell(&out, 0, 0, 0), json!("10"));
+    s.execute("tab1", "", "DROP DATABASE mdb_sequences", &opts())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

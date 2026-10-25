@@ -449,8 +449,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/nightly" --jq .id 2>/dev/null || true)
-          if [ -z "$id" ]; then
+          # gh api prints the error body to stdout on a 404, so test the exit status rather than the output
+          if ! id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/nightly" --jq .id 2>/dev/null); then
             id=$(gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name=nightly -f target_commitish="$GITHUB_SHA" \
               -f name="Nightly channel" -F prerelease=true -f make_latest=false \
               -f body="Holds the updater manifest for the nightly release channel. The builds themselves are the vX.Y.Z-N pre-releases." \
