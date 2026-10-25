@@ -231,6 +231,15 @@ cd src-tauri && cargo test -- --test-threads=1
 `up` finishes by printing the host, port, user, password and connection string for each
 server. Run `./scripts/test-databases.sh info` to print them again.
 
+To work with only some engines, list them after the command (`pg`, `mysql`, `mariadb`, `mssql`,
+`babelfish`, `mongo`, `redis`). Every command accepts the list:
+
+```sh
+./scripts/test-databases.sh up pg
+eval "$(./scripts/test-databases.sh env pg)"
+./scripts/test-databases.sh down pg
+```
+
 ### CI and releases
 
 `ci.yml` runs formatting, type checks, unit tests, clippy and the Rust tests on Windows, macOS and
