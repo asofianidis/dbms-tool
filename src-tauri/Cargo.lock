@@ -1141,6 +1141,7 @@ version = "0.1.0"
 dependencies = [
  "bson 3.1.0",
  "chrono",
+ "encoding_rs",
  "flate2",
  "futures-util",
  "hickory-resolver",
