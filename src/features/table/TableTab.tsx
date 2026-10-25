@@ -44,6 +44,7 @@ import {
 import { formatDuration, plural } from '@/lib/format'
 import { addInsert } from '@/lib/pending'
 import { queries } from '@/lib/queries'
+import { isPhysical, loadRowLocator, rowLocatorNote, withRowLocator } from '@/lib/row-locator'
 import { canHaveTriggers } from '@/lib/triggers'
 import { settingsStore } from '@/lib/settings'
 import {
@@ -86,6 +87,7 @@ import { exportMenu } from '../query/ResultsPanel'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
+import { RoutineAttributesBar } from './RoutineAttributesBar'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { SequenceDetails } from './SequenceDetails'
 import { openTableDesigner } from './TableDesigner'
@@ -218,10 +220,33 @@ function DataView({
   const [filter, setFilter] = useState('')
   const [exporting, setExporting] = useState(false)
 
+  // PostgreSQL tables without a primary key are edited by a unique key or by ctid
+  const needsLocator =
+    engine === 'postgres' && !readOnly && !!info.data && !info.data.primaryKey.length
+  const locatorQuery = useQuery({
+    queryKey: ['conn', tab.connectionId, 'row-locator', tab.database, tab.schema, tab.name],
+    queryFn: () => loadRowLocator(tab.connectionId, tab.database, tab.schema, tab.name),
+    enabled: needsLocator
+  })
+  const locator = needsLocator ? (locatorQuery.data ?? null) : null
+  const editInfo = useMemo(
+    () => info.data && withRowLocator(info.data, locator),
+    [info.data, locator]
+  )
+
   const set = output?.results[0]
-  const columns: ColumnMeta[] = set?.columns ?? []
-  const pk = info.data?.primaryKey ?? []
-  const canEdit = !readOnly && pk.length > 0 && !!info.data
+  const pk = editInfo?.primaryKey ?? []
+  // Hidden system columns (ctid) come first in the result; the grid doesn't show them
+  const hiddenCount =
+    set && locator?.hidden.length && locator.hidden.every((h, i) => set.columns[i]?.name === h)
+      ? locator.hidden.length
+      : 0
+  const columns: ColumnMeta[] = useMemo(
+    () => set?.columns.slice(hiddenCount) ?? [],
+    [set, hiddenCount]
+  )
+  const canEdit =
+    !readOnly && pk.length > 0 && !!info.data && hiddenCount === (locator?.hidden.length ?? 0)
   const appliedWhere = useMemo(
     () =>
       buildWhere(
@@ -232,9 +257,13 @@ function DataView({
     [dialect, query, info.data]
   )
   const appliedOrder = useMemo(() => buildOrderBy(dialect, query.sorts), [dialect, query.sorts])
-  // Default to primary-key order so rows don't move around after an edit
+  // Default to primary-key order so rows don't move around after an edit. Not by ctid:
+  // that sorts the whole table for one page
   const orderBy =
-    appliedOrder || (pk.length ? pk.map((k) => quoteIdent(dialect, k)).join(', ') : undefined)
+    appliedOrder ||
+    (pk.length && !isPhysical(locator)
+      ? pk.map((k) => quoteIdent(dialect, k)).join(', ')
+      : undefined)
 
   /** Applies a new filter / sort from the builder, chips or grid header. */
   const applyQuery = (next: QueryState): void => {
@@ -262,7 +291,8 @@ function DataView({
         orderBy,
         limit: pageSize + 1,
         offset: page * pageSize,
-        keyColumns: pk
+        keyColumns: pk,
+        leadingColumns: locator?.hidden
       })
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
         maxRows: pageSize + 1
@@ -286,14 +316,17 @@ function DataView({
     appliedOrder,
     page,
     pageSize,
-    pk.join(',')
+    pk.join(','),
+    locator?.hidden.join(',')
   ])
 
+  // Wait for the row locator too, so a table without a key isn't loaded twice
+  const locating = needsLocator && locatorQuery.isPending
   useEffect(() => {
-    if (info.isPending) return
+    if (info.isPending || locating) return
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appliedWhere, appliedOrder, page, pageSize, info.isPending])
+  }, [appliedWhere, appliedOrder, page, pageSize, info.isPending, locating])
 
   const count = async (): Promise<void> => {
     try {
@@ -311,7 +344,21 @@ function DataView({
   }
 
   // The page shown, without the extra row fetched to detect a next page
-  const baseRows = useMemo(() => set?.rows.slice(0, pageSize) ?? [], [set, pageSize])
+  const loadedRows = useMemo(() => set?.rows.slice(0, pageSize) ?? [], [set, pageSize])
+  const baseRows = useMemo(
+    () => (hiddenCount ? loadedRows.map((r) => r.slice(hiddenCount)) : loadedRows),
+    [loadedRows, hiddenCount]
+  )
+  const hidden = useMemo(
+    () =>
+      set && hiddenCount
+        ? {
+            columns: set.columns.slice(0, hiddenCount),
+            rows: loadedRows.map((r) => r.slice(0, hiddenCount))
+          }
+        : undefined,
+    [set, loadedRows, hiddenCount]
+  )
   const generatedColumns = useMemo(() => {
     const generated = new Set<number>()
     columns.forEach((c, i) => {
@@ -324,7 +371,8 @@ function DataView({
     baseRows,
     primaryKey: pk,
     enabled: canEdit,
-    readOnlyColumns: generatedColumns
+    readOnlyColumns: generatedColumns,
+    hidden
   })
 
   // Open the panel when the first change is made
@@ -336,18 +384,19 @@ function DataView({
 
   /** Commits the given pending changes (all by default) in one transaction. */
   const commit = async (ids?: string[]): Promise<void> => {
-    if (!info.data) return
+    if (!editInfo) return
     const subset = ids ? changes.filter((c) => ids.includes(c.id)) : changes
     const done = new Set(subset.map((c) => c.id))
     const ok = await commitPendingChanges({
       changes: subset,
       dialect,
       tableRef,
-      info: info.data,
+      info: editInfo,
       confirmDangerous,
       connection: getConnection(tab.connectionId),
       execute: (sql, options) => api.execute(tab.connectionId, tab.id, tab.database, sql, options),
-      busy: setLoading
+      busy: setLoading,
+      locator
     })
     if (!ok) return
     // Functional update keeps changes edited while the commit ran
@@ -582,18 +631,19 @@ function DataView({
               cellMenuItems={referenceItems}
               layoutKey={`table:${tab.connectionId}:${tab.database}:${tab.schema ?? ''}.${tab.name}`}
               onLoadValue={
-                pk.length && info.data
+                pk.length && editInfo
                   ? (row, col) =>
                       fetchCellValue({
                         execute: (sql, options) =>
                           api.execute(tab.connectionId, tab.id, tab.database, sql, options),
                         dialect,
                         tableRef,
-                        info: info.data!,
-                        columns,
+                        info: editInfo,
+                        // With the hidden key columns, which the grid's indexes skip
+                        columns: set?.columns ?? columns,
                         // As loaded: pending edits may change the key
-                        row: baseRows[row],
-                        column: col
+                        row: loadedRows[row],
+                        column: col + hiddenCount
                       })
                   : undefined
               }
@@ -604,12 +654,13 @@ function DataView({
             <EmptyState title="Loading…" icon={<Spinner className="size-5" />} />
           )}
         </div>
-        {canEdit && panelOpen && info.data && (
+        {canEdit && panelOpen && info.data && editInfo && (
           <ChangesPanel
             changes={changes}
             columns={columns}
             primaryKey={pk}
-            info={info.data}
+            info={editInfo}
+            locator={locator}
             dialect={dialect}
             tableRef={tableRef}
             visibleKeys={visibleKeys}
@@ -628,6 +679,18 @@ function DataView({
         <div className="flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 text-[11px] text-muted">
           <span>{plural(baseRows.length, 'row')}</span>
           <span className="text-faint">{formatDuration(output.elapsedMs)}</span>
+          {canEdit && rowLocatorNote(locator) && (
+            <span
+              className="text-faint"
+              title={
+                isPhysical(locator)
+                  ? 'This table has no primary key or unique NOT NULL key, so rows are found by their physical location. It changes on every update, so rows reload after each save and a save fails if a row changed since it was loaded.'
+                  : 'This table has no primary key, so rows are found by a unique index on NOT NULL columns.'
+              }
+            >
+              {rowLocatorNote(locator)}
+            </span>
+          )}
           {canEdit && (
             <span className="text-faint">
               Double-click or F2 to edit · Delete removes rows · changes wait in Pending until
@@ -1008,6 +1071,16 @@ function DefinitionView({
           </span>
         )}
       </Toolbar>
+      {routineKind && connection?.engine === 'postgres' && (
+        <RoutineAttributesBar
+          connectionId={tab.connectionId}
+          database={tab.database}
+          schema={tab.schema}
+          name={tab.name}
+          kind={routineKind}
+          detail={tab.detail}
+        />
+      )}
       <div className="min-h-0 flex-1">
         {error ? (
           <div className="p-4">

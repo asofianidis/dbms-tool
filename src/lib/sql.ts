@@ -159,6 +159,8 @@ export interface SelectOptions {
   offset?: number
   /** Columns used for a stable order when paging SQL Server */
   keyColumns?: string[]
+  /** Expressions selected ahead of `*`, e.g. PostgreSQL's ctid for editing without a key */
+  leadingColumns?: string[]
 }
 
 export function selectRows(dialect: Dialect, ref: TableRef, opts: SelectOptions): string {
@@ -175,7 +177,8 @@ export function selectRows(dialect: Dialect, ref: TableRef, opts: SelectOptions)
         : '(SELECT NULL)')
     return `SELECT *\nFROM ${table}${where}\nORDER BY ${orderBy}\nOFFSET ${offset} ROWS FETCH NEXT ${opts.limit} ROWS ONLY`
   }
-  return `SELECT *\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
+  const leading = opts.leadingColumns?.length ? `${opts.leadingColumns.join(', ')}, ` : ''
+  return `SELECT ${leading}*\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
 }
 
 export function countRows(dialect: Dialect, ref: TableRef, where?: string): string {

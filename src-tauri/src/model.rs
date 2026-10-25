@@ -136,6 +136,29 @@ pub struct RoutineInfo {
     /// Return type for functions; `TABLE` for table-valued functions
     pub returns: Option<String>,
     pub language: Option<String>,
+    /// PostgreSQL only: security, volatility and the other function attributes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<RoutineAttributes>,
+}
+
+/// Attributes of a PostgreSQL function or procedure, from `pg_proc`.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineAttributes {
+    /// Runs with the owner's privileges rather than the caller's
+    pub security_definer: bool,
+    /// IMMUTABLE | STABLE | VOLATILE
+    pub volatility: String,
+    /// Returns NULL on NULL input without being called
+    pub strict: bool,
+    /// SAFE | RESTRICTED | UNSAFE
+    pub parallel: String,
+    pub leakproof: bool,
+    pub cost: f64,
+    /// Estimated rows for set-returning functions; 0 otherwise
+    pub rows: f64,
+    /// `SET` options, e.g. `search_path=pg_catalog, pg_temp`
+    pub config: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

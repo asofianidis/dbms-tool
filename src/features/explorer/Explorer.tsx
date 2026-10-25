@@ -51,6 +51,7 @@ import {
   Sprout,
   Server,
   Shapes,
+  ShieldAlert,
   ShieldCheck,
   Table2,
   Terminal,
@@ -76,6 +77,11 @@ import { principalKey, principalLabel, type Principal } from '@/lib/grants'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
+import {
+  routineSearchPath,
+  searchPathWarning,
+  SECURITY_DEFINER_TITLE
+} from '@/lib/routine-attributes'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
 import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
@@ -1660,6 +1666,25 @@ function RoutineChildren({
           label="returns"
           muted
           detail={<span className="font-mono">{returns}</span>}
+        />
+      )}
+      {q.data.attributes?.securityDefiner && (
+        <Row
+          id={`${base}/security`}
+          depth={depth}
+          icon={<ShieldAlert className="text-warn" />}
+          label="security definer"
+          muted
+          title={searchPathWarning(q.data.attributes) ?? SECURITY_DEFINER_TITLE}
+          detail={
+            searchPathWarning(q.data.attributes) && (
+              <span className="text-warn">
+                {routineSearchPath(q.data.attributes) === null
+                  ? 'no search_path'
+                  : 'pg_temp not last'}
+              </span>
+            )
+          }
         />
       )}
       {!params.length && !returns && <EmptyRow depth={depth}>No parameters</EmptyRow>}

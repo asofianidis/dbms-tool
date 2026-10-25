@@ -583,7 +583,10 @@ impl PgSession {
         let head = self
             .strings(
                 &format!(
-                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text \
+                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text, \
+                       p.prosecdef, CASE p.provolatile WHEN 'i' THEN 'IMMUTABLE' WHEN 's' THEN 'STABLE' ELSE 'VOLATILE' END, \
+                       p.proisstrict, CASE p.proparallel WHEN 's' THEN 'SAFE' WHEN 'r' THEN 'RESTRICTED' ELSE 'UNSAFE' END, \
+                       p.proleakproof, p.procost::float8, p.prorows::float8, coalesce(p.proconfig, '{{}}'::text[]) \
                      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
                      JOIN pg_language l ON l.oid = p.prolang WHERE {FILTER}"
                 ),
@@ -621,6 +624,16 @@ impl PgSession {
                 .collect(),
             returns: head.get(0),
             language: head.get(1),
+            attributes: Some(RoutineAttributes {
+                security_definer: head.get(2),
+                volatility: head.get(3),
+                strict: head.get(4),
+                parallel: head.get(5),
+                leakproof: head.get(6),
+                cost: head.get(7),
+                rows: head.get(8),
+                config: head.get(9),
+            }),
         })
     }
 
