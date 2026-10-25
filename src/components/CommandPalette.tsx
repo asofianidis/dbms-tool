@@ -22,6 +22,7 @@ import {
   ListOrdered,
   Plug,
   Plus,
+  RadioTower,
   Search,
   Settings,
   Table2,
@@ -54,6 +55,7 @@ import {
   openCollection,
   openConnectionDialog,
   openDashboard,
+  openPgNotify,
   openSettings,
   openTable,
   openWelcome,
@@ -179,6 +181,25 @@ function compareCommands(): Item[] {
   ]
 }
 
+/** LISTEN / NOTIFY for each connected PostgreSQL connection, the active tab's first. */
+function notifyCommands(): Item[] {
+  const tab = activeTab()
+  const current = tab && 'connectionId' in tab ? tab.connectionId : null
+  const statuses = statusStore.get()
+  return connectionsStore
+    .get()
+    .filter((c) => c.engine === 'postgres' && statuses[c.id]?.state === 'connected')
+    .sort((a, b) => Number(b.id === current) - Number(a.id === current))
+    .map((c) => ({
+      id: `pg-notify:${c.id}`,
+      group: 'Commands',
+      label: 'Notifications (LISTEN / NOTIFY)',
+      detail: connectionLabel(c),
+      icon: <RadioTower />,
+      run: () => openPgNotify(c.id)
+    }))
+}
+
 export function CommandPalette(): React.JSX.Element | null {
   const { open, query } = paletteStore.use()
   if (!open) return null
@@ -229,6 +250,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       },
       ...backupCommands(),
       ...compareCommands(),
+      ...notifyCommands(),
       {
         id: 'new-query',
         group: 'Commands',

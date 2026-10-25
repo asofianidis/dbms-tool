@@ -35,6 +35,7 @@ import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { KeyBrowserTab } from './features/redis/KeyBrowserTab'
 import { PubSubTab } from './features/redis/PubSubTab'
+import { NotifyTab } from './features/notify/NotifyTab'
 import { RedisConsoleTab } from './features/redis/RedisConsoleTab'
 import { QueryTab } from './features/query/QueryTab'
 import { ServerTab } from './features/server/ServerTab'
@@ -81,6 +82,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <KeyBrowserTab tab={tab} />
     case 'redisPubsub':
       return <PubSubTab tab={tab} />
+    case 'pgNotify':
+      return <NotifyTab tab={tab} />
     case 'table':
       return <TableTab tab={tab} />
     case 'collection':

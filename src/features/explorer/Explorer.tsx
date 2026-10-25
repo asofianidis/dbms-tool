@@ -104,6 +104,7 @@ import {
   openTable,
   openRedisKeys,
   openRedisPubsub,
+  openPgNotify,
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
@@ -389,6 +390,16 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <RadioTower />,
               disabled: !connected,
               onSelect: () => openRedisPubsub(connection.id)
+            }
+          ]
+        : []),
+      ...(connection.engine === 'postgres'
+        ? [
+            {
+              label: 'Notifications (LISTEN / NOTIFY)',
+              icon: <RadioTower />,
+              disabled: !connected,
+              onSelect: () => openPgNotify(connection.id)
             }
           ]
         : []),
