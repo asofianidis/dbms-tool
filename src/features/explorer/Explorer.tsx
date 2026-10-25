@@ -120,6 +120,7 @@ import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 import { EventSchedulerBadge, newEvent } from './events'
+import { MatviewRowDetail } from './matviews'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -1318,6 +1319,10 @@ function ObjectNode({
   const isRoutine = obj.kind === 'procedure' || obj.kind === 'function'
   const showSchema =
     (connection.engine === 'mssql' || connection.engine === 'babelfish') && obj.schema
+  // Row estimate, or "not populated"
+  const matviewDetail = obj.kind === 'materialized_view' && connection.engine === 'postgres' && (
+    <MatviewRowDetail connectionId={connection.id} database={database} obj={obj} />
+  )
   return (
     <>
       <Row
@@ -1355,11 +1360,12 @@ function ObjectNode({
           </>
         }
         detail={
-          obj.kind === 'event'
+          matviewDetail ||
+          (obj.kind === 'event'
             ? (eventStatusLabel(obj.detail) ?? undefined)
             : obj.rowEstimate != null && obj.rowEstimate >= 0
               ? compactCount(obj.rowEstimate)
-              : undefined
+              : undefined)
         }
         actions={
           isRoutine && (

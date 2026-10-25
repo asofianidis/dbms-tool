@@ -61,6 +61,7 @@ import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { eventMenuItems } from './events'
+import { matviewMenuItems } from './matviews'
 import { mariaDbSequenceItems } from './sequence-actions'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
@@ -256,7 +257,13 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         label: 'Count rows',
         icon: <Hash />,
         onSelect: () => void countTable(connectionId, database, obj)
-      }
+      },
+      ...(obj.kind === 'materialized_view' && dialect === 'postgres'
+        ? ([
+            'separator',
+            ...matviewMenuItems(connectionId, database, obj, tableRef(connectionId, database, obj))
+          ] as MenuItem[])
+        : [])
     )
   } else if (isRoutine) {
     items.push(
