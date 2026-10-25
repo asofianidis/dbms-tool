@@ -54,6 +54,14 @@ import {
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
 import { queries } from '@/lib/queries'
+import {
+  countPgOptionChanges,
+  newPgTableOptions,
+  pgTableOptionProblem,
+  pgTableOptionWarnings,
+  withPgTableOptions,
+  type PgTableOptions
+} from '@/lib/pg-table-options'
 import { createStore } from '@/lib/store'
 import {
   countOptionChanges,
@@ -63,7 +71,7 @@ import {
   withTableOptions,
   type TableOptions
 } from '@/lib/storage-engines'
-import { loadTableExtras } from '@/lib/table-extras'
+import { loadTableExtras, type TableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
 import {
   connectionsStore,
@@ -75,6 +83,12 @@ import {
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import { TableOptionsEditor, useTableOptionsContext } from './StorageOptions'
+import {
+  PgExclusionsEditor,
+  PgPartitionsEditor,
+  PgStorageEditor,
+  usePgTableContext
+} from './PgTableOptions'
 import {
   Badge,
   Button,
@@ -234,19 +248,21 @@ function TableDesigner(request: Request): React.JSX.Element {
     name !== null && table.data
       ? draftFromTable(dialect, draftSchema, name, table.data, extras.data)
       : newTableDraft(dialect, draftSchema)
-  return <DesignerForm request={request} dialect={dialect} initial={initial} />
+  return <DesignerForm request={request} dialect={dialect} initial={initial} extras={extras.data} />
 }
 
-type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'options' | 'sql'
+type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'partitions' | 'options' | 'sql'
 
 function DesignerForm({
   request,
   dialect,
-  initial
+  initial,
+  extras
 }: {
   request: Request
   dialect: Dialect
   initial: TableDraft
+  extras?: TableExtras
 }): React.JSX.Element {
   const { connectionId, database } = request
   const connection = connectionsStore.use().find((c) => c.id === connectionId)
@@ -265,11 +281,27 @@ function DesignerForm({
   const storage = useTableOptionsContext(connectionId, database, request.name, mysql)
   const [optionEdits, setOptionEdits] = useState<TableOptions | null>(null)
   const tableOptions = optionEdits ?? storage.context?.original ?? DEFAULT_TABLE_OPTIONS
+  // PostgreSQL: partitioning, exclusion constraints, persistence, storage parameters
+  const postgres = dialect === 'postgres'
+  const pg = usePgTableContext(
+    connectionId,
+    database,
+    request.schema,
+    request.name,
+    extras?.exclusions,
+    postgres
+  )
+  const [pgEdits, setPgEdits] = useState<PgTableOptions | null>(null)
+  const pgOptions = pgEdits ?? pg.context?.original ?? newPgTableOptions()
+  const updatePg = (change: (o: PgTableOptions) => PgTableOptions): void =>
+    setPgEdits((prev) => change(prev ?? pgOptions))
+  const pgContext = postgres ? pg.context : null
   const statements = useMemo(() => {
     const out = tableStatements(dialect, draft, options)
     const ctx = storage.context
+    if (pgContext) return withPgTableOptions(out, draft, pgOptions, pgContext)
     return mysql && ctx ? withTableOptions(out, draft, tableOptions, ctx.original) : out
-  }, [dialect, draft, options, mysql, storage.context, tableOptions])
+  }, [dialect, draft, options, mysql, storage.context, tableOptions, pgContext, pgOptions])
   const script = useMemo(
     () => ddlScript(dialect, statements, options),
     [dialect, statements, options]
@@ -277,14 +309,17 @@ function DesignerForm({
   const optionsContext = mysql ? storage.context : null
   const problem =
     validateDraft(dialect, draft) ??
-    (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext))
+    (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext)) ??
+    (pgContext && pgTableOptionProblem(draft, pgOptions, pgContext, statements))
   const warnings = [
     ...draftWarnings(draft, dialect, options),
-    ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : [])
+    ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : []),
+    ...(pgContext ? pgTableOptionWarnings(draft, pgOptions, pgContext) : [])
   ]
   const changes =
     countChanges(draft, dialect) +
-    countOptionChanges(tableOptions, optionsContext?.original ?? null)
+    countOptionChanges(tableOptions, optionsContext?.original ?? null) +
+    (pgContext ? countPgOptionChanges(draft, pgOptions, pgContext.original) : 0)
   const destructive = draft.columns.some((c) => c.original && c.dropped)
 
   const schemas = useQuery({
@@ -355,9 +390,20 @@ function DesignerForm({
       label: 'Constraints',
       count:
         draft.checks.filter((ck) => !ck.dropped).length +
-        draft.uniques.filter((uq) => !uq.dropped).length
+        draft.uniques.filter((uq) => !uq.dropped).length +
+        (postgres ? pgOptions.exclusions.filter((x) => !x.dropped).length : 0)
     },
-    ...(mysql ? [{ value: 'options' as const, label: 'Options' }] : []),
+    // New tables can be partitioned; existing ones only if they already are
+    ...(postgres && (creating || pg.context?.partitionedBy)
+      ? [
+          {
+            value: 'partitions' as const,
+            label: creating ? 'Partitioning' : 'Partitions',
+            ...(!creating && { count: pgOptions.existingPartitions.length })
+          }
+        ]
+      : []),
+    ...(mysql || postgres ? [{ value: 'options' as const, label: 'Options' }] : []),
     { value: 'sql', label: 'SQL', count: statements.length }
   ]
 
@@ -467,7 +513,23 @@ function DesignerForm({
               setDraft={setDraft}
             />
           ) : view === 'constraints' ? (
-            <ConstraintsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+            <>
+              <ConstraintsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+              {postgres && (
+                <PgExclusionsEditor {...pg} draft={draft} options={pgOptions} onChange={updatePg} />
+              )}
+            </>
+          ) : view === 'partitions' ? (
+            <PgPartitionsEditor
+              {...pg}
+              connectionId={connectionId}
+              database={database}
+              draft={draft}
+              options={pgOptions}
+              onChange={updatePg}
+            />
+          ) : view === 'options' && postgres ? (
+            <PgStorageEditor {...pg} draft={draft} options={pgOptions} onChange={updatePg} />
           ) : view === 'options' ? (
             <TableOptionsEditor {...storage} options={tableOptions} onChange={setOptionEdits} />
           ) : (
@@ -481,8 +543,8 @@ function DesignerForm({
 
 type SetDraft = React.Dispatch<React.SetStateAction<TableDraft>>
 
-const cellInput = 'h-7 text-xs'
-const checkbox = 'size-3.5 accent-accent disabled:opacity-40'
+export const cellInput = 'h-7 text-xs'
+export const checkbox = 'size-3.5 accent-accent disabled:opacity-40'
 
 /* ---------- Columns ---------- */
 
@@ -741,7 +803,7 @@ function columnState(c: ColumnDraft, changed: boolean): string {
 /* ---------- Shared pieces ---------- */
 
 /** Toggle chips for picking columns in order; selected chips show their position. */
-function ColumnPicker({
+export function ColumnPicker({
   options,
   value,
   onChange,
@@ -787,7 +849,7 @@ function ColumnPicker({
  * An existing index or constraint: a summary row to drop, or to open as an
  * editable card. Edited ones are recreated (or renamed in place) on apply.
  */
-function ExistingRow({
+export function ExistingRow({
   dropped,
   change,
   editing,
@@ -838,7 +900,7 @@ function ExistingRow({
   )
 }
 
-function NewCard({
+export function NewCard({
   onRemove,
   onReset,
   children
@@ -896,7 +958,7 @@ function useEditing(): [Set<string>, (id: string) => void] {
   return [editing, toggle]
 }
 
-const columnOptions = (draft: TableDraft): { id: string; label: string }[] =>
+export const columnOptions = (draft: TableDraft): { id: string; label: string }[] =>
   draft.columns
     .filter((c) => !c.dropped && c.name.trim())
     .map((c) => ({ id: c.id, label: c.name.trim() }))
