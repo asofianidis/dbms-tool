@@ -14,6 +14,8 @@ use crate::model::*;
 
 use super::tls::{self, ClientCert};
 
+mod events;
+
 pub struct MySession {
     conn: Conn,
     opts: Opts,
@@ -469,18 +471,24 @@ impl MySession {
             .iter()
             .map(|r| {
                 let kind = text(r, 1).unwrap_or_default();
+                // MariaDB 10.3+ lists sequences as tables of type SEQUENCE, always with one row
+                let sequence = kind == "SEQUENCE";
                 DbObject {
                     schema: None,
                     name: text(r, 0).unwrap_or_default(),
                     kind: if kind.contains("VIEW") {
                         "view"
+                    } else if sequence {
+                        "sequence"
                     } else {
                         "table"
                     }
                     .to_string(),
                     detail: None,
                     comment: text(r, 2).filter(|c| !c.is_empty()),
-                    row_estimate: text(r, 3).and_then(|s| s.parse().ok()),
+                    row_estimate: text(r, 3)
+                        .and_then(|s| s.parse().ok())
+                        .filter(|_| !sequence),
                 }
             })
             .collect();
@@ -506,6 +514,9 @@ impl MySession {
                 row_estimate: None,
             }
         }));
+        // Scheduled events, with their status and schedule as the detail
+        let events = self.rows(events::LIST_SQL, vec![database.into()]).await?;
+        objects.extend(events.iter().map(events::object));
         Ok(objects)
     }
 
@@ -654,6 +665,8 @@ impl MySession {
             "view" => (format!("SHOW CREATE VIEW {target}"), 1),
             "function" => (format!("SHOW CREATE FUNCTION {target}"), 2),
             "procedure" => (format!("SHOW CREATE PROCEDURE {target}"), 2),
+            "event" => (format!("SHOW CREATE EVENT {target}"), 3),
+            "sequence" => (format!("SHOW CREATE SEQUENCE {target}"), 1),
             _ => return Ok(None),
         };
         let row: Option<Row> = self.conn.query_first(sql).await?;

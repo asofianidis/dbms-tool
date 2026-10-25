@@ -67,6 +67,7 @@ import {
   type TabOf
 } from '@/lib/workspace'
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
+import { editorMariaDb } from '@/components/editor/mariadb-completion'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
 import { SavedButton } from '../saved/SavedButton'
@@ -558,11 +559,15 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   // Tabs opened by "Execute…" or a saved query run once, after the editor has the text
   const executeRef = useRef(execute)
   executeRef.current = execute
+  // Tabs opened by "Explain" (the slow query log) explain the text instead, like Mod-L
+  const explainRef = useRef((s: string) => s)
+  explainRef.current = (s) => explainSql(s, dialect, false, babelfish, mariadb)
   useEffect(() => {
     if (!tab.autorun) return
+    const explain = tab.autorun === 'explain'
     const timer = setTimeout(() => {
       updateTab(tab.id, { autorun: false })
-      void executeRef.current('all')
+      void executeRef.current('all', explain ? explainRef.current : undefined, explain)
     }, 50)
     return () => clearTimeout(timer)
   }, [tab.autorun, tab.id])
@@ -742,7 +747,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             ref={editor}
             value={tab.text}
             onChange={(text) => updateTab(tab.id, { text })}
-            language={{ kind: 'sql', dialect }}
+            language={{ kind: 'sql', dialect, mariaDb: editorMariaDb(connectedInfo(status)) }}
             completion={namespace}
             defaultSchema={defaultSchema}
             sqlTables={completion.data}
