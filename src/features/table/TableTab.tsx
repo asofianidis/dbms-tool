@@ -90,6 +90,7 @@ import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { SequenceDetails } from './SequenceDetails'
 import { openTableDesigner } from './TableDesigner'
 import { StorageSummary } from './StorageOptions'
+import { RlsSection } from './RlsSection'
 import { openTriggerDesigner } from './TriggerDesigner'
 
 /** Where a foreign key points. MySQL reports the referenced database as its schema. */
@@ -823,6 +824,14 @@ function StructureView({
             <p className="text-xs text-faint">No triggers</p>
           )}
         </Section>
+        {engine === 'postgres' && tab.objectKind === 'table' && (
+          <RlsSection
+            connectionId={tab.connectionId}
+            database={tab.database}
+            schema={tab.schema}
+            table={tab.name}
+          />
+        )}
       </div>
     </>
   )
