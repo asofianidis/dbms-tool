@@ -244,13 +244,40 @@ fn text(row: &Row, i: usize) -> Option<String> {
 }
 
 /// Interrupts the statement running on connection `thread_id` from a second connection.
-fn kill_query(opts: Opts, thread_id: u32) {
+/// The caller waits for the returned task before sending anything else on that
+/// connection, so a late KILL can't land on its next statement.
+fn kill_query(opts: Opts, thread_id: u32) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Ok(mut killer) = Conn::new(opts).await {
+        let connect = tokio::time::timeout(crate::limits::connect_timeout(), Conn::new(opts));
+        if let Ok(Ok(mut killer)) = connect.await {
             let _ = killer.query_drop(format!("KILL QUERY {thread_id}")).await;
             let _ = killer.disconnect().await;
         }
-    });
+    })
+}
+
+/// Awaits `fut`, which reads from the server, and starts a KILL QUERY the first
+/// time `cancel` fires. The future itself keeps running so the reply is still read
+/// in order; the kill makes the server end it early.
+async fn cancellable<T>(
+    fut: impl std::future::Future<Output = T>,
+    cancel: &CancelSignal,
+    out: &mut OutputBuilder,
+    kill: &mut Option<tokio::task::JoinHandle<()>>,
+    opts: &Opts,
+    thread_id: u32,
+) -> T {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.wait(), if !out.cancelled => {
+                out.cancelled = true;
+                *kill = Some(kill_query(opts.clone(), thread_id));
+            }
+            r = &mut fut => return r,
+        }
+    }
 }
 
 fn quote_ident(name: &str) -> String {
@@ -369,28 +396,36 @@ impl MySession {
         out: &mut OutputBuilder,
         cancel: &CancelSignal,
     ) -> Result<u16, mysql_async::Error> {
+        let mut kill = None;
+        let result = self.run_statements(sql, out, cancel, &mut kill).await;
+        // Let a pending KILL QUERY land before this connection runs anything else;
+        // on an idle connection it does nothing
+        if let Some(task) = kill {
+            let _ = task.await;
+        }
+        result
+    }
+
+    async fn run_statements(
+        &mut self,
+        sql: &str,
+        out: &mut OutputBuilder,
+        cancel: &CancelSignal,
+        kill: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<u16, mysql_async::Error> {
         let thread_id = self.conn.id();
         let opts = self.opts.clone();
-        // The server answers only once the first statement finishes, so watch for
-        // cancellation while waiting for the first result too
+        // Every read from the server waits for a statement to finish (the first
+        // result, and the next statement's after each set), so all of them watch
+        // for cancellation
         let query = self.conn.query_iter(sql);
-        tokio::pin!(query);
-        let mut result = loop {
-            tokio::select! {
-                biased;
-                _ = cancel.wait(), if !out.cancelled => {
-                    out.cancelled = true;
-                    kill_query(opts.clone(), thread_id);
-                }
-                r = &mut query => break r?,
-            }
-        };
+        let mut result = cancellable(query, cancel, out, kill, &opts, thread_id).await?;
         let mut warnings = 0;
         while let Some(columns) = result.columns() {
             warnings = result.warnings();
             if columns.is_empty() {
                 out.affected(result.affected_rows());
-                result.next().await?;
+                cancellable(result.next(), cancel, out, kill, &opts, thread_id).await?;
             } else {
                 out.begin_set(
                     columns
@@ -401,17 +436,9 @@ impl MySession {
                         })
                         .collect(),
                 );
-                loop {
-                    let next = tokio::select! {
-                        biased;
-                        _ = cancel.wait(), if !out.cancelled => {
-                            out.cancelled = true;
-                            kill_query(opts.clone(), thread_id);
-                            continue;
-                        }
-                        next = result.next() => next?,
-                    };
-                    let Some(row) = next else { break };
+                while let Some(row) =
+                    cancellable(result.next(), cancel, out, kill, &opts, thread_id).await?
+                {
                     if out.wants_rows() {
                         let max = out.max_binary();
                         let values = (0..row.len())

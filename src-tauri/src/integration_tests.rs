@@ -652,7 +652,7 @@ async fn mariadb_end_to_end() {
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
-    m.close(&c.id);
+    m.close(&c.id).await;
 }
 
 /// Signs in as `user`, on a connection config of its own.
@@ -666,7 +666,7 @@ async fn sign_in(
     c.user = user.into();
     let m = Manager::default();
     let result = m.open(c.clone(), Some(password.into())).await;
-    m.close(&c.id);
+    m.close(&c.id).await;
     result
 }
 
@@ -773,7 +773,7 @@ async fn mariadb_auth_plugins() {
         )
         .await;
     }
-    m.close(&c.id);
+    m.close(&c.id).await;
 }
 
 #[tokio::test]
@@ -797,7 +797,7 @@ async fn mysql_caching_sha2_sign_in() {
     .await;
     let result = sign_in(&c, &name, &pw).await;
     run_sql(&m, &c.id, "drop user", &format!("DROP USER '{name}'@'%'")).await;
-    m.close(&c.id);
+    m.close(&c.id).await;
     assert!(
         result.is_ok_and(|info| info.product.starts_with("MySQL")),
         "caching_sha2_password user didn't sign in"
@@ -845,7 +845,7 @@ async fn replica_status() {
                 row[lag].is_null() || row[lag].as_str().is_some_and(|v| v.parse::<u64>().is_ok())
             );
         }
-        m.close(&id);
+        m.close(&id).await;
     }
 }
 
@@ -1024,8 +1024,8 @@ async fn mariadb_explain_json() {
     assert_eq!(cell(&out, 0, 0, 0), json!("90"));
 
     run("DROP DATABASE mdb_explain").await;
-    m.close("ro");
-    m.close(&c.id);
+    m.close("ro").await;
+    m.close(&c.id).await;
 }
 
 #[tokio::test]
@@ -1093,6 +1093,27 @@ async fn mysql_end_to_end() {
     );
     let out = s.execute("tab2", "", "SELECT 7", &opts()).await.unwrap();
     assert_eq!(cell(&out, 0, 0, 0), json!("7"));
+
+    // The timeout also stops a slow statement after one without results
+    let started = std::time::Instant::now();
+    let limited = ExecOptions {
+        timeout_secs: Some(1),
+        ..opts()
+    };
+    let out = s
+        .execute("tab2", "", "DO 0; DO SLEEP(30)", &limited)
+        .await
+        .unwrap();
+    assert!(out.cancelled);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "timeout took {:?}",
+        started.elapsed()
+    );
+    // ...and its KILL QUERY doesn't hit what runs next
+    let out = s.execute("tab2", "", "SELECT 8", &opts()).await.unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("8"));
     s.execute("tab1", "", "DROP DATABASE dbms_test", &opts())
         .await
         .unwrap();
@@ -1833,7 +1854,29 @@ async fn sqlite_transactions() {
         Some(true)
     );
     assert_eq!(run("ROLLBACK").await.in_transaction, Some(false));
-    m.close("sqlite-tx");
+    m.close("sqlite-tx").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn concurrent_first_uses_share_one_session() {
+    let dir = std::env::temp_dir().join(format!("dbms-race-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db");
+    std::fs::write(&path, b"").unwrap();
+    let c: ConnectionConfig = serde_json::from_value(json!({
+        "id": "sqlite-race", "name": "t", "engine": "sqlite", "host": path.to_string_lossy()
+    }))
+    .unwrap();
+    let m = Manager::default();
+    m.open(c, None).await.expect("open");
+    let s = m.get("sqlite-race").unwrap();
+    for i in 0..20 {
+        let key = format!("tab{i}");
+        let (a, b) = tokio::join!(s.session(&key, ""), s.session(&key, ""));
+        assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()), "{key}");
+    }
+    m.close("sqlite-race").await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1873,7 +1916,7 @@ async fn postgres_through_ssh_tunnel() {
         .await
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
-    m.close("ssh-tunnel");
+    m.close("ssh-tunnel").await;
 }
 
 /// Scheduled events are listed with their status and schedule, and the scripts
@@ -1979,7 +2022,7 @@ async fn mysql_events_end_to_end() {
             .await
             .unwrap();
         assert!(out.error.is_none(), "{var}: {:?}", out.error);
-        m.close(&id);
+        m.close(&id).await;
     }
 }
 
@@ -2255,11 +2298,12 @@ async fn postgres_listen_notify() {
         .expect("disconnect reported")
         .unwrap();
     assert!(batch.error.is_some());
+    // The new session listens on the old channels again
     let channels = s
-        .pg_listen("notify-tab", db, vec!["pg_notify_A".into()], emit.clone())
+        .pg_listen("notify-tab", db, vec!["pg_notify c".into()], emit.clone())
         .await
         .unwrap();
-    assert_eq!(channels, vec!["pg_notify_A"]);
+    assert_eq!(channels, vec!["pg_notify c", "pg_notify_A"]);
     s.execute("ed2", db, "NOTIFY \"pg_notify_A\", 'again'", &opts())
         .await
         .unwrap();

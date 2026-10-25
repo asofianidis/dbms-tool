@@ -151,8 +151,8 @@ pub fn connection_save(
 }
 
 #[tauri::command]
-pub fn connection_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.manager.close(&id);
+pub async fn connection_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.manager.close(&id).await;
     config::delete_password(&id);
     config::delete_password(&config::ssh_secret_id(&id));
     state.store.remove(&id)
@@ -206,8 +206,9 @@ pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn connection_close(state: State<'_, AppState>, id: String) {
-    state.manager.close(&id);
+pub async fn connection_close(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.manager.close(&id).await;
+    Ok(())
 }
 
 /// Applies the connect timeout from Settings to connections opened from now on.
