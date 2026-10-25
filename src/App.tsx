@@ -11,6 +11,7 @@ import { TabBar } from './components/shell/TabBar'
 import { TitleBar } from './components/shell/TitleBar'
 import { EmptyState, Toaster } from './components/ui'
 import { ExecuteRoutineHost } from './features/explorer/ExecuteRoutineDialog'
+import { LogicalReplicationHost } from './features/explorer/logical-replication'
 import { CreateCollectionHost } from './features/mongo/CreateCollectionDialog'
 import { MongoUserDesignerHost } from './features/mongo/MongoUserDesigner'
 import { Explorer } from './features/explorer/Explorer'
@@ -262,6 +263,7 @@ export function App(): React.JSX.Element {
       <ConfirmHost />
       <PromptHost />
       <ExecuteRoutineHost />
+      <LogicalReplicationHost />
       <CreateCollectionHost />
       <TableDesignerHost />
       <SchemaDesignerHost />

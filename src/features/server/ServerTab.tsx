@@ -40,6 +40,7 @@ import { ClusterPanel } from '../mongo/ClusterPanel'
 import { AuroraPanel, useAurora } from './AuroraPanel'
 import { ExtensionsPanel } from './ExtensionsPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
+import { PgReplicationPanel, usePgReplication } from './PgReplicationPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
 import {
@@ -164,6 +165,11 @@ function ServerDashboard({
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
   const extensions = extensionFlavor(connection.engine, info)
+  const replication = usePgReplication(
+    connection,
+    connection.engine === 'postgres' && !babelfish,
+    active && visible ? refresh : 0
+  )
   const aurora = useAurora(
     connection,
     connection.engine === 'postgres' && !babelfish,
@@ -332,6 +338,8 @@ function ServerDashboard({
         />
 
         <GaleraPanel galera={galera} />
+
+        <PgReplicationPanel connection={connection} replication={replication} />
 
         <AuroraPanel aurora={aurora} />
 
