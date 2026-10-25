@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { KeyBinding } from '@codemirror/view'
 import { api } from '@/lib/api'
-import { parseShellValue, toShell } from '@/lib/ejson'
+import { parseShellValue, sameEjson, toShell } from '@/lib/ejson'
 import { MOD } from '@/lib/keys'
 import { errorMessage, toast } from '@/lib/toast'
 import { CodeEditor } from '@/components/editor/CodeEditor'
@@ -62,7 +62,7 @@ export function DocumentEditor({
         if (id === undefined)
           throw new Error('The original document has no _id, so it can’t be replaced safely')
         const next = doc as Record<string, unknown>
-        if (JSON.stringify(next._id) !== JSON.stringify(id))
+        if (!sameEjson(next._id, id))
           throw new Error('_id can’t be changed. Clone the document instead.')
         const out = await api.mongo(request.connectionId, '__meta', {
           op: 'replaceOne',

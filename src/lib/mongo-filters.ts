@@ -1,4 +1,12 @@
-import { bsonType, parseShellValue, shellHelpers, toEjson, toShell, type BsonType } from './ejson'
+import {
+  bsonType,
+  parseIsoDate,
+  parseShellValue,
+  shellHelpers,
+  toEjson,
+  toShell,
+  type BsonType
+} from './ejson'
 import {
   OPERATORS,
   type ColumnKind,
@@ -58,6 +66,8 @@ export function sampleFields(documents: Doc[], maxDepth = 3): Record<string, str
   return fields
 }
 
+const DECIMAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/
+
 /** Typed text from the builder: mongosh literals like ObjectId('…') work for any field. */
 function typedValue(text: string, type: string): unknown {
   const t = text.trim()
@@ -65,10 +75,21 @@ function typedValue(text: string, type: string): unknown {
     case 'text':
       return text
     case 'number':
+      // Same BSON type as the field: a double never equals Decimal128 1.10, and
+      // Int64 values past 2^53 would round
+      if (type === 'Decimal128' && DECIMAL.test(t)) return shellHelpers.NumberDecimal(t)
+      if (type === 'Int64' && /^[+-]?\d+$/.test(t)) return shellHelpers.NumberLong(BigInt(t))
       if (t && Number.isFinite(Number(t))) return Number(t)
       break
     case 'date': {
-      const d = new Date(t)
+      if (type === 'Timestamp') {
+        if (/^\d+$/.test(t)) return shellHelpers.Timestamp(Number(t), 0)
+        const d = parseIsoDate(t)
+        if (t && !/^[A-Za-z]\w*\(/.test(t) && !Number.isNaN(d.getTime()))
+          return shellHelpers.Timestamp(Math.floor(d.getTime() / 1000), 0)
+        break
+      }
+      const d = parseIsoDate(t)
       if (t && !Number.isNaN(d.getTime())) return d
       break
     }
