@@ -36,6 +36,7 @@ import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
+import { ReplicationPanel, useReplication } from './ReplicationPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
 import {
@@ -156,6 +157,11 @@ function ServerDashboard({
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
+  const replication = useReplication(
+    connection,
+    connection.engine === 'postgres' && !babelfish,
+    active && visible ? refresh : 0
+  )
 
   // Blocking chains from the activity list's blocked-by column and the lock list's
   const forest = useMemo(() => {
@@ -313,6 +319,8 @@ function ServerDashboard({
         />
 
         <GaleraPanel galera={galera} />
+
+        <ReplicationPanel connection={connection} replication={replication} />
 
         {babelfish && (
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
