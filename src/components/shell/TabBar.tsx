@@ -110,6 +110,8 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       if (
         tab.objectKind === 'function' ||
         tab.objectKind === 'procedure' ||
+        tab.objectKind === 'aggregate' ||
+        tab.objectKind === 'window_function' ||
         tab.objectKind === 'package'
       ) {
         return <FunctionSquare className={cn(c, 'text-syn-fn')} />

@@ -250,6 +250,9 @@ export type ObjectKind =
   | 'timeseries'
   /** MySQL / MariaDB scheduled event */
   | 'event'
+  /** PostgreSQL aggregate and window function: listed with routines, but not callable alone */
+  | 'aggregate'
+  | 'window_function'
 
 export interface DbObject {
   schema: string | null

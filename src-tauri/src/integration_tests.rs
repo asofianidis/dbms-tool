@@ -1983,6 +1983,154 @@ async fn mysql_events_end_to_end() {
     }
 }
 
+/// Aggregates and window functions in the explorer, and catalog queries that
+/// must also work on PostgreSQL 10 and 11 (`DBMS_TEST_PG_OLD`, e.g. postgres:11-alpine).
+#[tokio::test]
+async fn postgres_aggregates_and_old_servers() {
+    for var in ["DBMS_TEST_PG", "DBMS_TEST_PG_OLD"] {
+        let Some((m, id)) = open(Engine::Postgres, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let db = "pg_objects";
+        // DROP DATABASE can't share an (implicitly transactional) multi-statement query
+        let terminate = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+            WHERE datname = 'pg_objects' AND pid <> pg_backend_pid()";
+        let reset = "DROP DATABASE IF EXISTS pg_objects";
+        for sql in [terminate, reset] {
+            let out = s.execute("t", "", sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        }
+        let out = s
+            .execute("t", "", "CREATE DATABASE pg_objects", &opts())
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        let setup = "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, n int, s serial); \
+            CREATE AGGREGATE agg_sum(int) (SFUNC = int4pl, STYPE = int, INITCOND = '0', \
+              COMBINEFUNC = int4pl, PARALLEL = SAFE); \
+            CREATE AGGREGATE agg_moving(int) (SFUNC = int4pl, STYPE = int, INITCOND = '0', \
+              MSFUNC = int4pl, MINVFUNC = int4mi, MSTYPE = int, MINITCOND = '0'); \
+            CREATE AGGREGATE agg_max(int) (SFUNC = int4larger, STYPE = int, SORTOP = >); \
+            CREATE AGGREGATE agg_count(*) (SFUNC = int8inc, STYPE = int8, INITCOND = '0'); \
+            CREATE AGGREGATE agg_pct(float8 ORDER BY anyelement) (SFUNC = ordered_set_transition, \
+              STYPE = internal, FINALFUNC = percentile_disc_final, FINALFUNC_EXTRA); \
+            CREATE FUNCTION plain(a int) RETURNS int LANGUAGE sql AS $$ SELECT a $$;";
+        let out = s.execute("t", db, setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+
+        let objects = s.list_objects(db, Some("public")).await.unwrap();
+        let kind = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .map(|o| (o.kind.clone(), o.detail.clone().unwrap_or_default()))
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+        };
+        assert_eq!(
+            kind("plain"),
+            ("function".into(), "a integer".into()),
+            "{var}"
+        );
+        assert_eq!(
+            kind("agg_sum"),
+            ("aggregate".into(), "integer".into()),
+            "{var}"
+        );
+        assert_eq!(
+            kind("agg_count"),
+            ("aggregate".into(), String::new()),
+            "{var}"
+        );
+        assert_eq!(kind("t").0, "table", "{var}");
+        let info = s.describe_table(db, Some("public"), "t").await.unwrap();
+        assert_eq!(info.primary_key, vec!["id"], "{var}");
+        assert!(
+            info.columns[0].is_identity && info.columns[0].is_generated,
+            "{var}"
+        );
+        assert!(!info.columns[1].is_generated, "{var}");
+        assert!(info.columns[2].is_generated, "{var}");
+
+        let catalog = s.list_objects(db, Some("pg_catalog")).await.unwrap();
+        let find = |name: &str| {
+            catalog
+                .iter()
+                .find(|o| o.name == name)
+                .map(|o| o.kind.as_str())
+        };
+        assert_eq!(find("row_number"), Some("window_function"), "{var}");
+        assert_eq!(find("count"), Some("aggregate"), "{var}");
+        let ddl = s
+            .object_definition(
+                db,
+                Some("pg_catalog"),
+                "row_number",
+                "window_function",
+                Some(""),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        // Messages name the server only: CodeQL treats what this connection reads as secret
+        assert!(ddl.contains("WINDOW"), "{var}");
+        let routine = s
+            .describe_routine(db, Some("public"), "plain", "function", Some("a integer"))
+            .await
+            .unwrap();
+        assert_eq!(routine.returns.as_deref(), Some("integer"), "{var}");
+
+        // Every aggregate's DDL recreates it as it was
+        for (name, args, expect) in [
+            ("agg_sum", "integer", "COMBINEFUNC = int4pl"),
+            ("agg_moving", "integer", "MINVFUNC = int4mi"),
+            ("agg_max", "integer", "SORTOP = OPERATOR(pg_catalog.>)"),
+            ("agg_count", "", "CREATE AGGREGATE public.agg_count (*)"),
+            (
+                "agg_pct",
+                "double precision ORDER BY anyelement",
+                "FINALFUNC_EXTRA",
+            ),
+        ] {
+            let definition =
+                || s.object_definition(db, Some("public"), name, "aggregate", Some(args));
+            let ddl = definition().await.unwrap().unwrap_or_default();
+            assert!(ddl.contains(expect), "{var}: {name}");
+            let signature = if args.is_empty() { "*" } else { args };
+            let sql = format!("DROP AGGREGATE public.{name}({signature}); {ddl}");
+            let out = s.execute("t", db, &sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {name}");
+            assert_eq!(
+                definition().await.unwrap().unwrap_or_default(),
+                ddl,
+                "{var}"
+            );
+        }
+        let parallel = s
+            .object_definition(db, Some("public"), "agg_sum", "aggregate", Some("integer"))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(parallel.contains("PARALLEL = SAFE"), "{var}");
+
+        m.close(&id);
+        let (m, id) = open(Engine::Postgres, var).await.unwrap();
+        let s = m.get(&id).unwrap();
+        let mut dropped = false;
+        for _ in 0..10 {
+            s.execute("t", "", terminate, &opts()).await.unwrap();
+            let out = s.execute("t", "", reset, &opts()).await.unwrap();
+            if out.error.is_none() {
+                dropped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(dropped, "{var}: pg_objects not dropped");
+        m.close(&id);
+    }
+}
+
 /// Notifications show in the messages of the tab that LISTENs, and the
 /// Notifications tab's own session streams them until it's closed.
 #[tokio::test]

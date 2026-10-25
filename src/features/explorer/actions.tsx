@@ -64,6 +64,7 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { versioningScriptItems } from './Versioning'
 import { eventMenuItems } from './events'
 import { matviewMenuItems } from './matviews'
+import { pgAggregateMenuItems } from './pg-routine-actions'
 import { rlsMenuItems } from './rls-actions'
 import { mariaDbSequenceItems } from './sequence-actions'
 
@@ -350,6 +351,8 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
     )
   } else if (obj.kind === 'event') {
     items.push(...eventMenuItems(connectionId, database, obj))
+  } else if (obj.kind === 'aggregate' || obj.kind === 'window_function') {
+    items.push(...pgAggregateMenuItems(connectionId, database, obj))
   } else if (obj.kind === 'sequence' && dialect === 'mysql') {
     // Only MariaDB lists sequences on the MySQL engine
     items.push(

@@ -482,6 +482,8 @@ const KIND_LABELS: Record<DiffItem['kind'], string> = {
   collection: 'Collections',
   timeseries: 'Time series',
   event: 'Events',
+  aggregate: 'Aggregates',
+  window_function: 'Window functions',
   type: 'Types',
   extension: 'Extensions'
 }

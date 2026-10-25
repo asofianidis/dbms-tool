@@ -137,6 +137,8 @@ import { MatviewRowDetail } from './matviews'
 import { RlsBadge, hasRls, policyMenuItems, rlsActionItems, useRlsFlags } from './rls-actions'
 import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
+import { routineSignature } from '@/lib/pg-objects'
+import { PgDatabaseFolders } from './PgObjects'
 import { Inbox, Send } from 'lucide-react'
 import { logicalQueries, type Publication, type Subscription } from '@/lib/pg-logical'
 import {
@@ -855,6 +857,7 @@ function DatabaseNode({
           <>
             <SchemaList connection={connection} database={database} depth={depth + 1} />
             <ExtensionsFolder connection={connection} database={database} depth={depth + 1} />
+            <PgDatabaseFolders connection={connection} database={database} depth={depth + 1} />
             <PublicationsFolder connection={connection} database={database} depth={depth + 1} />
             <SubscriptionsFolder connection={connection} database={database} depth={depth + 1} />
           </>
@@ -1111,7 +1114,8 @@ const FOLDERS: {
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
-  { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['function', 'window_function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['aggregate'], label: 'Aggregates' },
   { kinds: ['package'], label: 'Packages', packages: true },
   { kinds: ['sequence'], label: 'Sequences', newSequence: true },
   { kinds: ['synonym'], label: 'Synonyms' },
@@ -1354,6 +1358,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
       return <Eye className="text-syn-type" />
     case 'function':
     case 'procedure':
+    case 'aggregate':
+    case 'window_function':
       return <FunctionSquare className="text-syn-fn" />
     case 'package':
       return <Package className="text-syn-fn" />
@@ -1383,6 +1389,8 @@ function ObjectNode({
   const [open, setOpen] = useExpanded(id)
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(obj.kind)
   const isRoutine = obj.kind === 'procedure' || obj.kind === 'function'
+  // Aggregates and window functions show their arguments, but can't be executed alone
+  const hasArgs = isRoutine || obj.kind === 'aggregate' || obj.kind === 'window_function'
   const showSchema =
     (connection.engine === 'mssql' || connection.engine === 'babelfish') && obj.schema
   // Row estimate, or "not populated"
@@ -1394,7 +1402,7 @@ function ObjectNode({
       <Row
         id={id}
         depth={depth}
-        expandable={browsable || isRoutine}
+        expandable={browsable || hasArgs}
         open={open}
         onToggle={() => setOpen()}
         onOpen={() =>
@@ -1420,10 +1428,10 @@ function ObjectNode({
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
             <VersionedMark connection={connection} database={database} obj={obj} />
-            {(obj.kind === 'function' || obj.kind === 'procedure') &&
-              connection.engine === 'postgres' && (
-                <span className="text-faint">({obj.detail})</span>
-              )}
+            {hasArgs && connection.engine === 'postgres' && (
+              <span className="text-faint">({routineSignature(obj)})</span>
+            )}
+            {obj.kind === 'window_function' && <span className="ml-1 text-faint">window</span>}
             <RlsBadge connection={connection} database={database} obj={obj} />
           </>
         }
@@ -1451,7 +1459,7 @@ function ObjectNode({
       {open && browsable && (
         <TableChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
       )}
-      {open && isRoutine && (
+      {open && hasArgs && (
         <RoutineChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
       )}
     </>
@@ -1889,6 +1897,9 @@ function CatalogFolder<T>({
     </>
   )
 }
+
+// For the PostgreSQL folders in PgObjects.tsx
+export { CatalogFolder, EmptyRow, Row, useExpanded }
 
 const copyName = (name: string): MenuItem => ({
   label: 'Copy name',
