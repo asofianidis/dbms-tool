@@ -39,8 +39,11 @@ fn ssl_opts(cfg: &ConnectionConfig) -> AppResult<SslOpts> {
         .with_danger_skip_domain_validation(!cfg.verify_hostname())
         // Through a tunnel the certificate names the real server, not 127.0.0.1
         .with_danger_tls_hostname_override(cfg.tunneled.as_ref().map(|(h, _)| h.clone()));
+    // Trust only the CA file, not the system roots too (see tls::native_connector)
     if let Some(path) = cfg.root_cert() {
-        ssl = ssl.with_root_certs(vec![tls::read_file(path, "CA certificate")?.into()]);
+        ssl = ssl
+            .with_root_certs(vec![tls::read_file(path, "CA certificate")?.into()])
+            .with_disable_built_in_roots(true);
     }
     match tls::client_cert(cfg)? {
         None => {}
@@ -799,5 +802,35 @@ impl MySession {
             );
         }
         Ok(tables)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ssl_opts;
+    use crate::config::{ConnectionConfig, SslMode};
+
+    fn cfg(ssl: SslMode, ca: &str) -> ConnectionConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "x", "engine": "mysql", "ssl": ssl, "sslRootCert": ca
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ca_file_replaces_the_system_roots() {
+        let path = std::env::temp_dir().join(format!("dbms-tool-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"ca").unwrap();
+        let opts = ssl_opts(&cfg(SslMode::VerifyCa, path.to_str().unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        let opts = opts.unwrap();
+        assert!(opts.disable_built_in_roots());
+        assert_eq!(opts.root_certs().len(), 1);
+        // Without a CA file the system roots are still used
+        assert!(
+            !ssl_opts(&cfg(SslMode::VerifyFull, ""))
+                .unwrap()
+                .disable_built_in_roots()
+        );
     }
 }
