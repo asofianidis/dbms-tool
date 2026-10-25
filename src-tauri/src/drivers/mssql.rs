@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use chrono::Timelike;
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use tiberius::{
@@ -251,29 +252,72 @@ fn cell(data: &ColumnData<'static>, max_binary: usize) -> Value {
         ColumnData::Binary(v) => v
             .as_ref()
             .map_or(Value::Null, |b| s(hex_bytes_max(b, max_binary))),
-        ColumnData::Numeric(v) => v.map_or(Value::Null, |n| s(n.to_string())),
+        ColumnData::Numeric(v) => v.map_or(Value::Null, |n| s(numeric_text(n.value(), n.scale()))),
         ColumnData::Xml(v) => v.as_ref().map_or(Value::Null, |x| s(x.to_string())),
-        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
+        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) => {
             match chrono::NaiveDateTime::from_sql(data) {
                 Ok(Some(dt)) => s(dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
                 _ => Value::Null,
             }
         }
+        ColumnData::DateTime2(v) => match (v, chrono::NaiveDateTime::from_sql(data)) {
+            (Some(raw), Ok(Some(dt))) => s(format!(
+                "{}{}",
+                dt.format("%Y-%m-%d %H:%M:%S"),
+                fraction(dt.nanosecond(), raw.time().scale())
+            )),
+            _ => Value::Null,
+        },
         ColumnData::Date(_) => match chrono::NaiveDate::from_sql(data) {
             Ok(Some(d)) => s(d.format("%Y-%m-%d").to_string()),
             _ => Value::Null,
         },
-        ColumnData::Time(_) => match chrono::NaiveTime::from_sql(data) {
-            Ok(Some(t)) => s(t.format("%H:%M:%S%.f").to_string()),
+        ColumnData::Time(v) => match (v, chrono::NaiveTime::from_sql(data)) {
+            (Some(raw), Ok(Some(t))) => s(format!(
+                "{}{}",
+                t.format("%H:%M:%S"),
+                fraction(t.nanosecond(), raw.scale())
+            )),
             _ => Value::Null,
         },
-        ColumnData::DateTimeOffset(_) => {
-            match chrono::DateTime::<chrono::FixedOffset>::from_sql(data) {
-                Ok(Some(dt)) => s(dt.format("%Y-%m-%d %H:%M:%S%.f %:z").to_string()),
+        ColumnData::DateTimeOffset(v) => {
+            match (v, chrono::DateTime::<chrono::FixedOffset>::from_sql(data)) {
+                (Some(raw), Ok(Some(dt))) => s(format!(
+                    "{}{} {}",
+                    dt.format("%Y-%m-%d %H:%M:%S"),
+                    fraction(dt.nanosecond(), raw.datetime2().time().scale()),
+                    dt.format("%:z")
+                )),
                 _ => Value::Null,
             }
         }
     }
+}
+
+/// Fractional seconds with exactly `scale` digits (the column's precision,
+/// 0-7 for time/datetime2/datetimeoffset), so the text round-trips into a
+/// WHERE clause.
+fn fraction(nanos: u32, scale: u8) -> String {
+    let scale = scale.min(9) as u32;
+    if scale == 0 {
+        return String::new();
+    }
+    // A leap second is reported as nanos >= 1e9; keep it within the digits
+    let digits = (nanos % 1_000_000_000) / 10u32.pow(9 - scale);
+    format!(".{digits:0width$}", width = scale as usize)
+}
+
+/// `value / 10^scale` as exact decimal text: `5` for decimal(10,0), `-0.05`.
+fn numeric_text(value: i128, scale: u8) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let sign = if value < 0 { "-" } else { "" };
+    let scale = scale as usize;
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let digits = format!("{digits:0>width$}", width = scale + 1);
+    let (int, frac) = digits.split_at(digits.len() - scale);
+    format!("{sign}{int}.{frac}")
 }
 
 fn text(row: &Row, i: usize) -> Option<String> {
@@ -294,39 +338,19 @@ pub fn split_batches(script: &str) -> Vec<(u32, String, u32)> {
     let mut batches = Vec::new();
     let mut current = String::new();
     let mut start = 1u32;
-    let mut in_block_comment = false;
+    let mut lex = Lex::Code;
     for (i, line) in script.split_inclusive('\n').enumerate() {
         let line_no = i as u32 + 1;
         // `GO -- comment` is still a separator
         let trimmed = line.split("--").next().unwrap_or("").trim();
-        // Track /* */ so a GO inside a block comment isn't treated as a separator
-        let was_in_comment = in_block_comment;
-        let mut rest = line;
-        loop {
-            if in_block_comment {
-                match rest.find("*/") {
-                    Some(p) => {
-                        in_block_comment = false;
-                        rest = &rest[p + 2..];
-                    }
-                    None => break,
-                }
-            } else {
-                match rest.find("/*") {
-                    Some(p) => {
-                        in_block_comment = true;
-                        rest = &rest[p + 2..];
-                    }
-                    None => break,
-                }
-            }
-        }
+        // A GO inside a block comment, string or [identifier] isn't a separator
+        let in_code = lex == Lex::Code;
+        lex = lex.scan(line);
         let mut words = trimmed.split_whitespace();
-        let is_go =
-            !was_in_comment && words.next().is_some_and(|w| w.eq_ignore_ascii_case("go")) && {
-                let count = words.next();
-                words.next().is_none() && count.is_none_or(|c| c.parse::<u32>().is_ok())
-            };
+        let is_go = in_code && words.next().is_some_and(|w| w.eq_ignore_ascii_case("go")) && {
+            let count = words.next();
+            words.next().is_none() && count.is_none_or(|c| c.parse::<u32>().is_ok())
+        };
         if is_go {
             let repeat = trimmed
                 .split_whitespace()
@@ -347,6 +371,70 @@ pub fn split_batches(script: &str) -> Vec<(u32, String, u32)> {
         batches.push((start, current, 1));
     }
     batches
+}
+
+/// Where a line of T-SQL leaves the lexer, for [`split_batches`].
+#[derive(Clone, Copy, PartialEq)]
+enum Lex {
+    Code,
+    /// Inside '...' or "..." (the byte is the quote)
+    Quoted(u8),
+    /// Inside a [bracketed] identifier
+    Bracket,
+    /// Inside /* */, which T-SQL nests
+    Comment(u32),
+}
+
+impl Lex {
+    fn scan(mut self, line: &str) -> Lex {
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let next = b.get(i + 1).copied();
+            match self {
+                Lex::Code => match b[i] {
+                    b'-' if next == Some(b'-') => break,
+                    b'/' if next == Some(b'*') => {
+                        self = Lex::Comment(1);
+                        i += 1;
+                    }
+                    q @ (b'\'' | b'"') => self = Lex::Quoted(q),
+                    b'[' => self = Lex::Bracket,
+                    _ => {}
+                },
+                // A doubled quote or ]] is an escape, not the end
+                Lex::Quoted(q) if b[i] == q => {
+                    if next == Some(q) {
+                        i += 1;
+                    } else {
+                        self = Lex::Code;
+                    }
+                }
+                Lex::Bracket if b[i] == b']' => {
+                    if next == Some(b']') {
+                        i += 1;
+                    } else {
+                        self = Lex::Code;
+                    }
+                }
+                Lex::Comment(depth) if b[i] == b'*' && next == Some(b'/') => {
+                    self = if depth == 1 {
+                        Lex::Code
+                    } else {
+                        Lex::Comment(depth - 1)
+                    };
+                    i += 1;
+                }
+                Lex::Comment(depth) if b[i] == b'/' && next == Some(b'*') => {
+                    self = Lex::Comment(depth + 1);
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        self
+    }
 }
 
 impl MsSession {
@@ -994,7 +1082,7 @@ impl MsSession {
 
 #[cfg(test)]
 mod tests {
-    use super::split_batches;
+    use super::{fraction, numeric_text, split_batches};
 
     #[test]
     fn splits_on_go_lines() {
@@ -1011,5 +1099,51 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let batches = split_batches("SELECT 1\nGO -- end of batch\nSELECT 2");
         assert_eq!(batches.len(), 2);
+    }
+
+    #[test]
+    fn go_after_strings_and_line_comments_still_splits() {
+        let batches = split_batches("PRINT '/* start'\nGO\nCREATE PROC p AS SELECT 1\nGO\nEXEC p");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[1], (3, "CREATE PROC p AS SELECT 1\n".into(), 1));
+        let batches = split_batches("SELECT 1 -- old /*\nGO\nSELECT 2");
+        assert_eq!(batches.len(), 2);
+        let batches = split_batches("SELECT [a /* b], \"c /* d\"\nGO\nSELECT 2");
+        assert_eq!(batches.len(), 2);
+    }
+
+    #[test]
+    fn ignores_go_inside_multiline_strings_and_identifiers() {
+        let batches = split_batches("SELECT 'it''s\nGO\n'\nGO\nSELECT 2");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].1, "SELECT 'it''s\nGO\n'\n");
+        let batches = split_batches("SELECT 1 AS [x]]\nGO\n]\nGO 2");
+        assert_eq!(batches, vec![(1, "SELECT 1 AS [x]]\nGO\n]\n".into(), 2)]);
+        // T-SQL block comments nest
+        let batches = split_batches("/* a /* b */\nGO\n*/\nSELECT 1");
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn numeric_text_uses_the_scale() {
+        assert_eq!(numeric_text(5, 0), "5");
+        assert_eq!(numeric_text(-5, 0), "-5");
+        assert_eq!(numeric_text(-5, 2), "-0.05");
+        assert_eq!(numeric_text(5, 2), "0.05");
+        assert_eq!(numeric_text(12345, 2), "123.45");
+        assert_eq!(numeric_text(0, 3), "0.000");
+        // money's limits, decoded at scale 4
+        assert_eq!(numeric_text(i64::MAX.into(), 4), "922337203685477.5807");
+        assert_eq!(numeric_text(i64::MIN.into(), 4), "-922337203685477.5808");
+        assert_eq!(numeric_text(i128::MIN, 0), i128::MIN.to_string());
+    }
+
+    #[test]
+    fn fraction_keeps_the_column_precision() {
+        assert_eq!(fraction(123_456_700, 7), ".1234567");
+        assert_eq!(fraction(100_000_000, 7), ".1000000");
+        assert_eq!(fraction(5_000_000, 3), ".005");
+        assert_eq!(fraction(123_456_700, 0), "");
+        assert_eq!(fraction(1_999_999_900, 7), ".9999999");
     }
 }

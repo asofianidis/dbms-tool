@@ -825,7 +825,8 @@ async fn tds_suite(engine: Engine, var: &str) {
         set.rows[0][3],
         json!("6F9619FF-8B86-D011-B42D-00C04FC964FF")
     );
-    assert_eq!(set.rows[0][4], json!("2024-01-02 03:04:05.678"));
+    // datetime2 keeps its scale (7 by default)
+    assert_eq!(set.rows[0][4], json!("2024-01-02 03:04:05.6780000"));
     assert_eq!(set.rows[0][5], json!("1"));
     assert_eq!(set.rows[0][6], json!("0xBEEF"));
     assert_eq!(set.columns[1].type_name, "nvarchar");
@@ -847,6 +848,55 @@ async fn tds_suite(engine: Engine, var: &str) {
     let err = out.error.expect("error");
     assert_eq!(err.line, Some(2), "{}", err.message);
     assert_eq!(out.results.len(), 1, "results before the error survive");
+
+    // Values keep the column's exact precision, so grid edits can match them
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "SELECT CAST('2024-01-01 12:00:00.1234567' AS datetime2), \
+             CAST('2024-01-01 12:00:00.12' AS datetime2(2)), \
+             CAST('2024-01-01 12:00:00.123' AS datetime), \
+             CAST('12:00:00.1234567' AS time), CAST('12:00:00' AS time(0)), \
+             CAST('2024-01-01 12:00:00.1234567 +02:00' AS datetimeoffset), \
+             CAST(5 AS decimal(10,0)), CAST(-0.05 AS decimal(10,2)), \
+             CAST(922337203685477.5807 AS money), CAST(-922337203685477.5808 AS money), \
+             CAST(-1.5 AS smallmoney), CAST(NULL AS money)",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let expected = [
+        json!("2024-01-01 12:00:00.1234567"),
+        json!("2024-01-01 12:00:00.12"),
+        json!("2024-01-01 12:00:00.123"),
+        json!("12:00:00.1234567"),
+        json!("12:00:00"),
+        json!("2024-01-01 12:00:00.1234567 +02:00"),
+        json!("5"),
+        json!("-0.05"),
+        json!("922337203685477.5807"),
+        json!("-922337203685477.5808"),
+        json!("-1.5000"),
+        Value::Null,
+    ];
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(&cell(&out, 0, 0, i), want, "column {i}");
+    }
+
+    // A string or line comment holding /* doesn't hide later GO separators
+    let out = s
+        .execute(
+            "tab1",
+            "dbms_test",
+            "PRINT '/* start'\nGO\nCREATE PROCEDURE dbo.p AS SELECT 8 -- old /*\nGO\nEXEC dbo.p",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("8"));
 
     let dbs = s.list_databases().await.unwrap();
     assert!(dbs.iter().any(|d| d.name == "dbms_test"));
