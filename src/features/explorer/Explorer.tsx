@@ -72,6 +72,7 @@ import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
+import { knownMariaDb } from '@/lib/mariadb'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
@@ -1866,7 +1867,8 @@ function PrincipalsFolder({
       p.kind === 'role' ? 'role' : 'user',
       drop
     )
-  const options = catalogQueries.principals(connection.id, dialect, database)
+  const mariadb = knownMariaDb(statusStore.use()[connection.id])
+  const options = catalogQueries.principals(connection.id, dialect, database, mariadb)
   return (
     <CatalogFolder
       id={id}

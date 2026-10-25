@@ -37,10 +37,11 @@ import {
   type Securable,
   type SecurableKind
 } from '@/lib/grants'
+import { knownMariaDb } from '@/lib/mariadb'
 import { queries, queryClient } from '@/lib/queries'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
-import { connectionsStore, newQueryTab } from '@/lib/workspace'
+import { connectionsStore, newQueryTab, statusStore } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import {
   Badge,
@@ -156,11 +157,12 @@ function PermissionsDesigner(request: Request): React.JSX.Element {
   // Babelfish has no DENY
   const canDeny = dialect === 'tsql' && connection?.engine !== 'babelfish'
 
+  const mariadb = knownMariaDb(statusStore.use()[connectionId])
   const principals = useQuery({
     queryKey: ['conn', connectionId, 'principals', database],
     queryFn: async () => {
       const list = parsePrincipals(
-        await firstRows(connectionId, database, principalQueries(dialect))
+        await firstRows(connectionId, database, principalQueries(dialect, mariadb))
       )
       return dialect === 'postgres' ? [PUBLIC_PRINCIPAL, ...list] : list
     },

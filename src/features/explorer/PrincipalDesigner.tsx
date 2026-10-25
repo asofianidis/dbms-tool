@@ -14,7 +14,7 @@ import {
   type GrantMap,
   type Principal
 } from '@/lib/grants'
-import { connectedInfo, isMariaDb } from '@/lib/mariadb'
+import { connectedInfo, isMariaDb, knownMariaDb } from '@/lib/mariadb'
 import {
   TSQL_LOGINS_QUERY,
   canRenamePrincipal,
@@ -111,8 +111,9 @@ function PrincipalDesigner(request: Request): React.JSX.Element {
   const { connectionId, database } = request
   const connection = connectionsStore.use().find((c) => c.id === connectionId)
   const dialect: Dialect = (connection && ENGINES[connection.engine].dialect) || 'postgres'
+  const mariadb = knownMariaDb(statusStore.use()[connectionId])
   const principals = useQuery({
-    ...catalogQueries.principals(connectionId, dialect, database),
+    ...catalogQueries.principals(connectionId, dialect, database, mariadb),
     staleTime: 0
   })
   const principal =
