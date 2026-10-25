@@ -30,7 +30,6 @@ import {
   type TableInfo,
   type TriggerInfo
 } from '@/lib/api'
-import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
 import { browseColumns, isInvisible, tableColumnTypes } from '@/lib/column-types'
 import { ENGINES, type Dialect } from '@/lib/engines'
@@ -95,6 +94,7 @@ import {
 } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
 import { exportMenu } from '../query/ResultsPanel'
+import { modifyRoutine } from '../explorer/actions'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
@@ -1061,30 +1061,24 @@ function DefinitionView({
     <>
       <Toolbar>
         {routineKind && (
-          <>
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={() => openExecuteRoutine(tab.connectionId, tab.database, routine)}
-            >
-              <Play className="size-3.5 fill-current" /> Execute…
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={!definition.data}
-              onClick={() =>
-                definition.data &&
-                newQueryTab(
-                  tab.connectionId,
-                  tab.database,
-                  modifyScript(dialect, definition.data, tableRef, routineKind)
-                )
-              }
-            >
-              <Pencil className="size-3.5" /> {dialect === 'tsql' ? 'Modify (ALTER)' : 'Modify'}
-            </Button>
-          </>
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => openExecuteRoutine(tab.connectionId, tab.database, routine)}
+          >
+            <Play className="size-3.5 fill-current" /> Execute…
+          </Button>
+        )}
+        {/* MariaDB packages can be modified, but not executed */}
+        {(routineKind || tab.objectKind === 'package') && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={!definition.data}
+            onClick={() => void modifyRoutine(tab.connectionId, tab.database, routine)}
+          >
+            <Pencil className="size-3.5" /> {dialect === 'tsql' ? 'Modify (ALTER)' : 'Modify'}
+          </Button>
         )}
         <Button
           size="sm"

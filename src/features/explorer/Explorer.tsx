@@ -41,6 +41,7 @@ import {
   ListOrdered,
   Lock,
   Network,
+  Package,
   Pencil,
   Plug,
   Puzzle,
@@ -72,6 +73,7 @@ import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
+import { supportsPackages } from '@/lib/mariadb-packages'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
@@ -111,6 +113,7 @@ import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
 import { newSequence as newSequenceScript } from './sequence-actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { newPackage } from './packages'
 import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
@@ -1063,6 +1066,8 @@ const FOLDERS: {
   always?: boolean
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  /** MariaDB 10.3+ only, shown even when empty */
+  packages?: boolean
   /** MySQL / MariaDB scheduled events */
   event?: boolean
   /** Shown, with a New sequence action, on MariaDB 10.3+ */
@@ -1073,6 +1078,7 @@ const FOLDERS: {
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['package'], label: 'Packages', packages: true },
   { kinds: ['sequence'], label: 'Sequences', newSequence: true },
   { kinds: ['synonym'], label: 'Synonyms' },
   { kinds: ['event'], label: 'Events', always: true, event: true }
@@ -1090,15 +1096,18 @@ function ObjectFolders({
   depth: number
 }): React.JSX.Element {
   const q = useQuery(queries.objects(connection.id, database, schema))
-  const sequences = mariaDbAtLeast(connectedInfo(statusStore.use()[connection.id]), 10, 3)
+  const info = connectedInfo(statusStore.use()[connection.id])
+  const packages = supportsPackages(info)
+  const sequences = mariaDbAtLeast(info, 10, 3)
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   return (
     <>
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
+        if (folder.packages && !packages) return null
         const newSequence = folder.newSequence && sequences
-        if (!objects.length && !folder.always && !newSequence) return null
+        if (!objects.length && !folder.always && !folder.packages && !newSequence) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
         if (folder.event && connection.engine !== 'mysql') return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
@@ -1112,6 +1121,7 @@ function ObjectFolders({
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
             newTable={folder.newTable}
+            newPackage={folder.packages}
             event={folder.event}
             newSequence={newSequence}
             objects={objects}
@@ -1134,6 +1144,7 @@ function ObjectFolder({
   label,
   routine,
   newTable,
+  newPackage: canAddPackage,
   event,
   newSequence,
   objects,
@@ -1146,6 +1157,7 @@ function ObjectFolder({
   label: string
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  newPackage?: boolean
   event?: boolean
   newSequence?: boolean
   objects: DbObject[]
@@ -1186,6 +1198,15 @@ function ObjectFolder({
                     label: routine === 'procedure' ? 'New procedure' : 'New function',
                     icon: <Plus />,
                     onSelect: () => newRoutine(connection.id, database, schema, routine)
+                  }
+                ]
+              : []),
+            ...(canAddPackage
+              ? [
+                  {
+                    label: 'New package',
+                    icon: <Plus />,
+                    onSelect: () => newPackage(connection.id, database)
                   }
                 ]
               : []),
@@ -1233,6 +1254,15 @@ function ObjectFolder({
               variant="ghost"
               title={routine === 'procedure' ? 'New procedure' : 'New function'}
               onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : canAddPackage ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New package"
+              onClick={() => newPackage(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>
@@ -1291,6 +1321,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
     case 'function':
     case 'procedure':
       return <FunctionSquare className="text-syn-fn" />
+    case 'package':
+      return <Package className="text-syn-fn" />
     case 'sequence':
       return <ListOrdered className="text-syn-number" />
     case 'synonym':
