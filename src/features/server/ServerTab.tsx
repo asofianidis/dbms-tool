@@ -42,6 +42,7 @@ import {
   SlowQueriesSection,
   useLocks
 } from './PerformancePanels'
+import { ReplicationPanel } from './ReplicationPanel'
 import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
@@ -391,6 +392,15 @@ function ServerDashboard({
         )}
 
         {locks && <LocksSection locks={locks} engineKey={engineKey} />}
+
+        {connection.engine === 'mysql' && (
+          <ReplicationPanel
+            connection={connection}
+            info={info}
+            refresh={refresh}
+            active={active && visible}
+          />
+        )}
 
         <SlowQueriesSection
           connection={connection}

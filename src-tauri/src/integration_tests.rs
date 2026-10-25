@@ -4,6 +4,8 @@
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
+//! DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password
+//! DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
@@ -212,6 +214,51 @@ async fn mariadb_end_to_end() {
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
     m.close(&c.id);
+}
+
+/// The server tab's replication panel reads these through the driver. Point the variables at
+/// a replica: `DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password` (with a named
+/// connection) or `DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password` (8.0.22+).
+#[tokio::test]
+async fn replica_status() {
+    for (var, sql, running) in [
+        (
+            "DBMS_TEST_MARIADB_REPLICA",
+            "SHOW ALL REPLICAS STATUS",
+            "Slave_IO_Running",
+        ),
+        (
+            "DBMS_TEST_MYSQL_REPLICA",
+            "SHOW REPLICA STATUS",
+            "Replica_IO_Running",
+        ),
+    ] {
+        let Some((m, id)) = open(Engine::Mysql, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let out = s.execute(META, "", sql, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let set = &out.results[0];
+        assert!(!set.rows.is_empty(), "{var} is not a replica");
+        let col = |name: &str| set.columns.iter().position(|c| c.name == name);
+        let io = col(running).expect(running);
+        assert!(
+            ["Yes", "No", "Connecting"].contains(&set.rows[0][io].as_str().unwrap_or("")),
+            "{:?}",
+            set.rows[0][io]
+        );
+        // NULL lag (SQL thread stopped) arrives as null, not the string "NULL"
+        let lag = col("Seconds_Behind_Master")
+            .or(col("Seconds_Behind_Source"))
+            .unwrap();
+        for row in &set.rows {
+            assert!(
+                row[lag].is_null() || row[lag].as_str().is_some_and(|v| v.parse::<u64>().is_ok())
+            );
+        }
+        m.close(&id);
+    }
 }
 
 #[tokio::test]
