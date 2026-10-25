@@ -18,6 +18,8 @@ use crate::config::{ConnectionConfig, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
 
+mod table_ddl;
+
 pub struct PgSession {
     client: Client,
     tls: MakeTlsConnector,
@@ -540,6 +542,7 @@ impl PgSession {
         detail: Option<&str>,
     ) -> AppResult<Option<String>> {
         let sql = match kind {
+            "table" => return self.table_definition(schema, name).await,
             "view" => {
                 "SELECT 'CREATE OR REPLACE VIEW ' || format('%I.%I', $1::text, $2::text) || ' AS' || chr(10) \
                  || pg_get_viewdef(format('%I.%I', $1::text, $2::text)::regclass, true)"
