@@ -260,6 +260,12 @@ describe('production write detection', () => {
     expect(mongoIsWrite({ op: 'aggregate', ...base, pipeline: [{ $out: 'x' }] })).toBe(true)
     expect(mongoIsWrite({ op: 'runCommand', database: 'db', command: { ping: 1 } })).toBe(false)
     expect(mongoIsWrite({ op: 'runCommand', database: 'db', command: { compact: 'c' } })).toBe(true)
+    expect(mongoIsWrite({ op: 'runCommand', database: 'db', command: { validate: 'c' } })).toBe(
+      false
+    )
+    expect(
+      mongoIsWrite({ op: 'runCommand', database: 'db', command: { validate: 'c', repair: true } })
+    ).toBe(true)
     expect(mongoIsWrite({ op: 'deleteOne', ...base, filter: { _id: 1 } })).toBe(true)
     expect(describeMongoDanger({ op: 'deleteMany', ...base, filter: {} })).toMatch(/every document/)
     expect(describeMongoDanger({ op: 'deleteMany', ...base, filter: { a: 1 } })).toBeNull()

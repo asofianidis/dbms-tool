@@ -115,6 +115,10 @@ export function mongoIsWrite(request: MongoRequest): boolean {
       const command = request.command
       const name =
         command && typeof command === 'object' ? Object.keys(command as object)[0] : undefined
+      // `{ validate: c, repair: true }` rewrites the collection
+      if (name?.toLowerCase() === 'validate' && (command as Record<string, unknown>).repair) {
+        return true
+      }
       return !name || !READ_COMMANDS.has(name.toLowerCase())
     }
     default:

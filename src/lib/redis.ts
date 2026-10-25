@@ -307,6 +307,8 @@ export function isReadCommand(args: string[]): boolean {
   if (!name) return true
   if (READS.has(name)) return true
   const sub = (args[1] ?? '').toUpperCase()
+  // `ACL LOG RESET` clears the log; `ACL LOG [count]` reads it
+  if (name === 'ACL' && sub === 'LOG' && args[2]?.toUpperCase() === 'RESET') return false
   return READ_SUBCOMMANDS[name]?.includes(sub) ?? false
 }
 

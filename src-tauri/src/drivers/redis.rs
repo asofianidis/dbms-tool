@@ -861,6 +861,13 @@ pub fn is_read_command(args: &[String]) -> bool {
     if READS.contains(&name.as_str()) {
         return true;
     }
+    // `ACL LOG RESET` clears the log; `ACL LOG [count]` reads it
+    if name == "ACL"
+        && args.get(1).is_some_and(|a| a.eq_ignore_ascii_case("LOG"))
+        && args.get(2).is_some_and(|a| a.eq_ignore_ascii_case("RESET"))
+    {
+        return false;
+    }
     let sub = args
         .get(1)
         .map(|a| a.to_ascii_uppercase())
@@ -1733,6 +1740,10 @@ mod tests {
         assert!(!is_read_command(&args("config set maxmemory 1")));
         assert!(!is_read_command(&args("FLUSHALL")));
         assert!(!is_read_command(&args("EVAL return 1 0")));
+        assert!(is_read_command(&args("ACL LOG")));
+        assert!(is_read_command(&args("acl log 10")));
+        assert!(!is_read_command(&args("ACL LOG RESET")));
+        assert!(!is_read_command(&args("acl log reset")));
     }
 
     #[test]

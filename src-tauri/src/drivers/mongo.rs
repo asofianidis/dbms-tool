@@ -510,8 +510,22 @@ fn is_read_command(command: &Value) -> bool {
     let Some((key, value)) = command.as_object().and_then(|o| o.iter().next()) else {
         return false;
     };
+    // `{ validate: c, repair: true }` rewrites the collection
+    if key == "validate" && command.get("repair").is_some_and(truthy) {
+        return false;
+    }
     // `{ profile: -1 }` reads the profiler level; any other level changes it
     READS.contains(&key.as_str()) || (key == "profile" && value.as_i64() == Some(-1))
+}
+
+/// Whether a command option counts as set, the way the server reads it.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        _ => true,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1318,6 +1332,16 @@ mod tests {
         assert!(is_read_command(&json!({ "profile": -1 })));
         assert!(!is_read_command(&json!({ "profile": 1, "slowms": 100 })));
         assert!(!is_read_command(&json!({ "collMod": "users" })));
+        assert!(is_read_command(&json!({ "validate": "users" })));
+        assert!(is_read_command(
+            &json!({ "validate": "users", "repair": false })
+        ));
+        assert!(!is_read_command(
+            &json!({ "validate": "users", "repair": true })
+        ));
+        assert!(!is_read_command(
+            &json!({ "validate": "users", "repair": 1 })
+        ));
         assert!(is_read_command(
             &json!({ "usersInfo": { "forAllDBs": true } })
         ));
