@@ -94,6 +94,7 @@ import {
   ToolbarDivider
 } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
+import { DataError, MatviewBadge } from './MatviewNotice'
 import { exportMenu } from '../query/ResultsPanel'
 import { modifyRoutine } from '../explorer/actions'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
@@ -173,6 +174,7 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
           {tab.detail != null && <span className="text-faint">({tab.detail})</span>}
         </span>
         <Badge>{tab.objectKind.replace('_', ' ')}</Badge>
+        <MatviewBadge tab={tab} />
         {connection.readOnly && (
           <Badge tone="warning">
             <Lock className="size-3" /> read-only
@@ -713,9 +715,12 @@ function DataView({
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
           {error ? (
-            <div className="p-4">
-              <ErrorText error={error} />
-            </div>
+            <DataError
+              tab={tab}
+              tableRef={tableRef}
+              error={error}
+              onRefreshed={() => void load()}
+            />
           ) : set ? (
             <ResultGrid
               columns={columns}

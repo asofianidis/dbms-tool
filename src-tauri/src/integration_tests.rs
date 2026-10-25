@@ -320,6 +320,95 @@ async fn postgres_edit_by_row_location() {
 }
 
 #[tokio::test]
+async fn postgres_materialized_views() {
+    let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let setup = "DROP SCHEMA IF EXISTS dbms_mv CASCADE; CREATE SCHEMA dbms_mv; \
+        CREATE TABLE dbms_mv.orders (id int PRIMARY KEY, region text, amount numeric); \
+        INSERT INTO dbms_mv.orders SELECT g, 'r' || (g % 3), g FROM generate_series(1, 30) g; \
+        CREATE MATERIALIZED VIEW dbms_mv.totals WITH (fillfactor = 80) AS \
+          SELECT region, sum(amount) AS total FROM dbms_mv.orders GROUP BY region WITH NO DATA; \
+        CREATE UNIQUE INDEX totals_region ON dbms_mv.totals (region); \
+        COMMENT ON MATERIALIZED VIEW dbms_mv.totals IS 'per region'; \
+        COMMENT ON COLUMN dbms_mv.totals.total IS 'it''s a sum'";
+    let out = s.execute("mv", "", setup, &opts()).await.unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+
+    let ddl = s
+        .object_definition("", Some("dbms_mv"), "totals", "materialized_view", None)
+        .await
+        .unwrap()
+        .expect("definition");
+    // No DDL in the messages: CodeQL treats what this connection reads as secret
+    assert!(ddl.starts_with("CREATE MATERIALIZED VIEW dbms_mv.totals WITH (fillfactor=80) AS\n"));
+    assert!(ddl.contains("\nWITH NO DATA;"));
+    assert!(ddl.contains("CREATE UNIQUE INDEX totals_region ON dbms_mv.totals"));
+    assert!(ddl.contains("COMMENT ON MATERIALIZED VIEW dbms_mv.totals IS 'per region';"));
+    assert!(ddl.contains("COMMENT ON COLUMN dbms_mv.totals.total IS 'it''s a sum';"));
+
+    // Reading it fails until it's refreshed, with the message the table tab looks for
+    let out = s
+        .execute("mv", "", "SELECT * FROM dbms_mv.totals", &opts())
+        .await
+        .unwrap();
+    let err = out.error.expect("unpopulated");
+    assert!(err.message.contains("has not been populated"), "{err:?}");
+
+    // Completion lists its columns, which information_schema.columns doesn't
+    let completion = s.completion("").await.unwrap();
+    let totals = completion
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("dbms_mv") && t.name == "totals")
+        .expect("matview in completion");
+    assert_eq!(totals.columns, vec!["region", "total"]);
+
+    // The DDL recreates it as it was
+    let out = s
+        .execute(
+            "mv",
+            "",
+            &format!("DROP MATERIALIZED VIEW dbms_mv.totals; {ddl}"),
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let again = s
+        .object_definition("", Some("dbms_mv"), "totals", "materialized_view", None)
+        .await
+        .unwrap();
+    assert_eq!(again.as_deref(), Some(ddl.as_str()));
+
+    // Populated views drop WITH NO DATA and refresh concurrently on the unique index
+    let out = s
+        .execute(
+            "mv",
+            "",
+            "REFRESH MATERIALIZED VIEW dbms_mv.totals; \
+             REFRESH MATERIALIZED VIEW CONCURRENTLY dbms_mv.totals; \
+             SELECT count(*) FROM dbms_mv.totals",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("3"));
+    let ddl = s
+        .object_definition("", Some("dbms_mv"), "totals", "materialized_view", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ddl.contains("WITH NO DATA"));
+    assert!(ddl.contains("GROUP BY region;"));
+
+    s.execute("mv", "", "DROP SCHEMA dbms_mv CASCADE", &opts())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn mariadb_end_to_end() {
     // MariaDB uses the MySQL engine; the frontend tells them apart by `product`
     let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB") else {
