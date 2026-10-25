@@ -360,15 +360,21 @@ async fn sign_in(
     result
 }
 
-/// Runs root's SQL, failing the test on an error.
-async fn run_sql(m: &Manager, id: &str, sql: &str) -> ExecOutput {
+/// A password for a test account, made up per run
+fn test_password() -> String {
+    format!("Pw_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+}
+
+/// Runs root's SQL, failing the test on an error. `what` labels the assert: the SQL can
+/// hold a password, and CodeQL treats what the server returns as secret.
+async fn run_sql(m: &Manager, id: &str, what: &str, sql: &str) -> ExecOutput {
     let out = m
         .get(id)
         .unwrap()
         .execute("tab1", "", sql, &opts())
         .await
         .unwrap();
-    assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+    assert!(out.error.is_none(), "{what}");
     out
 }
 
@@ -389,12 +395,12 @@ async fn mariadb_auth_plugins() {
             .execute("tab1", "", &format!("INSTALL SONAME '{soname}'"), &opts())
             .await;
     }
-    let out = run_sql(&m, &c.id, plugins).await;
+    let out = run_sql(&m, &c.id, "list plugins", plugins).await;
     let active: Vec<Value> = out.results[0].rows.iter().map(|r| r[0].clone()).collect();
     assert!(active.contains(&json!("ed25519")), "{active:?}");
 
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    let pw = "Auth_pw1";
+    let pw = test_password();
     let users = [
         ("ed", format!("ed25519 USING PASSWORD('{pw}')")),
         ("pa", format!("parsec USING PASSWORD('{pw}')")),
@@ -423,26 +429,39 @@ async fn mariadb_auth_plugins() {
         run_sql(
             &m,
             &c.id,
+            &format!("create {kind} user"),
             &format!("CREATE USER '{name}'@'%' IDENTIFIED VIA {via}"),
         )
         .await;
         created.push((*kind, name));
     }
 
-    for (_, name) in &created {
-        let info = sign_in(&c, name, pw)
-            .await
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(info.product.contains("MariaDB"), "{name}: {}", info.product);
+    // Messages name the account kind only: CodeQL treats the sign-in's output as secret
+    for (kind, name) in &created {
+        let signed_in = sign_in(&c, name, &pw).await;
+        assert!(
+            signed_in.is_ok_and(|info| info.product.contains("MariaDB")),
+            "{kind} user didn't sign in"
+        );
     }
     // A wrong password is the server's plain refusal, whichever method gets it last
-    for (_, name) in &created {
-        let wrong = sign_in(&c, name, "nope").await.expect_err(name).to_string();
-        assert!(wrong.contains("1045"), "{name}: {wrong}");
+    let wrong_pw = format!("{pw}_wrong");
+    for (kind, name) in &created {
+        let refused = sign_in(&c, name, &wrong_pw).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("1045")),
+            "{kind} user: no ERROR 1045 for a wrong password"
+        );
     }
 
-    for (_, name) in &created {
-        run_sql(&m, &c.id, &format!("DROP USER '{name}'@'%'")).await;
+    for (kind, name) in &created {
+        run_sql(
+            &m,
+            &c.id,
+            &format!("drop {kind} user"),
+            &format!("DROP USER '{name}'@'%'"),
+        )
+        .await;
     }
     m.close(&c.id);
 }
@@ -458,16 +477,21 @@ async fn mysql_caching_sha2_sign_in() {
         "mdb_auth_{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
+    let pw = test_password();
     run_sql(
         &m,
         &c.id,
-        &format!("CREATE USER '{name}'@'%' IDENTIFIED WITH caching_sha2_password BY 'Auth_pw1'"),
+        "create user",
+        &format!("CREATE USER '{name}'@'%' IDENTIFIED WITH caching_sha2_password BY '{pw}'"),
     )
     .await;
-    let result = sign_in(&c, &name, "Auth_pw1").await;
-    run_sql(&m, &c.id, &format!("DROP USER '{name}'@'%'")).await;
+    let result = sign_in(&c, &name, &pw).await;
+    run_sql(&m, &c.id, "drop user", &format!("DROP USER '{name}'@'%'")).await;
     m.close(&c.id);
-    assert!(result.expect("sign in").product.starts_with("MySQL"));
+    assert!(
+        result.is_ok_and(|info| info.product.starts_with("MySQL")),
+        "caching_sha2_password user didn't sign in"
+    );
 }
 
 /// The server tab's replication panel reads these through the driver. Point the variables at
