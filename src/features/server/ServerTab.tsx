@@ -4,6 +4,7 @@ import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } f
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
 import { withAuroraMetrics } from '@/lib/aurora'
 import { ENGINES } from '@/lib/engines'
+import { extensionFlavor } from '@/lib/extensions'
 import { formatBytes } from '@/lib/format'
 import { withGaleraMetrics } from '@/lib/galera'
 import { isMariaDb } from '@/lib/mariadb'
@@ -37,6 +38,7 @@ import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
 import { AuroraPanel, useAurora } from './AuroraPanel'
+import { ExtensionsPanel } from './ExtensionsPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
 import { PgReplicationPanel, usePgReplication } from './PgReplicationPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
@@ -162,6 +164,7 @@ function ServerDashboard({
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
+  const extensions = extensionFlavor(connection.engine, info)
   const replication = usePgReplication(
     connection,
     connection.engine === 'postgres' && !babelfish,
@@ -446,6 +449,17 @@ function ServerDashboard({
         />
 
         {connection.engine === 'mysql' && <SlowLogPanel connection={connection} />}
+
+        {extensions && (
+          <ExtensionsPanel
+            // A different flavor (MariaDB detected after connecting) starts with fresh state
+            key={extensions}
+            connection={connection}
+            flavor={extensions}
+            databases={dbs.data?.filter((d) => !d.isSystem).map((d) => d.name) ?? []}
+            defaultDatabase={info?.currentDatabase ?? ''}
+          />
+        )}
 
         {engineKey === 'postgres' && (
           <PgHealthSection
