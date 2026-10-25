@@ -77,6 +77,7 @@ import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
+import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
 import { quoteIdent } from '@/lib/sql'
 import { canHaveTriggers } from '@/lib/triggers'
 import { toast, toastError, errorMessage } from '@/lib/toast'
@@ -106,6 +107,7 @@ import { showContextMenu, showMenuAt, type MenuItem } from '@/components/Context
 import { exportConnectionsToFile, openImportConnections } from '../connections/ImportConnections'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
+import { newSequence as newSequenceScript } from './sequence-actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { openSeed } from '../seed/SeedDialog'
@@ -1057,13 +1059,15 @@ const FOLDERS: {
   always?: boolean
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  /** Shown, with a New sequence action, on MariaDB 10.3+ */
+  newSequence?: boolean
 }[] = [
   { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
-  { kinds: ['sequence'], label: 'Sequences' },
+  { kinds: ['sequence'], label: 'Sequences', newSequence: true },
   { kinds: ['synonym'], label: 'Synonyms' }
 ]
 
@@ -1079,13 +1083,15 @@ function ObjectFolders({
   depth: number
 }): React.JSX.Element {
   const q = useQuery(queries.objects(connection.id, database, schema))
+  const sequences = mariaDbAtLeast(connectedInfo(statusStore.use()[connection.id]), 10, 3)
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   return (
     <>
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
-        if (!objects.length && !folder.always) return null
+        const newSequence = folder.newSequence && sequences
+        if (!objects.length && !folder.always && !newSequence) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
@@ -1098,6 +1104,7 @@ function ObjectFolders({
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
             newTable={folder.newTable}
+            newSequence={newSequence}
             objects={objects}
             depth={depth}
           />
@@ -1118,6 +1125,7 @@ function ObjectFolder({
   label,
   routine,
   newTable,
+  newSequence,
   objects,
   depth
 }: {
@@ -1128,6 +1136,7 @@ function ObjectFolder({
   label: string
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  newSequence?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -1169,6 +1178,15 @@ function ObjectFolder({
                   }
                 ]
               : []),
+            ...(newSequence
+              ? [
+                  {
+                    label: 'New sequence',
+                    icon: <Plus />,
+                    onSelect: () => newSequenceScript(connection.id, database)
+                  }
+                ]
+              : []),
             {
               label: 'Refresh',
               icon: <RefreshCw />,
@@ -1186,6 +1204,15 @@ function ObjectFolder({
               variant="ghost"
               title={routine === 'procedure' ? 'New procedure' : 'New function'}
               onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : newSequence ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New sequence"
+              onClick={() => newSequenceScript(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>

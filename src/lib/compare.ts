@@ -19,6 +19,7 @@ import {
 } from './ddl'
 import type { Dialect } from './engines'
 import { qualified, quoteIdent, scriptCreateTable } from './sql'
+import { sequenceAlterStatements } from './mariadb-sequences'
 import { dropTriggerStatement } from './triggers'
 
 /* ---------- Snapshots ---------- */
@@ -717,6 +718,15 @@ function definitionSteps(
       if (!/\bCYCLE$/i.test(alter)) alter += ' NO CYCLE'
       item.steps.push({ phase: Phase.Sequences, sql: alter })
       return
+    }
+    if (o.kind === 'sequence' && dialect === 'mysql') {
+      // MariaDB: the same, as long as both definitions can be read
+      const name = qualified(dialect, { schema: qualifier, name: o.name })
+      const alters = sequenceAlterStatements(name, create, target?.definition)
+      if (alters) {
+        for (const sql of alters) item.steps.push({ phase: Phase.Sequences, sql })
+        return
+      }
     }
     // PostgreSQL replaces functions in place; views are recreated in case their columns changed
     const replaces =
