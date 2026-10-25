@@ -4,6 +4,8 @@ import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } f
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
 import { formatBytes } from '@/lib/format'
+import { withGaleraMetrics } from '@/lib/galera'
+import { isMariaDb } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
 import { parseClientList, parseSlowlog, recordsToSet, dataText } from '@/lib/redis'
 import { dashboardFor } from '@/lib/server-metrics'
@@ -33,6 +35,7 @@ import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
+import { GaleraPanel, useGalera } from './GaleraPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
 import {
@@ -151,6 +154,7 @@ function ServerDashboard({
   const locks = useLocks(connection, engineKey)
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
+  const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
 
   // Blocking chains from the activity list's blocked-by column and the lock list's
   const forest = useMemo(() => {
@@ -300,7 +304,14 @@ function ServerDashboard({
           ))}
         </div>
 
-        <LiveMetrics connectionId={connection.id} session={session} spec={spec} active={active} />
+        <LiveMetrics
+          connectionId={connection.id}
+          session={session}
+          spec={galera.status ? withGaleraMetrics(spec) : spec}
+          active={active}
+        />
+
+        <GaleraPanel galera={galera} />
 
         {babelfish && (
           <BabelfishPanel connection={connection} version={info?.babelfishVersion ?? null} />
