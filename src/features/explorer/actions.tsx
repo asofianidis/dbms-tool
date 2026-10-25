@@ -60,6 +60,7 @@ import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
+import { versioningScriptItems } from './Versioning'
 import { eventMenuItems } from './events'
 import { pgAggregateMenuItems } from './pg-routine-actions'
 import { mariaDbSequenceItems } from './sequence-actions'
@@ -248,6 +249,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
                 }
               ]
             : []),
+          ...versioningScriptItems(connectionId, database, obj),
           'separator',
           { label: 'CREATE', onSelect: () => void scriptTo(connectionId, database, obj, 'create') },
           { label: 'DROP', onSelect: () => void scriptTo(connectionId, database, obj, 'drop') }
