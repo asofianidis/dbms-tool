@@ -137,11 +137,18 @@ impl Server {
 
         tunnel::ensure(&self.config.id).await?;
         let session = Session::connect(&self.config, self.password.as_deref(), database).await?;
+        let mut sessions = self.sessions.lock().await;
+        // Another call opened this key while we connected: keep its session, which
+        // may hold a transaction by now, and go through the checks above with it
+        if sessions.contains_key(&key) {
+            drop((sessions, session));
+            return Box::pin(self.session(&key, database)).await;
+        }
         let slot = Arc::new(Mutex::new(Slot {
             session,
             last_used: Instant::now(),
         }));
-        self.sessions.lock().await.insert(key, slot.clone());
+        sessions.insert(key, slot.clone());
         Ok(slot)
     }
 
@@ -627,14 +634,16 @@ impl Manager {
             .ok_or(AppError::NotConnected)
     }
 
-    pub fn close(&self, id: &str) {
-        if let Some(server) = self.servers.lock().remove(id) {
+    /// Returns once the connection's tunnel is down, so reopening right after
+    /// starts a new one rather than reusing the one being closed.
+    pub async fn close(&self, id: &str) {
+        let server = self.servers.lock().remove(id);
+        if let Some(server) = server {
             for signal in server.running.lock().values() {
                 signal.fire();
             }
         }
-        let id = id.to_string();
-        tauri::async_runtime::spawn(async move { tunnel::close(&id).await });
+        tunnel::close(id).await;
     }
 }
 

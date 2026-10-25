@@ -73,6 +73,10 @@ fn statement(verb: &str, channels: &[String]) -> String {
 
 impl Listeners {
     /// The listener `id`, opened (or reopened after its session ended) on `database`.
+    /// Reopening on the same database listens on the old channels again, so callers'
+    /// channel lists include them. Channels belong to one database (NOTIFY doesn't
+    /// cross databases), so moving to another starts with none; the tab only lets
+    /// the database change while it listens on nothing.
     async fn ensure(
         &self,
         config: &ConnectionConfig,
@@ -88,10 +92,14 @@ impl Listeners {
         }
         // Held while connecting so two calls can't open two sessions for one tab
         let mut open = self.open.lock().await;
+        let mut carried = Vec::new();
         if let Some(listener) = open.get(id) {
             let session = listener.session.lock().await;
-            if !session.is_closed() && session.database.eq_ignore_ascii_case(database) {
-                return Ok(listener.clone());
+            if session.database.eq_ignore_ascii_case(database) {
+                if !session.is_closed() {
+                    return Ok(listener.clone());
+                }
+                carried = listener.channels.lock().iter().cloned().collect();
             }
         }
         // A dropped SSH or Fly tunnel comes back on the same port
@@ -101,6 +109,13 @@ impl Listeners {
                 "LISTEN / NOTIFY needs a PostgreSQL connection".into(),
             ));
         };
+        if !carried.is_empty() {
+            session
+                .client()
+                .batch_execute(&statement("LISTEN", &carried))
+                .await
+                .map_err(|e| AppError::msg(super::postgres::describe_error(&e)))?;
+        }
         let inbox = session.inbox();
         let listener_id = id.to_string();
         let task = tokio::spawn(async move {
@@ -127,7 +142,7 @@ impl Listeners {
         });
         let listener = Arc::new(Listener {
             session: Mutex::new(session),
-            channels: parking_lot::Mutex::new(BTreeSet::new()),
+            channels: parking_lot::Mutex::new(carried.into_iter().collect()),
             task: task.abort_handle(),
         });
         open.insert(id.to_string(), listener.clone());

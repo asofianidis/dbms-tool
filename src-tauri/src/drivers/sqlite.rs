@@ -4,6 +4,7 @@
 //! D1 documents as supported.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rusqlite::fallible_iterator::FallibleIterator as _;
@@ -163,6 +164,9 @@ struct RunLimits {
     max_rows: usize,
     max_binary: usize,
     sink: Option<SinkHandle>,
+    /// Set on cancel. `sqlite3_interrupt` only stops a statement that is running,
+    /// so a script also checks this before each statement
+    stop: Arc<AtomicBool>,
 }
 
 impl RunLimits {
@@ -171,6 +175,7 @@ impl RunLimits {
             max_rows: usize::MAX,
             max_binary: usize::MAX,
             sink: None,
+            stop: Arc::default(),
         }
     }
 }
@@ -186,6 +191,12 @@ fn run_file(
     let mut sets = 0;
     let mut batch = rusqlite::Batch::new(conn, sql);
     while let Some(mut stmt) = batch.next()? {
+        if limits.stop.load(Ordering::SeqCst) {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                None,
+            ));
+        }
         if stmt.column_count() == 0 {
             let changes = stmt.execute([])? as u64;
             let dml = stmt.expanded_sql().as_deref().is_some_and(is_dml);
@@ -674,12 +685,15 @@ impl SqSession {
             },
             max_binary: opts.max_binary_bytes.max(1),
             sink: opts.sink.clone().filter(|_| file_sink),
+            stop: Arc::default(),
         };
+        let stop = limits.stop.clone();
         let run = self.backend.run(sql, limits);
         let (results, error) = tokio::select! {
             r = run => r,
             _ = cancel.wait() => {
                 // A local query stops at the next step; D1 can't be stopped, only abandoned
+                stop.store(true, Ordering::SeqCst);
                 if let Backend::File { interrupt, .. } = &self.backend {
                     interrupt.interrupt();
                 }
@@ -904,6 +918,31 @@ mod tests {
                 .message
                 .contains("no such table: missing")
         );
+    }
+
+    #[test]
+    fn a_cancelled_script_runs_no_further_statements() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let limits = RunLimits::all();
+        let mut out = Vec::new();
+        run_file(&conn, "CREATE TABLE a (x); SELECT 1;", &limits, &mut out).unwrap();
+        assert_eq!(out.len(), 2);
+
+        // Between statements nothing is running, so only the flag can stop the script
+        limits.stop.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        let err = run_file(
+            &conn,
+            "INSERT INTO a VALUES (1); SELECT 1;",
+            &limits,
+            &mut out,
+        );
+        assert!(err.is_err());
+        assert!(out.is_empty());
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM a", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]
