@@ -174,6 +174,8 @@ export interface VersionedSelect {
   offset?: number
   /** Add the row start / end columns */
   periods?: boolean
+  /** Columns to select instead of *, e.g. so invisible columns show */
+  columns?: string[]
 }
 
 /** A page of a versioned table at the given system time (MySQL dialect). */
@@ -188,7 +190,10 @@ export function versionedSelect(
   const where = opts.where?.trim() ? `\nWHERE ${opts.where.trim()}` : ''
   const order = opts.orderBy?.trim() ? `\nORDER BY ${opts.orderBy.trim()}` : ''
   const offset = opts.offset ? ` OFFSET ${opts.offset}` : ''
-  return `SELECT *${opts.periods ? periodColumns(v) : ''}\nFROM ${from}${where}${order}\nLIMIT ${opts.limit}${offset}`
+  // Hidden period columns only come with `periods`
+  const named = opts.columns?.filter((c) => !v.hidden || (c !== v.rowStart && c !== v.rowEnd))
+  const list = named?.length ? named.map((c) => quoteIdent('mysql', c)).join(', ') : '*'
+  return `SELECT ${list}${opts.periods ? periodColumns(v) : ''}\nFROM ${from}${where}${order}\nLIMIT ${opts.limit}${offset}`
 }
 
 export function versionedCount(ref: TableRef, st: SystemTime, where?: string): string {

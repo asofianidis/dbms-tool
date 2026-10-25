@@ -47,7 +47,7 @@ pub struct DbObject {
     pub schema: Option<String>,
     pub name: String,
     /// table | view | materialized_view | foreign_table | sequence | function |
-    /// procedure | synonym | collection | timeseries
+    /// procedure | synonym | collection | timeseries | event (MySQL/MariaDB)
     pub kind: String,
     /// Function identity arguments, collection options, …
     pub detail: Option<String>,

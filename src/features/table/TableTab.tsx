@@ -32,6 +32,7 @@ import {
 } from '@/lib/api'
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
+import { browseColumns, isInvisible, tableColumnTypes } from '@/lib/column-types'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText, EXPORT_MAX_ROWS, type FetchedRows } from '@/lib/export'
 import {
@@ -99,7 +100,9 @@ import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { SystemTimeBar } from './SystemTimeBar'
+import { SequenceDetails } from './SequenceDetails'
 import { openTableDesigner } from './TableDesigner'
+import { StorageSummary } from './StorageOptions'
 import { openTriggerDesigner } from './TriggerDesigner'
 
 /** Where a foreign key points. MySQL reports the referenced database as its schema. */
@@ -133,6 +136,8 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
       ? { schema: tab.database, name: tab.name }
       : { schema: tab.schema, name: tab.name }
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(tab.objectKind)
+  // Only MariaDB has sequences on the MySQL engine; they get a details view, never a data grid
+  const sequenceDetails = tab.objectKind === 'sequence' && connection?.engine === 'mysql'
 
   useEffect(() => {
     if (!connected && connection) void connect(connection.id)
@@ -144,7 +149,12 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
         { value: 'structure', label: 'Structure' },
         { value: 'definition', label: tab.objectKind === 'table' ? 'DDL' : 'Definition' }
       ]
-    : [{ value: 'definition', label: 'Definition' }]
+    : sequenceDetails
+      ? [
+          { value: 'structure', label: 'Details' },
+          { value: 'definition', label: 'DDL' }
+        ]
+      : [{ value: 'definition', label: 'Definition' }]
 
   if (!connection) return <EmptyState title="This connection no longer exists" />
 
@@ -186,6 +196,8 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
         />
       ) : tab.view === 'structure' && browsable ? (
         <StructureView tab={tab} engine={connection.engine} dialect={dialect} />
+      ) : tab.view === 'structure' && sequenceDetails ? (
+        <SequenceDetails tab={tab} tableRef={ref} />
       ) : (
         <DefinitionView tab={tab} dialect={dialect} tableRef={ref} />
       )}
@@ -232,13 +244,18 @@ function DataView({
   const history = versioned && systemTime.kind !== 'current'
 
   const set = output?.results[0]
-  const columns: ColumnMeta[] = set?.columns ?? []
+  const columns: ColumnMeta[] = useMemo(
+    () => tableColumnTypes(set?.columns ?? [], info.data),
+    [set, info.data]
+  )
   const pk = editKey(info.data?.primaryKey ?? [], versioning)
   const editInfo = useMemo(
     () => info.data && { ...info.data, primaryKey: pk },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [info.data, pk.join(',')]
   )
+  // SELECT * leaves invisible columns out, so name them all
+  const listed = browseColumns(info.data)
   // Old row versions can't be edited
   const canEdit = !readOnly && !history && pk.length > 0 && !!info.data
   const appliedWhere = useMemo(
@@ -268,14 +285,16 @@ function DataView({
           orderBy,
           limit,
           offset,
-          periods
+          periods,
+          columns: listed
         })
       : selectRows(dialect, tableRef, {
           where: appliedWhere,
           orderBy,
           limit,
           offset,
-          keyColumns: pk
+          keyColumns: pk,
+          columns: listed
         })
 
   /** Applies a new filter / sort from the builder, chips or grid header. */
@@ -325,7 +344,8 @@ function DataView({
     pk.join(','),
     versioned,
     systemTime,
-    periods
+    periods,
+    listed?.join(',')
   ])
 
   useEffect(() => {
@@ -764,6 +784,13 @@ function StructureView({
         </Toolbar>
       )}
       <div className="min-h-0 flex-1 overflow-auto p-4">
+        {engine === 'mysql' && tab.objectKind === 'table' && (
+          <StorageSummary
+            connectionId={tab.connectionId}
+            database={tab.database}
+            table={tab.name}
+          />
+        )}
         <Section title="Columns" count={info.columns.length}>
           <table className="w-full text-left text-[12.5px]">
             <thead className="text-[11px] text-muted">
@@ -787,6 +814,11 @@ function StructureView({
                     {c.isGenerated && (
                       <Badge className="ml-2" tone="info">
                         generated
+                      </Badge>
+                    )}
+                    {isInvisible(c.extra) && (
+                      <Badge className="ml-2" title="SELECT * leaves it out">
+                        invisible
                       </Badge>
                     )}
                   </td>

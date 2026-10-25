@@ -25,8 +25,8 @@ export type Tab =
       text: string
       filePath?: string
       savedText?: string
-      /** Run the whole script once, as soon as the editor has the text */
-      autorun?: boolean
+      /** Run (or explain) the whole script once, as soon as the editor has the text */
+      autorun?: boolean | 'explain'
       /** The saved query this tab was opened from or saved as */
       savedQueryId?: string
     }
@@ -396,7 +396,7 @@ export function newQueryTab(
   connectionId?: string,
   database?: string,
   text = '',
-  options: { autorun?: boolean; title?: string; savedQueryId?: string } = {}
+  options: { autorun?: boolean | 'explain'; title?: string; savedQueryId?: string } = {}
 ): void {
   const fallback = connectionId ?? activeConnectionId() ?? connectionsStore.get()[0]?.id
   if (!fallback) {
@@ -416,7 +416,7 @@ export function newQueryTab(
       options.title ??
       `${kind === 'mongo' ? 'shell' : kind === 'redis' ? 'console' : 'query'}-${untitled}`,
     text,
-    ...(options.autorun ? { autorun: true } : {}),
+    ...(options.autorun ? { autorun: options.autorun } : {}),
     ...(options.savedQueryId ? { savedQueryId: options.savedQueryId } : {})
   } as Tab)
 }
