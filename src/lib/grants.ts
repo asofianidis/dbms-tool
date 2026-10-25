@@ -347,8 +347,9 @@ export function privilegeOptions(
 /**
  * Queries listing users and roles, tried in order until one succeeds. Each returns
  * rows of name, host, kind ('user' | 'role' | 'group') and builtin ('y' | 'n').
+ * `mariadb` picks the MySQL or MariaDB query when the server is known; undefined tries both.
  */
-export function principalQueries(dialect: Dialect): string[] {
+export function principalQueries(dialect: Dialect, mariadb?: boolean): string[] {
   switch (dialect) {
     case 'postgres':
       return [
@@ -359,11 +360,14 @@ export function principalQueries(dialect: Dialect): string[] {
     case 'mysql': {
       const system =
         "CASE WHEN User IN ('mysql.sys', 'mysql.session', 'mysql.infoschema', 'mariadb.sys') THEN 'y' ELSE 'n' END"
+      // MariaDB flags roles
+      const maria = `SELECT User, Host, CASE WHEN is_role = 'Y' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`
+      // MySQL roles are locked accounts without a password, by convention
+      const mysql = `SELECT User, Host, CASE WHEN account_locked = 'Y' AND authentication_string = '' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`
       return [
-        // MariaDB flags roles
-        `SELECT User, Host, CASE WHEN is_role = 'Y' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`,
-        // MySQL roles are locked accounts without a password, by convention
-        `SELECT User, Host, CASE WHEN account_locked = 'Y' AND authentication_string = '' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`,
+        // Skipping the other server's query keeps its 'Unknown column' error out of the log
+        ...(mariadb === false ? [] : [maria]),
+        ...(mariadb === true ? [] : [mysql]),
         // Without access to mysql.user, the accounts that hold privileges
         "SELECT DISTINCT GRANTEE, NULL, 'user', 'n' FROM information_schema.USER_PRIVILEGES ORDER BY 1"
       ]
