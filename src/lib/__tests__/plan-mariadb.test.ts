@@ -91,11 +91,13 @@ describe('MariaDB EXPLAIN statements', () => {
   it('treats ANALYZE of a write as the write it runs', () => {
     // The production confirmation and read-only guard see the DELETE inside the ANALYZE
     const sql = explainSql("DELETE FROM orders WHERE status = 'void'", 'mysql', true, false, true)
-    expect(sqlWriteKeyword(sql)).toBe('DELETE')
-    expect(sqlWriteKeyword(explainSql('UPDATE t SET a = 1', 'mysql', true, false, true))).toBe(
-      'UPDATE'
-    )
-    expect(sqlWriteKeyword(explainSql('SELECT * FROM t', 'mysql', true, false, true))).toBeNull()
+    expect(sqlWriteKeyword(sql, 'mysql')).toBe('DELETE')
+    expect(
+      sqlWriteKeyword(explainSql('UPDATE t SET a = 1', 'mysql', true, false, true), 'mysql')
+    ).toBe('UPDATE')
+    expect(
+      sqlWriteKeyword(explainSql('SELECT * FROM t', 'mysql', true, false, true), 'mysql')
+    ).toBeNull()
   })
 })
 

@@ -1,7 +1,7 @@
 import { setWriteGuard, type ConnectionConfig, type GuardedWrite, type MongoRequest } from './api'
 import { describeRedisDanger, redisIsWrite, redisSummary } from './redis'
-import { ENGINES, connectionLabel } from './engines'
-import { dangerousStatements } from './sql'
+import { ENGINES, connectionLabel, type Dialect } from './engines'
+import { dangerousStatements, skipQuoted } from './sql'
 import { confirm, getConnection } from './workspace'
 
 /** Same list as the backend's read-only guard (guard.rs). */
@@ -52,22 +52,14 @@ const WRITE_KEYWORDS = new Set([
 ])
 
 /** The first keyword that could modify data, ignoring strings, quoted identifiers and comments. */
-export function sqlWriteKeyword(sql: string): string | null {
+export function sqlWriteKeyword(sql: string, dialect: Dialect): string | null {
   const n = sql.length
   let i = 0
   while (i < n) {
     const c = sql[i]
-    const next = sql[i + 1]
-    if ((c === '-' && next === '-') || c === '#') {
-      while (i < n && sql[i] !== '\n') i++
-    } else if (c === '/' && next === '*') {
-      const end = sql.indexOf('*/', i + 2)
-      i = end < 0 ? n : end + 2
-    } else if (c === "'" || c === '"' || c === '`' || c === '[') {
-      const close = c === '[' ? ']' : c
-      i++
-      while (i < n && sql[i] !== close) i += sql[i] === '\\' && c !== '[' ? 2 : 1
-      i++
+    const skip = skipQuoted(sql, i, dialect)
+    if (skip >= 0) {
+      i = skip
     } else if (/[A-Za-z_]/.test(c)) {
       const start = i
       while (i < n && /[A-Za-z0-9_$]/.test(sql[i])) i++
@@ -175,9 +167,9 @@ interface WriteSummary {
 
 function summarize(connection: ConnectionConfig, write: GuardedWrite): WriteSummary | null {
   if ('sql' in write) {
-    const keyword = sqlWriteKeyword(write.sql)
-    if (!keyword) return null
     const dialect = ENGINES[connection.engine].dialect ?? 'postgres'
+    const keyword = sqlWriteKeyword(write.sql, dialect)
+    if (!keyword) return null
     const sql = write.sql
     return {
       action: `This script runs ${keyword}`,

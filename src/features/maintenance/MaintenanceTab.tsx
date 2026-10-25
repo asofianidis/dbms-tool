@@ -139,7 +139,7 @@ function MaintenanceForm({
   const noun = engine === 'mongo' ? 'collection' : 'table'
   const writes = steps.some((s) =>
     'sql' in s
-      ? !!sqlWriteKeyword(s.sql)
+      ? !!sqlWriteKeyword(s.sql, ENGINES[engine].dialect ?? 'postgres')
       : mongoIsWrite({ op: 'runCommand', database, command: s.command })
   )
   const problem =

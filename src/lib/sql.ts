@@ -395,48 +395,10 @@ export function splitStatements(sql: string, dialect: Dialect): StatementRange[]
     dialect === 'tsql' &&
     /\b(create|alter)\s+(or\s+alter\s+)?(proc|procedure|function|trigger|view)\b/i
   while (i < n) {
-    const c = sql[i]
-    const next = sql[i + 1]
-    if (c === '-' && next === '-') {
-      while (i < n && sql[i] !== '\n') i++
+    const skip = skipQuoted(sql, i, dialect)
+    if (skip >= 0) {
+      i = skip
       continue
-    }
-    if (c === '#' && dialect === 'mysql') {
-      while (i < n && sql[i] !== '\n') i++
-      continue
-    }
-    if (c === '/' && next === '*') {
-      const end = sql.indexOf('*/', i + 2)
-      i = end < 0 ? n : end + 2
-      continue
-    }
-    if (c === "'" || c === '"' || c === '`' || (c === '[' && dialect === 'tsql')) {
-      const close = c === '[' ? ']' : c
-      i++
-      while (i < n) {
-        if (sql[i] === '\\' && dialect === 'mysql') {
-          i += 2
-          continue
-        }
-        if (sql[i] === close) {
-          if (sql[i + 1] === close) {
-            i += 2
-            continue
-          }
-          break
-        }
-        i++
-      }
-      i++
-      continue
-    }
-    if (c === '$' && dialect === 'postgres') {
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
-      if (m) {
-        const end = sql.indexOf(m[0], i + m[0].length)
-        i = end < 0 ? n : end + m[0].length
-        continue
-      }
     }
     if (dialect === 'tsql' && (i === 0 || sql[i - 1] === '\n')) {
       const lineEnd = sql.indexOf('\n', i)
@@ -447,9 +409,12 @@ export function splitStatements(sql: string, dialect: Dialect): StatementRange[]
         continue
       }
     }
-    if (c === ';') {
+    if (sql[i] === ';') {
       const current = sql.slice(start, i)
-      if (!(tsqlBlock && tsqlBlock.test(current)) && !insideMysqlBody(current, dialect)) {
+      if (
+        !(tsqlBlock && tsqlBlock.test(blankLiterals(current, dialect))) &&
+        !insideMysqlBody(current, dialect)
+      ) {
         push(i, i + 1)
       }
     }
@@ -457,6 +422,91 @@ export function splitStatements(sql: string, dialect: Dialect): StatementRange[]
   }
   push(n, n)
   return out
+}
+
+/**
+ * Where the comment, string, quoted identifier or dollar-quoted body starting at `i` ends,
+ * or -1 when none starts there. A line comment ends before its line break.
+ */
+export function skipQuoted(sql: string, i: number, dialect: Dialect): number {
+  const n = sql.length
+  const c = sql[i]
+  const next = sql[i + 1]
+  if ((c === '-' && next === '-') || (c === '#' && dialect === 'mysql')) {
+    const end = sql.indexOf('\n', i)
+    return end < 0 ? n : end
+  }
+  if (c === '/' && next === '*') {
+    // PostgreSQL and SQL Server nest block comments
+    const nests = dialect === 'postgres' || dialect === 'tsql'
+    let depth = 1
+    let j = i + 2
+    while (j < n) {
+      if (sql[j] === '*' && sql[j + 1] === '/') {
+        j += 2
+        if (--depth === 0) return j
+      } else if (nests && sql[j] === '/' && sql[j + 1] === '*') {
+        j += 2
+        depth++
+      } else j++
+    }
+    return n
+  }
+  if (c === "'" || c === '"' || c === '`' || (c === '[' && dialect === 'tsql')) {
+    const close = c === '[' ? ']' : c
+    // MySQL strings and PostgreSQL E'…' strings take backslash escapes
+    const backslash =
+      (dialect === 'mysql' && c !== '`') ||
+      (dialect === 'postgres' &&
+        c === "'" &&
+        /[Ee]/.test(sql[i - 1] ?? '') &&
+        !/[A-Za-z0-9_$]/.test(sql[i - 2] ?? ''))
+    let j = i + 1
+    while (j < n) {
+      if (backslash && sql[j] === '\\') {
+        j += 2
+        continue
+      }
+      if (sql[j] === close) {
+        // A doubled quote is an escaped one
+        if (sql[j + 1] !== close) return j + 1
+        j++
+      }
+      j++
+    }
+    return n
+  }
+  if (c === '$' && dialect === 'postgres') {
+    const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
+    if (m) {
+      const end = sql.indexOf(m[0], i + m[0].length)
+      return end < 0 ? n : end + m[0].length
+    }
+  }
+  return -1
+}
+
+/**
+ * `sql` read as `dialect`, without comments and with strings emptied to `''`.
+ * Quoted identifiers are kept.
+ */
+export function blankLiterals(sql: string, dialect: Dialect): string {
+  let out = ''
+  let from = 0
+  let i = 0
+  while (i < sql.length) {
+    const end = skipQuoted(sql, i, dialect)
+    if (end < 0) {
+      i++
+      continue
+    }
+    const c = sql[i]
+    const name = c === '`' || c === '[' || (c === '"' && dialect !== 'mysql')
+    const comment = c === '-' || c === '#' || c === '/'
+    out += sql.slice(from, i) + (name ? sql.slice(i, end) : comment ? ' ' : "''")
+    i = from = end
+  }
+  return out + sql.slice(from)
 }
 
 /** The statement containing (or immediately before) `pos`. */
@@ -513,24 +563,117 @@ export function stripComments(sql: string): string {
 export function dangerousStatements(sql: string, dialect: Dialect): string[] {
   const reasons: string[] = []
   for (const statement of splitStatements(sql, dialect)) {
-    const s = stripComments(statement.text).trim()
-    // MariaDB: removes old versions of a system-versioned table's rows
-    if (/^delete\s+history\b/i.test(s)) reasons.push('DELETE HISTORY')
-    else if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
-      reasons.push('DELETE without a WHERE clause')
-    else if (/^(with\b[\s\S]*?\)\s*)?update\b/i.test(s) && !/\bwhere\b/i.test(s))
-      reasons.push('UPDATE without a WHERE clause')
-    else if (
-      /^drop\s+(table|database|schema|view|materialized\s+view|index|function|procedure|collection)\b/i.test(
+    const s = blankLiterals(statement.text, dialect).trim()
+    // Routine bodies run later, if at all; in T-SQL the rest of the batch is the body
+    if (
+      /^create\s+(or\s+(replace|alter)\s+)?(definer\s*=\s*\S+\s+)?(proc|procedure|function|trigger|event|rule|view|package)\b/i.test(
         s
       )
-    ) {
-      reasons.push(s.split(/\s+/).slice(0, 3).join(' ').toUpperCase())
-    } else if (/^truncate\b/i.test(s)) reasons.push('TRUNCATE')
-    else if (/^alter\s+table\b[\s\S]*\bdrop\b/i.test(s)) reasons.push('ALTER TABLE … DROP')
+    )
+      continue
+    // Only EXPLAIN ANALYZE runs the statement
+    if (
+      /^explain\b/i.test(s) &&
+      !/^explain\s+(analy[sz]e\b|\([^)]*\banaly[sz]e\b(?!\s+(false|off)\b))/i.test(s)
+    )
+      continue
+    const alter = /^alter\b/i.test(s)
+    if (alter && /^alter\s+table\b[\s\S]*\bdrop\b/i.test(s)) reasons.push('ALTER TABLE … DROP')
+    const tokens = [...s.matchAll(/"(?:[^"]|"")*"|\[(?:[^\]]|\]\])*\]|`(?:[^`]|``)*`|[\w$#@]+|\S/g)]
+    const words = tokens.map((t) => t[0].toLowerCase())
+    // Parenthesis depth of each token
+    const depths: number[] = []
+    let depth = 0
+    for (const w of words) {
+      if (w === ')') depth--
+      depths.push(depth)
+      if (w === '(') depth++
+    }
+    // T-SQL needs no semicolons, so a statement can start at any word
+    const startsStatement = (k: number, keywords: Set<string>): boolean =>
+      keywords.has(words[k]) && !NOT_A_STATEMENT.has(words[k - 1])
+    // Words of the statement starting at `k`, at its own depth
+    const clause = (k: number): string[] => {
+      const out: string[] = []
+      for (let j = k + 1; j < words.length && depths[j] >= depths[k]; j++) {
+        if (depths[j] !== depths[k]) continue
+        if (startsStatement(j, STATEMENT_START)) break
+        out.push(words[j])
+      }
+      return out
+    }
+    for (let k = 0; k < words.length; k++) {
+      if (!startsStatement(k, WRITES)) continue
+      const w = words[k]
+      // MariaDB: removes old versions of a system-versioned table's rows
+      if (w === 'delete' && words[k + 1] === 'history') reasons.push('DELETE HISTORY')
+      else if ((w === 'delete' || w === 'update') && !clause(k).includes('where'))
+        reasons.push(`${w.toUpperCase()} without a WHERE clause`)
+      else if (w === 'merge' && clause(k).includes('delete')) reasons.push('MERGE … DELETE')
+      else if (w === 'drop' && !alter && DROPPED.has(words[k + 1]))
+        reasons.push(s.slice(tokens[k].index).split(/\s+/).slice(0, 3).join(' ').toUpperCase())
+      else if (w === 'truncate') reasons.push('TRUNCATE')
+    }
   }
   return [...new Set(reasons)]
 }
+
+const WRITES = new Set(['delete', 'update', 'merge', 'drop', 'truncate'])
+
+/** Words that start a statement, ending the one before when T-SQL leaves out the `;`. */
+const STATEMENT_START = new Set([
+  ...WRITES,
+  'select',
+  'insert',
+  'alter',
+  'create',
+  'exec',
+  'execute',
+  'declare',
+  'print'
+])
+
+/** Words before DELETE, UPDATE and the like that make them part of another statement. */
+const NOT_A_STATEMENT = new Set([
+  ',',
+  'on', // ON DELETE CASCADE
+  'for', // FOR UPDATE, policies
+  'after', // triggers
+  'before',
+  'of', // INSTEAD OF DELETE
+  'or',
+  'key', // ON DUPLICATE KEY UPDATE, FOR NO KEY UPDATE
+  'share', // SHARE UPDATE EXCLUSIVE
+  'do', // ON CONFLICT DO UPDATE
+  'then', // MERGE … WHEN MATCHED THEN UPDATE
+  'grant',
+  'revoke',
+  'deny'
+])
+
+/** Objects whose DROP deserves a confirmation. */
+const DROPPED = new Set([
+  'table',
+  'temporary',
+  'database',
+  'schema',
+  'view',
+  'materialized',
+  'index',
+  'function',
+  'procedure',
+  'collection',
+  'user',
+  'owned',
+  'role',
+  'login',
+  'sequence',
+  'trigger',
+  'type',
+  'extension',
+  'tablespace',
+  'event'
+])
 
 export function explainSql(
   sql: string,
@@ -568,7 +711,7 @@ export function explainSql(
  */
 function insideMysqlBody(current: string, dialect: Dialect): boolean {
   if (dialect !== 'mysql') return false
-  const text = current.replace(/--[^\n]*/g, ' ').replace(/'(?:[^'\\]|\\.|'')*'/g, "''")
+  const text = blankLiterals(current, dialect)
   // MariaDB packages and Oracle-mode routines nest differently
   const mariaDb = insideMariaDbBlock(text)
   if (mariaDb !== null) return mariaDb
@@ -578,8 +721,17 @@ function insideMysqlBody(current: string, dialect: Dialect): boolean {
     )
   )
     return false
-  const begins = (text.match(/\bbegin\b/gi) ?? []).length
-  // END IF / END LOOP / END WHILE / END REPEAT / END CASE close other blocks
-  const ends = (text.match(/\bend\b(?!\s+(if|loop|while|repeat|case)\b)/gi) ?? []).length
-  return begins > ends
+  // Quoted names may hold any word
+  const words = (text.replace(/`(?:[^`]|``)*`/g, ' ').match(/[A-Za-z_][\w$]*/g) ?? []).map((w) =>
+    w.toLowerCase()
+  )
+  let depth = 0
+  for (let k = 0; k < words.length; k++) {
+    const w = words[k]
+    // A CASE (statement or expression) ends at END CASE or a bare END
+    if (w === 'begin' || (w === 'case' && words[k - 1] !== 'end')) depth++
+    // END IF / END LOOP / END WHILE / END REPEAT close blocks whose openers aren't counted
+    else if (w === 'end' && !/^(if|loop|while|repeat)$/.test(words[k + 1] ?? '')) depth--
+  }
+  return depth > 0
 }

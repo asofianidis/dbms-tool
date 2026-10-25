@@ -1,5 +1,5 @@
 import type { Dialect } from './engines'
-import { literal } from './sql'
+import { literal, skipQuoted } from './sql'
 import { createPersistentStore } from './store'
 
 /**
@@ -37,37 +37,9 @@ export function findParams(sql: string, dialect: Dialect): ParamRef[] {
   while (i < n) {
     const c = sql[i]
     const next = sql[i + 1]
-    if (c === '-' && next === '-') {
-      while (i < n && sql[i] !== '\n') i++
-      continue
-    }
-    if (c === '#' && dialect === 'mysql') {
-      while (i < n && sql[i] !== '\n') i++
-      continue
-    }
-    if (c === '/' && next === '*') {
-      const end = sql.indexOf('*/', i + 2)
-      i = end < 0 ? n : end + 2
-      continue
-    }
-    if (c === "'" || c === '"' || c === '`' || (c === '[' && dialect === 'tsql')) {
-      const close = c === '[' ? ']' : c
-      i++
-      while (i < n) {
-        if (sql[i] === '\\' && dialect === 'mysql') {
-          i += 2
-          continue
-        }
-        if (sql[i] === close) {
-          if (sql[i + 1] === close) {
-            i += 2
-            continue
-          }
-          break
-        }
-        i++
-      }
-      i++
+    const skip = skipQuoted(sql, i, dialect)
+    if (skip >= 0) {
+      i = skip
       continue
     }
     if (c === '$' && next === '{') {
@@ -75,14 +47,6 @@ export function findParams(sql: string, dialect: Dialect): ParamRef[] {
       if (m) {
         out.push({ name: m[1], from: i, to: i + m[0].length })
         i += m[0].length
-        continue
-      }
-    }
-    if (c === '$' && dialect === 'postgres') {
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
-      if (m) {
-        const end = sql.indexOf(m[0], i + m[0].length)
-        i = end < 0 ? n : end + m[0].length
         continue
       }
     }
