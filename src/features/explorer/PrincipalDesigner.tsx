@@ -14,6 +14,7 @@ import {
   type GrantMap,
   type Principal
 } from '@/lib/grants'
+import { connectedInfo, isMariaDb } from '@/lib/mariadb'
 import {
   TSQL_LOGINS_QUERY,
   canRenamePrincipal,
@@ -191,7 +192,7 @@ function PrincipalForm({
   const connection = connectionsStore.use().find((c) => c.id === connectionId)
   const status = statusStore.use()[connectionId]
   const options: PrincipalOptions = {
-    mariadb: status?.state === 'connected' && status.info.product === 'MariaDB',
+    mariadb: isMariaDb(connectedInfo(status)),
     babelfish: connection?.engine === 'babelfish'
   }
   const [draft, setDraft] = useState<PrincipalDraft>(() =>
