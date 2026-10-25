@@ -480,7 +480,8 @@ async fn mariadb_packages() {
     let opts = crate::model::ExecOptions::with_max_rows(100);
     let exec = async |sql: &str| {
         let out = server.execute("t", db, sql, &opts).await.unwrap();
-        assert!(out.error.is_none(), "{sql}\n{:?}", out.error);
+        // Messages leave out what the server returns: CodeQL treats it as secret
+        assert!(out.error.is_none(), "{sql}");
         out
     };
     let mut admin = match session(&server, "").await.unwrap() {
@@ -539,10 +540,10 @@ async fn mariadb_packages() {
         pkg_o.starts_with("CREATE DEFINER=\"root\"@")
             && pkg_o.contains("END;\n\nCREATE DEFINER=\"root\"@")
             && pkg_o.contains("PACKAGE BODY \"pkg_o\""),
-        "{pkg_o}"
+        "pkg_o definition"
     );
     let spec_only = definition("spec_only").await;
-    assert!(!spec_only.contains("BODY"), "{spec_only}");
+    assert!(!spec_only.contains("BODY"), "spec_only definition");
 
     // The package Modify script: both parts CREATE OR REPLACE, under the stored mode
     let mode: String = conn
@@ -554,7 +555,7 @@ async fn mariadb_packages() {
         .await
         .unwrap()
         .unwrap();
-    assert!(mode.split(',').any(|m| m == "ORACLE"), "{mode}");
+    assert!(mode.split(',').any(|m| m == "ORACLE"), "pkg_o sql_mode");
     let wrap = |script: String| {
         format!(
             "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = '{mode}';\n\n{script};\n\n\
