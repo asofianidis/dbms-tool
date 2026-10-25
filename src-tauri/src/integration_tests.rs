@@ -259,6 +259,77 @@ async fn mariadb_sequences() {
 }
 
 #[tokio::test]
+async fn mariadb_column_types() {
+    // INET4 / INET6 / UUID / VECTOR, INVISIBLE and COMPRESSED columns as the grid and designer see them
+    let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MARIADB").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "DROP DATABASE IF EXISTS mdb_coltypes; CREATE DATABASE mdb_coltypes; USE mdb_coltypes; \
+             CREATE TABLE t (id INT PRIMARY KEY, ip4 INET4, ip6 INET6, u UUID, v VECTOR(2) NOT NULL, \
+               secret INT INVISIBLE, notes TEXT COMPRESSED, VECTOR INDEX vix (v)); \
+             INSERT INTO t (id, ip4, ip6, u, v, secret, notes) VALUES \
+               (1, '10.0.0.1', '2001:db8::1', '123e4567-e89b-12d3-a456-426614174000', VEC_FromText('[1,-2.5]'), 7, 'hi'); \
+             SELECT ip4, ip6, u, v FROM t",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let set = &out.results[0];
+    let types: Vec<&str> = set.columns.iter().map(|c| c.type_name.as_str()).collect();
+    println!("DBMS_TEST_MARIADB: wire types {types:?}");
+    assert_eq!(set.rows[0][0], json!("10.0.0.1"));
+    assert_eq!(set.rows[0][1], json!("2001:db8::1"));
+    assert_eq!(
+        set.rows[0][2],
+        json!("123e4567-e89b-12d3-a456-426614174000")
+    );
+    // Little-endian float32s: 1.0, -2.5
+    assert_eq!(set.rows[0][3], json!("0x0000803F000020C0"));
+
+    // SELECT * leaves invisible columns out
+    let out = s
+        .execute("tab1", "", "SELECT * FROM t", &opts())
+        .await
+        .unwrap();
+    assert!(!out.results[0].columns.iter().any(|c| c.name == "secret"));
+
+    // Edits the grid writes: hex and VEC_FromText for vectors, text for the others
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "UPDATE t SET v = 0x00000040000080BF, ip6 = '::ffff:1.2.3.4' WHERE id = 1; \
+             SELECT VEC_ToText(v), ip6 FROM t; \
+             UPDATE t SET v = VEC_FromText('[3,4]') WHERE id = 1; SELECT VEC_ToText(v) FROM t",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("[2,-1]"));
+    assert_eq!(cell(&out, 0, 0, 1), json!("::ffff:1.2.3.4"));
+    assert_eq!(cell(&out, 1, 0, 0), json!("[3,4]"));
+
+    let info = s.describe_table("mdb_coltypes", None, "t").await.unwrap();
+    let column = |name: &str| info.columns.iter().find(|c| c.name == name).unwrap();
+    assert_eq!(column("secret").extra.as_deref(), Some("INVISIBLE"));
+    assert_eq!(column("notes").data_type, "text /*M!100301 COMPRESSED*/");
+    assert_eq!(column("v").data_type, "vector(2)");
+    let vix = info.indexes.iter().find(|i| i.name == "vix").unwrap();
+    assert_eq!(vix.method.as_deref(), Some("VECTOR"));
+
+    s.execute("tab1", "", "DROP DATABASE mdb_coltypes", &opts())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn mysql_end_to_end() {
     let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MYSQL").await else {
         return;
