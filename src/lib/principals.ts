@@ -296,9 +296,8 @@ export function memberQueries(dialect: Dialect, role: Principal): string[] {
 const MASK = '********'
 
 function secret(dialect: Dialect, password: string, options: PrincipalOptions): string {
-  const value = literal(dialect, options.maskPasswords ? MASK : password)
-  // Unicode, so passwords outside the server's code page survive
-  return dialect === 'tsql' ? `N${value}` : value
+  // nvarchar makes T-SQL passwords Unicode, so ones outside the server's code page survive
+  return literal(dialect, options.maskPasswords ? MASK : password, 'nvarchar')
 }
 
 const PG_FLAGS: [keyof PrincipalState, string][] = [

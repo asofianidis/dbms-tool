@@ -109,3 +109,19 @@ describe('buildWhere / buildOrderBy', () => {
     expect(describeCondition(newCondition({ column: 'n', op: 'null' }))).toBe('n is NULL')
   })
 })
+
+describe('bit column filters', () => {
+  it('compares PostgreSQL bits with bit strings', () => {
+    expect(conditionSql('postgres', newCondition({ column: 'on', op: 'true' }), 'bit(1)')).toBe(
+      `"on" = B'1'`
+    )
+    expect(columnKind('bit(3)')).toBe('other')
+    expect(columnKind('bit varying(8)')).toBe('other')
+    expect(
+      conditionSql('postgres', newCondition({ column: 'flags', value: '101' }), 'bit(3)')
+    ).toBe("flags = B'101'")
+    expect(conditionSql('mysql', newCondition({ column: 'ok', op: 'true' }), 'bit(1)')).toBe(
+      '`ok` IS TRUE'
+    )
+  })
+})

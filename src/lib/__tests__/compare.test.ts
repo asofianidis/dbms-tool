@@ -4,6 +4,7 @@ import {
   cleanDefinition,
   compareSnapshots,
   defaultSelection,
+  dropCount,
   diffLines,
   migrationScript,
   migrationStatements,
@@ -639,5 +640,37 @@ describe('helpers', () => {
     expect(diffLines('', 'x')).toEqual([
       { left: null, right: { line: 1, text: 'x' }, kind: 'added' }
     ])
+  })
+})
+
+describe('column drops in altered tables', () => {
+  it('warns, counts and leaves out of the default selection alters that drop columns', () => {
+    const source = obj('users', {
+      table: table({
+        columns: [column({ name: 'id', nullable: false }), column({ name: 'email' })]
+      })
+    })
+    const target = obj('users', {
+      table: table({ columns: [column({ name: 'id', nullable: false }), column({ name: 'mail' })] })
+    })
+    const [item] = compareSnapshots(pg(snapshot([source]), snapshot([target])))
+    expect(item.action).toBe('alter')
+    expect(dropCount(item)).toBe(1)
+    expect(item.warnings).toContainEqual(expect.stringMatching(/^Drops column mail and its data/))
+    expect(defaultSelection([item]).size).toBe(0)
+  })
+
+  it('still preselects alters that only add columns', () => {
+    const source = obj('users', {
+      table: table({
+        columns: [column({ name: 'id', nullable: false }), column({ name: 'email' })]
+      })
+    })
+    const target = obj('users', {
+      table: table({ columns: [column({ name: 'id', nullable: false })] })
+    })
+    const items = compareSnapshots(pg(snapshot([source]), snapshot([target])))
+    expect(dropCount(items[0])).toBe(0)
+    expect(defaultSelection(items).size).toBe(1)
   })
 })

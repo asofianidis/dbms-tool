@@ -346,3 +346,19 @@ describe('parseShell', () => {
     })
   })
 })
+
+describe('bit literals', () => {
+  it('writes PostgreSQL bit strings as B literals', () => {
+    expect(literal('postgres', '101', 'bit(3)')).toBe("B'101'")
+    expect(literal('postgres', '1', 'bit')).toBe("B'1'")
+    expect(literal('postgres', '0110', 'bit varying(8)')).toBe("B'0110'")
+    expect(literal('postgres', '01', 'varbit')).toBe("B'01'")
+    expect(literal('postgres', true, 'bit(1)')).toBe("B'1'")
+  })
+
+  it('keeps MySQL and SQL Server bits numeric', () => {
+    expect(literal('mysql', '5', 'bit(3)')).toBe('5')
+    expect(literal('tsql', '1', 'bit')).toBe('1')
+    expect(literal('tsql', false, 'bit')).toBe('0')
+  })
+})

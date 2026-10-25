@@ -53,6 +53,11 @@ export interface GrantState {
   grantOption: boolean
   /** PostgreSQL bulk kinds: default privileges on objects the current role creates later */
   defaults: GrantMap
+  /**
+   * MySQL databases: the name as the server stores the grant, when it was granted
+   * without escaping _ and % (so it also matches other databases)
+   */
+  databasePattern?: string
 }
 
 export const emptyGrantState = (): GrantState => ({
@@ -501,9 +506,12 @@ export function grantQuery(dialect: Dialect, grantee: Principal, s: Securable): 
     const who = lit(`'${grantee.name}'@'${grantee.host ?? ''}'`)
     if (s.kind === 'server')
       return `SELECT PRIVILEGE_TYPE, IS_GRANTABLE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = ${who}`
-    if (s.kind === 'database')
-      return `SELECT PRIVILEGE_TYPE, IS_GRANTABLE FROM information_schema.SCHEMA_PRIVILEGES \
-        WHERE GRANTEE = ${who} AND TABLE_SCHEMA = ${lit(s.name ?? '')}`
+    if (s.kind === 'database') {
+      // Database grants are stored as LIKE patterns: my\_db is the database, my_db any match
+      const names = [...new Set([mysqlDatabasePattern(s.name ?? ''), s.name ?? ''])]
+      return `SELECT PRIVILEGE_TYPE, IS_GRANTABLE, TABLE_SCHEMA FROM information_schema.SCHEMA_PRIVILEGES \
+        WHERE GRANTEE = ${who} AND TABLE_SCHEMA IN (${names.map(lit).join(', ')})`
+    }
     return `SELECT PRIVILEGE_TYPE, IS_GRANTABLE FROM information_schema.TABLE_PRIVILEGES \
       WHERE GRANTEE = ${who} AND TABLE_SCHEMA = ${lit(s.schema ?? '')} AND TABLE_NAME = ${lit(s.name ?? '')}`
   }
@@ -536,7 +544,15 @@ export function parseGrantRows(dialect: Dialect, s: Securable, rows: Cell[][]): 
       }
       return state
     }
-    for (const r of rows) {
+    // Database grants: prefer the escaped one; an unescaped one is read (and edited) as stored
+    const escaped = mysqlDatabasePattern(s.name ?? '')
+    const stored =
+      s.kind !== 'database' || rows.some((r) => r[2] == null || text(r[2]) === escaped)
+        ? escaped
+        : text(rows[0]?.[2])
+    const held = rows.filter((r) => r[2] == null || text(r[2]) === stored)
+    if (s.kind === 'database' && held.length && stored !== escaped) state.databasePattern = stored
+    for (const r of held) {
       const p = text(r[0])
       if (text(r[1]) === 'YES') state.grantOption = true
       // USAGE means "no privileges"
@@ -672,8 +688,13 @@ function changes(
   )
 }
 
+/** A MySQL database name as a grant pattern, with `\` and the _ and % wildcards escaped. */
+export function mysqlDatabasePattern(name: string): string {
+  return name.replace(/[\\_%]/g, '\\$&')
+}
+
 /** The ON clause target; null for SQL Server database permissions, which have none. */
-function onTarget(dialect: Dialect, s: Securable): string | null {
+function onTarget(dialect: Dialect, s: Securable, databasePattern?: string): string | null {
   const q = (n: string | null): string => quoteIdent(dialect, n ?? '')
   const object = qualified(dialect, { schema: s.schema, name: s.name ?? '' })
   if (dialect === 'postgres') {
@@ -702,7 +723,7 @@ function onTarget(dialect: Dialect, s: Securable): string | null {
       case 'server':
         return '*.*'
       case 'database':
-        return `${q(s.name)}.*`
+        return `${q(databasePattern ?? mysqlDatabasePattern(s.name ?? ''))}.*`
       case 'function':
       case 'procedure':
         return `${s.kind.toUpperCase()} ${object}`
@@ -751,7 +772,7 @@ export function grantStatements(
   draft: GrantState
 ): string[] {
   const who = granteeSql(dialect, grantee)
-  const on = onTarget(dialect, s)
+  const on = onTarget(dialect, s, original.databasePattern)
   const options = privilegeOptions(dialect, s.kind, original)
   const keys = [...options, ...Object.keys(draft.privileges).filter((p) => !options.includes(p))]
 

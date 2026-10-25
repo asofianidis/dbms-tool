@@ -125,9 +125,14 @@ const BOOL_TYPE = /^(bool|boolean)\b/i
 export function literal(dialect: Dialect, value: Cell, dataType = ''): string {
   if (value === null) return 'NULL'
   if (typeof value === 'boolean') {
+    if (dialect === 'postgres' && /^(bit|varbit)\b/i.test(dataType.trim()))
+      return value ? "B'1'" : "B'0'"
     return dialect === 'tsql' ? (value ? '1' : '0') : value ? 'TRUE' : 'FALSE'
   }
-  if (isNumericType(dataType) && /^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(value.trim())) {
+  // PostgreSQL bit strings aren't numbers: 101 is an integer, B'101' the bits
+  if (dialect === 'postgres' && /^(bit|varbit)\b/i.test(dataType.trim())) {
+    if (/^[01]*$/.test(value.trim())) return `B'${value.trim()}'`
+  } else if (isNumericType(dataType) && /^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(value.trim())) {
     return value.trim()
   }
   if (BOOL_TYPE.test(dataType) && /^(t|f|true|false)$/i.test(value)) {

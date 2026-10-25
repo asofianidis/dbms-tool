@@ -71,6 +71,13 @@ pub struct ColumnInfo {
     /// MySQL `EXTRA` attributes such as `on update CURRENT_TIMESTAMP`, which a
     /// `MODIFY COLUMN` has to restate
     pub extra: Option<String>,
+    /// MySQL character set of a text column, which `MODIFY COLUMN` has to restate
+    #[serde(default)]
+    pub charset: Option<String>,
+    /// MySQL / SQL Server collation of a text column, which `MODIFY COLUMN` and
+    /// `ALTER COLUMN` have to restate
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

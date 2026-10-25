@@ -53,6 +53,8 @@ export type ColumnKind = 'text' | 'number' | 'date' | 'boolean' | 'other'
 
 export function columnKind(dataType: string): ColumnKind {
   const t = dataType.trim().toLowerCase()
+  // Wider bit columns hold bit strings, compared as values rather than true or false
+  if (/^(varbit|bit\s+varying|bit\s*\(\s*([2-9]|\d\d+)\s*\))/.test(t)) return 'other'
   if (/^(bool|boolean|bit)\b/.test(t)) return 'boolean'
   if (isNumericType(t)) return 'number'
   if (/date|time|year|interval/.test(t)) return 'date'
@@ -177,7 +179,9 @@ export function conditionSql(dialect: Dialect, c: FilterCondition, dataType = ''
       return `${column} IS NOT NULL`
     case 'true':
     case 'false':
-      // SQL Server bit columns have no IS TRUE
+      // SQL Server and PostgreSQL bit columns have no IS TRUE
+      if (dialect === 'postgres' && /^bit\b/i.test(dataType.trim()))
+        return `${column} = B'${c.op === 'true' ? 1 : 0}'`
       return dialect === 'tsql'
         ? `${column} = ${c.op === 'true' ? 1 : 0}`
         : `${column} IS ${c.op === 'true' ? 'TRUE' : 'FALSE'}`

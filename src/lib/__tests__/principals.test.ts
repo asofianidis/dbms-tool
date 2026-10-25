@@ -329,3 +329,15 @@ describe('SQL Server users and roles', () => {
     )
   })
 })
+
+describe('SQL Server passwords', () => {
+  it('prefixes N exactly once, ASCII or not', () => {
+    const base = draft(newPrincipalDraft('tsql', 'user'), { name: 'u', auth: 'password' })
+    expect(principalStatements('tsql', { ...base, password: 'pässword' })).toEqual([
+      "CREATE USER [u] WITH PASSWORD = N'pässword'"
+    ])
+    expect(principalStatements('tsql', { ...base, password: 'plain' })).toEqual([
+      "CREATE USER [u] WITH PASSWORD = N'plain'"
+    ])
+  })
+})

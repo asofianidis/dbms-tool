@@ -275,6 +275,10 @@ export interface ColumnInfo {
   comment: string | null
   /** MySQL column attributes such as `on update CURRENT_TIMESTAMP` */
   extra: string | null
+  /** MySQL character set of a text column */
+  charset?: string | null
+  /** MySQL / SQL Server collation of a text column */
+  collation?: string | null
 }
 
 export interface IndexInfo {

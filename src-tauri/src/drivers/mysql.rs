@@ -531,7 +531,8 @@ impl MySession {
     pub async fn describe_table(&mut self, database: &str, table: &str) -> AppResult<TableInfo> {
         let columns = self
             .rows(
-                "SELECT column_name, column_type, is_nullable, column_default, column_key, extra, column_comment \
+                "SELECT column_name, column_type, is_nullable, column_default, column_key, extra, column_comment, \
+                   character_set_name, collation_name \
                  FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
                  ORDER BY ordinal_position",
                 vec![database.into(), table.into()],
@@ -626,6 +627,8 @@ impl MySession {
                         is_identity: extra.contains("auto_increment"),
                         comment: text(r, 6).filter(|c| !c.is_empty()),
                         extra: text(r, 5).filter(|e| !e.is_empty()),
+                        charset: text(r, 7),
+                        collation: text(r, 8),
                     }
                 })
                 .collect(),

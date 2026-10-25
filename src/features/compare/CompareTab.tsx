@@ -26,6 +26,7 @@ import {
   compareSnapshots,
   defaultSelection,
   diffLines,
+  dropCount,
   migrationScript,
   migrationStatements,
   type Change,
@@ -828,7 +829,7 @@ function ScriptPane({
         body
       ].join('\n')
     : ''
-  const drops = items.filter((i) => i.action === 'drop' && selected.has(i.id)).length
+  const drops = items.filter((i) => selected.has(i.id)).reduce((n, i) => n + dropCount(i), 0)
   const warnings = items
     .filter((i) => selected.has(i.id))
     .reduce((n, i) => n + i.warnings.length, 0)
@@ -857,7 +858,11 @@ function ScriptPane({
           Save…
         </Button>
         <div className="flex-1" />
-        {drops > 0 && <Badge tone="danger">Drops {drops}</Badge>}
+        {drops > 0 && (
+          <Badge tone="danger" title="Objects and columns the script drops, with their data">
+            Drops {drops}
+          </Badge>
+        )}
         {warnings > 0 && (
           <Badge tone="warning" title="See each object's differences">
             {warnings} {warnings === 1 ? 'warning' : 'warnings'}
