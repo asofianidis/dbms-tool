@@ -1,0 +1,82 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.125703448
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 7.013321488,
+    "r_loops": 1,
+    "r_total_time_ms": 3.578116741,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "customers",
+          "access_type": "ALL",
+          "possible_keys": ["PRIMARY", "idx_country"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 2000,
+          "r_rows": 2000,
+          "cost": 0.3411288,
+          "r_table_time_ms": 0.265371723,
+          "r_other_time_ms": 0.103975938,
+          "r_engine_stats": {
+            "pages_accessed": 8
+          },
+          "filtered": 20,
+          "r_total_filtered": 20,
+          "attached_condition": "customers.country = 'US'",
+          "r_filtered": 20
+        }
+      },
+      {
+        "table": {
+          "table_name": "<subquery2>",
+          "access_type": "eq_ref",
+          "possible_keys": ["distinct_key"],
+          "key": "distinct_key",
+          "key_length": "4",
+          "used_key_parts": ["customer_id"],
+          "ref": ["func"],
+          "r_loops": 400,
+          "r_table_loops": 520,
+          "rows": 1,
+          "r_rows": 0.06,
+          "r_table_time_ms": 0.034421898,
+          "r_other_time_ms": 0.013325395,
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "r_filtered": 100,
+          "materialized": {
+            "unique": 1,
+            "query_block": {
+              "select_id": 2,
+              "nested_loop": [
+                {
+                  "table": {
+                    "table_name": "orders",
+                    "access_type": "ALL",
+                    "loops": 1,
+                    "r_loops": 1,
+                    "rows": 19847,
+                    "r_rows": 20000,
+                    "cost": 3.3279766,
+                    "r_table_time_ms": 2.122042674,
+                    "r_other_time_ms": 1.035667969,
+                    "r_engine_stats": {
+                      "pages_accessed": 55
+                    },
+                    "filtered": 100,
+                    "r_total_filtered": 0.6,
+                    "attached_condition": "orders.total > 990",
+                    "r_filtered": 0.6
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}
