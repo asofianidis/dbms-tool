@@ -244,11 +244,13 @@ describe('export', () => {
 
 describe('production write detection', () => {
   it('finds write keywords outside strings and comments', () => {
-    expect(sqlWriteKeyword('SELECT * FROM t WHERE a = 1')).toBeNull()
-    expect(sqlWriteKeyword("SELECT 'drop table' -- delete\n/* update */ FROM t")).toBeNull()
-    expect(sqlWriteKeyword('select 1;\nupdate t set a = 1')).toBe('UPDATE')
-    expect(sqlWriteKeyword('SELECT * INTO backup_t FROM t')).toBe('INTO')
-    expect(sqlWriteKeyword('SELECT "delete" FROM [drop]')).toBeNull()
+    expect(sqlWriteKeyword('SELECT * FROM t WHERE a = 1', 'postgres')).toBeNull()
+    expect(
+      sqlWriteKeyword("SELECT 'drop table' -- delete\n/* update */ FROM t", 'postgres')
+    ).toBeNull()
+    expect(sqlWriteKeyword('select 1;\nupdate t set a = 1', 'postgres')).toBe('UPDATE')
+    expect(sqlWriteKeyword('SELECT * INTO backup_t FROM t', 'postgres')).toBe('INTO')
+    expect(sqlWriteKeyword('SELECT "delete" FROM [drop]', 'tsql')).toBeNull()
   })
 
   it('classifies MongoDB requests', () => {
