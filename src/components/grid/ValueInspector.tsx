@@ -12,12 +12,15 @@ import {
   type BinaryValue
 } from '@/lib/binary'
 import { displayTimestamp } from '@/lib/datetime'
+import { decodeEwkb, type Geometry } from '@/lib/ewkb'
 import { copyText, saveBytesToFile, saveToFile } from '@/lib/export'
 import { formatBytes } from '@/lib/format'
+import { isSpatialType, isVectorType, vectorDims } from '@/lib/pg-extensions-aware'
 import { settingsStore } from '@/lib/settings'
 import { errorMessage, toast } from '@/lib/toast'
 import { CodeEditor } from '../editor/CodeEditor'
 import { Badge, Button, Modal, Segmented, Spinner } from '../ui'
+import { SpatialInspector } from './SpatialInspector'
 
 function prettyJson(text: string): string | null {
   const t = text.trim()
@@ -61,6 +64,22 @@ export function ValueInspector({
         : null,
     [current, column.typeName]
   )
+  // PostGIS values arrive as hex EWKB
+  const geometry = useMemo<Geometry | null>(
+    () =>
+      typeof current === 'string' && isSpatialType(column.typeName) ? decodeEwkb(current) : null,
+    [current, column.typeName]
+  )
+  if (geometry)
+    return (
+      <SpatialInspector
+        column={column}
+        geometry={geometry}
+        editable={editable}
+        onSave={onSave}
+        onClose={onClose}
+      />
+    )
   if (binary)
     return (
       <BinaryInspector
@@ -119,6 +138,7 @@ function TextInspector({
       ? displayTimestamp(value, column.typeName, { timeZone, assumeUtc, format: dateFormat })
       : null
   const changed = text !== (pretty ?? original)
+  const dims = typeof value === 'string' && isVectorType(column.typeName) ? vectorDims(value) : null
   return (
     <Modal
       width="lg"
@@ -132,6 +152,7 @@ function TextInspector({
             <span>{original.length.toLocaleString()} characters</span>
           )}
           {pretty && <Badge tone="info">JSON</Badge>}
+          {dims !== null && <Badge tone="info">{dims.toLocaleString()} dims</Badge>}
           {local && (
             <span className="font-mono text-syn-type" title={`Shown in ${timeZone}`}>
               {local}

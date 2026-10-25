@@ -40,6 +40,7 @@ import {
   type GridLayout
 } from '@/lib/grid-layout'
 import { isMod } from '@/lib/keys'
+import { extensionCellDisplay, extensionEditText } from '@/lib/pg-extensions-aware'
 import { settingsStore } from '@/lib/settings'
 import { isNumericType } from '@/lib/sql'
 import { showContextMenu, type MenuItem } from '../ContextMenu'
@@ -980,15 +981,18 @@ export const ResultGrid = memo(function ResultGrid({
                 const modified = modifiedOf(dataRow, c)
                 const sticky = stickyStyle(pos)
                 if (editingCell && editingCell.r === vr.index && editingCell.c === pos) {
+                  // Geometry is edited as EWKT rather than the hex EWKB it arrives as
+                  const editText =
+                    dialect === 'postgres' ? extensionEditText(value, columns[c].typeName) : null
                   return (
                     <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
                       <CellEditor
                         width={width}
                         style={sticky}
-                        initial={value}
+                        initial={editText ?? value}
                         onDone={(next, moveBy) => {
                           setEditingCell(null)
-                          if (next !== undefined && next !== value)
+                          if (next !== undefined && next !== value && next !== editText)
                             editing?.onEdit(dataRow, c, next)
                           scrollRef.current?.focus({ preventScroll: true })
                           if (moveBy) {
@@ -1004,10 +1008,16 @@ export const ResultGrid = memo(function ResultGrid({
                     </Padded>
                   )
                 }
-                const shown =
+                const time =
                   typeof value === 'string'
                     ? displayTimestamp(value, columns[c].typeName, timeDisplay)
                     : null
+                // PostGIS geometry as EWKT, pgvector vectors in short
+                const shown =
+                  time ??
+                  (dialect === 'postgres' && typeof value === 'string'
+                    ? extensionCellDisplay(value, columns[c].typeName)
+                    : null)
                 return (
                   <Padded key={key} before={n === frozenCols.length ? leftPad : 0}>
                     <div
@@ -1034,7 +1044,7 @@ export const ResultGrid = memo(function ResultGrid({
                           : setInspect({ row: dataRow, col: c })
                       }
                       onContextMenu={(e) => cellMenu(e, { r: vr.index, c: pos })}
-                      title={shown ? String(value) : undefined}
+                      title={time ? String(value) : undefined}
                     >
                       {value === null ? (
                         <span className="text-faint italic">NULL</span>

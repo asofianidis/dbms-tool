@@ -73,8 +73,16 @@ import {
   withTableOptions,
   type TableOptions
 } from '@/lib/storage-engines'
+import {
+  extensionColumnTypes,
+  extensionIndexMethods,
+  methodDefaults,
+  NO_PG_EXTENSIONS,
+  type PgExtensions
+} from '@/lib/pg-extensions-aware'
 import { loadTableExtras, type TableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
+import { usePgExtensions } from '@/lib/use-pg-extensions'
 import {
   supportsVersioning,
   versionedTableStatements,
@@ -94,6 +102,7 @@ import {
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import { ColumnAttributes, hasColumnAttributes } from './ColumnAttributes'
+import { PgIndexOptions } from './PgIndexOptions'
 import { TableOptionsEditor, useTableOptionsContext } from './StorageOptions'
 import {
   PgExclusionsEditor,
@@ -318,6 +327,8 @@ function DesignerForm({
   const options = useMemo(() => ({ babelfish, d1 }), [babelfish, d1])
   // MySQL / MariaDB table options: engine, charset, row format
   const storage = useTableOptionsContext(connectionId, database, request.name, mysql)
+  // pgvector / PostGIS types and index methods, when the database has them
+  const pgExtensions = usePgExtensions(connectionId, database, dialect === 'postgres')
   const [optionEdits, setOptionEdits] = useState<TableOptions | null>(null)
   const tableOptions = optionEdits ?? storage.context?.original ?? DEFAULT_TABLE_OPTIONS
   // PostgreSQL: partitioning, exclusion constraints, persistence, storage parameters
@@ -581,7 +592,10 @@ function DesignerForm({
               dialect={dialect}
               draft={draft}
               setDraft={setDraft}
-              types={serverTypes(dialect, TYPES[dialect], info)}
+              types={[
+                ...serverTypes(dialect, TYPES[dialect], info),
+                ...extensionColumnTypes(pgExtensions)
+              ]}
               features={features}
             />
           ) : view === 'indexes' ? (
@@ -589,6 +603,7 @@ function DesignerForm({
               dialect={dialect}
               draft={draft}
               setDraft={setDraft}
+              extensions={pgExtensions}
               vector={features.vectorIndex}
             />
           ) : view === 'foreignKeys' ? (
@@ -646,7 +661,7 @@ function ColumnsEditor({
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
-  /** Type suggestions for the connected server */
+  /** Type suggestions for the connected server, including those installed extensions add */
   types: string[]
   features: ColumnFeatures
 }): React.JSX.Element {
@@ -1085,11 +1100,14 @@ function IndexesEditor({
   dialect,
   draft,
   setDraft,
+  extensions = NO_PG_EXTENSIONS,
   vector
 }: {
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
+  /** pgvector / PostGIS, for their index methods and operator classes */
+  extensions?: PgExtensions
   /** MariaDB 11.7+ VECTOR indexes */
   vector: boolean
 }): React.JSX.Element {
@@ -1101,7 +1119,12 @@ function IndexesEditor({
     }))
   const existing = draft.indexes.filter((ix) => ix.original)
   const added = draft.indexes.filter((ix) => !ix.original)
-  const methods = [...indexMethods(dialect), ...(vector ? ['VECTOR'] : [])]
+  const pg = dialect === 'postgres'
+  const methods = [
+    ...indexMethods(dialect),
+    ...(pg ? extensionIndexMethods(extensions) : []),
+    ...(vector ? ['VECTOR'] : [])
+  ]
   const features = indexFeatures(dialect)
 
   const form = (ix: IndexDraft): React.JSX.Element => (
@@ -1121,7 +1144,12 @@ function IndexesEditor({
             <Select
               selectClassName="h-7 font-mono text-xs"
               value={ix.method}
-              onChange={(e) => patch(ix.id, { method: e.target.value })}
+              onChange={(e) =>
+                patch(ix.id, {
+                  method: e.target.value,
+                  ...(pg ? methodDefaults(e.target.value, extensions) : {})
+                })
+              }
             >
               <option value="">{methods[0]} (default)</option>
               {methods.slice(1).map((m) => (
@@ -1144,6 +1172,7 @@ function IndexesEditor({
           Unique
         </label>
       </div>
+      {pg && <PgIndexOptions ix={ix} extensions={extensions} onChange={(c) => patch(ix.id, c)} />}
       <div className="space-y-1.5">
         <span className="text-xs font-medium text-muted">Columns, in key order</span>
         <ColumnPicker

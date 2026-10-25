@@ -1,5 +1,6 @@
 import type { ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo } from './api'
 import type { Dialect } from './engines'
+import { extensionIndexProblem } from './pg-extensions-aware'
 import { retargetDefinition, type SqliteTableShape } from './sqlite-schema'
 import { isCompressible, isInvisible, splitCompressed, withCompressed } from './column-types'
 import { isNumericType, literal, qualified, quoteIdent } from './sql'
@@ -43,6 +44,10 @@ export interface IndexState {
   where: string
   /** Access method or index kind from indexMethods(), '' for the default */
   method: string
+  /** PostgreSQL operator class of the first key column, e.g. vector_cosine_ops */
+  opclass?: string
+  /** PostgreSQL storage parameters, `WITH (name = value)`, e.g. hnsw's m */
+  params?: Record<string, string>
 }
 
 export interface IndexDraft extends IndexState {
@@ -525,7 +530,9 @@ export function indexChange(dialect: Dialect, draft: TableDraft, ix: IndexDraft)
     ix.unique === was.unique &&
     sameList(ix.include, was.include) &&
     ix.where.trim() === was.where &&
-    normMethod(dialect, ix.method) === normMethod(dialect, was.method)
+    normMethod(dialect, ix.method) === normMethod(dialect, was.method) &&
+    (ix.opclass ?? '').trim() === (was.opclass ?? '').trim() &&
+    indexWith(ix) === indexWith(was)
   return change(sameShape, indexName(draft, ix) === was.name, renamesIndexes(dialect))
 }
 
@@ -643,6 +650,8 @@ export function validateDraft(dialect: Dialect, draft: TableDraft): string | nul
   for (const ix of draft.indexes) {
     if (!checked(ix, !!ix.original, () => indexChange(dialect, draft, ix))) continue
     if (!ix.columns.length) return `Pick the columns for index ${indexName(draft, ix)}`
+    const extension = dialect === 'postgres' && extensionIndexProblem(ix)
+    if (extension) return `Index ${indexName(draft, ix)}: ${extension}`
     if (usesDropped(ix.columns) || usesDropped(ix.include))
       return `Index ${indexName(draft, ix)} uses a dropped column`
   }
@@ -894,6 +903,14 @@ function mysqlIndexClause(draft: TableDraft, ix: IndexDraft): string {
   return `${kind}INDEX ${quoteIdent('mysql', indexName(draft, ix))} (${columnList('mysql', draft, ix.columns)})${using}`
 }
 
+/** The `WITH (…)` storage parameters of a PostgreSQL index, '' for none; whole numbers only. */
+function indexWith(ix: IndexState): string {
+  return Object.entries(ix.params ?? {})
+    .filter(([k, v]) => /^[a-z_]+$/.test(k) && /^\d+$/.test(v.trim()))
+    .map(([k, v]) => `${k} = ${v.trim()}`)
+    .join(', ')
+}
+
 function createIndex(dialect: Dialect, draft: TableDraft, table: string, ix: IndexDraft): string {
   const method = normMethod(dialect, ix.method)
   const kind = dialect === 'tsql' && method ? `${method} ` : ''
@@ -904,11 +921,17 @@ function createIndex(dialect: Dialect, draft: TableDraft, table: string, ix: Ind
       ? ` INCLUDE (${columnList(dialect, draft, ix.include)})`
       : ''
   const where = features.where && ix.where.trim() ? ` WHERE ${ix.where.trim()}` : ''
-  return `CREATE ${ix.unique ? 'UNIQUE ' : ''}${kind}INDEX ${quoteIdent(dialect, indexName(draft, ix))} ON ${table}${using} (${columnList(
-    dialect,
-    draft,
-    ix.columns
-  )})${include}${where}`
+  // pgvector / PostGIS: an operator class on the first key column and storage parameters
+  const opclass = dialect === 'postgres' && /^[\w.]+$/.test(ix.opclass?.trim() ?? '')
+  const keys = opclass
+    ? [
+        `${columnList(dialect, draft, ix.columns.slice(0, 1))} ${ix.opclass!.trim()}`,
+        ...(ix.columns.length > 1 ? [columnList(dialect, draft, ix.columns.slice(1))] : [])
+      ].join(', ')
+    : columnList(dialect, draft, ix.columns)
+  const params = dialect === 'postgres' ? indexWith(ix) : ''
+  const storage = params ? ` WITH (${params})` : ''
+  return `CREATE ${ix.unique ? 'UNIQUE ' : ''}${kind}INDEX ${quoteIdent(dialect, indexName(draft, ix))} ON ${table}${using} (${keys})${include}${storage}${where}`
 }
 
 function commentOn(dialect: Dialect, table: string, column: string, comment: string): string {

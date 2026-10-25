@@ -1,6 +1,7 @@
 import type { Dialect } from './engines'
 import type { ServerVersion } from './mariadb'
 import { MARIADB_FUNCTIONS } from './sql-functions-mariadb'
+import { PG_EXTENSION_FUNCTIONS } from './sql-functions-pg-extensions'
 import { POSTGRES_FUNCTIONS } from './sql-functions-postgres'
 
 /** A built-in function, for completion and the signature tooltip. */
@@ -22,6 +23,8 @@ export interface SqlFunction {
   minPostgres?: number
   /** Inserted instead of `name()`, with `${field}` placeholders */
   snippet?: string
+  /** Only when this PostgreSQL extension is installed, e.g. `vector`, `postgis` */
+  extension?: string
 }
 
 const PG: Dialect[] = ['postgres']
@@ -636,12 +639,20 @@ const FUNCTIONS: SqlFunction[] = [
 export function functionsFor(
   dialect: Dialect,
   mariaDb?: ServerVersion | null,
-  postgres?: number | null
+  postgres?: number | null,
+  /** PostgreSQL extensions installed in the database, whose functions then complete too */
+  pgExtensions?: string[]
 ): SqlFunction[] {
   const seen = new Set<string>()
   const maria = dialect === 'mysql' ? mariaDb : null
-  return [...MARIADB_FUNCTIONS, ...POSTGRES_FUNCTIONS, ...FUNCTIONS].filter((f) => {
+  return [
+    ...MARIADB_FUNCTIONS,
+    ...POSTGRES_FUNCTIONS,
+    ...FUNCTIONS,
+    ...PG_EXTENSION_FUNCTIONS
+  ].filter((f) => {
     if (f.dialects && !f.dialects.includes(dialect)) return false
+    if (f.extension && !pgExtensions?.includes(f.extension)) return false
     if (maria ? f.notMariaDb : f.onlyMariaDb) return false
     if (maria && f.minMariaDb) {
       const [major, minor] = f.minMariaDb
