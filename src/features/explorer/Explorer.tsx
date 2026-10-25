@@ -116,6 +116,7 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { VersionedMark } from './Versioning'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -1280,6 +1281,7 @@ function ObjectNode({
           <>
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
+            <VersionedMark connection={connection} database={database} obj={obj} />
             {(obj.kind === 'function' || obj.kind === 'procedure') &&
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>

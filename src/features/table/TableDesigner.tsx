@@ -53,15 +53,25 @@ import {
 } from '@/lib/ddl'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
+import { connectedInfo } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
 import { createStore } from '@/lib/store'
 import { loadTableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
 import {
+  supportsVersioning,
+  versionedTableStatements,
+  versioningProblem,
+  versioningQuery,
+  versioningWarnings,
+  type Versioning
+} from '@/lib/versioning'
+import {
   connectionsStore,
   newQueryTab,
   openTable,
   refreshConnection,
+  statusStore,
   tabsStore,
   updateTab
 } from '@/lib/workspace'
@@ -200,12 +210,25 @@ function TableDesigner(request: Request): React.JSX.Element {
     staleTime: 0,
     gcTime: 0
   })
+  // MariaDB system versioning, which the ALTERs have to work around
+  const versionable =
+    connection?.engine === 'mysql' &&
+    supportsVersioning(connectedInfo(statusStore.use()[connectionId]))
+  const versioning = useQuery({
+    ...versioningQuery(connectionId, database, name ?? ''),
+    enabled: versionable && name !== null,
+    staleTime: 0
+  })
+  const versioningReady = !versionable || versioning.isFetchedAfterMount
   // Wait for the fresh fetch only; later refetches mustn't unmount the form and lose edits
-  if (name !== null && (!table.isFetchedAfterMount || !table.data || !extras.data)) {
+  if (
+    name !== null &&
+    (!table.isFetchedAfterMount || !table.data || !extras.data || !versioningReady)
+  ) {
     return (
       <Modal width="sm" title={`Design ${name}`} onClose={close}>
-        {table.isError || extras.isError ? (
-          <ErrorText error={table.error ?? extras.error} />
+        {table.isError || extras.isError || versioning.isError ? (
+          <ErrorText error={table.error ?? extras.error ?? versioning.error} />
         ) : (
           <div className="flex justify-center py-6">
             <Spinner className="size-5" />
@@ -225,7 +248,14 @@ function TableDesigner(request: Request): React.JSX.Element {
     name !== null && table.data
       ? draftFromTable(dialect, draftSchema, name, table.data, extras.data)
       : newTableDraft(dialect, draftSchema)
-  return <DesignerForm request={request} dialect={dialect} initial={initial} />
+  return (
+    <DesignerForm
+      request={request}
+      dialect={dialect}
+      initial={initial}
+      versioning={versionable ? (versioning.data ?? null) : undefined}
+    />
+  )
 }
 
 type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'sql'
@@ -233,11 +263,14 @@ type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'sql'
 function DesignerForm({
   request,
   dialect,
-  initial
+  initial,
+  versioning
 }: {
   request: Request
   dialect: Dialect
   initial: TableDraft
+  /** MariaDB 10.3+: the table's system versioning as loaded (null when creating); absent elsewhere */
+  versioning?: Versioning | null
 }): React.JSX.Element {
   const { connectionId, database } = request
   const connection = connectionsStore.use().find((c) => c.id === connectionId)
@@ -248,22 +281,34 @@ function DesignerForm({
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const creating = !draft.original
+  const [versioned, setVersioned] = useState(!!versioning?.versioned)
 
   const babelfish = connection?.engine === 'babelfish'
   const d1 = sqlite && connection?.cloud?.provider === 'cloudflare'
   const options = useMemo(() => ({ babelfish, d1 }), [babelfish, d1])
   const statements = useMemo(
-    () => tableStatements(dialect, draft, options),
-    [dialect, draft, options]
+    () =>
+      versioning !== undefined
+        ? versionedTableStatements(draft, options, versioning, versioned)
+        : tableStatements(dialect, draft, options),
+    [dialect, draft, options, versioning, versioned]
   )
   const script = useMemo(
     () => ddlScript(dialect, statements, options),
     [dialect, statements, options]
   )
-  const problem = validateDraft(dialect, draft)
-  const warnings = draftWarnings(draft, dialect, options)
-  const changes = countChanges(draft, dialect)
-  const destructive = draft.columns.some((c) => c.original && c.dropped)
+  const versioningChanged =
+    !creating && versioning !== undefined && versioned !== !!versioning?.versioned
+  const problem =
+    validateDraft(dialect, draft) ?? versioningProblem(draft, versioning ?? null, versioned)
+  const warnings = [
+    ...versioningWarnings(draft, versioning ?? null, versioned, countChanges(draft, dialect)),
+    ...draftWarnings(draft, dialect, options)
+  ]
+  const changes = countChanges(draft, dialect) + (versioningChanged ? 1 : 0)
+  // Turning versioning off discards the history
+  const destructive =
+    draft.columns.some((c) => c.original && c.dropped) || (versioningChanged && !versioned)
 
   const schemas = useQuery({
     ...queries.schemas(connectionId, database),
@@ -422,6 +467,23 @@ function DesignerForm({
               onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
             />
           </Field>
+          {versioning !== undefined && (
+            <label
+              className="mb-2 flex shrink-0 items-center gap-1.5 text-xs text-muted"
+              title={
+                'WITH SYSTEM VERSIONING: MariaDB keeps every old version of the rows, readable with FOR SYSTEM_TIME.' +
+                (versioning?.versioned ? ' Turning it off deletes that history.' : '')
+              }
+            >
+              <input
+                type="checkbox"
+                className={checkbox}
+                checked={versioned}
+                onChange={(e) => setVersioned(e.target.checked)}
+              />
+              System versioning
+            </label>
+          )}
           <Segmented value={view} options={views} onChange={setView} className="mb-1" />
         </div>
         {error && (

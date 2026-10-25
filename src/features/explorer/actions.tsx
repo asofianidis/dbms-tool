@@ -60,6 +60,7 @@ import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
+import { versioningScriptItems } from './Versioning'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -245,6 +246,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
                 }
               ]
             : []),
+          ...versioningScriptItems(connectionId, database, obj),
           'separator',
           { label: 'CREATE', onSelect: () => void scriptTo(connectionId, database, obj, 'create') },
           { label: 'DROP', onSelect: () => void scriptTo(connectionId, database, obj, 'drop') }
