@@ -1,9 +1,8 @@
 name: ci
 
-# main is checked by the release workflow, which runs this before building
+# The release workflow also runs this before building
 on:
   push:
-    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:

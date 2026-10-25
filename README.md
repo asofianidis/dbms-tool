@@ -232,8 +232,8 @@ cd src-tauri && cargo test -- --test-threads=1
 
 `ci.yml` runs formatting, type checks, unit tests, clippy and the Rust tests on Windows, macOS and
 Linux, plus the live database suite against all five engines. `release.yml` builds and publishes
-signed installers; see [docs/RELEASING.md](docs/RELEASING.md) for versioning and the signing
-secrets.
+signed installers; see [docs/RELEASING.md](docs/RELEASING.md) for channels, versioning and the
+signing secrets.
 
 ### Layout
 

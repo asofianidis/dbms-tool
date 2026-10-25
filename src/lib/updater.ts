@@ -1,7 +1,9 @@
-import { check, type Update } from '@tauri-apps/plugin-updater'
+import { getVersion } from '@tauri-apps/api/app'
+import { invoke } from '@tauri-apps/api/core'
+import { Update } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { settingsStore } from './settings'
+import { settingsStore, type UpdateChannel } from './settings'
 import { createStore } from './store'
 import { errorMessage } from './toast'
 
@@ -11,7 +13,7 @@ export type UpdateState =
   | { state: 'idle' }
   | { state: 'checking' }
   | { state: 'current'; checkedAt: number }
-  | { state: 'downloading'; version: string; progress: number | null }
+  | { state: 'downloading'; version: string; progress: number | null; notes: string | null }
   | { state: 'ready'; version: string; notes: string | null }
   | { state: 'installing'; version: string }
   | { state: 'error'; error: string; version?: string }
@@ -22,6 +24,28 @@ const CHECK_EVERY_MS = 6 * 60 * 60 * 1000
 
 let pending: Update | null = null
 let running: Promise<void> | null = null
+
+/** Nightly builds carry a pre-release version such as 0.1.37-12. */
+export function isNightlyVersion(version: string): boolean {
+  return version.includes('-')
+}
+
+/** The channel to update from: the chosen one, or the installed build's own. */
+export async function updateChannel(): Promise<UpdateChannel> {
+  const chosen = settingsStore.get().updateChannel
+  if (chosen) return chosen
+  return isNightlyVersion(await getVersion()) ? 'nightly' : 'stable'
+}
+
+type UpdateMetadata = ConstructorParameters<typeof Update>[0]
+
+/** Like the updater plugin's `check`, but against the channel's manifest. */
+async function check(): Promise<Update | null> {
+  const metadata = await invoke<UpdateMetadata | null>('update_check', {
+    channel: await updateChannel()
+  })
+  return metadata ? new Update(metadata) : null
+}
 
 /**
  * Checks GitHub Releases for a newer signed build and downloads it in the
@@ -43,7 +67,8 @@ export function checkForUpdates(manual = false): Promise<void> {
       pending = update
       let total = 0
       let received = 0
-      updateStore.set({ state: 'downloading', version: update.version, progress: null })
+      const notes = update.body?.trim() || null
+      updateStore.set({ state: 'downloading', version: update.version, progress: null, notes })
       await update.download((event) => {
         if (event.event === 'Started') total = event.data.contentLength ?? 0
         else if (event.event === 'Progress') {
@@ -51,11 +76,12 @@ export function checkForUpdates(manual = false): Promise<void> {
           updateStore.set({
             state: 'downloading',
             version: update.version,
-            progress: total ? Math.round((received / total) * 100) : null
+            progress: total ? Math.round((received / total) * 100) : null,
+            notes
           })
         }
       })
-      updateStore.set({ state: 'ready', version: update.version, notes: update.body ?? null })
+      updateStore.set({ state: 'ready', version: update.version, notes })
     } catch (e) {
       // Offline, rate limited or a dev build without a signing key: stay quiet unless asked
       if (manual) updateStore.set({ state: 'error', error: errorMessage(e) })
@@ -65,6 +91,18 @@ export function checkForUpdates(manual = false): Promise<void> {
     running = null
   })
   return running
+}
+
+/** Drops any update fetched from the previous channel and checks the new one. */
+export async function switchUpdateChannel(channel: UpdateChannel | ''): Promise<void> {
+  settingsStore.set((s) => ({ ...s, updateChannel: channel }))
+  await running?.catch(() => {})
+  const current = updateStore.get()
+  if (current.state === 'installing') return
+  await pending?.close().catch(() => {})
+  pending = null
+  updateStore.set({ state: 'idle' })
+  if (!import.meta.env.DEV) await checkForUpdates(true)
 }
 
 export async function installUpdate(): Promise<void> {

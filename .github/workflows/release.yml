@@ -1,11 +1,18 @@
 name: release
 
 # Builds signed installers for Windows, macOS and Linux, publishes them to a
-# GitHub release with checksums, build-provenance attestations and the
+# GitHub release with a changelog, checksums, build-provenance attestations and the
 # updater manifest (latest.json) that installed apps poll.
 #
-# Signing secrets live in the "release" environment, which only main and v* tags may use and
-# which waits for a maintainer's approval, so only the approved build job can read them.
+# Channels
+#   stable   Made by hand: push a vX.Y.Z tag, or run this workflow with channel "stable" to
+#            release the next patch version. Becomes the Latest release, which stable apps poll.
+#   nightly  Built every 6 hours from main when the app changed since the last release, as a
+#            pre-release (vX.Y.Z-N). Nightly apps poll the manifest on the "nightly" release,
+#            which stable releases update too, so nightly users also get those.
+#
+# Signing secrets live in the "release" environment, which only main and v* tags may use, so
+# only build jobs for those refs can read them. Releases of both channels run without approval.
 #
 # Required secrets
 #   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
@@ -20,9 +27,16 @@ name: release
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options: [stable, nightly]
+        default: stable
 
 permissions:
   contents: read
@@ -35,79 +49,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      channel: ${{ steps.version.outputs.channel }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags and history, to number the release and look for changes since the last one
+          fetch-depth: 0
+
+      - name: Version
+        id: version
+        env:
+          CHANNEL: ${{ github.event_name == 'schedule' && 'nightly' || inputs.channel || 'stable' }}
+        run: |
+          node scripts/release-version.mjs
+          if grep -q '^release=false' "$GITHUB_OUTPUT"; then
+            echo "No app changes since the last release; skipping the nightly build." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   checks:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
 
-  prepare:
-    needs: checks
+  draft:
+    needs: [prepare, checks]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
-      release: ${{ steps.decide.outputs.release }}
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
       release_id: ${{ steps.draft.outputs.id }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-
-      - name: Detect app changes
-        id: filter
-        if: github.event_name == 'push' && github.ref_type == 'branch'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        with:
-          filters: |
-            app:
-              - 'src/**'
-              - 'src-tauri/**'
-              - 'index.html'
-              - 'package.json'
-              - 'pnpm-lock.yaml'
-              - 'vite.config.ts'
-              - 'scripts/release-version.mjs'
-              - 'scripts/updater-manifest.mjs'
-              - '.github/workflows/release.yml'
-
-      - name: Decide
-        id: decide
-        env:
-          EVENT: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          APP: ${{ steps.filter.outputs.app }}
-        run: |
-          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "branch" ] && [ "$APP" != "true" ]; then
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            echo "No app changes; skipping release." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Version
-        id: version
-        if: steps.decide.outputs.release == 'true'
-        run: node scripts/release-version.mjs
-
       - name: Create draft release
         id: draft
-        if: steps.decide.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          NAME: dbms-tool ${{ needs.prepare.outputs.tag }}${{ needs.prepare.outputs.channel == 'nightly' && ' (nightly)' || '' }}
+          PRERELEASE: ${{ needs.prepare.outputs.channel == 'nightly' }}
         run: |
           # Re-runs reuse the existing draft
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
           if [ -z "$id" ]; then
             id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
-              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="dbms-tool $TAG" \
-              -F draft=true -F prerelease=false -f body="Built from $GITHUB_SHA." --jq .id)
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="$NAME" \
+              -F draft=true -F prerelease="$PRERELEASE" -f body="Built from $GITHUB_SHA." --jq .id)
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: prepare
-    if: needs.prepare.outputs.release == 'true'
+    needs: [prepare, draft]
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +175,8 @@ jobs:
             const p = 'src-tauri/tauri.conf.json'
             const c = JSON.parse(fs.readFileSync(p, 'utf8'))
             c.version = process.env.VERSION
+            // CFBundleVersion only takes numbers, so nightlies use their stable version there
+            c.bundle.macOS.bundleVersion = process.env.VERSION.split('-')[0]
             fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n')
           "
 
@@ -247,7 +246,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          releaseId: ${{ needs.prepare.outputs.release_id }}
+          releaseId: ${{ needs.draft.outputs.release_id }}
           tauriScript: pnpm tauri
           args: ${{ matrix.args }} ${{ steps.signing.outputs.args }}
           # latest.json is generated once all platforms have uploaded
@@ -260,7 +259,7 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_ID != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
         run: |
           shopt -s nullglob
           dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
@@ -288,7 +287,7 @@ jobs:
           echo "Notarized and stapled $name" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    needs: [prepare, build]
+    needs: [prepare, draft, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -296,6 +295,9 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # History back to the previous release, for the changelog
+          fetch-depth: 0
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -307,7 +309,7 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
         run: |
           mkdir -p assets
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate --jq '.[] | [.id, .name] | @tsv' |
@@ -326,16 +328,23 @@ jobs:
         with:
           subject-path: 'assets/*'
 
+      - name: Changelog
+        env:
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+        run: |
+          node scripts/changelog.mjs "$PREVIOUS_TAG" > changelog.md
+          { echo "## What's changed"; echo; cat changelog.md; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Updater manifest
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
-        run: node scripts/updater-manifest.mjs assets "$VERSION" "$TAG" "$GITHUB_REPOSITORY"
+        run: node scripts/updater-manifest.mjs assets "$VERSION" "$TAG" "$GITHUB_REPOSITORY" changelog.md
 
       - name: Upload manifest and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
         run: |
           upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets"
           for file in latest.json SHA256SUMS.txt; do
@@ -348,10 +357,28 @@ jobs:
       - name: Release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
-          cat > notes.md <<NOTES
+          {
+            if [ "$CHANNEL" = "nightly" ]; then
+              echo "> [!WARNING]"
+              echo "> Nightly build of the latest changes on main. It may be unstable; apps on the"
+              echo "> nightly release channel update to it automatically."
+              echo
+            fi
+            echo "## What's changed"
+            echo
+            cat changelog.md
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo
+              echo "**Full changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$PREVIOUS_TAG...$TAG"
+            fi
+            echo
+          } > notes.md
+          cat >> notes.md <<NOTES
           ## Downloads
 
           | Platform | File |
@@ -361,7 +388,7 @@ jobs:
           | Linux (x64) | \`*_amd64.AppImage\` (self-updating), \`*_amd64.deb\`, \`*.x86_64.rpm\` |
           | Linux (arm64) | \`*_aarch64.AppImage\` (self-updating), \`*_arm64.deb\`, \`*.aarch64.rpm\` |
 
-          Installed apps update themselves from this release.
+          Installed apps on the $CHANNEL channel update themselves from this release.
 
           ## Install on macOS
 
@@ -388,21 +415,64 @@ jobs:
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F body=@notes.md > /dev/null
 
       - name: Publish
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
-          # Installed apps read releases/latest, so only a newer version may become Latest
-          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo "v0.0.0")
-          latest=${latest#v}
-          newest=$(printf '%s\n' "$latest" "$VERSION" | sort -V | tail -n1)
           make_latest=false
-          if [ "$VERSION" != "$latest" ] && [ "$newest" = "$VERSION" ]; then make_latest=true; fi
+          prerelease=true
+          if [ "$CHANNEL" = "stable" ]; then
+            prerelease=false
+            # Stable apps read releases/latest, so only a newer version may become Latest
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo "v0.0.0")
+            latest=${latest#v}
+            newest=$(printf '%s\n' "$latest" "$VERSION" | sort -V | tail -n1)
+            if [ "$VERSION" != "$latest" ] && [ "$newest" = "$VERSION" ]; then make_latest=true; fi
+          fi
           # Name the tag explicitly: publishing a draft without it makes GitHub create an
           # "untagged-<hash>" tag, which breaks the releases/download/<tag>/ URLs in latest.json
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
-            -F draft=false -F prerelease=false -f make_latest="$make_latest" > /dev/null
-          echo "Published v$VERSION (latest: $make_latest)" >> "$GITHUB_STEP_SUMMARY"
+            -F draft=false -F prerelease="$prerelease" -f make_latest="$make_latest" > /dev/null
+          echo "latest=$make_latest" >> "$GITHUB_OUTPUT"
+          echo "Published v$VERSION ($CHANNEL, latest: $make_latest)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Nightly apps poll the manifest on the "nightly" release. A new Latest stable release is
+      # newer than every nightly before it, so it goes there too and nightly users get it.
+      - name: Update nightly channel
+        if: needs.prepare.outputs.channel == 'nightly' || steps.publish.outputs.latest == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/nightly" --jq .id 2>/dev/null || true)
+          if [ -z "$id" ]; then
+            id=$(gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name=nightly -f target_commitish="$GITHUB_SHA" \
+              -f name="Nightly channel" -F prerelease=true -f make_latest=false \
+              -f body="Holds the updater manifest for the nightly release channel. The builds themselves are the vX.Y.Z-N pre-releases." \
+              --jq .id)
+          fi
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --jq '.[] | select(.name == "latest.json") | .id')
+          [ -n "$existing" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$existing"
+          curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary "@assets/latest.json" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=latest.json" > /dev/null
+          echo "Nightly channel now offers v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune old nightlies
+        if: needs.prepare.outputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: 10
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.prerelease and (.draft | not) and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+$"))) | [.created_at, .tag_name] | @tsv' |
+            sort -r | tail -n +$((KEEP + 1)) | cut -f2 |
+            while read -r tag; do
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              echo "Removed old nightly $tag" >> "$GITHUB_STEP_SUMMARY"
+            done
