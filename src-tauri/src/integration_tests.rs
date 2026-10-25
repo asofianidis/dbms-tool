@@ -197,8 +197,9 @@ async fn mariadb_end_to_end() {
     };
     let m = Manager::default();
     let info = m.open(c.clone(), password).await.expect("connect");
-    assert!(info.product.starts_with("MariaDB "), "{}", info.product);
-    assert!(info.version.contains("MariaDB"), "{}", info.version);
+    // No message arguments: the info comes from a password-bearing connect
+    assert!(info.product.starts_with("MariaDB "));
+    assert!(info.version.contains("MariaDB"));
     let s = m.get(&c.id).unwrap();
     let out = s
         .execute(
