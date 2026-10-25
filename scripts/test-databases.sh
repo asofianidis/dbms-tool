@@ -1,11 +1,36 @@
 #!/usr/bin/env bash
 # Starts throwaway database servers for the live integration tests:
 #   ./scripts/test-databases.sh up      start containers
+#   ./scripts/test-databases.sh info    print connection details for each server
 #   ./scripts/test-databases.sh env     print the DBMS_TEST_* variables
 #   ./scripts/test-databases.sh down    remove containers
 set -euo pipefail
 
 PASSWORD='Dbms_test_pw1'
+
+print_info() {
+  cat <<INFO
+Test database connections (host: localhost)
+
+  Engine            Port   User            Password        Database
+  PostgreSQL 17     55432  postgres        $PASSWORD   postgres
+  MySQL 8.4         53306  root            $PASSWORD   -
+  MariaDB 11.8      53307  root            $PASSWORD   -
+  SQL Server 2022   51433  sa              $PASSWORD   master
+  Babelfish (TDS)   51434  babelfish_user  12345678        master
+  MongoDB 8         57017  (no auth)       -               -
+  Redis Stack       56379  (no auth)       -               -
+
+Connection strings:
+  postgresql://postgres:$PASSWORD@localhost:55432/postgres
+  mysql://root:$PASSWORD@localhost:53306
+  mysql://root:$PASSWORD@localhost:53307
+  sqlserver://localhost:51433;user=sa;password=$PASSWORD;database=master;trustServerCertificate=true
+  sqlserver://localhost:51434;user=babelfish_user;password=12345678;database=master;encrypt=false
+  mongodb://localhost:57017
+  redis://localhost:56379
+INFO
+}
 
 case "${1:-up}" in
   up)
@@ -16,6 +41,11 @@ case "${1:-up}" in
     docker run -d --name dbms-babelfish -p 51434:1433 jonathanpotts/babelfishpg
     docker run -d --name dbms-mongo -p 57017:27017 mongo:8
     docker run -d --name dbms-redis -p 56379:6379 redis/redis-stack-server:latest
+    echo
+    print_info
+    ;;
+  info)
+    print_info
     ;;
   env)
     echo "export DBMS_TEST_PG=localhost:55432:postgres:$PASSWORD"
