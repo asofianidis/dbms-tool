@@ -325,6 +325,24 @@ export interface RoutineInfo {
   /** Return type for functions; `TABLE` for table-valued functions */
   returns: string | null
   language: string | null
+  /** PostgreSQL only: security, volatility and the other function attributes */
+  attributes?: RoutineAttributes
+}
+
+/** Attributes of a PostgreSQL function or procedure, from `pg_proc`. */
+export interface RoutineAttributes {
+  /** Runs with the owner's privileges rather than the caller's */
+  securityDefiner: boolean
+  volatility: 'IMMUTABLE' | 'STABLE' | 'VOLATILE'
+  /** Returns NULL on NULL input without being called */
+  strict: boolean
+  parallel: 'SAFE' | 'RESTRICTED' | 'UNSAFE'
+  leakproof: boolean
+  cost: number
+  /** Estimated rows for set-returning functions; 0 otherwise */
+  rows: number
+  /** `SET` options, e.g. `search_path=pg_catalog, pg_temp` */
+  config: string[]
 }
 
 export interface CompletionTable {
