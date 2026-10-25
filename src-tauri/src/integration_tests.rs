@@ -4,6 +4,9 @@
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
+//! DBMS_TEST_MARIADB_AUTH=localhost:3308:root:password   # disposable: loads plugins, creates users
+//! DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password
+//! DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
@@ -19,6 +22,7 @@ use serde_json::{Value, json};
 
 use crate::config::{AuthMode, ConnectionConfig, Engine, SslMode};
 use crate::drivers::mongo::MongoRequest;
+use crate::drivers::pg_listen::NotifyBatch;
 use crate::drivers::redis::RedisRequest;
 use crate::manager::{META, Manager};
 use crate::model::*;
@@ -189,6 +193,132 @@ async fn postgres_end_to_end() {
         .unwrap();
 }
 
+/// The guard the table tab wraps around UPDATE / DELETE when it edits by ctid
+/// (`expectOneRow` in row-locator.ts; its test pins the same text).
+fn expect_one_row(statement: &str) -> String {
+    format!(
+        "DO $dbms_edit$\nDECLARE dbms_rows bigint;\nBEGIN\n  {statement};\n  \
+         GET DIAGNOSTICS dbms_rows = ROW_COUNT;\n  IF dbms_rows <> 1 THEN\n    \
+         RAISE EXCEPTION 'Row changed since it was loaded (it was updated, deleted or moved); refresh and retry';\n  \
+         END IF;\nEND\n$dbms_edit$"
+    )
+}
+
+/// Tables without a primary key are edited by ctid (tableoid + ctid when
+/// partitioned); a row that changed since it was loaded rolls the commit back.
+#[tokio::test]
+async fn postgres_edit_by_row_location() {
+    let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let run = |session: &'static str, sql: String| {
+        let s = s.clone();
+        async move { s.execute(session, "", &sql, &opts()).await.unwrap() }
+    };
+    let setup = "DROP TABLE IF EXISTS dbms_nopk, dbms_parted; \
+        CREATE TABLE dbms_nopk (a int, b text); \
+        INSERT INTO dbms_nopk VALUES (1, 'x'), (1, 'x'), (2, 'y'); \
+        CREATE TABLE dbms_parted (k int, v text) PARTITION BY RANGE (k); \
+        CREATE TABLE dbms_parted_1 PARTITION OF dbms_parted FOR VALUES FROM (0) TO (10); \
+        CREATE TABLE dbms_parted_2 PARTITION OF dbms_parted FOR VALUES FROM (10) TO (20); \
+        INSERT INTO dbms_parted VALUES (1, 'a'), (11, 'b')";
+    let out = run("tab", setup.into()).await;
+    assert!(out.error.is_none(), "{:?}", out.error);
+
+    // What the grid loads: the hidden ctid ahead of the table's columns
+    let load = || run("tab", "SELECT ctid, *\nFROM dbms_nopk\nLIMIT 101".into());
+    let ctid = |rows: &ExecOutput, row: usize| cell(rows, 0, row, 0).as_str().unwrap().to_owned();
+    let rows = load().await;
+    let first = ctid(&rows, 0);
+
+    // One of two identical rows changes
+    let script = format!(
+        "BEGIN;\n{};\nCOMMIT;",
+        expect_one_row(&format!(
+            "UPDATE dbms_nopk SET b = 'z' WHERE ctid = '{first}'"
+        ))
+    );
+    let out = run("tab", script).await;
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let out = run(
+        "tab",
+        "SELECT count(*) FILTER (WHERE b = 'z'), count(*) FROM dbms_nopk".into(),
+    )
+    .await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("1"));
+    assert_eq!(cell(&out, 0, 0, 1), json!("3"));
+
+    // Another session updates a row after it was loaded: its ctid moves
+    let rows = load().await;
+    let y = (0..3)
+        .find(|&i| cell(&rows, 0, i, 2) == json!("y"))
+        .expect("row y");
+    let stale = ctid(&rows, y);
+    let other = (0..3).find(|&i| i != y).unwrap();
+    let out = run(
+        "other",
+        "UPDATE dbms_nopk SET b = 'y2' WHERE b = 'y'".into(),
+    )
+    .await;
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let script = format!(
+        "BEGIN;\n{};\n{};\nCOMMIT;",
+        expect_one_row(&format!(
+            "DELETE FROM dbms_nopk WHERE ctid = '{}'",
+            ctid(&rows, other)
+        )),
+        expect_one_row(&format!(
+            "UPDATE dbms_nopk SET b = 'lost' WHERE ctid = '{stale}'"
+        ))
+    );
+    let out = run("tab", script).await;
+    let err = out.error.expect("a stale ctid fails");
+    assert!(
+        err.message.contains("Row changed since it was loaded"),
+        "{err:?}"
+    );
+    // The table tab rolls back after a failed commit; nothing was applied
+    run("tab", "ROLLBACK".into()).await;
+    let out = run(
+        "tab",
+        "SELECT count(*), count(*) FILTER (WHERE b = 'lost') FROM dbms_nopk".into(),
+    )
+    .await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("3"));
+    assert_eq!(cell(&out, 0, 0, 1), json!("0"));
+
+    // Partitions repeat ctids; tableoid tells them apart
+    let rows = run(
+        "tab",
+        "SELECT tableoid, ctid, *\nFROM dbms_parted\nORDER BY k\nLIMIT 101".into(),
+    )
+    .await;
+    assert_eq!(
+        cell(&rows, 0, 0, 1),
+        cell(&rows, 0, 1, 1),
+        "same ctid in both partitions"
+    );
+    let script = format!(
+        "BEGIN;\n{};\nCOMMIT;",
+        expect_one_row(&format!(
+            "UPDATE dbms_parted SET v = 'A' WHERE tableoid = '{}' AND ctid = '{}'",
+            cell(&rows, 0, 0, 0).as_str().unwrap(),
+            cell(&rows, 0, 0, 1).as_str().unwrap()
+        ))
+    );
+    let out = run("tab", script).await;
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let out = run(
+        "tab",
+        "SELECT string_agg(v, ',' ORDER BY k) FROM dbms_parted".into(),
+    )
+    .await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("A,b"));
+
+    run("tab", "DROP TABLE dbms_nopk, dbms_parted".into()).await;
+}
+
 #[tokio::test]
 async fn mariadb_end_to_end() {
     // MariaDB uses the MySQL engine; the frontend tells them apart by `product`
@@ -213,6 +343,200 @@ async fn mariadb_end_to_end() {
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
     m.close(&c.id);
+}
+
+/// Signs in as `user`, on a connection config of its own.
+async fn sign_in(
+    c: &ConnectionConfig,
+    user: &str,
+    password: &str,
+) -> Result<ServerInfo, crate::error::AppError> {
+    let mut c = c.clone();
+    c.id = format!("{}-{user}", c.id);
+    c.user = user.into();
+    let m = Manager::default();
+    let result = m.open(c.clone(), Some(password.into())).await;
+    m.close(&c.id);
+    result
+}
+
+/// A password for a test account, made up per run
+fn test_password() -> String {
+    format!("Pw_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+}
+
+/// Runs root's SQL, failing the test on an error. `what` labels the assert: the SQL can
+/// hold a password, and CodeQL treats what the server returns as secret.
+async fn run_sql(m: &Manager, id: &str, what: &str, sql: &str) -> ExecOutput {
+    let out = m
+        .get(id)
+        .unwrap()
+        .execute("tab1", "", sql, &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{what}");
+    out
+}
+
+#[tokio::test]
+async fn mariadb_auth_plugins() {
+    // Every method signs in, through mysql_async's client_ed25519 / client_parsec for those two
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB_AUTH") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let plugins = "SELECT PLUGIN_NAME FROM information_schema.PLUGINS \
+                   WHERE PLUGIN_TYPE = 'AUTHENTICATION' AND PLUGIN_STATUS = 'ACTIVE'";
+    let s = m.get(&c.id).unwrap();
+    for soname in ["auth_ed25519", "auth_parsec"] {
+        // Already loaded, or not shipped (parsec is 11.6+): either is fine
+        let _ = s
+            .execute("tab1", "", &format!("INSTALL SONAME '{soname}'"), &opts())
+            .await;
+    }
+    let out = run_sql(&m, &c.id, "list plugins", plugins).await;
+    let active: Vec<Value> = out.results[0].rows.iter().map(|r| r[0].clone()).collect();
+    assert!(active.contains(&json!("ed25519")), "{active:?}");
+
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let pw = test_password();
+    let users = [
+        ("ed", format!("ed25519 USING PASSWORD('{pw}')")),
+        ("pa", format!("parsec USING PASSWORD('{pw}')")),
+        (
+            "na",
+            format!("mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+        (
+            "or",
+            format!("unix_socket OR mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+        // A wrong password falls through to ed25519, which used to panic the driver
+        (
+            "ne",
+            format!(
+                "mysql_native_password USING PASSWORD('{pw}') OR ed25519 USING PASSWORD('{pw}')"
+            ),
+        ),
+    ];
+    let mut created = vec![];
+    for (kind, via) in &users {
+        if *kind == "pa" && !active.contains(&json!("parsec")) {
+            continue;
+        }
+        let name = format!("dbms_auth_{kind}_{tag}");
+        run_sql(
+            &m,
+            &c.id,
+            &format!("create {kind} user"),
+            &format!("CREATE USER '{name}'@'%' IDENTIFIED VIA {via}"),
+        )
+        .await;
+        created.push((*kind, name));
+    }
+
+    // Messages name the account kind only: CodeQL treats the sign-in's output as secret
+    for (kind, name) in &created {
+        let signed_in = sign_in(&c, name, &pw).await;
+        assert!(
+            signed_in.is_ok_and(|info| info.product.contains("MariaDB")),
+            "{kind} user didn't sign in"
+        );
+    }
+    // A wrong password is the server's plain refusal, whichever method gets it last
+    let wrong_pw = format!("{pw}_wrong");
+    for (kind, name) in &created {
+        let refused = sign_in(&c, name, &wrong_pw).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("1045")),
+            "{kind} user: no ERROR 1045 for a wrong password"
+        );
+    }
+
+    for (kind, name) in &created {
+        run_sql(
+            &m,
+            &c.id,
+            &format!("drop {kind} user"),
+            &format!("DROP USER '{name}'@'%'"),
+        )
+        .await;
+    }
+    m.close(&c.id);
+}
+
+#[tokio::test]
+async fn mysql_caching_sha2_sign_in() {
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MYSQL") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let name = format!(
+        "mdb_auth_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let pw = test_password();
+    run_sql(
+        &m,
+        &c.id,
+        "create user",
+        &format!("CREATE USER '{name}'@'%' IDENTIFIED WITH caching_sha2_password BY '{pw}'"),
+    )
+    .await;
+    let result = sign_in(&c, &name, &pw).await;
+    run_sql(&m, &c.id, "drop user", &format!("DROP USER '{name}'@'%'")).await;
+    m.close(&c.id);
+    assert!(
+        result.is_ok_and(|info| info.product.starts_with("MySQL")),
+        "caching_sha2_password user didn't sign in"
+    );
+}
+
+/// The server tab's replication panel reads these through the driver. Point the variables at
+/// a replica: `DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password` (with a named
+/// connection) or `DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password` (8.0.22+).
+#[tokio::test]
+async fn replica_status() {
+    for (var, sql, running) in [
+        (
+            "DBMS_TEST_MARIADB_REPLICA",
+            "SHOW ALL REPLICAS STATUS",
+            "Slave_IO_Running",
+        ),
+        (
+            "DBMS_TEST_MYSQL_REPLICA",
+            "SHOW REPLICA STATUS",
+            "Replica_IO_Running",
+        ),
+    ] {
+        let Some((m, id)) = open(Engine::Mysql, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let out = s.execute(META, "", sql, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let set = &out.results[0];
+        assert!(!set.rows.is_empty(), "{var} is not a replica");
+        let col = |name: &str| set.columns.iter().position(|c| c.name == name);
+        let io = col(running).expect(running);
+        assert!(
+            ["Yes", "No", "Connecting"].contains(&set.rows[0][io].as_str().unwrap_or("")),
+            "{:?}",
+            set.rows[0][io]
+        );
+        // NULL lag (SQL thread stopped) arrives as null, not the string "NULL"
+        let lag = col("Seconds_Behind_Master")
+            .or(col("Seconds_Behind_Source"))
+            .unwrap();
+        for row in &set.rows {
+            assert!(
+                row[lag].is_null() || row[lag].as_str().is_some_and(|v| v.parse::<u64>().is_ok())
+            );
+        }
+        m.close(&id);
+    }
 }
 
 #[tokio::test]
@@ -327,6 +651,71 @@ async fn mariadb_column_types() {
     s.execute("tab1", "", "DROP DATABASE mdb_coltypes", &opts())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn mariadb_explain_json() {
+    // The plan viewer reads MariaDB's EXPLAIN/ANALYZE FORMAT=JSON out of a single text cell
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password.clone()).await.expect("connect");
+    let s = m.get(&c.id).unwrap();
+    let run = |sql: &'static str| {
+        let s = s.clone();
+        async move {
+            let out = s.execute("tab1", "", sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+            out
+        }
+    };
+    run(
+        "DROP DATABASE IF EXISTS mdb_explain; CREATE DATABASE mdb_explain; USE mdb_explain; \
+         CREATE TABLE t (id INT PRIMARY KEY, a INT); \
+         INSERT INTO t SELECT seq, seq % 10 FROM seq_1_to_100",
+    )
+    .await;
+    let plan = |out: &ExecOutput| -> Value {
+        let text = cell(out, 0, 0, 0);
+        serde_json::from_str(text.as_str().expect("plan is a text cell")).expect("plan is JSON")
+    };
+
+    let doc = plan(&run("EXPLAIN FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["access_type"], json!("ALL"), "{doc}");
+    assert!(table.get("r_rows").is_none(), "{doc}");
+
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["r_rows"].as_f64(), Some(100.0), "{doc}");
+    assert_eq!(table["r_filtered"].as_f64(), Some(10.0), "{doc}");
+
+    // ANALYZE runs the statement: a read-only connection refuses it for a write...
+    let (mut ro, _) = config(Engine::Mysql, "DBMS_TEST_MARIADB").unwrap();
+    ro.read_only = true;
+    ro.id = "ro".into();
+    m.open(ro, password).await.unwrap();
+    let blocked = m
+        .get("ro")
+        .unwrap()
+        .execute(
+            "tab",
+            "",
+            "ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t",
+            &opts(),
+        )
+        .await;
+    assert!(blocked.is_err());
+    // ...and a writable one really deletes the rows
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t WHERE a = 3").await);
+    assert_eq!(doc["query_block"]["table"]["delete"], json!(1), "{doc}");
+    let out = run("SELECT COUNT(*) FROM mdb_explain.t").await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("90"));
+
+    run("DROP DATABASE mdb_explain").await;
+    m.close("ro");
+    m.close(&c.id);
 }
 
 #[tokio::test]
@@ -941,6 +1330,45 @@ async fn routines_end_to_end() {
                 "{var}: {p:?}"
             );
         }
+        // PostgreSQL reports security and planner attributes; other engines leave them out
+        if engine == Engine::Postgres {
+            let attrs = f.attributes.as_ref().expect("attributes");
+            assert!(!attrs.security_definer, "{attrs:?}");
+            assert_eq!(attrs.volatility, "VOLATILE");
+            assert_eq!(attrs.parallel, "UNSAFE");
+            assert_eq!(attrs.cost, 100.0);
+            let out = s
+                .execute(
+                    "t",
+                    db,
+                    "CREATE OR REPLACE FUNCTION probe_secdef() RETURNS SETOF int LANGUAGE sql \
+                     IMMUTABLE STRICT PARALLEL SAFE LEAKPROOF COST 5 ROWS 20 SECURITY DEFINER \
+                     SET search_path = pg_catalog, pg_temp AS 'SELECT 1'",
+                    &opts(),
+                )
+                .await
+                .unwrap();
+            assert!(out.error.is_none(), "{:?}", out.error);
+            let d = s
+                .describe_routine(db, Some("public"), "probe_secdef", "function", Some(""))
+                .await
+                .unwrap();
+            let attrs = d.attributes.expect("attributes");
+            // Messages name the server only: CodeQL treats what this connection reads as secret
+            assert!(
+                attrs.security_definer && attrs.strict && attrs.leakproof,
+                "{var}"
+            );
+            assert_eq!(attrs.volatility, "IMMUTABLE");
+            assert_eq!(attrs.parallel, "SAFE");
+            assert_eq!((attrs.cost, attrs.rows), (5.0, 20.0));
+            assert_eq!(attrs.config, vec!["search_path=pg_catalog, pg_temp"]);
+            s.execute("t", db, "DROP FUNCTION probe_secdef()", &opts())
+                .await
+                .unwrap();
+        } else {
+            assert!(f.attributes.is_none(), "{var}");
+        }
         println!("{var}: fn {f:?}\n{var}: proc {p:?}");
 
         // Run the exact statements the Execute dialog generates (see routines.test.ts)
@@ -1243,4 +1671,166 @@ async fn mysql_events_end_to_end() {
         assert!(out.error.is_none(), "{var}: {:?}", out.error);
         m.close(&id);
     }
+}
+
+/// Notifications show in the messages of the tab that LISTENs, and the
+/// Notifications tab's own session streams them until it's closed.
+#[tokio::test]
+async fn postgres_listen_notify() {
+    let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let db = "pg_notify";
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        let out = s.execute(META, "", &sql, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+    }
+
+    // An editor tab sees what arrived since its last statement, like psql
+    let out = s
+        .execute("ed1", db, "LISTEN pg_notify_editor", &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    s.execute("ed2", db, "NOTIFY pg_notify_editor, 'hello'", &opts())
+        .await
+        .unwrap();
+    let pid = cell(
+        &s.execute("ed2", db, "SELECT pg_backend_pid()", &opts())
+            .await
+            .unwrap(),
+        0,
+        0,
+        0,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let out = s.execute("ed1", db, "SELECT 1", &opts()).await.unwrap();
+    let line = format!(
+        "NOTIFY pg_notify_editor (pid {}): hello",
+        pid.as_str().unwrap()
+    );
+    assert!(
+        out.messages.iter().any(|x| x.text == line),
+        "{:?}",
+        out.messages
+    );
+    // ...once
+    let out = s.execute("ed1", db, "SELECT 1", &opts()).await.unwrap();
+    assert!(!out.messages.iter().any(|x| x.text.starts_with("NOTIFY")));
+
+    // The Notifications tab
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit = move |batch: NotifyBatch| {
+        let _ = tx.send(batch);
+    };
+    let channels = s
+        .pg_listen(
+            "notify-tab",
+            db,
+            vec!["pg_notify_A".into(), "pg_notify b".into()],
+            emit.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(channels, vec!["pg_notify b", "pg_notify_A"]);
+    s.execute(
+        "ed2",
+        db,
+        "SELECT pg_notify('pg_notify_A', '{\"n\":1}')",
+        &opts(),
+    )
+    .await
+    .unwrap();
+    s.pg_notify("notify-tab", db, "pg_notify b", "", emit.clone())
+        .await
+        .unwrap();
+    // Unquoted NOTIFY folds case, so this one goes to a channel nobody listens on
+    s.execute("ed2", db, "NOTIFY pg_notify_A", &opts())
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("notifications")
+            .unwrap();
+        assert_eq!(batch.listener, "notify-tab");
+        assert!(batch.error.is_none(), "{:?}", batch.error);
+        got.extend(batch.notifications);
+    }
+    assert_eq!(got[0].channel, "pg_notify_A");
+    assert_eq!(got[0].payload, "{\"n\":1}");
+    assert_eq!(got[0].pid.to_string(), pid.as_str().unwrap());
+    assert_eq!(got[1].channel, "pg_notify b");
+    assert_eq!(got[1].payload, "");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "nothing more arrives"
+    );
+
+    let left = s
+        .pg_unlisten("notify-tab", vec!["pg_notify b".into()])
+        .await
+        .unwrap();
+    assert_eq!(left, vec!["pg_notify_A"]);
+
+    // Ending the listener's backend reports it, and listening again reconnects
+    let out = s
+        .execute(
+            META,
+            "",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = 'pg_notify' AND query LIKE 'UNLISTEN%'",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("disconnect reported")
+        .unwrap();
+    assert!(batch.error.is_some());
+    let channels = s
+        .pg_listen("notify-tab", db, vec!["pg_notify_A".into()], emit.clone())
+        .await
+        .unwrap();
+    assert_eq!(channels, vec!["pg_notify_A"]);
+    s.execute("ed2", db, "NOTIFY \"pg_notify_A\", 'again'", &opts())
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("notification after reconnect")
+        .unwrap();
+    assert_eq!(batch.notifications[0].payload, "again");
+
+    // Closing the tab ends its session
+    s.close_session("notify-tab").await;
+    assert!(
+        s.pg_unlisten("notify-tab", Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    for tab in ["ed1", "ed2"] {
+        s.close_session(tab).await;
+    }
+    let out = s
+        .execute(
+            META,
+            "",
+            &format!("DROP DATABASE {db} WITH (FORCE)"),
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
 }

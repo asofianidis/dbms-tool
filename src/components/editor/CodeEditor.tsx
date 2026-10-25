@@ -55,11 +55,15 @@ import type { Dialect } from '@/lib/engines'
 import type { ServerVersion } from '@/lib/mariadb'
 import { allSnippets, snippetsStore, type Snippet } from '@/lib/snippets'
 import { MariaDbSQL, mariaDbCompletion } from './mariadb-completion'
+import { PostgresSQL, postgresCompletion } from './postgres-completion'
 import { signatureHelp, sqlAssistCompletion, tableAwareCompletion } from './sql-completion'
 
 export type EditorLanguage =
-  /** `mariaDb` is the server's version when a MySQL-dialect connection is MariaDB */
-  | { kind: 'sql'; dialect: Dialect; mariaDb?: ServerVersion }
+  /**
+   * `mariaDb` is the server's version when a MySQL-dialect connection is MariaDB;
+   * `postgres` a PostgreSQL server's major version (everything is offered without it)
+   */
+  | { kind: 'sql'; dialect: Dialect; mariaDb?: ServerVersion; postgres?: number }
   | { kind: 'mongo' }
   | { kind: 'json' }
   | { kind: 'text' }
@@ -242,7 +246,12 @@ function languageExtension(
 ): Extension {
   if (language.kind === 'sql') {
     const mariaDb = language.dialect === 'mysql' ? language.mariaDb : undefined
-    const dialect = mariaDb ? MariaDbSQL : DIALECTS[language.dialect]
+    const postgres = language.dialect === 'postgres' ? (language.postgres ?? Infinity) : undefined
+    const dialect = mariaDb
+      ? MariaDbSQL
+      : postgres !== undefined
+        ? PostgresSQL
+        : DIALECTS[language.dialect]
     const ext = sql({ dialect, upperCaseKeywords: true })
     const names = tableAwareCompletion(
       schemaCompletionSource({ dialect, schema: completion, defaultSchema })
@@ -252,14 +261,18 @@ function languageExtension(
       dialect: language.dialect,
       defaultSchema,
       mariaDb,
+      postgres,
       snippets
     })
     return [
       ext,
       ext.language.data.of({ autocomplete: names }),
       ext.language.data.of({ autocomplete: assist }),
-      signatureHelp(language.dialect, mariaDb),
+      signatureHelp(language.dialect, mariaDb, postgres),
       ...(mariaDb ? [ext.language.data.of({ autocomplete: mariaDbCompletion(mariaDb) })] : []),
+      ...(postgres !== undefined
+        ? [ext.language.data.of({ autocomplete: postgresCompletion(postgres) })]
+        : []),
       ...(extra ? [ext.language.data.of({ autocomplete: extra })] : [])
     ]
   }
@@ -386,6 +399,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
     language.kind,
     language.kind === 'sql' ? language.dialect : '',
     language.kind === 'sql' ? language.mariaDb?.join('.') : '',
+    language.kind === 'sql' ? language.postgres : undefined,
     completion,
     defaultSchema,
     extraCompletion,

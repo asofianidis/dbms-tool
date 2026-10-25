@@ -77,7 +77,7 @@ const onOff = (v: boolean | null): string => (v == null ? '—' : v ? 'Yes' : 'N
 const onOffTone = (v: boolean | null): GaleraTone =>
   v == null ? 'neutral' : v ? 'success' : 'danger'
 
-function Stat({
+export function Stat({
   label,
   value,
   hint,
@@ -98,7 +98,7 @@ function Stat({
   )
 }
 
-function Detail({
+export function Detail({
   label,
   hint,
   children

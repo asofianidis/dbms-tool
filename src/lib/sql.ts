@@ -1,5 +1,6 @@
 import type { Cell, ColumnInfo, TableInfo } from './api'
 import type { Dialect } from './engines'
+import { insideMariaDbBlock } from './mariadb-packages'
 
 export function quoteIdent(dialect: Dialect, name: string): string {
   switch (dialect) {
@@ -171,6 +172,8 @@ export interface SelectOptions {
   offset?: number
   /** Columns used for a stable order when paging SQL Server */
   keyColumns?: string[]
+  /** Expressions selected ahead of the columns, e.g. PostgreSQL's ctid for editing without a key */
+  leadingColumns?: string[]
   /** Columns to select instead of *, e.g. so MySQL's invisible columns show */
   columns?: string[]
 }
@@ -192,7 +195,8 @@ export function selectRows(dialect: Dialect, ref: TableRef, opts: SelectOptions)
         : '(SELECT NULL)')
     return `SELECT ${list}\nFROM ${table}${where}\nORDER BY ${orderBy}\nOFFSET ${offset} ROWS FETCH NEXT ${opts.limit} ROWS ONLY`
   }
-  return `SELECT ${list}\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
+  const leading = opts.leadingColumns?.length ? `${opts.leadingColumns.join(', ')}, ` : ''
+  return `SELECT ${leading}${list}\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
 }
 
 export function countRows(dialect: Dialect, ref: TableRef, where?: string): string {
@@ -507,7 +511,9 @@ export function dangerousStatements(sql: string, dialect: Dialect): string[] {
   const reasons: string[] = []
   for (const statement of splitStatements(sql, dialect)) {
     const s = stripComments(statement.text).trim()
-    if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
+    // MariaDB: removes old versions of a system-versioned table's rows
+    if (/^delete\s+history\b/i.test(s)) reasons.push('DELETE HISTORY')
+    else if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('DELETE without a WHERE clause')
     else if (/^(with\b[\s\S]*?\)\s*)?update\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('UPDATE without a WHERE clause')
@@ -527,13 +533,16 @@ export function explainSql(
   sql: string,
   dialect: Dialect,
   analyze: boolean,
-  babelfish: boolean
+  babelfish: boolean,
+  mariadb = false
 ): string {
   const body = sql.trim().replace(/;\s*$/, '')
   switch (dialect) {
     case 'postgres':
       return `EXPLAIN (${analyze ? 'ANALYZE, BUFFERS, ' : ''}VERBOSE, FORMAT JSON)\n${body}`
     case 'mysql':
+      // MariaDB has neither FORMAT=TREE nor EXPLAIN ANALYZE; its ANALYZE runs the statement
+      if (mariadb) return `${analyze ? 'ANALYZE' : 'EXPLAIN'} FORMAT=JSON\n${body}`
       return analyze ? `EXPLAIN ANALYZE\n${body}` : `EXPLAIN FORMAT=TREE\n${body}`
     case 'tsql':
       if (babelfish) {
@@ -557,7 +566,14 @@ export function explainSql(
 function insideMysqlBody(current: string, dialect: Dialect): boolean {
   if (dialect !== 'mysql') return false
   const text = current.replace(/--[^\n]*/g, ' ').replace(/'(?:[^'\\]|\\.|'')*'/g, "''")
-  if (!/^\s*create\s+(definer\s*=\s*\S+\s+)?(procedure|function|trigger|event)\b/i.test(text))
+  // MariaDB packages and Oracle-mode routines nest differently
+  const mariaDb = insideMariaDbBlock(text)
+  if (mariaDb !== null) return mariaDb
+  if (
+    !/^\s*create\s+(or\s+replace\s+)?(definer\s*=\s*\S+\s+)?(procedure|function|trigger|event)\b/i.test(
+      text
+    )
+  )
     return false
   const begins = (text.match(/\bbegin\b/gi) ?? []).length
   // END IF / END LOOP / END WHILE / END REPEAT / END CASE close other blocks

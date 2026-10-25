@@ -4,7 +4,8 @@ import type { Cell, ColumnMeta, TableInfo } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import type { Dialect } from '@/lib/engines'
 import { removeChange, removeColumn, setValue, toRowEdits, type PendingChange } from '@/lib/pending'
-import { editStatements, wrapInTransaction, type TableRef } from '@/lib/sql'
+import { locatedEditScript, type RowLocator } from '@/lib/row-locator'
+import type { TableRef } from '@/lib/sql'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import { Badge, Button, Spinner } from '@/components/ui'
 
@@ -24,7 +25,8 @@ export function ChangesPanel({
   onCancelAll,
   onClose,
   onAddRow,
-  notice
+  notice,
+  locator
 }: {
   changes: PendingChange[]
   columns: ColumnMeta[]
@@ -46,12 +48,14 @@ export function ChangesPanel({
   onAddRow?: () => void
   /** Shown above the changes, e.g. why committing is held back */
   notice?: string
+  /** How rows are found when the table has no primary key (PostgreSQL) */
+  locator?: RowLocator | null
 }): React.JSX.Element {
   const [showSql, setShowSql] = useState(false)
-  const script = useMemo(() => {
-    const statements = editStatements(dialect, tableRef, info, toRowEdits(changes))
-    return statements.length ? wrapInTransaction(dialect, statements) : ''
-  }, [changes, dialect, tableRef, info])
+  const script = useMemo(
+    () => locatedEditScript(dialect, tableRef, info, toRowEdits(changes), locator),
+    [changes, dialect, tableRef, info, locator]
+  )
 
   return (
     <aside className="flex w-[22rem] shrink-0 flex-col border-l border-line bg-panel">

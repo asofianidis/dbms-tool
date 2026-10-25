@@ -9,7 +9,7 @@ export interface SqlPanel {
   reload: () => void
 }
 
-/** Runs `sql` on the connection's metadata session (in `database`, if given), and again on `reload`. */
+/** Runs `sql` on the connection's metadata session (in `database`, else the default), and again on `reload`. */
 export function useSqlPanel(
   connection: ConnectionConfig,
   sql: string | null,
@@ -20,8 +20,6 @@ export function useSqlPanel(
   const [loading, setLoading] = useState(false)
   const sqlRef = useRef(sql)
   sqlRef.current = sql
-  const databaseRef = useRef(database)
-  databaseRef.current = database
   // Auto-refresh mustn't stack requests behind a slow one; a change while busy runs once after
   const busy = useRef(false)
   const queued = useRef(false)
@@ -43,7 +41,7 @@ export function useSqlPanel(
         }
         try {
           // Listings only; `EXEC sp_babelfish_configure` reads settings, so no production prompt
-          const out = await api.execute(connection.id, '__meta', databaseRef.current, text, {
+          const out = await api.execute(connection.id, '__meta', database, text, {
             confirmed: true
           })
           // Results for SQL that has since changed are stale
@@ -61,9 +59,9 @@ export function useSqlPanel(
       busy.current = false
       setLoading(false)
     }
-  }, [connection.id])
+  }, [connection.id, database])
   useEffect(() => {
     void reload()
-  }, [reload, sql, database])
+  }, [reload, sql])
   return { set, error, loading, reload: () => void reload() }
 }

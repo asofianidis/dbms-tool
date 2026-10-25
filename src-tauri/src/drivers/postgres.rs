@@ -1,6 +1,7 @@
 //! PostgreSQL via tokio-postgres. Queries run over the simple-query protocol so
 //! every value arrives as text, exactly as psql would print it.
 
+use std::collections::VecDeque;
 use std::error::Error as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use postgres_native_tls::MakeTlsConnector;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode as PgSslMode;
@@ -22,6 +24,7 @@ pub struct PgSession {
     client: Client,
     tls: MakeTlsConnector,
     notices: Arc<Mutex<Vec<(String, String)>>>,
+    inbox: Arc<Mutex<Inbox>>,
     pub database: String,
     task: JoinHandle<()>,
 }
@@ -29,6 +32,62 @@ pub struct PgSession {
 impl Drop for PgSession {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Most notifications a session holds until they're read; older ones give way.
+const INBOX_CAPACITY: usize = 1000;
+
+/// Most notifications listed in a statement's messages; the rest are counted.
+const NOTIFICATIONS_SHOWN: usize = 100;
+
+/// A `NOTIFY` delivered to a channel the session listens on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgNotification {
+    pub channel: String,
+    pub payload: String,
+    /// The sending backend's process id
+    pub pid: i32,
+    /// Unix time in milliseconds
+    pub at: i64,
+}
+
+/// Notifications the connection has received and nobody has read yet.
+#[derive(Debug, Default)]
+pub struct Inbox {
+    pub items: VecDeque<PgNotification>,
+    /// Pushed out by newer ones while the inbox was full
+    pub dropped: u64,
+    /// Why the connection ended, once it has
+    pub closed: Option<String>,
+}
+
+impl Inbox {
+    fn push(&mut self, n: PgNotification) {
+        if self.items.len() >= INBOX_CAPACITY {
+            self.items.pop_front();
+            self.dropped += 1;
+        }
+        self.items.push_back(n);
+    }
+
+    /// Everything waiting, and how many were dropped since the last take.
+    pub fn take(&mut self) -> (Vec<PgNotification>, u64) {
+        (
+            self.items.drain(..).collect(),
+            std::mem::take(&mut self.dropped),
+        )
+    }
+}
+
+/// How a notification reads in the query messages, like psql's
+/// `Asynchronous notification "chan" with payload "x" received from server process with PID 123.`
+pub fn notification_line(n: &PgNotification) -> String {
+    if n.payload.is_empty() {
+        format!("NOTIFY {} (pid {})", n.channel, n.pid)
+    } else {
+        format!("NOTIFY {} (pid {}): {}", n.channel, n.pid, n.payload)
     }
 }
 
@@ -112,18 +171,31 @@ pub async fn connect(
         AppError::msg("Timed out waiting for the server to finish the connection handshake")
     })??;
     let notices = Arc::new(Mutex::new(Vec::new()));
-    let sink = notices.clone();
+    let inbox = Arc::new(Mutex::new(Inbox::default()));
+    let (sink, mailbox) = (notices.clone(), inbox.clone());
     let task = tokio::spawn(async move {
         let mut messages = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
+        let mut ended = None;
         while let Some(message) = messages.next().await {
             match message {
                 Ok(AsyncMessage::Notice(n)) => sink
                     .lock()
                     .push((n.severity().to_string(), n.message().to_string())),
+                Ok(AsyncMessage::Notification(n)) => mailbox.lock().push(PgNotification {
+                    channel: n.channel().to_string(),
+                    payload: n.payload().to_string(),
+                    pid: n.process_id(),
+                    at: chrono::Utc::now().timestamp_millis(),
+                }),
                 Ok(_) => {}
-                Err(_) => break,
+                Err(e) => {
+                    ended = Some(describe_error(&e));
+                    break;
+                }
             }
         }
+        mailbox.lock().closed =
+            Some(ended.unwrap_or_else(|| "The server closed the connection".into()));
     });
 
     if cfg.read_only {
@@ -139,6 +211,7 @@ pub async fn connect(
         client,
         tls,
         notices,
+        inbox,
         database,
         task,
     })
@@ -202,6 +275,29 @@ impl PgSession {
         })
     }
 
+    /// Notifications received but not yet read, shared with the connection task.
+    pub fn inbox(&self) -> Arc<Mutex<Inbox>> {
+        self.inbox.clone()
+    }
+
+    /// Like psql, lists what arrived since the last statement, including while idle.
+    fn flush_notifications(&self, out: &mut OutputBuilder) {
+        let (items, dropped) = self.inbox.lock().take();
+        for n in items.iter().take(NOTIFICATIONS_SHOWN) {
+            out.message("notice", notification_line(n));
+        }
+        let more = items.len().saturating_sub(NOTIFICATIONS_SHOWN) as u64 + dropped;
+        if more > 0 {
+            out.message(
+                "notice",
+                format!(
+                    "…and {more} more notification{}",
+                    if more == 1 { "" } else { "s" }
+                ),
+            );
+        }
+    }
+
     fn flush_notices(&self, out: &mut OutputBuilder) {
         for (severity, text) in self.notices.lock().drain(..) {
             let level = if severity == "WARNING" {
@@ -230,6 +326,7 @@ impl PgSession {
             }
         }
         self.flush_notices(&mut out);
+        self.flush_notifications(&mut out);
 
         // The simple protocol doesn't carry column types; a prepare (which never
         // executes) recovers them for the common single-statement case.
@@ -583,7 +680,10 @@ impl PgSession {
         let head = self
             .strings(
                 &format!(
-                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text \
+                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text, \
+                       p.prosecdef, CASE p.provolatile WHEN 'i' THEN 'IMMUTABLE' WHEN 's' THEN 'STABLE' ELSE 'VOLATILE' END, \
+                       p.proisstrict, CASE p.proparallel WHEN 's' THEN 'SAFE' WHEN 'r' THEN 'RESTRICTED' ELSE 'UNSAFE' END, \
+                       p.proleakproof, p.procost::float8, p.prorows::float8, coalesce(p.proconfig, '{{}}'::text[]) \
                      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
                      JOIN pg_language l ON l.oid = p.prolang WHERE {FILTER}"
                 ),
@@ -621,6 +721,16 @@ impl PgSession {
                 .collect(),
             returns: head.get(0),
             language: head.get(1),
+            attributes: Some(RoutineAttributes {
+                security_definer: head.get(2),
+                volatility: head.get(3),
+                strict: head.get(4),
+                parallel: head.get(5),
+                leakproof: head.get(6),
+                cost: head.get(7),
+                rows: head.get(8),
+                config: head.get(9),
+            }),
         })
     }
 
@@ -679,5 +789,43 @@ impl PgSession {
             );
         }
         Ok(tables)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(channel: &str, payload: &str) -> PgNotification {
+        PgNotification {
+            channel: channel.into(),
+            payload: payload.into(),
+            pid: 42,
+            at: 0,
+        }
+    }
+
+    #[test]
+    fn formats_notifications_like_messages() {
+        assert_eq!(
+            notification_line(&note("jobs", "done")),
+            "NOTIFY jobs (pid 42): done"
+        );
+        assert_eq!(notification_line(&note("jobs", "")), "NOTIFY jobs (pid 42)");
+    }
+
+    #[test]
+    fn inbox_keeps_the_newest_and_counts_the_rest() {
+        let mut inbox = Inbox::default();
+        for i in 0..INBOX_CAPACITY + 5 {
+            inbox.push(note("c", &i.to_string()));
+        }
+        let (items, dropped) = inbox.take();
+        assert_eq!(items.len(), INBOX_CAPACITY);
+        assert_eq!(dropped, 5);
+        assert_eq!(items[0].payload, "5");
+        let (items, dropped) = inbox.take();
+        assert!(items.is_empty());
+        assert_eq!(dropped, 0);
     }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { connectedInfo, isMariaDb, mariaDbAtLeast, mariaDbVersion } from '../mariadb'
+import { connectedInfo, isMariaDb, knownMariaDb, mariaDbAtLeast, mariaDbVersion } from '../mariadb'
 
 const info = (product: string, version: string) => ({ product, version })
 
@@ -37,5 +37,16 @@ describe('MariaDB detection', () => {
     ).toBe('MariaDB 11.4.2')
     expect(connectedInfo({ state: 'connecting' })).toBeNull()
     expect(connectedInfo(undefined)).toBeNull()
+  })
+
+  it('knows the server only once connected', () => {
+    const status = (product: string, version: string) => ({
+      state: 'connected' as const,
+      info: { product, version, currentDatabase: '', user: '', babelfishVersion: null }
+    })
+    expect(knownMariaDb(status('MariaDB 11.8.3', '11.8.3-MariaDB'))).toBe(true)
+    expect(knownMariaDb(status('MySQL 8.4.0', '8.4.0'))).toBe(false)
+    expect(knownMariaDb({ state: 'connecting' })).toBeUndefined()
+    expect(knownMariaDb(undefined)).toBeUndefined()
   })
 })

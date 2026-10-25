@@ -1,4 +1,11 @@
 import type { Cell } from './api'
+import {
+  authPlugin,
+  identifiedVia,
+  parseAuthMethods,
+  takesPassword,
+  validPluginName
+} from './authPlugins'
 import type { Dialect } from './engines'
 import {
   granteeSql,
@@ -38,6 +45,8 @@ export interface PrincipalState {
   connectionLimit: string
   /** MySQL ACCOUNT LOCK */
   locked: boolean
+  /** MySQL and MariaDB authentication plugins, in the order MariaDB tries them; [] for the server default */
+  plugins: string[]
   /* SQL Server */
   auth: TsqlAuth
   /** Server login the user maps to */
@@ -81,6 +90,7 @@ const emptyState = (type: PrincipalType): PrincipalState => ({
   validUntil: '',
   connectionLimit: '',
   locked: false,
+  plugins: [],
   auth: 'login',
   login: '',
   defaultSchema: '',
@@ -149,10 +159,12 @@ export function principalStateQueries(dialect: Dialect, p: Principal): string[] 
     case 'mysql': {
       const where = `WHERE User = ${lit(p.name)} AND Host = ${lit(p.host ?? '')}`
       return [
-        `SELECT ${yn("account_locked = 'Y'")}, CAST(max_user_connections AS CHAR) FROM mysql.user ${where}`,
-        // MariaDB 10.4+ keeps account options as JSON
+        `SELECT ${yn("account_locked = 'Y'")}, CAST(max_user_connections AS CHAR), plugin FROM mysql.user ${where}`,
+        // MariaDB 10.4+ keeps account options as JSON, with every sign-in method in auth_or
         `SELECT ${yn("JSON_VALUE(Priv, '$.account_locked') IN ('1', 'true')")}, \
-           COALESCE(JSON_VALUE(Priv, '$.max_user_connections'), '0') FROM mysql.global_priv ${where}`,
+           COALESCE(JSON_VALUE(Priv, '$.max_user_connections'), '0'), \
+           COALESCE(JSON_VALUE(Priv, '$.plugin'), ''), COALESCE(JSON_QUERY(Priv, '$.auth_or'), '') \
+         FROM mysql.global_priv ${where}`,
         // Older MariaDB has no account locking
         `SELECT 'n', CAST(max_user_connections AS CHAR) FROM mysql.user ${where}`
       ]
@@ -209,7 +221,12 @@ export function parsePrincipalState(
     }
     case 'mysql': {
       const limit = text(r[1])
-      return { ...base, locked: flag(0), connectionLimit: limit === '0' ? '' : limit }
+      return {
+        ...base,
+        locked: flag(0),
+        connectionLimit: limit === '0' ? '' : limit,
+        plugins: parseAuthMethods(text(r[2]), text(r[3]))
+      }
     }
     case 'tsql': {
       const type = text(r[0]).trim()
@@ -335,7 +352,7 @@ function mysqlStatements(d: PrincipalDraft, options: PrincipalOptions): string[]
       ? [d.locked ? 'ACCOUNT LOCK' : 'ACCOUNT UNLOCK']
       : [])
   ]
-  const identified = d.password ? ` IDENTIFIED BY ${secret('mysql', d.password, options)}` : ''
+  const identified = identifiedClause(d, options)
   const rest = `${identified}${tail.length ? ` ${tail.join(' ')}` : ''}`
   if (!o) return [`CREATE USER ${who}${rest}`]
   const statements: string[] = []
@@ -343,6 +360,20 @@ function mysqlStatements(d: PrincipalDraft, options: PrincipalOptions): string[]
   if (before !== who) statements.push(`RENAME USER ${before} TO ${who}`)
   if (rest) statements.push(`ALTER USER ${who}${rest}`)
   return statements
+}
+
+const samePlugins = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((p, i) => p === b[i])
+
+function identifiedClause(d: PrincipalDraft, options: PrincipalOptions): string {
+  const mariadb = !!options.mariadb
+  const changed = d.original ? !samePlugins(d.plugins, d.original.plugins) : d.plugins.length > 0
+  const password = takesPassword(d.plugins, mariadb) ? d.password : ''
+  // MariaDB's IDENTIFIED BY resets the account to mysql_native_password, so a new password
+  // restates the methods; MySQL's keeps the plugin
+  if (changed || (password && mariadb))
+    return identifiedVia(d.plugins, mariadb, secret('mysql', password, options))
+  return d.password ? ` IDENTIFIED BY ${secret('mysql', d.password, options)}` : ''
 }
 
 function tsqlStatements(d: PrincipalDraft, options: PrincipalOptions): string[] {
@@ -496,6 +527,16 @@ export function validatePrincipal(
     return "Enter the host the user connects from ('%' for any)"
   const limit = d.connectionLimit.trim()
   if (limit && !/^\d+$/.test(limit)) return 'The connection limit must be a whole number'
+  if (dialect === 'mysql' && d.type === 'user' && d.plugins.length) {
+    const mariadb = !!options.mariadb
+    const bad = d.plugins.find((p) => !validPluginName(p))
+    if (bad !== undefined) return bad ? `${bad} isn't a plugin name` : 'Pick a sign-in method'
+    if (new Set(d.plugins).size < d.plugins.length) return 'List each sign-in method once'
+    if (!mariadb && d.plugins.length > 1) return 'MySQL accounts have one authentication plugin'
+    const changed = !d.original || !samePlugins(d.plugins, d.original.plugins)
+    const needs = d.plugins.find((p) => authPlugin(p, mariadb).password)
+    if (changed && needs && !d.password) return `Enter a password for ${needs}`
+  }
   if (dialect === 'tsql' && d.type === 'user' && !d.original) {
     if (d.auth === 'login' && !d.login.trim()) return 'Pick or name a login'
     if (d.auth === 'login' && d.createLogin && !d.password) return 'Enter a password for the login'
