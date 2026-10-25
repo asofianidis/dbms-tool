@@ -134,8 +134,20 @@ export function literal(dialect: Dialect, value: Cell, dataType = ''): string {
   if (dialect === 'tsql' && /^0x[0-9a-f]*$/i.test(value) && /binary|image/i.test(dataType)) {
     return value
   }
-  if (dialect === 'mysql' && /^0x[0-9a-f]*$/i.test(value) && /binary|blob/i.test(dataType)) {
+  if (
+    dialect === 'mysql' &&
+    /^0x[0-9a-f]*$/i.test(value) &&
+    /binary|blob|^vector\b/i.test(dataType)
+  ) {
     return value
+  }
+  // MariaDB vectors can also be typed as a float array: [0.1, 0.2]
+  if (
+    dialect === 'mysql' &&
+    /^vector\b/i.test(dataType) &&
+    /^\s*\[[\d\s.,eE+-]*\]\s*$/.test(value)
+  ) {
+    return `VEC_FromText('${value.trim()}')`
   }
   if (dialect === 'postgres' && /^0x[0-9a-f]*$/i.test(value) && /bytea/i.test(dataType)) {
     return `'\\x${value.slice(2)}'`
@@ -159,8 +171,10 @@ export interface SelectOptions {
   offset?: number
   /** Columns used for a stable order when paging SQL Server */
   keyColumns?: string[]
-  /** Expressions selected ahead of `*`, e.g. PostgreSQL's ctid for editing without a key */
+  /** Expressions selected ahead of the columns, e.g. PostgreSQL's ctid for editing without a key */
   leadingColumns?: string[]
+  /** Columns to select instead of *, e.g. so MySQL's invisible columns show */
+  columns?: string[]
 }
 
 export function selectRows(dialect: Dialect, ref: TableRef, opts: SelectOptions): string {
@@ -168,17 +182,20 @@ export function selectRows(dialect: Dialect, ref: TableRef, opts: SelectOptions)
   const where = opts.where?.trim() ? `\nWHERE ${opts.where.trim()}` : ''
   const order = opts.orderBy?.trim()
   const offset = opts.offset ?? 0
+  const list = opts.columns?.length
+    ? opts.columns.map((c) => quoteIdent(dialect, c)).join(', ')
+    : '*'
   if (dialect === 'tsql') {
-    if (!offset && !order) return `SELECT TOP (${opts.limit}) *\nFROM ${table}${where}`
+    if (!offset && !order) return `SELECT TOP (${opts.limit}) ${list}\nFROM ${table}${where}`
     const orderBy =
       order ||
       (opts.keyColumns?.length
         ? opts.keyColumns.map((c) => quoteIdent(dialect, c)).join(', ')
         : '(SELECT NULL)')
-    return `SELECT *\nFROM ${table}${where}\nORDER BY ${orderBy}\nOFFSET ${offset} ROWS FETCH NEXT ${opts.limit} ROWS ONLY`
+    return `SELECT ${list}\nFROM ${table}${where}\nORDER BY ${orderBy}\nOFFSET ${offset} ROWS FETCH NEXT ${opts.limit} ROWS ONLY`
   }
   const leading = opts.leadingColumns?.length ? `${opts.leadingColumns.join(', ')}, ` : ''
-  return `SELECT ${leading}*\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
+  return `SELECT ${leading}${list}\nFROM ${table}${where}${order ? `\nORDER BY ${order}` : ''}\nLIMIT ${opts.limit}${offset ? ` OFFSET ${offset}` : ''}`
 }
 
 export function countRows(dialect: Dialect, ref: TableRef, where?: string): string {
@@ -493,7 +510,9 @@ export function dangerousStatements(sql: string, dialect: Dialect): string[] {
   const reasons: string[] = []
   for (const statement of splitStatements(sql, dialect)) {
     const s = stripComments(statement.text).trim()
-    if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
+    // MariaDB: removes old versions of a system-versioned table's rows
+    if (/^delete\s+history\b/i.test(s)) reasons.push('DELETE HISTORY')
+    else if (/^(with\b[\s\S]*?\)\s*)?delete\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('DELETE without a WHERE clause')
     else if (/^(with\b[\s\S]*?\)\s*)?update\b/i.test(s) && !/\bwhere\b/i.test(s))
       reasons.push('UPDATE without a WHERE clause')

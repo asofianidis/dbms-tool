@@ -10,6 +10,7 @@ import {
   Download,
   FilePlus2,
   Hash,
+  History,
   KeyRound,
   Link2,
   ListChecks,
@@ -31,6 +32,7 @@ import {
 } from '@/lib/api'
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
+import { browseColumns, isInvisible, tableColumnTypes } from '@/lib/column-types'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText, EXPORT_MAX_ROWS, type FetchedRows } from '@/lib/export'
 import {
@@ -42,6 +44,7 @@ import {
   type QueryState
 } from '@/lib/filters'
 import { formatDuration, plural } from '@/lib/format'
+import { connectedInfo } from '@/lib/mariadb'
 import { addInsert } from '@/lib/pending'
 import { queries } from '@/lib/queries'
 import { isPhysical, loadRowLocator, rowLocatorNote, withRowLocator } from '@/lib/row-locator'
@@ -56,6 +59,15 @@ import {
   type TableRef
 } from '@/lib/sql'
 import { errorMessage, toastError } from '@/lib/toast'
+import {
+  editKey,
+  rowHistoryQuery,
+  supportsVersioning,
+  versionedCount,
+  versionedSelect,
+  versioningQuery,
+  type SystemTime
+} from '@/lib/versioning'
 import {
   connect,
   connectionsStore,
@@ -89,6 +101,7 @@ import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
 import { RoutineAttributesBar } from './RoutineAttributesBar'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
+import { SystemTimeBar } from './SystemTimeBar'
 import { SequenceDetails } from './SequenceDetails'
 import { openTableDesigner } from './TableDesigner'
 import { StorageSummary } from './StorageOptions'
@@ -219,6 +232,18 @@ function DataView({
   const [panelOpen, setPanelOpen] = useState(false)
   const [filter, setFilter] = useState('')
   const [exporting, setExporting] = useState(false)
+  // MariaDB system-versioned tables: which rows to read, and whether to show the period columns
+  const status = statusStore.use()[tab.connectionId]
+  const versionable =
+    engine === 'mysql' && tab.objectKind === 'table' && supportsVersioning(connectedInfo(status))
+  const versioning = useQuery({
+    ...versioningQuery(tab.connectionId, tab.database, tab.name),
+    enabled: versionable
+  }).data
+  const versioned = versionable && !!versioning?.versioned
+  const [systemTime, setSystemTime] = useState<SystemTime>({ kind: 'current' })
+  const [periods, setPeriods] = useState(false)
+  const history = versioned && systemTime.kind !== 'current'
 
   // PostgreSQL tables without a primary key are edited by a unique key or by ctid
   const needsLocator =
@@ -229,24 +254,38 @@ function DataView({
     enabled: needsLocator
   })
   const locator = needsLocator ? (locatorQuery.data ?? null) : null
-  const editInfo = useMemo(
+  const locatedInfo = useMemo(
     () => info.data && withRowLocator(info.data, locator),
     [info.data, locator]
   )
 
   const set = output?.results[0]
-  const pk = editInfo?.primaryKey ?? []
+  // MariaDB versioned tables leave the row-end column out of the key; PostgreSQL
+  // tables without one use the locator's
+  const pk = editKey(locatedInfo?.primaryKey ?? [], versioning)
+  const editInfo = useMemo(
+    () => locatedInfo && { ...locatedInfo, primaryKey: pk },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [locatedInfo, pk.join(',')]
+  )
   // Hidden system columns (ctid) come first in the result; the grid doesn't show them
   const hiddenCount =
     set && locator?.hidden.length && locator.hidden.every((h, i) => set.columns[i]?.name === h)
       ? locator.hidden.length
       : 0
   const columns: ColumnMeta[] = useMemo(
-    () => set?.columns.slice(hiddenCount) ?? [],
-    [set, hiddenCount]
+    () => tableColumnTypes(set?.columns.slice(hiddenCount) ?? [], info.data),
+    [set, hiddenCount, info.data]
   )
+  // SELECT * leaves invisible columns out, so name them all
+  const listed = browseColumns(info.data)
+  // Old row versions can't be edited
   const canEdit =
-    !readOnly && pk.length > 0 && !!info.data && hiddenCount === (locator?.hidden.length ?? 0)
+    !readOnly &&
+    !history &&
+    pk.length > 0 &&
+    !!info.data &&
+    hiddenCount === (locator?.hidden.length ?? 0)
   const appliedWhere = useMemo(
     () =>
       buildWhere(
@@ -262,8 +301,31 @@ function DataView({
   const orderBy =
     appliedOrder ||
     (pk.length && !isPhysical(locator)
-      ? pk.map((k) => quoteIdent(dialect, k)).join(', ')
+      ? [...pk, ...(history ? [versioning!.rowStart] : [])]
+          .map((k) => quoteIdent(dialect, k))
+          .join(', ')
       : undefined)
+
+  /** The rows to show or export: the plain table, or a versioned one at its system time. */
+  const selectSql = (limit: number, offset?: number, leadingColumns?: string[]): string =>
+    versioned
+      ? versionedSelect(tableRef, versioning!, systemTime, {
+          where: appliedWhere,
+          orderBy,
+          limit,
+          offset,
+          periods,
+          columns: listed
+        })
+      : selectRows(dialect, tableRef, {
+          where: appliedWhere,
+          orderBy,
+          limit,
+          offset,
+          keyColumns: pk,
+          leadingColumns,
+          columns: listed
+        })
 
   /** Applies a new filter / sort from the builder, chips or grid header. */
   const applyQuery = (next: QueryState): void => {
@@ -286,14 +348,7 @@ function DataView({
     setRunning(tab.id, true)
     try {
       // One row past the page tells whether there's a next page
-      const sql = selectRows(dialect, tableRef, {
-        where: appliedWhere,
-        orderBy,
-        limit: pageSize + 1,
-        offset: page * pageSize,
-        keyColumns: pk,
-        leadingColumns: locator?.hidden
-      })
+      const sql = selectSql(pageSize + 1, page * pageSize, locator?.hidden)
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
         maxRows: pageSize + 1
       })
@@ -317,7 +372,11 @@ function DataView({
     page,
     pageSize,
     pk.join(','),
-    locator?.hidden.join(',')
+    locator?.hidden.join(','),
+    versioned,
+    systemTime,
+    periods,
+    listed?.join(',')
   ])
 
   // Wait for the row locator too, so a table without a key isn't loaded twice
@@ -326,7 +385,17 @@ function DataView({
     if (info.isPending || locating) return
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appliedWhere, appliedOrder, page, pageSize, info.isPending, locating])
+  }, [
+    appliedWhere,
+    appliedOrder,
+    page,
+    pageSize,
+    info.isPending,
+    locating,
+    versioned,
+    systemTime,
+    periods
+  ])
 
   const count = async (): Promise<void> => {
     try {
@@ -334,7 +403,9 @@ function DataView({
         tab.connectionId,
         tab.id,
         tab.database,
-        countRows(dialect, tableRef, appliedWhere)
+        versioned
+          ? versionedCount(tableRef, systemTime, appliedWhere)
+          : countRows(dialect, tableRef, appliedWhere)
       )
       if (out.error) throw new Error(out.error.message)
       setTotal(Number(out.results[0]?.rows[0]?.[0] ?? 0))
@@ -363,9 +434,11 @@ function DataView({
     const generated = new Set<number>()
     columns.forEach((c, i) => {
       if (info.data?.columns.find((col) => col.name === c.name)?.isGenerated) generated.add(i)
+      // The implicit ROW_START / ROW_END aren't in the catalog
+      if (versioned && [versioning!.rowStart, versioning!.rowEnd].includes(c.name)) generated.add(i)
     })
     return generated
-  }, [columns, info.data])
+  }, [columns, info.data, versioned, versioning])
   const { changes, setChanges, rows, editing, visibleKeys } = usePendingEdits({
     columns,
     baseRows,
@@ -448,6 +521,27 @@ function DataView({
         }
       })
 
+  // Every version of a row of a system-versioned table, oldest first
+  const historyItems = (row: number): MenuItem[] => {
+    if (!versioned || !pk.length) return []
+    const values = pk.map((k) => {
+      const i = columns.findIndex((c) => c.name === k)
+      return i < 0 ? undefined : rows[row][i]
+    })
+    return [
+      {
+        label: 'Show history',
+        icon: <History />,
+        disabled: values.some((v) => v === undefined),
+        onSelect: () => {
+          setSystemTime({ kind: 'all' })
+          setPeriods(true)
+          applyQuery(rowHistoryQuery(versioning!, pk, values as Cell[], valueCondition))
+        }
+      }
+    ]
+  }
+
   // The grid header shows and sets the first sort column
   const firstSort = query.sorts[0]
   const gridSort: SortState =
@@ -464,12 +558,7 @@ function DataView({
     const session = `${tab.id}:export`
     setExporting(true)
     try {
-      const sql = selectRows(dialect, tableRef, {
-        where: appliedWhere,
-        orderBy,
-        limit: EXPORT_MAX_ROWS + 1,
-        keyColumns: pk
-      })
+      const sql = selectSql(EXPORT_MAX_ROWS + 1)
       const out = await api.execute(tab.connectionId, session, tab.database, sql, {
         maxRows: EXPORT_MAX_ROWS,
         readOnly: true
@@ -595,6 +684,21 @@ function DataView({
           </Button>
         )}
       </Toolbar>
+      {versioned && (
+        <SystemTimeBar
+          connectionId={tab.connectionId}
+          database={tab.database}
+          tableRef={tableRef}
+          value={systemTime}
+          onChange={(next) => {
+            setSystemTime(next)
+            setPage(0)
+            setTotal(null)
+          }}
+          periods={periods}
+          onPeriodsChange={setPeriods}
+        />
+      )}
       {builderOpen && info.data && (
         <QueryBuilder
           columns={info.data.columns}
@@ -628,10 +732,11 @@ function DataView({
               dialect={dialect}
               tableName={qualified(dialect, tableRef)}
               onFilterByValue={filterByValue}
-              cellMenuItems={referenceItems}
+              cellMenuItems={(row, col) => [...referenceItems(row, col), ...historyItems(row)]}
               layoutKey={`table:${tab.connectionId}:${tab.database}:${tab.schema ?? ''}.${tab.name}`}
               onLoadValue={
-                pk.length && editInfo
+                // Old versions can't be read back by key from the current rows
+                pk.length && editInfo && !history
                   ? (row, col) =>
                       fetchCellValue({
                         execute: (sql, options) =>
@@ -782,6 +887,11 @@ function StructureView({
                     {c.isGenerated && (
                       <Badge className="ml-2" tone="info">
                         generated
+                      </Badge>
+                    )}
+                    {isInvisible(c.extra) && (
+                      <Badge className="ml-2" title="SELECT * leaves it out">
+                        invisible
                       </Badge>
                     )}
                   </td>
