@@ -20,6 +20,7 @@ import { HistoryPanel } from './features/history/HistoryPanel'
 import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
 import { TriggerDesignerHost } from './features/table/TriggerDesigner'
+import { PolicyDesignerHost } from './features/table/PolicyDesigner'
 import { PermissionsDesignerHost } from './features/explorer/PermissionsDesigner'
 import { PrincipalDesignerHost } from './features/explorer/PrincipalDesigner'
 import { SeedHost } from './features/seed/SeedDialog'
@@ -35,6 +36,7 @@ import { DiagramTab } from './features/diagram/DiagramTab'
 import { MongoShellTab } from './features/mongo/MongoShellTab'
 import { KeyBrowserTab } from './features/redis/KeyBrowserTab'
 import { PubSubTab } from './features/redis/PubSubTab'
+import { NotifyTab } from './features/notify/NotifyTab'
 import { RedisConsoleTab } from './features/redis/RedisConsoleTab'
 import { QueryTab } from './features/query/QueryTab'
 import { ServerTab } from './features/server/ServerTab'
@@ -81,6 +83,8 @@ const TabContent = memo(function TabContent({ tab }: { tab: Tab }): React.JSX.El
       return <KeyBrowserTab tab={tab} />
     case 'redisPubsub':
       return <PubSubTab tab={tab} />
+    case 'pgNotify':
+      return <NotifyTab tab={tab} />
     case 'table':
       return <TableTab tab={tab} />
     case 'collection':
@@ -264,6 +268,7 @@ export function App(): React.JSX.Element {
       <TableDesignerHost />
       <SchemaDesignerHost />
       <TriggerDesignerHost />
+      <PolicyDesignerHost />
       <PermissionsDesignerHost />
       <PrincipalDesignerHost />
       <MongoUserDesignerHost />

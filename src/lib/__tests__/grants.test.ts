@@ -8,6 +8,7 @@ import {
   parseGrantRows,
   parseMembershipRows,
   parsePrincipals,
+  principalQueries,
   securableComplete,
   securableFor,
   validateGrant,
@@ -143,6 +144,17 @@ describe('PostgreSQL grants', () => {
 describe('MySQL grants', () => {
   const app = role('app', { host: '%', kind: 'user' })
   const db: Securable = { kind: 'database', schema: null, name: 'shop', args: null }
+
+  it('lists principals with the known server query only', () => {
+    const uses = (queries: string[]) =>
+      queries.map((q) =>
+        q.includes('is_role') ? 'mariadb' : q.includes('account_locked') ? 'mysql' : 'grantees'
+      )
+    expect(uses(principalQueries('mysql', false))).toEqual(['mysql', 'grantees'])
+    expect(uses(principalQueries('mysql', true))).toEqual(['mariadb', 'grantees'])
+    // Not connected yet: try MariaDB's query, then MySQL's
+    expect(uses(principalQueries('mysql'))).toEqual(['mariadb', 'mysql', 'grantees'])
+  })
 
   it('grants and revokes at the database level', () => {
     expect(

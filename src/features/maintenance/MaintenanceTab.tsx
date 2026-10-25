@@ -11,11 +11,13 @@ import {
   mongoReplyLines,
   newMaintenanceDraft,
   optionInfo,
+  presetDraft,
   resultErrors,
   resultLines,
   taskInfo,
   validateMaintenance,
   type MaintenanceDraft,
+  type MaintenancePreset,
   type MaintenanceStep
 } from '@/lib/maintenance'
 import { confirmProductionWrite, mongoIsWrite, sqlWriteKeyword } from '@/lib/production'
@@ -61,7 +63,14 @@ export function MaintenanceTab({ tab }: { tab: TabOf<'maintenance'> }): React.JS
       </EmptyState>
     )
   }
-  return <MaintenanceForm tabId={tab.id} connection={connection} database={tab.database} />
+  return (
+    <MaintenanceForm
+      tabId={tab.id}
+      connection={connection}
+      database={tab.database}
+      preset={tab.preset}
+    />
+  )
 }
 
 const keyOf = (t: TableRef): string => `${t.schema ?? ''}\n${t.name}`
@@ -99,15 +108,26 @@ function useTargets(
 function MaintenanceForm({
   tabId,
   connection,
-  database
+  database,
+  preset
 }: {
   tabId: string
   connection: ConnectionConfig
   database: string
+  preset?: MaintenancePreset
 }): React.JSX.Element {
   const engine = connection.engine
   const tasks = maintenanceTasks(engine)
-  const [draft, setDraft] = useState<MaintenanceDraft>(() => newMaintenanceDraft(engine))
+  const [draft, setDraft] = useState<MaintenanceDraft>(() =>
+    preset ? presetDraft(engine, preset) : newMaintenanceDraft(engine)
+  )
+  // Opening the tab again for other tables starts over on them
+  const applied = useRef(preset?.nonce)
+  useEffect(() => {
+    if (!preset || applied.current === preset.nonce) return
+    applied.current = preset.nonce
+    setDraft(presetDraft(engine, preset))
+  }, [engine, preset])
   const patch = (p: Partial<MaintenanceDraft>): void => setDraft((d) => ({ ...d, ...p }))
   const { tables, loading } = useTargets(connection, database)
   const runner = useMaintenanceJob(tabId)

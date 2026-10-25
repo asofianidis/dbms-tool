@@ -1,14 +1,8 @@
-import {
-  snippetCompletion,
-  type Completion,
-  type CompletionContext,
-  type CompletionResult,
-  type CompletionSource
-} from '@codemirror/autocomplete'
+import type { CompletionSource } from '@codemirror/autocomplete'
 import { MariaSQL, SQLDialect } from '@codemirror/lang-sql'
 import type { ServerInfo } from '@/lib/api'
 import { isMariaDb, mariaDbVersion, type ServerVersion } from '@/lib/mariadb'
-import { statementAround } from './sql-completion'
+import { phraseCompletion, type Phrase as BasePhrase } from './phrase-completion'
 
 /*
  * MariaDB connects through the MySQL dialect. When the server is MariaDB the editor
@@ -32,16 +26,8 @@ export function editorMariaDb(
   return mariaDbVersion(info) ?? [Infinity, 0, 0]
 }
 
-interface Phrase {
-  /** The words, completed one or more at a time */
-  words: string
-  /** Snippet text after the last word, with `${field}` placeholders */
-  tail?: string
+interface Phrase extends BasePhrase {
   since: [major: number, minor: number]
-  /** Only at the start of a statement */
-  start?: boolean
-  /** Only in statements whose text before the phrase matches */
-  where?: RegExp
 }
 
 /** Right after a table in FROM or JOIN */
@@ -116,39 +102,9 @@ const atLeast = (v: ServerVersion, [major, minor]: [number, number]): boolean =>
  * so `FOR SYSTEM_TIME` offers `AS OF`, `ALL`… once `FOR ` is written.
  */
 export function mariaDbCompletion(version: ServerVersion): CompletionSource {
-  const phrases = PHRASES.filter((p) => atLeast(version, p.since))
-  return (context: CompletionContext): CompletionResult | null => {
-    const word = context.matchBefore(/(?:FORMAT=)?[\w$]*/i)
-    if (!word || (word.from === word.to && !context.explicit)) return null
-    const doc = context.state.doc.toString()
-    const { from } = statementAround(doc, context.pos)
-    const before = doc.slice(from, word.from)
-    // The statement's words before the one being typed, most recent last
-    const typed = before.trim() ? before.trim().split(/\s+/) : []
-    const current = word.text.toUpperCase()
-    const out: Completion[] = []
-    for (const p of phrases) {
-      const words = p.words.split(' ')
-      for (let k = 0; k < words.length; k++) {
-        // The phrase's first k words are the last k typed
-        if (k > typed.length) break
-        const lead = typed.slice(typed.length - k)
-        if (lead.some((w, i) => w.toUpperCase() !== words[i])) continue
-        if (!words[k].startsWith(current)) continue
-        const rest = typed.slice(0, typed.length - k)
-        if (p.start && rest.length) continue
-        if (p.where && !p.where.test(rest.join(' '))) continue
-        const label = words.slice(k).join(' ')
-        out.push(
-          snippetCompletion(label + (p.tail ?? ''), {
-            label,
-            detail: `MariaDB ${p.since.join('.')}+`,
-            type: 'keyword'
-          })
-        )
-        break
-      }
-    }
-    return out.length ? { from: word.from, options: out } : null
-  }
+  return phraseCompletion(
+    PHRASES.filter((p) => atLeast(version, p.since)),
+    (p) => `MariaDB ${p.since.join('.')}+`,
+    /(?:FORMAT=)?[\w$]*/i
+  )
 }
