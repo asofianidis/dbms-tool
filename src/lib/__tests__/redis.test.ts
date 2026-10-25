@@ -145,6 +145,8 @@ describe('write classification', () => {
     expect(isReadCommand(['get', 'k'])).toBe(true)
     expect(isReadCommand(['CONFIG', 'get', 'maxmemory'])).toBe(true)
     expect(isReadCommand(['CONFIG', 'SET', 'maxmemory', '1'])).toBe(false)
+    expect(isReadCommand(['ACL', 'LOG', '10'])).toBe(true)
+    expect(isReadCommand(['acl', 'log', 'reset'])).toBe(false)
     expect(redisIsWrite({ op: 'scan', database: '0' })).toBe(false)
     expect(redisIsWrite({ op: 'command', database: '0', args: ['HGETALL', 'h'] })).toBe(false)
     expect(redisIsWrite({ op: 'command', database: '0', args: ['DEL', 'h'] })).toBe(true)

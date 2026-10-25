@@ -4,6 +4,7 @@
 //! the safety net there.
 
 use crate::config::Engine;
+use crate::drivers::mssql::split_batches;
 
 const WRITE_KEYWORDS: &[&str] = &[
     "insert",
@@ -53,10 +54,21 @@ const WRITE_KEYWORDS: &[&str] = &[
 
 /// Words after which a write keyword can only be a column or alias name:
 /// `SELECT refresh`, `a, update`, `AS delete`, `ORDER BY lock`, `x = replace`.
+/// Not `on`: T-SQL's `SET NOCOUNT ON` can run straight into the next statement,
+/// and a column after a join's `ON` is followed by a comparison anyway.
 const VALUE_POSITION: &[&str] = &[
-    "select", "distinct", "as", "by", "where", "and", "or", "on", "having", "between", "like",
-    "in", "is",
+    "select", "distinct", "as", "by", "where", "and", "or", "having", "between", "like", "in", "is",
 ];
+
+/// Settings that hold PostgreSQL's and MySQL's read-only mode
+const READ_ONLY_SETTINGS: &[&str] = &[
+    "default_transaction_read_only",
+    "transaction_read_only",
+    "tx_read_only",
+];
+
+/// MySQL `SET` targets that change the server or an account rather than the session
+const MYSQL_SERVER_SETTINGS: &[&str] = &["global", "persist", "persist_only", "password"];
 
 /// Write keywords that are also functions: `REPLACE(s, …)`, MySQL's `INSERT(s, …)`.
 /// `EXEC('…')` runs dynamic SQL, so it isn't one of them.
@@ -109,8 +121,11 @@ enum Token {
 
 #[derive(Clone, Copy)]
 struct Lexing {
-    /// MySQL `#` comments; elsewhere `#` starts a name like `#temp`
-    hash_comments: bool,
+    /// MySQL comments: `#` starts one (elsewhere it starts a name like `#temp`),
+    /// `--` needs a space after it, and the body of `/*! … */` runs as code
+    mysql_comments: bool,
+    /// `[x]` is a name (T-SQL, SQLite); elsewhere `[` is a subscript
+    bracket_idents: bool,
     /// `\'` inside a string escapes the quote (MySQL, PostgreSQL `E'…'`)
     backslash_escapes: bool,
 }
@@ -119,24 +134,46 @@ struct Lexing {
 fn tokenize(sql: &str, lexing: Lexing) -> Vec<Token> {
     let chars: Vec<char> = sql.chars().collect();
     let mut tokens = Vec::new();
+    // Inside MySQL's `/*! … */`, whose body runs
+    let mut in_executable_comment = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
         match c {
             c if c.is_whitespace() => {}
-            '-' if next == Some('-') => {
+            // MySQL reads `5--1` as `5 - -1`
+            '-' if next == Some('-')
+                && (!lexing.mysql_comments
+                    || chars
+                        .get(i + 2)
+                        .is_none_or(|c| c.is_whitespace() || c.is_control())) =>
+            {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
-            '#' if lexing.hash_comments => {
+            '#' if lexing.mysql_comments => {
                 // MySQL line comment
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
             '/' if next == Some('*') => {
+                // `/*! … */`, `/*!50000 … */` and MariaDB's `/*M! … */` run on the server
+                let bang = if chars.get(i + 2) == Some(&'M') {
+                    i + 3
+                } else {
+                    i + 2
+                };
+                if lexing.mysql_comments && chars.get(bang) == Some(&'!') {
+                    i = bang + 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    in_executable_comment = true;
+                    continue;
+                }
                 i += 2;
                 while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                     i += 1;
@@ -144,7 +181,12 @@ fn tokenize(sql: &str, lexing: Lexing) -> Vec<Token> {
                 i += 2;
                 continue;
             }
-            '\'' | '"' | '`' | '[' => {
+            '*' if in_executable_comment && next == Some('/') => {
+                in_executable_comment = false;
+                i += 2;
+                continue;
+            }
+            '\'' | '"' | '`' | '[' if c != '[' || lexing.bracket_idents => {
                 let close = if c == '[' { ']' } else { c };
                 i += 1;
                 while i < chars.len() {
@@ -153,8 +195,8 @@ fn tokenize(sql: &str, lexing: Lexing) -> Vec<Token> {
                         continue;
                     }
                     if chars[i] == close {
-                        // Doubled quote is an escaped quote
-                        if chars.get(i + 1) == Some(&close) && close != ']' {
+                        // Doubled quote is an escaped quote, `]]` included
+                        if chars.get(i + 1) == Some(&close) {
                             i += 2;
                             continue;
                         }
@@ -235,7 +277,8 @@ fn used_as_name(tokens: &[Token], i: usize) -> bool {
 /// Returns the first keyword that could modify data, ignoring strings,
 /// quoted identifiers, comments and keywords used as column names.
 pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
-    let hash_comments = engine == Engine::Mysql;
+    let mysql_comments = engine == Engine::Mysql;
+    let bracket_idents = matches!(engine, Engine::Mssql | Engine::Babelfish | Engine::Sqlite);
     // Whether `'` escapes depends on server settings (NO_BACKSLASH_ESCAPES,
     // E'' strings), so read the script both ways and block if either finds a write
     let escapes: &[bool] = match engine {
@@ -246,16 +289,20 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
         let tokens = tokenize(
             sql,
             Lexing {
-                hash_comments,
+                mysql_comments,
+                bracket_idents,
                 backslash_escapes,
             },
         );
-        if let Some(word) = write_keyword(&tokens) {
+        if let Some(word) = write_keyword(&tokens).or_else(|| session_write(&tokens, engine)) {
             return Some(word);
         }
     }
     if matches!(engine, Engine::Mssql | Engine::Babelfish) {
-        return tsql_batches(sql).find_map(batch_procedure_call);
+        // Split exactly as the driver does, so each batch it sends is checked
+        return split_batches(sql)
+            .into_iter()
+            .find_map(|(_, batch, _)| batch_procedure_call(batch));
     }
     None
 }
@@ -276,22 +323,48 @@ fn write_keyword(tokens: &[Token]) -> Option<String> {
         })
 }
 
-/// Splits a T-SQL script on `GO` lines, as the client tools do.
-fn tsql_batches(sql: &str) -> impl Iterator<Item = String> + '_ {
-    let mut batches = vec![String::new()];
-    for line in sql.lines() {
-        let mut words = line.split_whitespace();
-        let is_go = words.next().is_some_and(|w| w.eq_ignore_ascii_case("go"))
-            && words.all(|w| w.chars().all(|c| c.is_ascii_digit()));
-        if is_go {
-            batches.push(String::new());
-        } else {
-            let batch = batches.last_mut().expect("never empty");
-            batch.push_str(line);
-            batch.push('\n');
+/// Statements that switch off the server-side read-only mode of read-only
+/// connections (`BEGIN READ WRITE`, `RESET ALL`), or change more than the
+/// session (MySQL's `SET GLOBAL`, SQLite's `PRAGMA writable_schema`).
+fn session_write(tokens: &[Token], engine: Engine) -> Option<String> {
+    for statement in tokens.split(|t| *t == Token::Punct(';')) {
+        let words: Vec<&str> = statement
+            .iter()
+            .map(|t| match t {
+                // `@@session.x` and `@@x` name the same setting as `x`
+                Token::Word(w) => w.trim_start_matches("@@"),
+                _ => "",
+            })
+            .collect();
+        // BEGIN / START TRANSACTION / SET [SESSION CHARACTERISTICS AS] TRANSACTION … READ WRITE
+        if words.windows(2).any(|w| w == ["read", "write"]) {
+            return Some("READ WRITE".into());
+        }
+        // `SELECT set_config('default_transaction_read_only', 'off', false)`
+        if engine == Engine::Postgres
+            && statement
+                .windows(2)
+                .any(|w| w[0] == Token::Word("set_config".into()) && w[1] == Token::Punct('('))
+        {
+            return Some("SET_CONFIG".into());
+        }
+        let first = words.first().copied().unwrap_or_default();
+        let found = match (first, engine) {
+            ("reset", Engine::Postgres) if words.get(1) == Some(&"all") => Some("all"),
+            ("set" | "reset", Engine::Postgres | Engine::Mysql) => {
+                words.iter().copied().find(|w| {
+                    READ_ONLY_SETTINGS.contains(w)
+                        || (engine == Engine::Mysql && MYSQL_SERVER_SETTINGS.contains(w))
+                })
+            }
+            ("pragma", Engine::Sqlite) => words.iter().copied().find(|w| *w == "writable_schema"),
+            _ => None,
+        };
+        if let Some(found) = found {
+            return Some(format!("{first} {found}").to_uppercase());
         }
     }
-    batches.into_iter()
+    None
 }
 
 /// The procedure a batch calls without `EXEC`, if its first statement is one.
@@ -299,7 +372,8 @@ fn batch_procedure_call(batch: String) -> Option<String> {
     let tokens = tokenize(
         &batch,
         Lexing {
-            hash_comments: false,
+            mysql_comments: false,
+            bracket_idents: true,
             backslash_escapes: false,
         },
     );
@@ -332,7 +406,7 @@ mod tests {
     fn allows_reads() {
         assert_eq!(pg("SELECT * FROM t WHERE name = 'drop table'"), None);
         assert_eq!(pg("select \"update\" from t -- delete"), None);
-        assert_eq!(pg("SELECT [delete] FROM t /* insert */"), None);
+        assert_eq!(ms("SELECT [delete] FROM t /* insert */"), None);
         assert_eq!(pg("SELECT $$ drop $$, t.update FROM t"), None);
         assert_eq!(pg("SELECT REPLACE(name, 'a', 'b') FROM t"), None);
         assert_eq!(pg("SHOW TABLES"), None);
@@ -410,5 +484,140 @@ mod tests {
         assert_eq!(ms("DECLARE @x int = 1; SELECT @x"), None);
         // Other engines treat a bare name as a syntax error, not a call
         assert_eq!(pg("sp_rename 'a', 'b'"), None);
+    }
+
+    #[test]
+    fn splits_tsql_batches_like_the_driver() {
+        assert!(ms("SELECT 1\nGO -- next\nxp_cmdshell 'dir'").is_some());
+        assert!(ms("SELECT 1\ngo 5 -- twice\nxp_cmdshell 'dir'").is_some());
+        assert_eq!(ms("SELECT 1\nGO -- next\nSELECT 2"), None);
+    }
+
+    #[test]
+    fn reads_escaped_brackets_in_tsql_names() {
+        assert_eq!(
+            ms("SELECT 1 AS [x]]'];DELETE FROM t;--']").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(ms("SELECT [a]]delete] FROM t"), None);
+        let lite = |sql| first_write_keyword(sql, Engine::Sqlite);
+        assert_eq!(
+            lite("SELECT [x]]'];DELETE FROM t;--']").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(lite("SELECT [delete] FROM t"), None);
+    }
+
+    #[test]
+    fn brackets_are_subscripts_on_postgres() {
+        assert_eq!(
+            pg("SELECT arr[length(']')] FROM t; DELETE FROM t; -- '").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(pg("SELECT arr[1] FROM t"), None);
+    }
+
+    #[test]
+    fn blocks_writes_after_set_options() {
+        assert_eq!(
+            ms("SET NOCOUNT ON\nDELETE FROM t").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(
+            ms("SET XACT_ABORT ON UPDATE t SET a=1").as_deref(),
+            Some("UPDATE")
+        );
+        assert_eq!(ms("SET NOCOUNT ON\nSELECT 1"), None);
+        assert_eq!(pg("SELECT * FROM a JOIN b ON update = b.id"), None);
+        assert_eq!(
+            pg("SELECT * FROM a JOIN b ON a.id = b.id AND lock > 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn follows_mysql_comment_rules() {
+        let my = |sql| first_write_keyword(sql, Engine::Mysql);
+        assert_eq!(my("SELECT 5--1; DELETE FROM t").as_deref(), Some("DELETE"));
+        assert_eq!(my("SELECT 1 -- delete"), None);
+        assert_eq!(my("SELECT 1 --\tdelete"), None);
+        assert_eq!(
+            my("SELECT 1 /*! ; DELETE FROM t */").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(
+            my("SELECT 1 /*!50000 ; DELETE FROM t */").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(
+            my("SELECT 1 /*M!100100 ; DELETE FROM t */").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(my("SELECT /*!40001 SQL_NO_CACHE */ * FROM t"), None);
+        assert_eq!(my("SELECT 1 /* delete */"), None);
+        // Other engines end the line at any `--`
+        assert_eq!(pg("SELECT 5--1; DELETE FROM t"), None);
+    }
+
+    #[test]
+    fn blocks_leaving_read_only_mode() {
+        for sql in [
+            "BEGIN READ WRITE",
+            "START TRANSACTION READ WRITE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+            "SET default_transaction_read_only = off",
+            "SET SESSION default_transaction_read_only TO off",
+            "SET LOCAL transaction_read_only = off",
+            "RESET default_transaction_read_only",
+            "RESET ALL",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "SELECT 1; SET default_transaction_read_only = off",
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+        }
+        let my = |sql| first_write_keyword(sql, Engine::Mysql);
+        for sql in [
+            "SET SESSION TRANSACTION READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "START TRANSACTION READ WRITE",
+            "SET GLOBAL max_connections = 1",
+            "SET @@global.read_only = 0",
+            "SET PERSIST max_connections = 1",
+            "SET PERSIST_ONLY max_connections = 1",
+            "SET PASSWORD = 'x'",
+            "SET SESSION transaction_read_only = 0",
+            "SET @@session.transaction_read_only = 0",
+            "SET tx_read_only = 0",
+            "SET @@tx_read_only = 0",
+            "SET NAMES utf8mb4, GLOBAL max_connections = 1",
+            "/*!80000 SET GLOBAL max_connections = 1 */",
+        ] {
+            assert!(my(sql).is_some(), "{sql}");
+        }
+        let lite = |sql| first_write_keyword(sql, Engine::Sqlite);
+        assert!(lite("PRAGMA writable_schema = ON").is_some());
+        assert!(lite("PRAGMA main.writable_schema = 1").is_some());
+
+        // Ordinary session settings stay allowed
+        assert_eq!(pg("SET search_path TO app, public"), None);
+        assert_eq!(pg("BEGIN"), None);
+        assert_eq!(pg("BEGIN READ ONLY"), None);
+        assert_eq!(pg("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), None);
+        assert_eq!(pg("SHOW default_transaction_read_only"), None);
+        assert_eq!(my("SET NAMES utf8mb4"), None);
+        assert_eq!(my("SET @password = 'x'"), None);
+        assert_eq!(
+            my("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            None
+        );
+        assert_eq!(my("SELECT @@global.read_only"), None);
+        assert_eq!(ms("SET NOCOUNT ON"), None);
+        assert_eq!(
+            ms("SET TRANSACTION ISOLATION LEVEL READ COMMITTED\nSELECT 1"),
+            None
+        );
+        assert_eq!(lite("PRAGMA table_info(t)"), None);
     }
 }
