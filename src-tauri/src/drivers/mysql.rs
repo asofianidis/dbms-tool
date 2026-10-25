@@ -98,11 +98,6 @@ pub async fn connect(
     password: Option<&str>,
     database: &str,
 ) -> AppResult<MySession> {
-    // mysql_async panics on ed25519 and parsec accounts; see mysql_auth
-    if password.is_some_and(|p| !p.is_empty()) && cfg.auth != AuthMode::Cloud {
-        let port = if cfg.port == 0 { 3306 } else { cfg.port };
-        super::mysql_auth::check_account(&cfg.host, port, &cfg.user).await?;
-    }
     let (conn, opts) = match cfg.ssl {
         SslMode::Disable => {
             let opts = build_opts(cfg, password, database, false)?;

@@ -247,8 +247,7 @@ async fn run_sql(m: &Manager, id: &str, sql: &str) -> ExecOutput {
 
 #[tokio::test]
 async fn mariadb_auth_plugins() {
-    // mysql_async can't answer ed25519 or parsec and panics trying; the connect has to fail
-    // with a message first
+    // Every method signs in, through mysql_async's client_ed25519 / client_parsec for those two
     let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB_AUTH") else {
         return;
     };
@@ -280,6 +279,13 @@ async fn mariadb_auth_plugins() {
             "or",
             format!("unix_socket OR mysql_native_password USING PASSWORD('{pw}')"),
         ),
+        // A wrong password falls through to ed25519, which used to panic the driver
+        (
+            "ne",
+            format!(
+                "mysql_native_password USING PASSWORD('{pw}') OR ed25519 USING PASSWORD('{pw}')"
+            ),
+        ),
     ];
     let mut created = vec![];
     for (kind, via) in &users {
@@ -296,25 +302,17 @@ async fn mariadb_auth_plugins() {
         created.push((*kind, name));
     }
 
-    for (kind, name) in &created {
-        let result = sign_in(&c, name, pw).await;
-        match *kind {
-            "ed" | "pa" => {
-                let plugin = if *kind == "ed" { "ed25519" } else { "parsec" };
-                let message = result.expect_err("signed in").to_string();
-                assert!(
-                    message.contains(&format!("its {plugin} authentication plugin")),
-                    "{message}"
-                );
-            }
-            _ => {
-                result.unwrap_or_else(|e| panic!("{name}: {e}"));
-            }
-        }
+    for (_, name) in &created {
+        let info = sign_in(&c, name, pw)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(info.product.contains("MariaDB"), "{name}: {}", info.product);
     }
-    // A wrong password is the server's plain refusal
-    let wrong = sign_in(&c, &created[0].1.replace("_ed_", "_na_"), "nope").await;
-    assert!(wrong.unwrap_err().to_string().contains("1045"));
+    // A wrong password is the server's plain refusal, whichever method gets it last
+    for (_, name) in &created {
+        let wrong = sign_in(&c, name, "nope").await.expect_err(name).to_string();
+        assert!(wrong.contains("1045"), "{name}: {wrong}");
+    }
 
     for (_, name) in &created {
         run_sql(&m, &c.id, &format!("DROP USER '{name}'@'%'")).await;
