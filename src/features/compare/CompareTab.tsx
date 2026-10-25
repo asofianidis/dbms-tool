@@ -474,6 +474,7 @@ const KIND_LABELS: Record<DiffItem['kind'], string> = {
   materialized_view: 'Materialized views',
   function: 'Functions',
   procedure: 'Procedures',
+  package: 'Packages',
   sequence: 'Sequences',
   synonym: 'Synonyms',
   collection: 'Collections',

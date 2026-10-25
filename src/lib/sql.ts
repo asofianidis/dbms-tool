@@ -1,5 +1,6 @@
 import type { Cell, ColumnInfo, TableInfo } from './api'
 import type { Dialect } from './engines'
+import { insideMariaDbBlock } from './mariadb-packages'
 
 export function quoteIdent(dialect: Dialect, name: string): string {
   switch (dialect) {
@@ -540,7 +541,14 @@ export function explainSql(
 function insideMysqlBody(current: string, dialect: Dialect): boolean {
   if (dialect !== 'mysql') return false
   const text = current.replace(/--[^\n]*/g, ' ').replace(/'(?:[^'\\]|\\.|'')*'/g, "''")
-  if (!/^\s*create\s+(definer\s*=\s*\S+\s+)?(procedure|function|trigger|event)\b/i.test(text))
+  // MariaDB packages and Oracle-mode routines nest differently
+  const mariaDb = insideMariaDbBlock(text)
+  if (mariaDb !== null) return mariaDb
+  if (
+    !/^\s*create\s+(or\s+replace\s+)?(definer\s*=\s*\S+\s+)?(procedure|function|trigger|event)\b/i.test(
+      text
+    )
+  )
     return false
   const begins = (text.match(/\bbegin\b/gi) ?? []).length
   // END IF / END LOOP / END WHILE / END REPEAT / END CASE close other blocks

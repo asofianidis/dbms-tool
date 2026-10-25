@@ -435,7 +435,7 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
                 obj.schema,
                 obj.name,
                 obj.kind,
-                ['function', 'procedure', 'sequence', 'synonym'].includes(obj.kind)
+                ['function', 'procedure', 'package', 'sequence', 'synonym'].includes(obj.kind)
                   ? 'definition'
                   : 'data',
                 obj.detail

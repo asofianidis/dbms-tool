@@ -40,6 +40,7 @@ import {
   ListOrdered,
   Lock,
   Network,
+  Package,
   Pencil,
   Plug,
   Puzzle,
@@ -71,6 +72,8 @@ import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
+import { connectedInfo } from '@/lib/mariadb'
+import { supportsPackages } from '@/lib/mariadb-packages'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
@@ -108,6 +111,7 @@ import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { newPackage } from './packages'
 import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
@@ -1057,12 +1061,15 @@ const FOLDERS: {
   always?: boolean
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  /** MariaDB 10.3+ only, shown even when empty */
+  packages?: boolean
 }[] = [
   { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['package'], label: 'Packages', packages: true },
   { kinds: ['sequence'], label: 'Sequences' },
   { kinds: ['synonym'], label: 'Synonyms' }
 ]
@@ -1079,13 +1086,15 @@ function ObjectFolders({
   depth: number
 }): React.JSX.Element {
   const q = useQuery(queries.objects(connection.id, database, schema))
+  const packages = supportsPackages(connectedInfo(statusStore.use()[connection.id]))
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   return (
     <>
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
-        if (!objects.length && !folder.always) return null
+        if (folder.packages && !packages) return null
+        if (!objects.length && !folder.always && !folder.packages) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
@@ -1098,6 +1107,7 @@ function ObjectFolders({
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
             newTable={folder.newTable}
+            newPackage={folder.packages}
             objects={objects}
             depth={depth}
           />
@@ -1118,6 +1128,7 @@ function ObjectFolder({
   label,
   routine,
   newTable,
+  newPackage: canAddPackage,
   objects,
   depth
 }: {
@@ -1128,6 +1139,7 @@ function ObjectFolder({
   label: string
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  newPackage?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -1160,6 +1172,15 @@ function ObjectFolder({
                   }
                 ]
               : []),
+            ...(canAddPackage
+              ? [
+                  {
+                    label: 'New package',
+                    icon: <Plus />,
+                    onSelect: () => newPackage(connection.id, database)
+                  }
+                ]
+              : []),
             ...(newTable && supports(connection.engine, 'tableDesigner')
               ? [
                   {
@@ -1186,6 +1207,15 @@ function ObjectFolder({
               variant="ghost"
               title={routine === 'procedure' ? 'New procedure' : 'New function'}
               onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : canAddPackage ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New package"
+              onClick={() => newPackage(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>
@@ -1226,6 +1256,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
     case 'function':
     case 'procedure':
       return <FunctionSquare className="text-syn-fn" />
+    case 'package':
+      return <Package className="text-syn-fn" />
     case 'sequence':
       return <ListOrdered className="text-syn-number" />
     case 'synonym':
