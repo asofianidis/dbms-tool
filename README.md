@@ -228,6 +228,9 @@ cd src-tauri && cargo test -- --test-threads=1
 ./scripts/test-databases.sh down
 ```
 
+`up` finishes by printing the host, port, user, password and connection string for each
+server. Run `./scripts/test-databases.sh info` to print them again.
+
 ### CI and releases
 
 `ci.yml` runs formatting, type checks, unit tests, clippy and the Rust tests on Windows, macOS and
