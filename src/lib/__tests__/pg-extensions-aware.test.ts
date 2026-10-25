@@ -199,16 +199,18 @@ describe('values', () => {
 describe('completion', () => {
   it('completes extension functions only where installed', () => {
     const names = (ext?: string[]): string[] =>
-      functionsFor('postgres', null, ext).map((f) => f.name)
+      functionsFor('postgres', null, undefined, ext).map((f) => f.name)
     expect(names()).not.toContain('l2_distance')
     expect(names()).not.toContain('ST_AsText')
     expect(names(['vector'])).toContain('cosine_distance')
     expect(names(['vector'])).not.toContain('ST_AsText')
     expect(names(['postgis'])).toContain('ST_DWithin')
-    expect(functionsFor('mysql', null, ['vector', 'postgis']).map((f) => f.name)).not.toContain(
-      'l2_distance'
+    expect(
+      functionsFor('mysql', null, undefined, ['vector', 'postgis']).map((f) => f.name)
+    ).not.toContain('l2_distance')
+    const fn = functionsFor('postgres', null, undefined, ['vector']).find(
+      (f) => f.name === 'l2_distance'
     )
-    const fn = functionsFor('postgres', null, ['vector']).find((f) => f.name === 'l2_distance')
     expect(fn?.description).toMatch(/pgvector/)
   })
 })

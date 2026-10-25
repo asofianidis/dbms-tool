@@ -384,6 +384,12 @@ mod tests {
         );
         let my = |sql| first_write_keyword(sql, Engine::Mysql);
         assert_eq!(my("SELECT 1 # delete"), None);
+        // MariaDB's ANALYZE runs the statement it explains
+        assert_eq!(
+            my("ANALYZE FORMAT=JSON\nDELETE FROM t WHERE a = 1").as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(my("EXPLAIN FORMAT=JSON\nSELECT * FROM t"), None);
         // `\'` keeps the string open in MySQL, so the DELETE is real
         assert_eq!(
             my(r"SELECT 'a\'' ; DELETE FROM t; -- '").as_deref(),

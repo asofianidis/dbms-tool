@@ -224,6 +224,8 @@ export interface AssistOptions {
   defaultSchema?: string
   /** The server's version when a MySQL-dialect connection is MariaDB */
   mariaDb?: ServerVersion
+  /** The server's major version when the connection is PostgreSQL */
+  postgres?: number
   /** PostgreSQL extensions installed in the database (pgvector, PostGIS functions) */
   pgExtensions?: string[]
   /** Read at completion time, so edits apply without rebuilding the editor */
@@ -249,7 +251,7 @@ function insertCall(name: string, params: number): Completion['apply'] {
 /** Columns, joins, functions and snippets for the statement at the cursor. */
 export function sqlAssistCompletion(options: AssistOptions): CompletionSource {
   const { dialect, defaultSchema } = options
-  const functions = functionsFor(dialect, options.mariaDb, options.pgExtensions)
+  const functions = functionsFor(dialect, options.mariaDb, options.postgres, options.pgExtensions)
   return (context: CompletionContext): CompletionResult | null => {
     const word = context.matchBefore(/[\w$]*/)
     if (!word) return null
@@ -415,10 +417,11 @@ export function callAt(
 export function signatureHelp(
   dialect: Dialect,
   mariaDb?: ServerVersion,
+  postgres?: number,
   pgExtensions?: string[]
 ): Extension {
   const byName = new Map(
-    functionsFor(dialect, mariaDb, pgExtensions).map((f) => [f.name.toLowerCase(), f])
+    functionsFor(dialect, mariaDb, postgres, pgExtensions).map((f) => [f.name.toLowerCase(), f])
   )
   const tooltip = (state: EditorState): Tooltip | null => {
     const sel = state.selection.main

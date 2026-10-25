@@ -19,6 +19,20 @@ import {
 } from './ddl'
 import type { Dialect } from './engines'
 import { qualified, quoteIdent, scriptCreateTable } from './sql'
+import {
+  extensionDiffers,
+  pgConstraintIndexes,
+  pgIndexSql,
+  pgObjectSteps,
+  pgTableSteps,
+  pgTableText,
+  withPartitionKey,
+  type PgEnv,
+  type PgOut,
+  type PgPhase,
+  type PgTableExtras,
+  type PgTypeDetail
+} from './compare-pg'
 import { sequenceAlterStatements } from './mariadb-sequences'
 import { dropTriggerStatement } from './triggers'
 
@@ -37,16 +51,23 @@ export const COMPARED_KINDS: ObjectKind[] = [
   'sequence'
 ]
 
+/** What a comparison covers: catalog objects, plus PostgreSQL types and extensions. */
+export type CompareKind = ObjectKind | 'type' | 'extension'
+
 export interface SnapshotObject {
   schema: string | null
   name: string
-  kind: ObjectKind
+  kind: CompareKind
   /** PostgreSQL routine identity arguments */
   detail: string | null
   /** Tables only */
   table?: TableInfo
   /** Views, routines and sequences: the CREATE statement the server reports */
   definition?: string | null
+  /** PostgreSQL tables: constraints and partitions `table` doesn't cover */
+  pg?: PgTableExtras
+  /** PostgreSQL types: labels, attributes or domain details */
+  pgType?: PgTypeDetail
 }
 
 /** One side of a comparison as loaded from the server. */
@@ -78,19 +99,33 @@ export interface Change {
 /** Script sections, run in this order whatever order the objects were compared in. */
 const Phase = {
   Schemas: 0,
-  DropForeignKeys: 1,
-  DropDependents: 2,
-  DropTables: 3,
-  Sequences: 4,
-  Tables: 5,
-  ForeignKeys: 6,
-  Routines: 7,
-  Views: 8,
-  Triggers: 9,
-  DropSequences: 10,
-  DropSchemas: 11
+  Extensions: 1,
+  Types: 2,
+  DropForeignKeys: 3,
+  DropDependents: 4,
+  DropTables: 5,
+  Sequences: 6,
+  Tables: 7,
+  ForeignKeys: 8,
+  Routines: 9,
+  Views: 10,
+  Triggers: 11,
+  DropSequences: 12,
+  DropTypes: 13,
+  DropExtensions: 14,
+  DropSchemas: 15
 } as const
 type Phase = (typeof Phase)[keyof typeof Phase]
+
+const PG_PHASES: Record<PgPhase, Phase> = {
+  extensions: Phase.Extensions,
+  types: Phase.Types,
+  detach: Phase.DropDependents,
+  dropConstraints: Phase.DropDependents,
+  tables: Phase.Tables,
+  dropTypes: Phase.DropTypes,
+  dropExtensions: Phase.DropExtensions
+}
 
 interface Step {
   phase: Phase
@@ -100,7 +135,7 @@ interface Step {
 export interface DiffItem {
   /** Stable across reloads, for selection */
   id: string
-  kind: ObjectKind | 'schema'
+  kind: CompareKind | 'schema'
   schema: string | null
   name: string
   action: DiffAction
@@ -187,7 +222,11 @@ const keyName = (dialect: Dialect, s: string): string =>
 function objectKey(ctx: CompareContext, o: SnapshotObject, detail: string | null): string {
   const kind = o.kind === 'foreign_table' ? 'table' : o.kind
   // Whole databases match objects schema by schema; narrower scopes map one schema onto another
-  const schema = ctx.scope === 'database' && ctx.dialect !== 'mysql' ? (o.schema ?? '') : ''
+  // Extensions are database-wide, whatever schema they're installed in
+  const schema =
+    ctx.scope === 'database' && ctx.dialect !== 'mysql' && o.kind !== 'extension'
+      ? (o.schema ?? '')
+      : ''
   const isRoutine = o.kind === 'function' || o.kind === 'procedure'
   // Comparing two tables matches them whatever they're called
   const name = ctx.scope === 'table' ? '' : o.name
@@ -214,7 +253,7 @@ export function cleanDefinition(dialect: Dialect, text: string): string {
 const comparable = (dialect: Dialect, text: string): string =>
   cleanDefinition(dialect, text).replace(/\s+/g, ' ')
 
-const KIND_KEYWORD: Partial<Record<ObjectKind, string>> = {
+const KIND_KEYWORD: Partial<Record<CompareKind, string>> = {
   table: 'TABLE',
   foreign_table: 'FOREIGN TABLE',
   view: 'VIEW',
@@ -259,7 +298,7 @@ function indexSignature(dialect: Dialect, ix: IndexInfo): string {
   // PostgreSQL's definition also covers expressions, predicates and operator classes
   if (dialect === 'postgres' && ix.definition)
     return ix.definition.replace(
-      /^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(?:CONCURRENTLY\s+)?(?:"(?:[^"]|"")+"|\S+)\s+ON\s+/i,
+      /^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(?:CONCURRENTLY\s+)?(?:"(?:[^"]|"")+"|\S+)\s+ON\s+(?:ONLY\s+)?/i,
       '$1ON '
     )
   return `${ix.unique ? 'unique ' : ''}(${lowerList(ix.columns)}) ${(ix.method ?? '').toLowerCase()}`
@@ -339,13 +378,43 @@ function tableText(
   dialect: Dialect,
   qualifier: string | null,
   name: string,
-  info: TableInfo
+  info: TableInfo,
+  pg?: { env: PgEnv; extras: PgTableExtras | undefined }
 ): string {
   const parts = [scriptCreateTable(dialect, { schema: qualifier, name }, info)]
+  if (pg?.extras) {
+    const lines = pgTableText(pg.env, qualified(dialect, { schema: qualifier, name }), pg.extras)
+    if (lines.length) parts.push(lines.join('\n'))
+  }
   for (const tr of info.triggers)
     if (tr.definition) parts.push(`${cleanDefinition(dialect, tr.definition)};`)
   return parts.join('\n\n')
 }
+
+/** Renaming and qualifying for the PostgreSQL extras in compare-pg.ts. */
+function pgEnv(ctx: CompareContext): PgEnv {
+  const rename = renamer(ctx)
+  return {
+    text: rename.text,
+    schema: rename.schema,
+    qualifier: (schema) => qualifierIn(ctx, ctx.target, schema)
+  }
+}
+
+function pgOut(item: DiffItem): PgOut {
+  return {
+    changes: item.changes,
+    warnings: item.warnings,
+    step: (phase, sql) => void item.steps.push({ phase: PG_PHASES[phase], sql })
+  }
+}
+
+/** The source's constraint and partition text with its schema references renamed. */
+const renamedExtras = (env: PgEnv, extras: PgTableExtras): PgTableExtras => ({
+  partitionKey: extras.partitionKey && env.text(extras.partitionKey),
+  constraints: extras.constraints.map((c) => ({ ...c, definition: env.text(c.definition) })),
+  partitions: extras.partitions.map((p) => ({ ...p, bound: env.text(p.bound) }))
+})
 
 const pgDefinitionIndex = (dialect: Dialect, ix: IndexInfo): boolean =>
   dialect === 'postgres' && !!ix.definition && /^CREATE\b/i.test(ix.definition)
@@ -495,11 +564,14 @@ function createTable(ctx: CompareContext, o: SnapshotObject, item: DiffItem): vo
     foreignKeys: [],
     original: null
   }
+  // Indexes behind UNIQUE and EXCLUDE constraints are created by the constraints
+  const constraintIndexes = pgConstraintIndexes(o.pg)
   for (const sql of tableStatements(dialect, draft, ctx.options))
-    item.steps.push({ phase: Phase.Tables, sql })
+    item.steps.push({ phase: Phase.Tables, sql: withPartitionKey(sql, o.pg?.partitionKey ?? null) })
   for (const ix of info.indexes)
-    if (!ix.primary && pgDefinitionIndex(dialect, ix))
-      item.steps.push({ phase: Phase.Tables, sql: ix.definition! })
+    if (!ix.primary && pgDefinitionIndex(dialect, ix) && !constraintIndexes.has(ix.name))
+      item.steps.push({ phase: Phase.Tables, sql: pgIndexSql(ix.definition!) })
+  if (dialect === 'postgres' && o.pg) pgTableSteps(pgEnv(ctx), table, o.pg, undefined, pgOut(item))
   // Added after every table exists, so tables can reference each other in any order
   item.steps.push(...addForeignKeySteps(dialect, draft, table, info.foreignKeys))
   item.steps.push(...triggerSteps(ctx, qualifier, o.name, info.triggers, [], [], item.warnings))
@@ -570,8 +642,13 @@ function alterTable(
   // Indexes
   const indexes: IndexDraft[] = loaded.indexes.map((ix) => ({ ...ix }))
   const extraIndexSql: string[] = []
-  const nonPrimary = (info: TableInfo): IndexInfo[] => info.indexes.filter((ix) => !ix.primary)
-  const indexPairs = pair(dialect, nonPrimary(s), nonPrimary(t), (ix) =>
+  // With PostgreSQL constraints loaded on both sides, their indexes are compared as constraints
+  const pg = dialect === 'postgres' && source.pg && target.pg ? [source.pg, target.pg] : null
+  const nonPrimary = (info: TableInfo, extras?: PgTableExtras): IndexInfo[] => {
+    const skip = pgConstraintIndexes(extras)
+    return info.indexes.filter((ix) => !ix.primary && !skip.has(ix.name))
+  }
+  const indexPairs = pair(dialect, nonPrimary(s, pg?.[0]), nonPrimary(t, pg?.[1]), (ix) =>
     indexSignature(dialect, ix)
   )
   const dropIndex = (ix: IndexInfo): void => {
@@ -579,7 +656,7 @@ function alterTable(
     if (draft) draft.dropped = true
   }
   const addIndex = (ix: IndexInfo, draft: TableDraft): void => {
-    if (pgDefinitionIndex(dialect, ix)) extraIndexSql.push(ix.definition!)
+    if (pgDefinitionIndex(dialect, ix)) extraIndexSql.push(pgIndexSql(ix.definition!))
     else indexes.push(newIndex(draft, ix))
   }
   const desired: TableDraft = {
@@ -676,17 +753,22 @@ function alterTable(
   for (const sql of tableStatements(dialect, desired, ctx.options))
     item.steps.push({ phase: Phase.Tables, sql })
   for (const sql of extraIndexSql) item.steps.push({ phase: Phase.Tables, sql })
+  if (pg) pgTableSteps(pgEnv(ctx), table, pg[0], pg[1], pgOut(item))
   item.steps.push(...addForeignKeySteps(dialect, desired, table, addedFks))
   item.steps.push(
     ...triggerSteps(ctx, qualifier, target.name, s.triggers, t.triggers, changes, item.warnings)
   )
-  item.sourceText = tableText(dialect, qualifier, target.name, s)
-  item.targetText = tableText(dialect, qualifier, target.name, t)
+  const env = pgEnv(ctx)
+  item.sourceText = tableText(dialect, qualifier, target.name, s, {
+    env,
+    extras: pg ? renamedExtras(env, pg[0]) : undefined
+  })
+  item.targetText = tableText(dialect, qualifier, target.name, t, { env, extras: pg?.[1] })
 }
 
 /* ---------- Views, routines, sequences ---------- */
 
-function createPhase(kind: ObjectKind): Phase {
+function createPhase(kind: CompareKind): Phase {
   if (kind === 'sequence') return Phase.Sequences
   if (kind === 'view' || kind === 'materialized_view') return Phase.Views
   return Phase.Routines
@@ -738,8 +820,10 @@ function definitionSteps(
 
 /* ---------- Comparing ---------- */
 
-const KIND_ORDER: (ObjectKind | 'schema')[] = [
+const KIND_ORDER: (CompareKind | 'schema')[] = [
   'schema',
+  'extension',
+  'type',
   'table',
   'foreign_table',
   'view',
@@ -821,11 +905,13 @@ export function compareSnapshots(ctx: CompareContext): DiffItem[] {
           )
       } else {
         createTable(ctx, o, item)
+        const env = pgEnv(ctx)
         item.sourceText = tableText(
           dialect,
           qualifierIn(ctx, ctx.target, o.schema),
           o.name,
-          renameTable(ctx, o.table)
+          renameTable(ctx, o.table),
+          { env, extras: o.pg && renamedExtras(env, o.pg) }
         )
       }
       if (o.kind === 'foreign_table' && item.action !== 'same') {
@@ -838,14 +924,20 @@ export function compareSnapshots(ctx: CompareContext): DiffItem[] {
       const targetText = target?.definition ? cleanDefinition(dialect, target.definition) : ''
       item.sourceText = sourceText
       item.targetText = targetText
+      const isPg = o.kind === 'type' || o.kind === 'extension'
       if (target) {
         const differs =
-          !!sourceText &&
-          !!targetText &&
-          comparable(dialect, sourceText) !== comparable(dialect, targetText)
+          o.kind === 'extension'
+            ? extensionDiffers(pgEnv(ctx), o, target)
+            : !!sourceText &&
+              !!targetText &&
+              comparable(dialect, sourceText) !== comparable(dialect, targetText)
         item.action = differs ? 'alter' : 'same'
       }
-      if (item.action !== 'same') definitionSteps(ctx, o, target, item)
+      if (item.action !== 'same') {
+        if (isPg) pgObjectSteps(pgEnv(ctx), o, target, pgOut(item))
+        else definitionSteps(ctx, o, target, item)
+      }
     }
     items.push(item)
   }
@@ -856,9 +948,14 @@ export function compareSnapshots(ctx: CompareContext): DiffItem[] {
     const qualifier = qualifierIn(ctx, ctx.target, o.schema)
     const item = emptyItem(key, o.kind, dialect === 'mysql' ? null : o.schema, o.name, 'drop')
     if (o.kind === 'table' || o.kind === 'foreign_table') {
-      item.targetText = o.table ? tableText(dialect, qualifier, o.name, o.table) : ''
+      item.targetText = o.table
+        ? tableText(dialect, qualifier, o.name, o.table, { env: pgEnv(ctx), extras: o.pg })
+        : ''
       item.warnings.push(`Drops ${o.name} and all of its data`)
       item.steps.push({ phase: Phase.DropTables, sql: dropStatement(dialect, qualifier, o) })
+    } else if (o.kind === 'type' || o.kind === 'extension') {
+      item.targetText = o.definition ? cleanDefinition(dialect, o.definition) : ''
+      pgObjectSteps(pgEnv(ctx), undefined, o, pgOut(item))
     } else {
       item.targetText = o.definition ? cleanDefinition(dialect, o.definition) : ''
       definitionSteps(ctx, undefined, o, item)

@@ -56,6 +56,14 @@ import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
 import { connectedInfo } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
+import {
+  countPgOptionChanges,
+  newPgTableOptions,
+  pgTableOptionProblem,
+  pgTableOptionWarnings,
+  withPgTableOptions,
+  type PgTableOptions
+} from '@/lib/pg-table-options'
 import { createStore } from '@/lib/store'
 import {
   countOptionChanges,
@@ -72,7 +80,7 @@ import {
   NO_PG_EXTENSIONS,
   type PgExtensions
 } from '@/lib/pg-extensions-aware'
-import { loadTableExtras } from '@/lib/table-extras'
+import { loadTableExtras, type TableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
 import { usePgExtensions } from '@/lib/use-pg-extensions'
 import {
@@ -96,6 +104,12 @@ import { CodeEditor } from '@/components/editor/CodeEditor'
 import { ColumnAttributes, hasColumnAttributes } from './ColumnAttributes'
 import { PgIndexOptions } from './PgIndexOptions'
 import { TableOptionsEditor, useTableOptionsContext } from './StorageOptions'
+import {
+  PgExclusionsEditor,
+  PgPartitionsEditor,
+  PgStorageEditor,
+  usePgTableContext
+} from './PgTableOptions'
 import {
   Badge,
   Button,
@@ -273,22 +287,25 @@ function TableDesigner(request: Request): React.JSX.Element {
       request={request}
       dialect={dialect}
       initial={initial}
+      extras={extras.data}
       versioning={versionable ? (versioning.data ?? null) : undefined}
     />
   )
 }
 
-type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'options' | 'sql'
+type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'partitions' | 'options' | 'sql'
 
 function DesignerForm({
   request,
   dialect,
   initial,
+  extras,
   versioning
 }: {
   request: Request
   dialect: Dialect
   initial: TableDraft
+  extras?: TableExtras
   /** MariaDB 10.3+: the table's system versioning as loaded (null when creating); absent elsewhere */
   versioning?: Versioning | null
 }): React.JSX.Element {
@@ -314,14 +331,41 @@ function DesignerForm({
   const pgExtensions = usePgExtensions(connectionId, database, dialect === 'postgres')
   const [optionEdits, setOptionEdits] = useState<TableOptions | null>(null)
   const tableOptions = optionEdits ?? storage.context?.original ?? DEFAULT_TABLE_OPTIONS
+  // PostgreSQL: partitioning, exclusion constraints, persistence, storage parameters
+  const postgres = dialect === 'postgres'
+  const pg = usePgTableContext(
+    connectionId,
+    database,
+    request.schema,
+    request.name,
+    extras?.exclusions,
+    postgres
+  )
+  const [pgEdits, setPgEdits] = useState<PgTableOptions | null>(null)
+  const pgOptions = pgEdits ?? pg.context?.original ?? newPgTableOptions()
+  const updatePg = (change: (o: PgTableOptions) => PgTableOptions): void =>
+    setPgEdits((prev) => change(prev ?? pgOptions))
+  const pgContext = postgres ? pg.context : null
   const statements = useMemo(() => {
     const out =
       versioning !== undefined
         ? versionedTableStatements(draft, options, versioning, versioned)
         : tableStatements(dialect, draft, options)
     const ctx = storage.context
+    if (pgContext) return withPgTableOptions(out, draft, pgOptions, pgContext)
     return mysql && ctx ? withTableOptions(out, draft, tableOptions, ctx.original) : out
-  }, [dialect, draft, options, versioning, versioned, mysql, storage.context, tableOptions])
+  }, [
+    dialect,
+    draft,
+    options,
+    versioning,
+    versioned,
+    mysql,
+    storage.context,
+    tableOptions,
+    pgContext,
+    pgOptions
+  ])
   const script = useMemo(
     () => ddlScript(dialect, statements, options),
     [dialect, statements, options]
@@ -332,16 +376,19 @@ function DesignerForm({
   const problem =
     validateDraft(dialect, draft) ??
     versioningProblem(draft, versioning ?? null, versioned) ??
-    (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext))
+    (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext)) ??
+    (pgContext && pgTableOptionProblem(draft, pgOptions, pgContext, statements))
   const warnings = [
     ...versioningWarnings(draft, versioning ?? null, versioned, countChanges(draft, dialect)),
     ...draftWarnings(draft, dialect, options),
-    ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : [])
+    ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : []),
+    ...(pgContext ? pgTableOptionWarnings(draft, pgOptions, pgContext) : [])
   ]
   const changes =
     countChanges(draft, dialect) +
     (versioningChanged ? 1 : 0) +
-    countOptionChanges(tableOptions, optionsContext?.original ?? null)
+    countOptionChanges(tableOptions, optionsContext?.original ?? null) +
+    (pgContext ? countPgOptionChanges(draft, pgOptions, pgContext.original) : 0)
   // Turning versioning off discards the history
   const destructive =
     draft.columns.some((c) => c.original && c.dropped) || (versioningChanged && !versioned)
@@ -414,9 +461,20 @@ function DesignerForm({
       label: 'Constraints',
       count:
         draft.checks.filter((ck) => !ck.dropped).length +
-        draft.uniques.filter((uq) => !uq.dropped).length
+        draft.uniques.filter((uq) => !uq.dropped).length +
+        (postgres ? pgOptions.exclusions.filter((x) => !x.dropped).length : 0)
     },
-    ...(mysql ? [{ value: 'options' as const, label: 'Options' }] : []),
+    // New tables can be partitioned; existing ones only if they already are
+    ...(postgres && (creating || pg.context?.partitionedBy)
+      ? [
+          {
+            value: 'partitions' as const,
+            label: creating ? 'Partitioning' : 'Partitions',
+            ...(!creating && { count: pgOptions.existingPartitions.length })
+          }
+        ]
+      : []),
+    ...(mysql || postgres ? [{ value: 'options' as const, label: 'Options' }] : []),
     { value: 'sql', label: 'SQL', count: statements.length }
   ]
 
@@ -558,7 +616,23 @@ function DesignerForm({
               setDraft={setDraft}
             />
           ) : view === 'constraints' ? (
-            <ConstraintsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+            <>
+              <ConstraintsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+              {postgres && (
+                <PgExclusionsEditor {...pg} draft={draft} options={pgOptions} onChange={updatePg} />
+              )}
+            </>
+          ) : view === 'partitions' ? (
+            <PgPartitionsEditor
+              {...pg}
+              connectionId={connectionId}
+              database={database}
+              draft={draft}
+              options={pgOptions}
+              onChange={updatePg}
+            />
+          ) : view === 'options' && postgres ? (
+            <PgStorageEditor {...pg} draft={draft} options={pgOptions} onChange={updatePg} />
           ) : view === 'options' ? (
             <TableOptionsEditor {...storage} options={tableOptions} onChange={setOptionEdits} />
           ) : (
@@ -572,8 +646,8 @@ function DesignerForm({
 
 type SetDraft = React.Dispatch<React.SetStateAction<TableDraft>>
 
-const cellInput = 'h-7 text-xs'
-const checkbox = 'size-3.5 accent-accent disabled:opacity-40'
+export const cellInput = 'h-7 text-xs'
+export const checkbox = 'size-3.5 accent-accent disabled:opacity-40'
 
 /* ---------- Columns ---------- */
 
@@ -855,7 +929,7 @@ function columnState(c: ColumnDraft, changed: boolean): string {
 /* ---------- Shared pieces ---------- */
 
 /** Toggle chips for picking columns in order; selected chips show their position. */
-function ColumnPicker({
+export function ColumnPicker({
   options,
   value,
   onChange,
@@ -901,7 +975,7 @@ function ColumnPicker({
  * An existing index or constraint: a summary row to drop, or to open as an
  * editable card. Edited ones are recreated (or renamed in place) on apply.
  */
-function ExistingRow({
+export function ExistingRow({
   dropped,
   change,
   editing,
@@ -952,7 +1026,7 @@ function ExistingRow({
   )
 }
 
-function NewCard({
+export function NewCard({
   onRemove,
   onReset,
   children
@@ -1010,7 +1084,7 @@ function useEditing(): [Set<string>, (id: string) => void] {
   return [editing, toggle]
 }
 
-const columnOptions = (draft: TableDraft): { id: string; label: string }[] =>
+export const columnOptions = (draft: TableDraft): { id: string; label: string }[] =>
   draft.columns
     .filter((c) => !c.dropped && c.name.trim())
     .map((c) => ({ id: c.id, label: c.name.trim() }))

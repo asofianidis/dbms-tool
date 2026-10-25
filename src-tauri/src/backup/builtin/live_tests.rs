@@ -466,6 +466,180 @@ async fn mysql_round_trip() {
     }
 }
 
+/* ---------- MariaDB packages ---------- */
+
+/// Packages and sql_mode=ORACLE routines on MariaDB: the explorer listing, the
+/// DDL and the Modify scripts the frontend builds (see mariadb-packages.test.ts),
+/// and a backup round trip.
+#[tokio::test]
+async fn mariadb_packages() {
+    let Some(server) = open(Engine::Mysql, "DBMS_TEST_MARIADB").await else {
+        return;
+    };
+    let db = "mdb_packages";
+    let opts = crate::model::ExecOptions::with_max_rows(100);
+    // `what` labels the assert: the SQL itself can hold DDL the server returned,
+    // which CodeQL treats as secret
+    let exec = async |what: &str, sql: &str| {
+        let out = server.execute("t", db, sql, &opts).await.unwrap();
+        assert!(out.error.is_none(), "{what}");
+        out
+    };
+    let mut admin = match session(&server, "").await.unwrap() {
+        Session::My(s) => s,
+        _ => unreachable!(),
+    };
+    let conn = admin.conn();
+    conn.query_drop(format!("DROP DATABASE IF EXISTS {db}"))
+        .await
+        .unwrap();
+    conn.query_drop(format!("CREATE DATABASE {db}"))
+        .await
+        .unwrap();
+    // Sent like the editor sends a script: one multi-statement batch, no DELIMITER
+    exec(
+        "setup script",
+        "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = 'ORACLE';\n\
+         CREATE PACKAGE pkg_o AS\n  FUNCTION f1(a INT) RETURN INT;\n  PROCEDURE p1(a INT);\nEND;\n\
+         CREATE PACKAGE BODY pkg_o AS\n  cnt INT := 0;\n  \
+         FUNCTION f1(a INT) RETURN INT AS x INT; BEGIN x := a + 1; IF x > 0 THEN cnt := cnt + 1; END IF; RETURN x; END;\n  \
+         PROCEDURE p1(a INT) AS BEGIN NULL; END;\nBEGIN\n  cnt := 10;\nEND;\n\
+         CREATE PACKAGE spec_only AS\n  PROCEDURE p;\nEND;\n\
+         CREATE PROCEDURE ora_proc(a INT) AS v INT := 1; BEGIN v := a; END;\n\
+         SET sql_mode = @saved_sql_mode;\n\
+         CREATE PACKAGE pkg_d\n  FUNCTION f2(a INT) RETURNS INT;\nEND;\n\
+         CREATE PACKAGE BODY pkg_d\n  FUNCTION f2(a INT) RETURNS INT BEGIN RETURN a * 2; END;\nEND;",
+    )
+    .await;
+
+    let objects = server.list_objects(db, None).await.unwrap();
+    let kinds: Vec<(&str, &str)> = objects
+        .iter()
+        .map(|o| (o.name.as_str(), o.kind.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("ora_proc", "procedure"),
+            ("pkg_d", "package"),
+            ("pkg_o", "package"),
+            ("spec_only", "package")
+        ]
+    );
+
+    let definition = |name: &'static str| {
+        let server = server.clone();
+        async move {
+            server
+                .object_definition(db, None, name, "package", None)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let pkg_o = definition("pkg_o").await;
+    assert!(
+        pkg_o.starts_with("CREATE DEFINER=\"root\"@")
+            && pkg_o.contains("END;\n\nCREATE DEFINER=\"root\"@")
+            && pkg_o.contains("PACKAGE BODY \"pkg_o\""),
+        "pkg_o definition"
+    );
+    let spec_only = definition("spec_only").await;
+    assert!(!spec_only.contains("BODY"), "spec_only definition");
+
+    // The package Modify script: both parts CREATE OR REPLACE, under the stored mode
+    let mode: String = conn
+        .exec_first(
+            "SELECT SQL_MODE FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = 'pkg_o' AND ROUTINE_TYPE = 'PACKAGE BODY'",
+            (db,),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(mode.split(',').any(|m| m == "ORACLE"), "pkg_o sql_mode");
+    let wrap = |script: String| {
+        format!(
+            "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = '{mode}';\n\n{script};\n\n\
+             SET sql_mode = @saved_sql_mode;"
+        )
+    };
+    let modify = wrap(pkg_o.replace("CREATE DEFINER", "CREATE OR REPLACE DEFINER"));
+    exec("package Modify script", &modify).await;
+    let out = exec(
+        "call pkg_o.f1",
+        "SELECT pkg_o.f1(1), @@sql_mode LIKE '%ORACLE%'",
+    )
+    .await;
+    assert_eq!(out.results[0].rows[0][0], serde_json::json!("2"));
+    assert_eq!(out.results[0].rows[0][1], serde_json::json!("0"));
+
+    // A routine Modify script: DROP, then the stored CREATE, under the stored mode
+    let proc = server
+        .object_definition(db, None, "ora_proc", "procedure", None)
+        .await
+        .unwrap()
+        .unwrap();
+    exec(
+        "routine Modify script",
+        &wrap(format!(
+            "DROP PROCEDURE IF EXISTS `{db}`.`ora_proc`;\n\n{proc}"
+        )),
+    )
+    .await;
+    exec("call ora_proc", "CALL ora_proc(1)").await;
+
+    // Backup and restore: packages are dumped with their own sql_mode
+    let routines = async |conn: &mut mysql_async::Conn| -> Vec<(String, String, String, String)> {
+        conn.exec(
+            "SELECT ROUTINE_TYPE, ROUTINE_NAME, ROUTINE_DEFINITION, SQL_MODE \
+             FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? \
+             ORDER BY ROUTINE_TYPE, ROUTINE_NAME",
+            (db,),
+        )
+        .await
+        .unwrap()
+    };
+    let expected = routines(admin.conn()).await;
+    assert_eq!(expected.len(), 6);
+    let file = temp("mdb_packages.sql");
+    let dumped = run(
+        &server,
+        serde_json::json!({
+            "tool": "mysqldump", "database": db, "file": file, "routines": true,
+            "singleTransaction": true
+        }),
+    )
+    .await;
+    assert_eq!(dumped.errors, 0);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("DROP PACKAGE BODY IF EXISTS `pkg_o`"),
+        "{text}"
+    );
+    for drop in [
+        "DROP PACKAGE pkg_o",
+        "DROP PACKAGE pkg_d",
+        "DROP PACKAGE spec_only",
+        "DROP PROCEDURE ora_proc",
+    ] {
+        exec(drop, drop).await;
+    }
+    let restored = run(
+        &server,
+        serde_json::json!({ "tool": "mysql", "database": db, "file": file }),
+    )
+    .await;
+    assert_eq!(restored.errors, 0);
+    assert_eq!(routines(admin.conn()).await, expected);
+
+    admin
+        .conn()
+        .query_drop(format!("DROP DATABASE {db}"))
+        .await
+        .unwrap();
+}
+
 /* ---------- MongoDB ---------- */
 
 async fn mongo_fingerprint(client: &mongodb::Client, db: &str) -> Vec<String> {

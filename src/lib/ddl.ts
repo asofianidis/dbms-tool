@@ -370,7 +370,11 @@ export function draftFromTable(
   const idOf = (column: string): string =>
     columns.find((c) => c.name === column)?.id ?? `?${column}`
   const primaryKey = info.primaryKey.map(idOf)
-  const constraintIndexes = new Set(extras?.uniques.map((u) => u.index) ?? [])
+  const constraintIndexes = new Set([
+    ...(extras?.uniques.map((u) => u.index) ?? []),
+    // PostgreSQL exclusion constraints own their index, which pg_get_indexdef shows without operators
+    ...(extras?.exclusions?.map((x) => x.index) ?? [])
+  ])
   return {
     schema,
     name,

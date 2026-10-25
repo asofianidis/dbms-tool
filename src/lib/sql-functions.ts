@@ -2,6 +2,7 @@ import type { Dialect } from './engines'
 import type { ServerVersion } from './mariadb'
 import { MARIADB_FUNCTIONS } from './sql-functions-mariadb'
 import { PG_EXTENSION_FUNCTIONS } from './sql-functions-pg-extensions'
+import { POSTGRES_FUNCTIONS } from './sql-functions-postgres'
 
 /** A built-in function, for completion and the signature tooltip. */
 export interface SqlFunction {
@@ -18,6 +19,8 @@ export interface SqlFunction {
   notMariaDb?: boolean
   /** The MariaDB version that added it */
   minMariaDb?: [major: number, minor: number]
+  /** The PostgreSQL major version that added it */
+  minPostgres?: number
   /** Inserted instead of `name()`, with `${field}` placeholders */
   snippet?: string
   /** Only when this PostgreSQL extension is installed, e.g. `vector`, `postgis` */
@@ -630,17 +633,24 @@ const FUNCTIONS: SqlFunction[] = [
 /**
  * The built-in functions of a dialect, one per name. `mariaDb` is the server's version when a
  * MySQL-dialect connection is MariaDB; its own functions (and its variants of shared ones,
- * listed first) then replace the MySQL-only ones.
+ * listed first) then replace the MySQL-only ones. `postgres` is a PostgreSQL server's major
+ * version; functions it doesn't have yet are left out (all are offered when it's unknown).
  */
 export function functionsFor(
   dialect: Dialect,
   mariaDb?: ServerVersion | null,
+  postgres?: number | null,
   /** PostgreSQL extensions installed in the database, whose functions then complete too */
   pgExtensions?: string[]
 ): SqlFunction[] {
   const seen = new Set<string>()
   const maria = dialect === 'mysql' ? mariaDb : null
-  return [...MARIADB_FUNCTIONS, ...FUNCTIONS, ...PG_EXTENSION_FUNCTIONS].filter((f) => {
+  return [
+    ...MARIADB_FUNCTIONS,
+    ...POSTGRES_FUNCTIONS,
+    ...FUNCTIONS,
+    ...PG_EXTENSION_FUNCTIONS
+  ].filter((f) => {
     if (f.dialects && !f.dialects.includes(dialect)) return false
     if (f.extension && !pgExtensions?.includes(f.extension)) return false
     if (maria ? f.notMariaDb : f.onlyMariaDb) return false
@@ -648,6 +658,7 @@ export function functionsFor(
       const [major, minor] = f.minMariaDb
       if (maria[0] < major || (maria[0] === major && maria[1] < minor)) return false
     }
+    if (f.minPostgres && postgres != null && postgres < f.minPostgres) return false
     if (seen.has(f.name)) return false
     seen.add(f.name)
     return true
