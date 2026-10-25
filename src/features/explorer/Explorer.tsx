@@ -119,6 +119,7 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
@@ -1348,6 +1349,7 @@ function ObjectNode({
           <>
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
+            <VersionedMark connection={connection} database={database} obj={obj} />
             {(obj.kind === 'function' || obj.kind === 'procedure') &&
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>

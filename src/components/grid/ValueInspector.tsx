@@ -8,6 +8,7 @@ import {
   isBinaryColumn,
   parseBinary,
   utf8Text,
+  vectorText,
   type BinaryValue
 } from '@/lib/binary'
 import { displayTimestamp } from '@/lib/datetime'
@@ -34,7 +35,7 @@ function prettyJson(text: string): string | null {
 /** Lines of the hex dump drawn at once; the rest is reachable by saving the value */
 const HEX_LINES = 4096
 
-type BinaryMode = 'image' | 'hex' | 'text'
+type BinaryMode = 'image' | 'hex' | 'text' | 'vector'
 
 /** Full view of one cell: JSON pretty-printing, hex and image views for binary data, editing. */
 export function ValueInspector({
@@ -236,7 +237,14 @@ function BinaryInspector({
   const { bytes, total, truncated } = binary
   const image = useMemo(() => imageType(bytes), [bytes])
   const text = useMemo(() => (bytes.length <= 1 << 20 ? utf8Text(bytes) : null), [bytes])
-  const [mode, setMode] = useState<BinaryMode>(image && !truncated ? 'image' : 'hex')
+  // VECTOR columns: the float array VEC_ToText would show
+  const vector = useMemo(
+    () => (/^vector$/i.test(column.typeName) && !truncated ? vectorText(bytes) : null),
+    [bytes, column.typeName, truncated]
+  )
+  const [mode, setMode] = useState<BinaryMode>(
+    vector !== null ? 'vector' : image && !truncated ? 'image' : 'hex'
+  )
   const lines = useMemo(() => hexLines(bytes, 0, HEX_LINES), [bytes])
   const [url, setUrl] = useState<string | null>(null)
 
@@ -259,6 +267,7 @@ function BinaryInspector({
   }
 
   const modes: { value: BinaryMode; label: string }[] = [
+    ...(vector !== null ? [{ value: 'vector' as const, label: 'Vector' }] : []),
     ...(image ? [{ value: 'image' as const, label: 'Image' }] : []),
     { value: 'hex', label: 'Hex' },
     ...(text !== null ? [{ value: 'text' as const, label: 'Text' }] : [])
@@ -332,6 +341,10 @@ function BinaryInspector({
           <div className="flex min-h-full items-center justify-center bg-[repeating-conic-gradient(var(--color-hover)_0%_25%,transparent_0%_50%)] bg-[length:16px_16px] p-4">
             <img src={url} alt={column.name} className="max-h-full max-w-full object-contain" />
           </div>
+        ) : mode === 'vector' && vector !== null ? (
+          <pre className="p-3 font-mono text-[12px] break-all whitespace-pre-wrap text-fg select-text">
+            {vector}
+          </pre>
         ) : mode === 'text' && text !== null ? (
           <pre className="p-3 font-mono text-[12px] whitespace-pre-wrap text-fg select-text">
             {text}

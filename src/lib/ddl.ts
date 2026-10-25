@@ -2,6 +2,7 @@ import type { ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo } from './api'
 import type { Dialect } from './engines'
 import { extensionIndexProblem } from './pg-extensions-aware'
 import { retargetDefinition, type SqliteTableShape } from './sqlite-schema'
+import { isCompressible, isInvisible, splitCompressed, withCompressed } from './column-types'
 import { isNumericType, literal, qualified, quoteIdent } from './sql'
 import type { TableExtras } from './table-extras'
 
@@ -15,6 +16,10 @@ export interface ColumnState {
   default: string
   identity: boolean
   comment: string
+  /** MySQL / MariaDB INVISIBLE: SELECT * leaves the column out */
+  invisible: boolean
+  /** MariaDB COMPRESSED (BLOB / TEXT / VARCHAR / VARBINARY) */
+  compressed: boolean
 }
 
 export interface ColumnDraft extends ColumnState {
@@ -158,6 +163,12 @@ export function indexMethods(dialect: Dialect): string[] {
   }
 }
 
+/** Methods the designer reads and writes: indexMethods() plus MariaDB 11.7's VECTOR. */
+function knownMethods(dialect: Dialect): string[] {
+  const methods = indexMethods(dialect)
+  return dialect === 'mysql' ? [...methods, 'VECTOR'] : methods
+}
+
 /** Which index options an engine has. */
 export function indexFeatures(dialect: Dialect): { include: boolean; where: boolean } {
   return {
@@ -168,7 +179,7 @@ export function indexFeatures(dialect: Dialect): { include: boolean; where: bool
 
 /** '' for the default method, otherwise the method as indexMethods() spells it. */
 function normMethod(dialect: Dialect, method: string | null): string {
-  const methods = indexMethods(dialect)
+  const methods = knownMethods(dialect)
   const found = methods.find((m) => m.toLowerCase() === (method ?? '').trim().toLowerCase())
   if (found === undefined) return (method ?? '').trim()
   return found === methods[0] ? '' : found
@@ -191,6 +202,8 @@ export function newColumn(dialect: Dialect, patch: Partial<ColumnState> = {}): C
     default: '',
     identity: false,
     comment: '',
+    invisible: false,
+    compressed: false,
     computed: false,
     onUpdate: null,
     dropped: false,
@@ -293,7 +306,7 @@ function indexLock(dialect: Dialect, ix: IndexInfo, columns: string[]): string |
   if (columns.some((id) => id.startsWith('?')) || !ix.columns.length)
     return 'Indexes on expressions can only be dropped here'
   const method = normMethod(dialect, ix.method)
-  if (method && !indexMethods(dialect).includes(method))
+  if (method && !knownMethods(dialect).includes(method))
     return `${ix.method} indexes can only be dropped here`
   // pg_get_indexdef / sqlite_master spell out sort orders, collations and operator classes
   const def = ix.definition ?? ''
@@ -324,9 +337,14 @@ export function draftFromTable(
   const shape = extras?.sqlite ?? null
   const columns = info.columns.map((c): ColumnDraft => {
     const key = info.primaryKey.includes(c.name)
+    // MariaDB writes COMPRESSED into COLUMN_TYPE
+    const { dataType, compressed } =
+      dialect === 'mysql'
+        ? splitCompressed(c.dataType)
+        : { dataType: c.dataType, compressed: false }
     const state: ColumnState = {
       name: c.name,
-      dataType: c.dataType,
+      dataType,
       // SQLite key columns may be declared nullable; the designer writes them NOT NULL
       nullable: c.nullable && !(dialect === 'sqlite' && key),
       default:
@@ -336,7 +354,9 @@ export function draftFromTable(
         dialect === 'sqlite' && shape
           ? !!shape.columns[c.name.toLowerCase()]?.autoincrement
           : c.isIdentity,
-      comment: c.comment ?? ''
+      comment: c.comment ?? '',
+      invisible: dialect === 'mysql' && isInvisible(c.extra),
+      compressed
     }
     return {
       ...state,
@@ -435,7 +455,9 @@ function effective(draft: TableDraft, c: ColumnState & { id?: string }): ColumnS
     nullable: c.nullable && !c.identity && !key,
     default: c.identity ? '' : c.default.trim(),
     identity: c.identity,
-    comment: c.comment.trim()
+    comment: c.comment.trim(),
+    invisible: c.invisible,
+    compressed: c.compressed
   }
 }
 
@@ -448,6 +470,8 @@ interface ColumnDiff {
   default: boolean
   identity: boolean
   comment: boolean
+  /** INVISIBLE or COMPRESSED */
+  attributes: boolean
 }
 
 function diffColumn(draft: TableDraft, c: ColumnDraft): ColumnDiff | null {
@@ -462,7 +486,8 @@ function diffColumn(draft: TableDraft, c: ColumnDraft): ColumnDiff | null {
     nullable: now.nullable !== was.nullable,
     default: now.default !== was.default,
     identity: now.identity !== was.identity,
-    comment: now.comment !== was.comment
+    comment: now.comment !== was.comment,
+    attributes: now.invisible !== was.invisible || now.compressed !== was.compressed
   }
   return Object.values(diff).some(Boolean) ? diff : null
 }
@@ -595,6 +620,12 @@ export function validateDraft(dialect: Dialect, draft: TableDraft): string | nul
   }
   if (dialect !== 'postgres' && live.filter((c) => c.identity).length > 1)
     return 'A table can have only one identity column'
+  if (dialect === 'mysql') {
+    if (live.every((c) => c.invisible)) return 'A table needs at least one visible column'
+    const compressed = live.find((c) => c.compressed && !isCompressible(c.dataType))
+    if (compressed)
+      return `Only BLOB, TEXT, VARCHAR and VARBINARY columns can be compressed, so ${compressed.name.trim()} can't`
+  }
   if (dialect === 'sqlite') {
     const identity = live.find((c) => c.identity)
     const key = primaryKeyOf(draft)
@@ -670,6 +701,17 @@ export function draftWarnings(
       warnings.push(
         `New NOT NULL column ${now.name || '(unnamed)'} has no default; fails if the table has rows`
       )
+    if (
+      !c.dropped &&
+      now.invisible &&
+      !now.nullable &&
+      !now.default &&
+      !now.identity &&
+      (!c.original || diffColumn(draft, c))
+    )
+      warnings.push(
+        `Invisible NOT NULL column ${now.name || '(unnamed)'} has no default; MariaDB rejects it and MySQL inserts that leave it out fail`
+      )
   }
   const added = [
     ...draft.checks
@@ -737,7 +779,8 @@ function columnDefinition(
   c: ColumnState,
   onUpdate: string | null = null
 ): string {
-  const parts = [quoteIdent(dialect, c.name), c.dataType]
+  const type = dialect === 'mysql' && c.compressed ? withCompressed(c.dataType) : c.dataType
+  const parts = [quoteIdent(dialect, c.name), type]
   switch (dialect) {
     case 'postgres':
       if (c.identity) parts.push('GENERATED BY DEFAULT AS IDENTITY')
@@ -749,6 +792,7 @@ function columnDefinition(
       if (c.default) parts.push(`DEFAULT ${c.default}`)
       if (onUpdate) parts.push(`ON UPDATE ${onUpdate}`)
       if (c.identity) parts.push('AUTO_INCREMENT')
+      if (c.invisible) parts.push('INVISIBLE')
       if (c.comment) parts.push(`COMMENT ${literal(dialect, c.comment)}`)
       break
     case 'tsql':
@@ -846,7 +890,11 @@ const toDrop = <T extends { dropped: boolean }>(
 function mysqlIndexClause(draft: TableDraft, ix: IndexDraft): string {
   const method = normMethod('mysql', ix.method)
   const kind =
-    method === 'FULLTEXT' || method === 'SPATIAL' ? `${method} ` : ix.unique ? 'UNIQUE ' : ''
+    method === 'FULLTEXT' || method === 'SPATIAL' || method === 'VECTOR'
+      ? `${method} `
+      : ix.unique
+        ? 'UNIQUE '
+        : ''
   const using = method === 'HASH' ? ' USING HASH' : ''
   return `${kind}INDEX ${quoteIdent('mysql', indexName(draft, ix))} (${columnList('mysql', draft, ix.columns)})${using}`
 }

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { columnFeatures, serverTypes, type ColumnFeatures } from '@/lib/column-types'
 import {
   checkChange,
   checkName,
@@ -53,6 +54,7 @@ import {
 } from '@/lib/ddl'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
+import { connectedInfo } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
 import { createStore } from '@/lib/store'
 import {
@@ -74,14 +76,24 @@ import { loadTableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
 import { usePgExtensions } from '@/lib/use-pg-extensions'
 import {
+  supportsVersioning,
+  versionedTableStatements,
+  versioningProblem,
+  versioningQuery,
+  versioningWarnings,
+  type Versioning
+} from '@/lib/versioning'
+import {
   connectionsStore,
   newQueryTab,
   openTable,
   refreshConnection,
+  statusStore,
   tabsStore,
   updateTab
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
+import { ColumnAttributes, hasColumnAttributes } from './ColumnAttributes'
 import { PgIndexOptions } from './PgIndexOptions'
 import { TableOptionsEditor, useTableOptionsContext } from './StorageOptions'
 import {
@@ -218,12 +230,25 @@ function TableDesigner(request: Request): React.JSX.Element {
     staleTime: 0,
     gcTime: 0
   })
+  // MariaDB system versioning, which the ALTERs have to work around
+  const versionable =
+    connection?.engine === 'mysql' &&
+    supportsVersioning(connectedInfo(statusStore.use()[connectionId]))
+  const versioning = useQuery({
+    ...versioningQuery(connectionId, database, name ?? ''),
+    enabled: versionable && name !== null,
+    staleTime: 0
+  })
+  const versioningReady = !versionable || versioning.isFetchedAfterMount
   // Wait for the fresh fetch only; later refetches mustn't unmount the form and lose edits
-  if (name !== null && (!table.isFetchedAfterMount || !table.data || !extras.data)) {
+  if (
+    name !== null &&
+    (!table.isFetchedAfterMount || !table.data || !extras.data || !versioningReady)
+  ) {
     return (
       <Modal width="sm" title={`Design ${name}`} onClose={close}>
-        {table.isError || extras.isError ? (
-          <ErrorText error={table.error ?? extras.error} />
+        {table.isError || extras.isError || versioning.isError ? (
+          <ErrorText error={table.error ?? extras.error ?? versioning.error} />
         ) : (
           <div className="flex justify-center py-6">
             <Spinner className="size-5" />
@@ -243,7 +268,14 @@ function TableDesigner(request: Request): React.JSX.Element {
     name !== null && table.data
       ? draftFromTable(dialect, draftSchema, name, table.data, extras.data)
       : newTableDraft(dialect, draftSchema)
-  return <DesignerForm request={request} dialect={dialect} initial={initial} />
+  return (
+    <DesignerForm
+      request={request}
+      dialect={dialect}
+      initial={initial}
+      versioning={versionable ? (versioning.data ?? null) : undefined}
+    />
+  )
 }
 
 type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'options' | 'sql'
@@ -251,11 +283,14 @@ type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'options' | 
 function DesignerForm({
   request,
   dialect,
-  initial
+  initial,
+  versioning
 }: {
   request: Request
   dialect: Dialect
   initial: TableDraft
+  /** MariaDB 10.3+: the table's system versioning as loaded (null when creating); absent elsewhere */
+  versioning?: Versioning | null
 }): React.JSX.Element {
   const { connectionId, database } = request
   const connection = connectionsStore.use().find((c) => c.id === connectionId)
@@ -266,7 +301,10 @@ function DesignerForm({
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const creating = !draft.original
+  const [versioned, setVersioned] = useState(!!versioning?.versioned)
 
+  const info = connectedInfo(statusStore.use()[connectionId])
+  const features = useMemo(() => columnFeatures(dialect, info), [dialect, info])
   const babelfish = connection?.engine === 'babelfish'
   const d1 = sqlite && connection?.cloud?.provider === 'cloudflare'
   const options = useMemo(() => ({ babelfish, d1 }), [babelfish, d1])
@@ -277,26 +315,36 @@ function DesignerForm({
   const [optionEdits, setOptionEdits] = useState<TableOptions | null>(null)
   const tableOptions = optionEdits ?? storage.context?.original ?? DEFAULT_TABLE_OPTIONS
   const statements = useMemo(() => {
-    const out = tableStatements(dialect, draft, options)
+    const out =
+      versioning !== undefined
+        ? versionedTableStatements(draft, options, versioning, versioned)
+        : tableStatements(dialect, draft, options)
     const ctx = storage.context
     return mysql && ctx ? withTableOptions(out, draft, tableOptions, ctx.original) : out
-  }, [dialect, draft, options, mysql, storage.context, tableOptions])
+  }, [dialect, draft, options, versioning, versioned, mysql, storage.context, tableOptions])
   const script = useMemo(
     () => ddlScript(dialect, statements, options),
     [dialect, statements, options]
   )
+  const versioningChanged =
+    !creating && versioning !== undefined && versioned !== !!versioning?.versioned
   const optionsContext = mysql ? storage.context : null
   const problem =
     validateDraft(dialect, draft) ??
+    versioningProblem(draft, versioning ?? null, versioned) ??
     (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext))
   const warnings = [
+    ...versioningWarnings(draft, versioning ?? null, versioned, countChanges(draft, dialect)),
     ...draftWarnings(draft, dialect, options),
     ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : [])
   ]
   const changes =
     countChanges(draft, dialect) +
+    (versioningChanged ? 1 : 0) +
     countOptionChanges(tableOptions, optionsContext?.original ?? null)
-  const destructive = draft.columns.some((c) => c.original && c.dropped)
+  // Turning versioning off discards the history
+  const destructive =
+    draft.columns.some((c) => c.original && c.dropped) || (versioningChanged && !versioned)
 
   const schemas = useQuery({
     ...queries.schemas(connectionId, database),
@@ -456,6 +504,23 @@ function DesignerForm({
               onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
             />
           </Field>
+          {versioning !== undefined && (
+            <label
+              className="mb-2 flex shrink-0 items-center gap-1.5 text-xs text-muted"
+              title={
+                'WITH SYSTEM VERSIONING: MariaDB keeps every old version of the rows, readable with FOR SYSTEM_TIME.' +
+                (versioning?.versioned ? ' Turning it off deletes that history.' : '')
+              }
+            >
+              <input
+                type="checkbox"
+                className={checkbox}
+                checked={versioned}
+                onChange={(e) => setVersioned(e.target.checked)}
+              />
+              System versioning
+            </label>
+          )}
           <Segmented value={view} options={views} onChange={setView} className="mb-1" />
         </div>
         {error && (
@@ -469,7 +534,11 @@ function DesignerForm({
               dialect={dialect}
               draft={draft}
               setDraft={setDraft}
-              extraTypes={extensionColumnTypes(pgExtensions)}
+              types={[
+                ...serverTypes(dialect, TYPES[dialect], info),
+                ...extensionColumnTypes(pgExtensions)
+              ]}
+              features={features}
             />
           ) : view === 'indexes' ? (
             <IndexesEditor
@@ -477,6 +546,7 @@ function DesignerForm({
               draft={draft}
               setDraft={setDraft}
               extensions={pgExtensions}
+              vector={features.vectorIndex}
             />
           ) : view === 'foreignKeys' ? (
             <ForeignKeysEditor
@@ -511,13 +581,15 @@ function ColumnsEditor({
   dialect,
   draft,
   setDraft,
-  extraTypes = []
+  types,
+  features
 }: {
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
-  /** Types installed extensions add, e.g. pgvector's vector(n) */
-  extraTypes?: string[]
+  /** Type suggestions for the connected server, including those installed extensions add */
+  types: string[]
+  features: ColumnFeatures
 }): React.JSX.Element {
   const creating = !draft.original
   // SQL Server keeps comments as extended properties; SQLite has none
@@ -572,18 +644,23 @@ function ColumnsEditor({
     })
   const add = (): void => setDraft((d) => ({ ...d, columns: [...d.columns, newColumn(dialect)] }))
 
+  // INVISIBLE / COMPRESSED toggles, on servers that have them or columns that use them
+  const attributes =
+    hasColumnAttributes(features) || draft.columns.some((c) => c.invisible || c.compressed)
   const grid = cn(
     'grid items-center gap-x-2',
-    comments
-      ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
-      : 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1.4fr)_3.75rem]'
+    attributes
+      ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
+      : comments
+        ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
+        : 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1.4fr)_3.75rem]'
   )
   const identityLabel = dialect === 'mysql' || dialect === 'sqlite' ? 'Auto inc.' : 'Identity'
 
   return (
     <div>
       <datalist id={`ddl-types-${dialect}`}>
-        {[...TYPES[dialect], ...extraTypes].map((t) => (
+        {types.map((t) => (
           <option key={t} value={t} />
         ))}
       </datalist>
@@ -596,6 +673,11 @@ function ColumnsEditor({
         </span>
         <span className="text-center">Not null</span>
         <span className="text-center">{identityLabel}</span>
+        {attributes && (
+          <span className="text-center" title="Invisible, compressed">
+            Options
+          </span>
+        )}
         <span>Default</span>
         {comments && <span>Comment</span>}
         <span />
@@ -687,6 +769,14 @@ function ColumnsEditor({
                   />
                 )}
               </span>
+              {attributes && (
+                <ColumnAttributes
+                  column={c}
+                  features={features}
+                  disabled={locked}
+                  onChange={(change) => patch(c.id, change)}
+                />
+              )}
               <Input
                 mono
                 className={cellInput}
@@ -936,13 +1026,16 @@ function IndexesEditor({
   dialect,
   draft,
   setDraft,
-  extensions = NO_PG_EXTENSIONS
+  extensions = NO_PG_EXTENSIONS,
+  vector
 }: {
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
   /** pgvector / PostGIS, for their index methods and operator classes */
   extensions?: PgExtensions
+  /** MariaDB 11.7+ VECTOR indexes */
+  vector: boolean
 }): React.JSX.Element {
   const [editing, toggleEditing] = useEditing()
   const patch = (id: string, change: Partial<IndexDraft>): void =>
@@ -953,7 +1046,11 @@ function IndexesEditor({
   const existing = draft.indexes.filter((ix) => ix.original)
   const added = draft.indexes.filter((ix) => !ix.original)
   const pg = dialect === 'postgres'
-  const methods = [...indexMethods(dialect), ...(pg ? extensionIndexMethods(extensions) : [])]
+  const methods = [
+    ...indexMethods(dialect),
+    ...(pg ? extensionIndexMethods(extensions) : []),
+    ...(vector ? ['VECTOR'] : [])
+  ]
   const features = indexFeatures(dialect)
 
   const form = (ix: IndexDraft): React.JSX.Element => (
@@ -994,8 +1091,8 @@ function IndexesEditor({
             type="checkbox"
             className={checkbox}
             checked={ix.unique}
-            // MySQL full-text and spatial indexes can't be unique
-            disabled={ix.method === 'FULLTEXT' || ix.method === 'SPATIAL'}
+            // MySQL full-text, spatial and vector indexes can't be unique
+            disabled={ix.method === 'FULLTEXT' || ix.method === 'SPATIAL' || ix.method === 'VECTOR'}
             onChange={(e) => patch(ix.id, { unique: e.target.checked })}
           />
           Unique
