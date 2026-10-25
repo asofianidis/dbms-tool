@@ -18,7 +18,14 @@ import { cn } from '@/lib/cn'
 import { timeZones } from '@/lib/datetime'
 import { timeAgo } from '@/lib/format'
 import { historyStore } from '@/lib/history'
-import { checkForUpdates, installUpdate, openReleasePage, updateStore } from '@/lib/updater'
+import {
+  checkForUpdates,
+  installUpdate,
+  isNightlyVersion,
+  openReleasePage,
+  switchUpdateChannel,
+  updateStore
+} from '@/lib/updater'
 import { ACCENTS, settingsStore, type Settings } from '@/lib/settings'
 import {
   allThemes,
@@ -87,6 +94,7 @@ export function SettingsTab(): React.JSX.Element {
     void getVersion()
       .then(setVersion)
       .catch(() => setVersion('dev'))
+  const channel = settings.updateChannel || (isNightlyVersion(version) ? 'nightly' : 'stable')
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]): void =>
     settingsStore.set((s) => ({ ...s, [key]: value }))
@@ -584,6 +592,23 @@ export function SettingsTab(): React.JSX.Element {
                 </Button>
               )}
             </div>
+          </Row>
+          <Row
+            title="Release channel"
+            description={
+              channel === 'nightly'
+                ? 'Nightly builds of the latest changes, published every few hours. Switching back to stable takes effect at the next stable release'
+                : 'Tested releases, published when they are ready'
+            }
+          >
+            <Segmented
+              value={channel}
+              onChange={(channel) => void switchUpdateChannel(channel)}
+              options={[
+                { value: 'stable', label: 'Stable' },
+                { value: 'nightly', label: 'Nightly' }
+              ]}
+            />
           </Row>
           <Row
             title="Check for updates automatically"

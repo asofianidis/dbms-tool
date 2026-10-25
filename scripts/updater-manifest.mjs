@@ -1,6 +1,6 @@
 // Builds the updater's latest.json from the signed bundles on a release.
 //
-//   node scripts/updater-manifest.mjs <assets dir> <version> <tag> <owner/repo>
+//   node scripts/updater-manifest.mjs <assets dir> <version> <tag> <owner/repo> [notes file]
 //
 // Every platform job uploads its bundles and `.sig` files to the same draft
 // release; generating the manifest once afterwards avoids jobs racing to edit it.
@@ -44,9 +44,11 @@ export function buildManifest({ files, readSignature, version, tag, repo, notes,
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [dir, version, tag, repo] = process.argv.slice(2)
+  const [dir, version, tag, repo, notesFile] = process.argv.slice(2)
   if (!dir || !version || !tag || !repo) {
-    console.error('usage: updater-manifest.mjs <assets dir> <version> <tag> <owner/repo>')
+    console.error(
+      'usage: updater-manifest.mjs <assets dir> <version> <tag> <owner/repo> [notes file]'
+    )
     process.exit(1)
   }
   const files = readdirSync(dir).sort(
@@ -58,7 +60,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     version,
     tag,
     repo,
-    notes: `See https://github.com/${repo}/releases/tag/${tag}`,
+    // The app shows these on its update button
+    notes: notesFile
+      ? readFileSync(notesFile, 'utf8').trim()
+      : `See https://github.com/${repo}/releases/tag/${tag}`,
     date: new Date().toISOString()
   })
   const required = ['windows-x86_64', 'darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']

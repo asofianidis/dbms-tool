@@ -4,6 +4,8 @@ export type ThemeMode = 'dark' | 'light' | 'system'
 
 export type CommitMode = 'auto' | 'manual'
 
+export type UpdateChannel = 'stable' | 'nightly'
+
 export interface Settings {
   /** Accent override; empty uses the current theme's accent */
   accent: string
@@ -34,6 +36,8 @@ export interface Settings {
   sidebarWidth: number
   /** Check GitHub Releases for signed updates in the background */
   autoUpdate: boolean
+  /** Release channel updates come from; '' follows the installed build (nightlies have a pre-release version) */
+  updateChannel: UpdateChannel | ''
   /** Zone timestamps are shown in: '' as the server sent them, 'local', 'UTC' or an IANA name */
   timeZone: string
   /** Read `timestamp` / `datetime` values without an offset as UTC */
@@ -73,6 +77,7 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   confirmDangerous: true,
   sidebarWidth: 280,
   autoUpdate: true,
+  updateChannel: '',
   timeZone: '',
   assumeUtc: false,
   dateFormat: 'iso'

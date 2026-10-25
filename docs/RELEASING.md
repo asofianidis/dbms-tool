@@ -2,13 +2,31 @@
 
 Releases are built by [`.github/workflows/release.yml`](../.github/workflows/release.yml):
 
-| Trigger | Version |
-| --- | --- |
-| Push to `main` that touches the app | Base version in `src-tauri/tauri.conf.json`, patch + workflow run number (e.g. `0.1.0` → `0.1.37`) |
-| Push a tag `vX.Y.Z` | `X.Y.Z` |
-| Manual run (Actions → release → Run workflow) | Same as a push to `main` |
+There are two release channels, and the app can follow either (Settings → Updates → Release
+channel):
 
-Bumping the base version by hand (say to `0.2.0`) releases exactly that version on the next push.
+| Channel | Trigger | Version |
+| --- | --- | --- |
+| Stable | Push a tag `vX.Y.Z` | `X.Y.Z` |
+| Stable | Manual run (Actions → release → Run workflow, channel `stable`) | The patch after the newest stable tag (`v0.1.35` → `0.1.36`) |
+| Nightly | Every 6 hours, when the app changed since the last release of either channel | The next stable version plus the run number as a pre-release (`0.1.36-412`) |
+| Nightly | Manual run with channel `nightly` | Same |
+
+Merging to `main` no longer releases anything by itself. Bumping the base version in
+`src-tauri/tauri.conf.json` past the newest stable tag (say to `0.2.0`) makes that the next stable
+version, and nightlies count towards it.
+
+Stable releases become the repository's **Latest** release, whose `latest.json` stable apps poll.
+Nightlies are published as pre-releases, and their `latest.json` is also copied to the `nightly`
+release, which only holds that manifest and is what nightly apps poll. A new stable release is
+copied there too, so nightly users get it. Nightly versions sort before the stable release they
+lead up to, so someone switching back from nightly to stable moves over at the next stable
+release. Only the 10 newest nightlies are kept.
+
+Release notes start with a changelog of the pull requests merged since the previous release of
+the same channel (stable compares with stable; nightly with the newest release of either), with
+Dependabot updates listed separately. The same list goes into `latest.json`, and the app shows it
+when you hover over its update button.
 
 Each release runs the full CI suite first (including the live database tests), then builds:
 
@@ -23,17 +41,16 @@ The release stays a draft until every platform has uploaded. The publish job the
 `SHA256SUMS.txt`, a build-provenance attestation for every file, and `latest.json` for the
 auto-updater, and only then makes the release public.
 
-## Approving a release
+## Signing environment
 
-The build job runs in the `release` environment (**Settings → Environments**), which only `main`
-and `v*` tags may use and which needs a maintainer's approval. After CI passes, the run waits at
-**Review deployments**; approve it to build, sign and publish. Merging to `main` therefore never
-ships an update to installed apps on its own.
+Builds of both channels run in the `release` environment (**Settings → Environments**), which
+only `main` and `v*` tags may use, so builds from other branches can't read the signing secrets.
+It has no required reviewers: once CI passes, a release builds, signs and publishes on its own.
 
 ## Secrets
 
 Add these as **environment secrets of `release`** (Settings → Environments → release), not as
-repository secrets, so that only the approved build job can read them:
+repository secrets, so that only the build jobs can read them:
 
 ```sh
 gh secret set TAURI_SIGNING_PRIVATE_KEY --env release < ~/.tauri/dbms-tool.key

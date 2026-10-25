@@ -13,6 +13,8 @@ mod limits;
 mod manager;
 mod model;
 mod tunnel;
+#[cfg(desktop)]
+mod updates;
 
 use tauri::Manager as _;
 
@@ -93,6 +95,8 @@ pub fn run() {
             commands::backup_cancel,
             commands::logs_reveal,
             commands::logs_read,
+            #[cfg(desktop)]
+            updates::update_check,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
