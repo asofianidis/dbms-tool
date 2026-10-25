@@ -14,6 +14,8 @@ use crate::model::*;
 
 use super::tls::{self, ClientCert};
 
+mod events;
+
 pub struct MySession {
     conn: Conn,
     opts: Opts,
@@ -506,6 +508,9 @@ impl MySession {
                 row_estimate: None,
             }
         }));
+        // Scheduled events, with their status and schedule as the detail
+        let events = self.rows(events::LIST_SQL, vec![database.into()]).await?;
+        objects.extend(events.iter().map(events::object));
         Ok(objects)
     }
 
@@ -654,6 +659,7 @@ impl MySession {
             "view" => (format!("SHOW CREATE VIEW {target}"), 1),
             "function" => (format!("SHOW CREATE FUNCTION {target}"), 2),
             "procedure" => (format!("SHOW CREATE PROCEDURE {target}"), 2),
+            "event" => (format!("SHOW CREATE EVENT {target}"), 3),
             _ => return Ok(None),
         };
         let row: Option<Row> = self.conn.query_first(sql).await?;

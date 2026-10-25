@@ -22,6 +22,7 @@ import {
   Code2,
   Columns3,
   ArchiveRestore,
+  CalendarClock,
   Copy,
   Database,
   DatabaseBackup,
@@ -116,6 +117,8 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { EventSchedulerBadge, newEvent } from './events'
+import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -1057,6 +1060,8 @@ const FOLDERS: {
   always?: boolean
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  /** MySQL / MariaDB scheduled events */
+  event?: boolean
 }[] = [
   { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
@@ -1064,7 +1069,8 @@ const FOLDERS: {
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
   { kinds: ['sequence'], label: 'Sequences' },
-  { kinds: ['synonym'], label: 'Synonyms' }
+  { kinds: ['synonym'], label: 'Synonyms' },
+  { kinds: ['event'], label: 'Events', always: true, event: true }
 ]
 
 function ObjectFolders({
@@ -1087,6 +1093,7 @@ function ObjectFolders({
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
         if (!objects.length && !folder.always) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
+        if (folder.event && connection.engine !== 'mysql') return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
           <ObjectFolder
@@ -1098,6 +1105,7 @@ function ObjectFolders({
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
             newTable={folder.newTable}
+            event={folder.event}
             objects={objects}
             depth={depth}
           />
@@ -1118,6 +1126,7 @@ function ObjectFolder({
   label,
   routine,
   newTable,
+  event,
   objects,
   depth
 }: {
@@ -1128,6 +1137,7 @@ function ObjectFolder({
   label: string
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  event?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -1146,7 +1156,16 @@ function ObjectFolder({
         onToggle={() => setOpen(!isOpen)}
         muted
         icon={isOpen ? <FolderOpen className="text-faint" /> : <Folder className="text-faint" />}
-        label={label}
+        label={
+          event ? (
+            <>
+              {label}
+              <EventSchedulerBadge connectionId={connection.id} />
+            </>
+          ) : (
+            label
+          )
+        }
         detail={filter ? `${visible.length}/${objects.length}` : objects.length}
         onMenu={(e) =>
           showContextMenu(e, [
@@ -1157,6 +1176,15 @@ function ObjectFolder({
                     label: routine === 'procedure' ? 'New procedure' : 'New function',
                     icon: <Plus />,
                     onSelect: () => newRoutine(connection.id, database, schema, routine)
+                  }
+                ]
+              : []),
+            ...(event
+              ? [
+                  {
+                    label: 'New event',
+                    icon: <Plus />,
+                    onSelect: () => newEvent(connection.id, database)
                   }
                 ]
               : []),
@@ -1186,6 +1214,15 @@ function ObjectFolder({
               variant="ghost"
               title={routine === 'procedure' ? 'New procedure' : 'New function'}
               onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : event ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New event"
+              onClick={() => newEvent(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>
@@ -1230,6 +1267,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
       return <ListOrdered className="text-syn-number" />
     case 'synonym':
       return <Link2 className="text-muted" />
+    case 'event':
+      return <CalendarClock className="text-syn-fn" />
     default:
       return <Table2 className="text-syn-prop" />
   }
@@ -1274,7 +1313,9 @@ function ObjectNode({
         onMenu={(e) => showContextMenu(e, objectMenu(connection.id, database, obj))}
         icon={objectIcon(obj.kind)}
         title={
-          [obj.comment, obj.detail && `(${obj.detail})`].filter(Boolean).join('\n') || undefined
+          obj.kind === 'event'
+            ? eventTooltip(obj)
+            : [obj.comment, obj.detail && `(${obj.detail})`].filter(Boolean).join('\n') || undefined
         }
         label={
           <>
@@ -1287,9 +1328,11 @@ function ObjectNode({
           </>
         }
         detail={
-          obj.rowEstimate != null && obj.rowEstimate >= 0
-            ? compactCount(obj.rowEstimate)
-            : undefined
+          obj.kind === 'event'
+            ? (eventStatusLabel(obj.detail) ?? undefined)
+            : obj.rowEstimate != null && obj.rowEstimate >= 0
+              ? compactCount(obj.rowEstimate)
+              : undefined
         }
         actions={
           isRoutine && (
