@@ -546,8 +546,16 @@ function prefixMatch(prefix: Uint8Array): RData {
 /** Filter-box text for keys starting with these bytes; `scanPattern` reads it back. */
 function prefixFilter(prefix: Uint8Array): string {
   const d = fromBytes(prefix)
-  // Binary text shows bytes (and `\`) as `\xNN`, which the filter reads as bytes
-  return (isHex(d) ? dataText(d).replace(/[*?[\]]/g, '\\$&') : globEscape(d)) + '*'
+  if (!isHex(d)) return globEscape(d) + '*'
+  // Binary text shows bytes (and `\`) as `\xNN`, which the filter reads as bytes;
+  // glob characters get a `\` so they match themselves
+  let text = ''
+  for (const b of prefix) {
+    const c = String.fromCharCode(b)
+    if (b < 0x20 || b >= 0x7f || b === 0x5c) text += `\\x${b.toString(16).padStart(2, '0')}`
+    else text += '*?[]'.includes(c) ? `\\${c}` : c
+  }
+  return text + '*'
 }
 
 function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
