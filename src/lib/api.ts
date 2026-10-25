@@ -243,9 +243,13 @@ export type ObjectKind =
   | 'sequence'
   | 'function'
   | 'procedure'
+  /** MariaDB CREATE PACKAGE (with its body, when it has one) */
+  | 'package'
   | 'synonym'
   | 'collection'
   | 'timeseries'
+  /** MySQL / MariaDB scheduled event */
+  | 'event'
 
 export interface DbObject {
   schema: string | null

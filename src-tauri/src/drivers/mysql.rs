@@ -14,6 +14,8 @@ use crate::model::*;
 
 use super::tls::{self, ClientCert};
 
+mod events;
+
 pub struct MySession {
     conn: Conn,
     opts: Opts,
@@ -478,18 +480,24 @@ impl MySession {
             .iter()
             .map(|r| {
                 let kind = text(r, 1).unwrap_or_default();
+                // MariaDB 10.3+ lists sequences as tables of type SEQUENCE, always with one row
+                let sequence = kind == "SEQUENCE";
                 DbObject {
                     schema: None,
                     name: text(r, 0).unwrap_or_default(),
                     kind: if kind.contains("VIEW") {
                         "view"
+                    } else if sequence {
+                        "sequence"
                     } else {
                         "table"
                     }
                     .to_string(),
                     detail: None,
                     comment: text(r, 2).filter(|c| !c.is_empty()),
-                    row_estimate: text(r, 3).and_then(|s| s.parse().ok()),
+                    row_estimate: text(r, 3)
+                        .and_then(|s| s.parse().ok())
+                        .filter(|_| !sequence),
                 }
             })
             .collect();
@@ -500,14 +508,18 @@ impl MySession {
                 vec![database.into()],
             )
             .await?;
-        objects.extend(routines.iter().map(|r| {
+        // A MariaDB package's body is shown under its spec's node
+        let routines = routines
+            .iter()
+            .filter(|r| text(r, 1).as_deref() != Some("PACKAGE BODY"));
+        objects.extend(routines.map(|r| {
             DbObject {
                 schema: None,
                 name: text(r, 0).unwrap_or_default(),
-                kind: if text(r, 1).as_deref() == Some("PROCEDURE") {
-                    "procedure"
-                } else {
-                    "function"
+                kind: match text(r, 1).as_deref() {
+                    Some("PROCEDURE") => "procedure",
+                    Some("PACKAGE") => "package",
+                    _ => "function",
                 }
                 .to_string(),
                 detail: None,
@@ -515,6 +527,9 @@ impl MySession {
                 row_estimate: None,
             }
         }));
+        // Scheduled events, with their status and schedule as the detail
+        let events = self.rows(events::LIST_SQL, vec![database.into()]).await?;
+        objects.extend(events.iter().map(events::object));
         Ok(objects)
     }
 
@@ -663,10 +678,38 @@ impl MySession {
             "view" => (format!("SHOW CREATE VIEW {target}"), 1),
             "function" => (format!("SHOW CREATE FUNCTION {target}"), 2),
             "procedure" => (format!("SHOW CREATE PROCEDURE {target}"), 2),
+            "package" => return self.package_definition(&target).await,
+            "event" => (format!("SHOW CREATE EVENT {target}"), 3),
+            "sequence" => (format!("SHOW CREATE SEQUENCE {target}"), 1),
             _ => return Ok(None),
         };
         let row: Option<Row> = self.conn.query_first(sql).await?;
         Ok(row.and_then(|r| text(&r, column)))
+    }
+
+    /// A MariaDB package's spec, then its body when it has one.
+    async fn package_definition(&mut self, target: &str) -> AppResult<Option<String>> {
+        let spec: Option<Row> = self
+            .conn
+            .query_first(format!("SHOW CREATE PACKAGE {target}"))
+            .await?;
+        let Some(spec) = spec.and_then(|r| text(&r, 2)) else {
+            return Ok(None);
+        };
+        let body = match self
+            .conn
+            .query_first::<Row, _>(format!("SHOW CREATE PACKAGE BODY {target}"))
+            .await
+        {
+            Ok(row) => row.and_then(|r| text(&r, 2)),
+            // 1305: the package has no body yet
+            Err(mysql_async::Error::Server(e)) if e.code == 1305 => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Some(match body {
+            Some(body) => format!("{spec};\n\n{body}"),
+            None => spec,
+        }))
     }
 
     pub async fn describe_routine(

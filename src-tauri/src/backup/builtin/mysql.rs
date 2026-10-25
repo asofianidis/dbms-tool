@@ -266,10 +266,12 @@ pub async fn dump(server: &Server, job: &MysqlDumpJob, report: &Report<'_>) -> A
             out.write_all(b"--\n-- Dumping routines\n--\n\n")?;
         }
         for (name, kind) in routines {
-            let kind = if kind == "FUNCTION" {
-                "FUNCTION"
-            } else {
-                "PROCEDURE"
+            // MariaDB packages sort before procedures, the spec before its body
+            let kind = match kind.as_str() {
+                "FUNCTION" => "FUNCTION",
+                "PACKAGE" => "PACKAGE",
+                "PACKAGE BODY" => "PACKAGE BODY",
+                _ => "PROCEDURE",
             };
             let sql = format!("SHOW CREATE {kind} {}.{}", ident(db), ident(&name));
             match show_create(conn, sql, 2).await? {

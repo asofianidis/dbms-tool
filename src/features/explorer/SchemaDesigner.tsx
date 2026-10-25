@@ -206,7 +206,8 @@ const KIND_LABELS: Partial<Record<DbObject['kind'], string>> = {
   function: 'function',
   procedure: 'procedure',
   sequence: 'sequence',
-  synonym: 'synonym'
+  synonym: 'synonym',
+  event: 'event'
 }
 
 function SchemaForm({

@@ -474,10 +474,12 @@ const KIND_LABELS: Record<DiffItem['kind'], string> = {
   materialized_view: 'Materialized views',
   function: 'Functions',
   procedure: 'Procedures',
+  package: 'Packages',
   sequence: 'Sequences',
   synonym: 'Synonyms',
   collection: 'Collections',
-  timeseries: 'Time series'
+  timeseries: 'Time series',
+  event: 'Events'
 }
 
 function KindIcon({ kind }: { kind: DiffItem['kind'] }): React.JSX.Element {

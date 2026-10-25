@@ -5,7 +5,12 @@ import type { Dialect } from './engines'
 
 /** What the EXPLAIN statement asked the server for, and so how to read its output. */
 export type PlanFormat =
-  'postgres-json' | 'postgres-text' | 'mysql-tree' | 'showplan-xml' | 'mongo-explain'
+  | 'postgres-json'
+  | 'postgres-text'
+  | 'mysql-tree'
+  | 'mariadb-json'
+  | 'showplan-xml'
+  | 'mongo-explain'
 
 export interface PlanNode {
   /** Depth-first position across the whole plan */
@@ -133,10 +138,10 @@ export function walkPlan(node: PlanNode, visit: (n: PlanNode, parent: PlanNode |
 
 /* ---------- EXPLAIN statements ---------- */
 
-/** The plan format `explainSql` asks for. */
-export function planFormat(dialect: Dialect, babelfish: boolean): PlanFormat {
+/** The plan format `explainSql` asks for. MariaDB's are read by `parseMariaDbPlan`. */
+export function planFormat(dialect: Dialect, babelfish: boolean, mariadb = false): PlanFormat {
   if (dialect === 'postgres') return 'postgres-json'
-  if (dialect === 'mysql') return 'mysql-tree'
+  if (dialect === 'mysql') return mariadb ? 'mariadb-json' : 'mysql-tree'
   return babelfish ? 'postgres-text' : 'showplan-xml'
 }
 
@@ -801,6 +806,8 @@ export function misestimate(node: PlanNode): number | null {
 function statsCommand(format: PlanFormat, relation: string | null): string {
   const target = relation ?? 'the tables involved'
   if (format === 'mysql-tree') return `ANALYZE TABLE ${target}`
+  // Plain ANALYZE TABLE leaves MariaDB without the histograms it estimates conditions from
+  if (format === 'mariadb-json') return `ANALYZE TABLE ${target} PERSISTENT FOR ALL`
   if (format === 'showplan-xml') return `UPDATE STATISTICS ${target}`
   return `ANALYZE ${target}`
 }

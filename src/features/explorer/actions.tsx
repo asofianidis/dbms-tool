@@ -59,7 +59,11 @@ import type { MenuItem } from '@/components/ContextMenu'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { runnableCreate, runnableModify } from './packages'
 import { openPermissionsDesigner } from './PermissionsDesigner'
+import { versioningScriptItems } from './Versioning'
+import { eventMenuItems } from './events'
+import { mariaDbSequenceItems } from './sequence-actions'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
   const connection = getConnection(connectionId)
@@ -89,10 +93,13 @@ async function scriptTo(
     const ref = tableRef(connectionId, database, obj)
     let text = ''
     if (kind === 'definition' || (kind === 'create' && obj.kind !== 'table')) {
-      text =
-        (await queryClient.fetchQuery(
-          queries.definition(connectionId, database, obj.schema, obj.name, obj.kind, obj.detail)
-        )) ?? `-- No definition available for ${obj.name}`
+      const stored = await queryClient.fetchQuery(
+        queries.definition(connectionId, database, obj.schema, obj.name, obj.kind, obj.detail)
+      )
+      text = stored ?? `-- No definition available for ${obj.name}`
+      // Oracle-mode routines need their sql_mode to run
+      if (stored && ROUTINE_KINDS.includes(obj.kind))
+        text = await runnableCreate(connectionId, database, obj, stored)
     } else if (kind === 'drop') {
       const what =
         obj.kind === 'materialized_view'
@@ -245,6 +252,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
                 }
               ]
             : []),
+          ...versioningScriptItems(connectionId, database, obj),
           'separator',
           { label: 'CREATE', onSelect: () => void scriptTo(connectionId, database, obj, 'create') },
           { label: 'DROP', onSelect: () => void scriptTo(connectionId, database, obj, 'drop') }
@@ -297,6 +305,45 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         onSelect: () => void scriptTo(connectionId, database, obj, 'drop')
       }
     )
+  } else if (obj.kind === 'package') {
+    // MariaDB packages can't be executed as a whole; their members are called by name
+    items.push(
+      {
+        label: 'Modify',
+        icon: <FileCode2 />,
+        onSelect: () => void modifyRoutine(connectionId, database, obj)
+      },
+      'separator',
+      {
+        label: 'Definition',
+        icon: <ScrollText />,
+        onSelect: () =>
+          openTable(connectionId, database, obj.schema, obj.name, obj.kind, 'definition')
+      },
+      {
+        label: 'Script as CREATE',
+        icon: <FileCode2 />,
+        onSelect: () => void scriptTo(connectionId, database, obj, 'definition')
+      },
+      {
+        label: 'Script as DROP',
+        icon: <Trash2 />,
+        onSelect: () => void scriptTo(connectionId, database, obj, 'drop')
+      }
+    )
+  } else if (obj.kind === 'event') {
+    items.push(...eventMenuItems(connectionId, database, obj))
+  } else if (obj.kind === 'sequence' && dialect === 'mysql') {
+    // Only MariaDB lists sequences on the MySQL engine
+    items.push(
+      ...mariaDbSequenceItems(
+        connectionId,
+        database,
+        obj,
+        tableRef(connectionId, database, obj),
+        (kind) => void scriptTo(connectionId, database, obj, kind)
+      )
+    )
   } else if (obj.kind === 'sequence') {
     items.push({
       label: 'Script as CREATE',
@@ -332,17 +379,30 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
   return items
 }
 
-async function modifyRoutine(connectionId: string, database: string, obj: DbObject): Promise<void> {
+/** Kinds whose stored DDL depends on the sql_mode it was created under. */
+const ROUTINE_KINDS: DbObject['kind'][] = ['function', 'procedure', 'package']
+
+export async function modifyRoutine(
+  connectionId: string,
+  database: string,
+  obj: DbObject
+): Promise<void> {
   try {
     const definition = await queryClient.fetchQuery(
       queries.definition(connectionId, database, obj.schema, obj.name, obj.kind, obj.detail)
     )
     if (!definition) throw new Error(`No definition available for ${obj.name}`)
     const kind = obj.kind === 'procedure' ? 'procedure' : 'function'
+    const script = modifyScript(
+      dialectOf(connectionId),
+      definition,
+      tableRef(connectionId, database, obj),
+      kind
+    )
     newQueryTab(
       connectionId,
       database,
-      modifyScript(dialectOf(connectionId), definition, tableRef(connectionId, database, obj), kind)
+      await runnableModify(connectionId, database, obj, definition, script)
     )
   } catch (e) {
     toastError(e)
