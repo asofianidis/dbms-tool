@@ -1066,3 +1066,110 @@ async fn postgres_through_ssh_tunnel() {
     assert!(out.error.is_none(), "{:?}", out.error);
     m.close("ssh-tunnel");
 }
+
+/// Scheduled events are listed with their status and schedule, and the scripts
+/// the explorer builds for them (see events.test.ts) run on MySQL and MariaDB.
+#[tokio::test]
+async fn mysql_events_end_to_end() {
+    for var in ["DBMS_TEST_MYSQL", "DBMS_TEST_MARIADB"] {
+        let Some((m, id)) = open(Engine::Mysql, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let db = "mdb_events";
+        let setup = "DROP DATABASE IF EXISTS mdb_events; CREATE DATABASE mdb_events; USE mdb_events; \
+            CREATE TABLE t (id INT); \
+            CREATE EVENT ev_every ON SCHEDULE EVERY 1 HOUR STARTS '2026-01-01 00:00:00' ENDS '2030-01-01 00:00:00' \
+              DISABLE COMMENT 'hourly cleanup' DO DELETE FROM t; \
+            CREATE EVENT ev_once ON SCHEDULE AT '2030-05-01 12:00:00' DO INSERT INTO t VALUES (1);";
+        let out = s.execute("t", "", setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+
+        let objects = s.list_objects(db, None).await.unwrap();
+        let find = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+                .clone()
+        };
+        let every = find("ev_every");
+        assert_eq!(every.kind, "event", "{var}");
+        assert_eq!(every.comment.as_deref(), Some("hourly cleanup"), "{var}");
+        let detail = every.detail.clone().unwrap_or_default();
+        assert!(
+            detail.starts_with(
+                "DISABLED · EVERY 1 HOUR STARTS 2026-01-01 00:00:00 ENDS 2030-01-01 00:00:00"
+            ),
+            "{var}: {detail}"
+        );
+        assert!(detail.contains("definer root@"), "{var}: {detail}");
+        let once = find("ev_once");
+        assert!(
+            once.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("ENABLED · AT 2030-05-01 12:00:00")),
+            "{var}: {:?}",
+            once.detail
+        );
+
+        let ddl = s
+            .object_definition(db, None, "ev_every", "event", None)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        // Messages name the server only: CodeQL treats what this connection reads as secret
+        assert!(ddl.starts_with("CREATE DEFINER="), "{var}");
+        assert!(
+            ddl.contains("EVENT `ev_every` ON SCHEDULE EVERY 1 HOUR"),
+            "{var}"
+        );
+
+        // Script as ALTER, then Disable, then the New event template (sent without DELIMITER)
+        let alter =
+            format!("ALTER{};", &ddl["CREATE".len()..]).replace("EVERY 1 HOUR", "EVERY 2 HOUR");
+        let template = "CREATE EVENT new_event\nON SCHEDULE EVERY 1 DAY\nSTARTS CURRENT_TIMESTAMP + INTERVAL 1 HOUR\n\
+            ON COMPLETION PRESERVE\nENABLE\nCOMMENT 'What this event does'\nDO\nBEGIN\n  \
+            -- event body, e.g. DELETE FROM sessions WHERE expires_at < NOW();\n  SET @new_event_ran_at = NOW();\nEND;";
+        for sql in [
+            alter.as_str(),
+            "ALTER EVENT `mdb_events`.`ev_once` DISABLE;",
+            template,
+        ] {
+            let out = s.execute("t", db, sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {sql}\n{:?}", out.error);
+        }
+        let objects = s.list_objects(db, None).await.unwrap();
+        let detail = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .and_then(|o| o.detail.clone())
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+        };
+        assert!(detail("ev_every").contains("EVERY 2 HOUR"), "{var}");
+        assert!(detail("ev_once").starts_with("DISABLED"), "{var}");
+        assert!(
+            detail("new_event").starts_with("ENABLED · EVERY 1 DAY"),
+            "{var}"
+        );
+
+        let out = s
+            .execute("t", db, "SELECT @@event_scheduler", &opts())
+            .await
+            .unwrap();
+        let scheduler = cell(&out, 0, 0, 0);
+        assert!(
+            ["ON", "OFF", "DISABLED"].contains(&scheduler.as_str().unwrap_or_default()),
+            "{var}: {scheduler}"
+        );
+        println!("{var}: event_scheduler = {scheduler}");
+
+        let out = s
+            .execute("t", "", "DROP DATABASE mdb_events", &opts())
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        m.close(&id);
+    }
+}

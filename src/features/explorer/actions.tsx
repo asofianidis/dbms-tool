@@ -60,6 +60,7 @@ import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
+import { eventMenuItems } from './events'
 import { mariaDbSequenceItems } from './sequence-actions'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
@@ -298,6 +299,8 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         onSelect: () => void scriptTo(connectionId, database, obj, 'drop')
       }
     )
+  } else if (obj.kind === 'event') {
+    items.push(...eventMenuItems(connectionId, database, obj))
   } else if (obj.kind === 'sequence' && dialect === 'mysql') {
     // Only MariaDB lists sequences on the MySQL engine
     items.push(

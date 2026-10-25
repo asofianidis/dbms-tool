@@ -31,7 +31,7 @@ export function likePattern(dialect: Dialect, term: string, prefix = false): str
 
 /**
  * One catalog query returning (db_name, schema_name, object_name, kind, detail)
- * for tables, views, sequences and routines whose name contains `term`, prefix
+ * for tables, views, sequences, routines and (MySQL) events whose name contains `term`, prefix
  * matches and short names first.
  */
 export function objectSearchSql(dialect: Dialect, term: string, limit = 50): string {
@@ -75,6 +75,10 @@ LIMIT ${limit}`
     CASE routine_type WHEN 'PROCEDURE' THEN 'procedure' ELSE 'function' END, NULL
   FROM information_schema.routines
   WHERE routine_schema NOT IN ${system} AND lower(routine_name) LIKE ${pattern}
+  UNION ALL
+  SELECT event_schema, NULL, event_name, 'event', NULL
+  FROM information_schema.events
+  WHERE event_schema NOT IN ${system} AND lower(event_name) LIKE ${pattern}
 ) o
 ORDER BY ${order('char_length')}
 LIMIT ${limit}`
