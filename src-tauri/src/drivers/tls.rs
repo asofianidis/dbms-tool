@@ -106,10 +106,13 @@ pub fn native_connector(cfg: &ConnectionConfig) -> AppResult<native_tls::TlsConn
     builder
         .danger_accept_invalid_certs(!cfg.verify_certificate())
         .danger_accept_invalid_hostnames(!cfg.verify_hostname());
+    // A CA file is the only trust anchor, as with libpq; otherwise verify-ca
+    // (no hostname check) would accept any publicly trusted certificate
     if let Some(path) = cfg.root_cert() {
         for cert in native_root_certs(path)? {
             builder.add_root_certificate(cert);
         }
+        builder.disable_built_in_roots(true);
     }
     if let Some(identity) = native_identity(cfg)? {
         builder.identity(identity);

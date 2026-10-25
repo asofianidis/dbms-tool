@@ -10,5 +10,7 @@ Vendored from crates.io so the query editor can show SSMS-style output. Changes:
 - `Client::simple_query_all`, which is `simple_query` without skipping tokens that arrive before the
   first result set.
 - `TokenDone::has_count`.
+- `money` / `smallmoney` decode to an exact scale-4 `ColumnData::Numeric` instead of a lossy
+  `F64`, so values like `922337203685477.5807` survive. `F64` still encodes into money columns.
 
 Everything else is unchanged from the published crate (MIT / Apache-2.0, see the license files).
