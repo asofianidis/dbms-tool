@@ -249,8 +249,14 @@ export const catalogQueries = {
       )
   }),
   /** Users and roles: server-wide on PostgreSQL and MySQL, per database on SQL Server */
-  principals: (id: string, dialect: Dialect, database: string): CatalogQuery<Principal> => ({
+  principals: (
+    id: string,
+    dialect: Dialect,
+    database: string,
+    mariadb?: boolean
+  ): CatalogQuery<Principal> => ({
     queryKey: ['conn', id, 'catalog', database, 'principals'],
-    queryFn: async () => parsePrincipals(await catalogRows(id, database, principalQueries(dialect)))
+    queryFn: async () =>
+      parsePrincipals(await catalogRows(id, database, principalQueries(dialect, mariadb)))
   })
 }
