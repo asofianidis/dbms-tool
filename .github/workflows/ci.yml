@@ -119,6 +119,13 @@ jobs:
         ports: ['53306:3306']
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -pDbms_test_pw1" --health-interval 5s --health-timeout 5s --health-retries 30
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: Dbms_test_pw1
+        ports: ['53307:3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
@@ -134,6 +141,7 @@ jobs:
     env:
       DBMS_TEST_PG: localhost:55432:postgres:Dbms_test_pw1
       DBMS_TEST_MYSQL: localhost:53306:root:Dbms_test_pw1
+      DBMS_TEST_MARIADB: localhost:53307:root:Dbms_test_pw1
       DBMS_TEST_MSSQL: localhost:51433:sa:Dbms_test_pw1
       DBMS_TEST_BABELFISH: localhost:51434:babelfish_user:12345678
       DBMS_TEST_MONGO: mongodb://localhost:57017

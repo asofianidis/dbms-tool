@@ -3,6 +3,7 @@
 //! ```text
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
+//! DBMS_TEST_MARIADB=localhost:3307:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
@@ -186,6 +187,31 @@ async fn postgres_end_to_end() {
     s.execute("tab1", "", "DROP TABLE dbms_t", &opts())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn mariadb_end_to_end() {
+    // MariaDB uses the MySQL engine; the frontend tells them apart by `product`
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB") else {
+        return;
+    };
+    let m = Manager::default();
+    let info = m.open(c.clone(), password).await.expect("connect");
+    assert!(info.product.starts_with("MariaDB "), "{}", info.product);
+    assert!(info.version.contains("MariaDB"), "{}", info.version);
+    let s = m.get(&c.id).unwrap();
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "SELECT IF(VERSION() LIKE '%MariaDB%', 'yes', 'no')",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
+    m.close(&c.id);
 }
 
 #[tokio::test]
