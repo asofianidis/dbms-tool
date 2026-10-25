@@ -353,6 +353,26 @@ export function newMaintenanceDraft(engine: Engine): MaintenanceDraft {
   }
 }
 
+/** A task and tables to start the maintenance tab on, e.g. from the server tab's table health. */
+export interface MaintenancePreset {
+  task: MaintenanceTask
+  tables: TableRef[]
+  options?: Partial<Record<MaintenanceOption, boolean>>
+  /** Changes each time the preset is applied, so re-opening the same tab applies it again */
+  nonce: number
+}
+
+export function presetDraft(engine: Engine, preset: MaintenancePreset): MaintenanceDraft {
+  const draft = newMaintenanceDraft(engine)
+  return {
+    ...draft,
+    task: taskInfo(engine, preset.task) ? preset.task : draft.task,
+    scope: preset.tables.length ? 'tables' : 'all',
+    tables: preset.tables,
+    options: preset.options ?? draft.options
+  }
+}
+
 const DIALECTS: Partial<Record<Engine, Dialect>> = {
   postgres: 'postgres',
   mysql: 'mysql',

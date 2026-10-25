@@ -1,0 +1,68 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.110378151
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 21.08484248,
+    "r_loops": 1,
+    "r_total_time_ms": 4.68009763,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ALL",
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 19847,
+          "r_rows": 20000,
+          "cost": 3.3279766,
+          "r_table_time_ms": 2.084570512,
+          "r_other_time_ms": 1.706619877,
+          "r_engine_stats": {
+            "pages_accessed": 55
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "attached_condition": "o.customer_id is not null",
+          "r_filtered": 100
+        }
+      },
+      {
+        "block-nl-join": {
+          "table": {
+            "table_name": "c",
+            "access_type": "hash_ALL",
+            "possible_keys": ["PRIMARY", "idx_country"],
+            "key": "#hash#PRIMARY",
+            "key_length": "4",
+            "used_key_parts": ["id"],
+            "ref": ["mdb_explain.o.customer_id"],
+            "loops": 19847,
+            "r_loops": 2,
+            "rows": 2000,
+            "r_rows": 2000,
+            "cost": 17.75686588,
+            "r_table_time_ms": 0.485287735,
+            "r_other_time_ms": 0.175410629,
+            "r_engine_stats": {
+              "pages_accessed": 15
+            },
+            "filtered": 0.01,
+            "r_total_filtered": 20,
+            "attached_condition": "c.country = 'GR'",
+            "r_filtered": 20
+          },
+          "buffer_type": "flat",
+          "buffer_size": "256KiB",
+          "join_type": "BNLH",
+          "r_loops": 20000,
+          "r_filtered": 100,
+          "r_unpack_time_ms": 0.095743093,
+          "r_other_time_ms": 0.129304693,
+          "r_effective_rows": 0.2
+        }
+      }
+    ]
+  }
+}

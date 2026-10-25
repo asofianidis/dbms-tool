@@ -1,0 +1,82 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.101935233
+  },
+  "query_block": {
+    "union_result": {
+      "table_name": "<union1,2>",
+      "access_type": "ALL",
+      "r_loops": 1,
+      "r_rows": 416,
+      "query_specifications": [
+        {
+          "query_block": {
+            "select_id": 1,
+            "cost": 0.06031992,
+            "r_loops": 1,
+            "r_total_time_ms": 0.163806618,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "customers",
+                  "access_type": "ref",
+                  "possible_keys": ["idx_country"],
+                  "key": "idx_country",
+                  "key_length": "9",
+                  "used_key_parts": ["country"],
+                  "ref": ["const"],
+                  "loops": 1,
+                  "r_loops": 1,
+                  "rows": 400,
+                  "r_rows": 400,
+                  "cost": 0.06031992,
+                  "r_table_time_ms": 0.061571282,
+                  "r_other_time_ms": 0.099434369,
+                  "r_engine_stats": {
+                    "pages_accessed": 4
+                  },
+                  "filtered": 100,
+                  "r_total_filtered": 100,
+                  "attached_condition": "customers.country = 'US'",
+                  "r_filtered": 100,
+                  "using_index": true
+                }
+              }
+            ]
+          }
+        },
+        {
+          "query_block": {
+            "select_id": 2,
+            "operation": "UNION",
+            "cost": 3.3279766,
+            "r_loops": 1,
+            "r_total_time_ms": 3.106443712,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "orders",
+                  "access_type": "ALL",
+                  "loops": 1,
+                  "r_loops": 1,
+                  "rows": 19847,
+                  "r_rows": 20000,
+                  "cost": 3.3279766,
+                  "r_table_time_ms": 2.077318005,
+                  "r_other_time_ms": 1.027375102,
+                  "r_engine_stats": {
+                    "pages_accessed": 55
+                  },
+                  "filtered": 100,
+                  "r_total_filtered": 0.1,
+                  "attached_condition": "orders.total > 995",
+                  "r_filtered": 0.1
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
