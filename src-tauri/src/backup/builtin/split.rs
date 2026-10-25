@@ -1,6 +1,7 @@
 //! Splits a SQL script into statements as it streams in, the way psql and the
 //! mysql client do: quotes, comments and dollar quotes hide semicolons, COPY …
-//! FROM stdin is followed by its data, backslash commands stand alone, and
+//! FROM stdin is followed by its data, backslash commands stand alone,
+//! PostgreSQL's BEGIN ATOMIC function bodies keep their semicolons, and
 //! MySQL's DELIMITER changes what ends a statement.
 //!
 //! It works on bytes: everything it looks for is ASCII, and mysqldump writes
@@ -52,6 +53,11 @@ pub struct Splitter {
     content: bool,
     delimiter: Vec<u8>,
     copying: bool,
+    /// The statement's first words, lowercased, to spot CREATE FUNCTION
+    head: Vec<Vec<u8>>,
+    /// BEGIN (ATOMIC) and CASE blocks open in a CREATE FUNCTION or
+    /// PROCEDURE, whose semicolons don't end it (as psql counts them)
+    begin_depth: u32,
 }
 
 impl Splitter {
@@ -63,6 +69,8 @@ impl Splitter {
             content: false,
             delimiter: b";".to_vec(),
             copying: false,
+            head: Vec::new(),
+            begin_depth: 0,
         }
     }
 
@@ -103,7 +111,7 @@ impl Splitter {
             let next = line.get(i + 1).copied();
             match self.state.clone() {
                 State::Normal => {
-                    if line[i..].starts_with(&self.delimiter) {
+                    if line[i..].starts_with(&self.delimiter) && self.begin_depth == 0 {
                         if self.content {
                             items.push(self.finish_statement());
                         } else {
@@ -168,6 +176,20 @@ impl Splitter {
                                 continue;
                             }
                             self.content = true;
+                        }
+                        c if self.dialect == Dialect::Postgres
+                            && (c.is_ascii_alphabetic() || c == b'_' || c >= 0x80)
+                            && (i == 0 || !is_ident(line[i - 1])) =>
+                        {
+                            let end = line[i..]
+                                .iter()
+                                .position(|&b| !is_ident(b))
+                                .map_or(line.len(), |n| i + n);
+                            self.word(&line[i..end]);
+                            self.buf.extend_from_slice(&line[i..end]);
+                            self.content = true;
+                            i = end;
+                            continue;
                         }
                         c if !c.is_ascii_whitespace() => self.content = true,
                         _ => {}
@@ -260,9 +282,39 @@ impl Splitter {
         }
     }
 
+    /// Tracks BEGIN / CASE / END in a CREATE FUNCTION or PROCEDURE.
+    fn word(&mut self, word: &[u8]) {
+        let word = word.to_ascii_lowercase();
+        if self.head.len() < 4 {
+            self.head.push(word.clone());
+        }
+        let routine = match self.head.as_slice() {
+            [create, kind, ..] if create == b"create" => {
+                matches!(kind.as_slice(), b"function" | b"procedure")
+                    || (kind == b"or"
+                        && self
+                            .head
+                            .get(3)
+                            .is_some_and(|k| matches!(k.as_slice(), b"function" | b"procedure")))
+            }
+            _ => false,
+        };
+        if !routine {
+            return;
+        }
+        match word.as_slice() {
+            b"begin" => self.begin_depth += 1,
+            b"case" if self.begin_depth > 0 => self.begin_depth += 1,
+            b"end" if self.begin_depth > 0 => self.begin_depth -= 1,
+            _ => {}
+        }
+    }
+
     fn finish_statement(&mut self) -> Item {
         let sql = std::mem::take(&mut self.buf).trim_ascii().to_vec();
         self.content = false;
+        self.head.clear();
+        self.begin_depth = 0;
         // pg_dump heads each COPY with a comment block
         let body = skip_comments(&sql);
         if self.dialect == Dialect::Postgres && is_copy_from_stdin(body) {
@@ -333,6 +385,29 @@ fn is_copy_from_stdin(sql: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn begin_atomic_bodies_keep_their_semicolons() {
+        let script = b"CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql\n\
+            BEGIN ATOMIC\n SELECT CASE WHEN true THEN 1 END;\n SELECT 2;\nEND;\n\
+            BEGIN;\nSELECT 'begin; end';\nCREATE PROCEDURE p() BEGIN ATOMIC INSERT INTO t VALUES (1); END;\n";
+        let statements: Vec<String> = split(Dialect::Postgres, script)
+            .into_iter()
+            .map(|i| match i {
+                Item::Statement(s) => String::from_utf8(s).unwrap(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            statements,
+            [
+                "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n SELECT CASE WHEN true THEN 1 END;\n SELECT 2;\nEND",
+                "BEGIN",
+                "SELECT 'begin; end'",
+                "CREATE PROCEDURE p() BEGIN ATOMIC INSERT INTO t VALUES (1); END",
+            ]
+        );
+    }
 
     fn split(dialect: Dialect, script: &[u8]) -> Vec<Item> {
         let mut s = Splitter::new(dialect);

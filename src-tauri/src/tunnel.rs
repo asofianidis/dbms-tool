@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Deserialize;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::cloud::{self, Provider};
@@ -78,11 +80,73 @@ fn target(config: &ConnectionConfig) -> Option<Target> {
 }
 
 /// Asks the OS for a free local port. Another process could take it before the
-/// tunnel binds, which shows up as the tunnel failing to start.
+/// tunnel binds; `start` then refuses to treat that process as the tunnel.
 fn free_port() -> AppResult<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port())
+}
+
+/// Fails if another program is listening on `port`, so it never receives the
+/// database credentials meant for the tunnel.
+fn check_port_free(port: u16) -> AppResult<()> {
+    std::net::TcpListener::bind(("127.0.0.1", port))
+        .map(drop)
+        .map_err(|e| {
+            AppError::msg(format!(
+                "Local port {port} for the tunnel is taken by another program ({e}); disconnect and connect again"
+            ))
+        })
+}
+
+/// What `ssh -v` prints once it has bound the forward's local port itself
+/// (OpenSSH's channel_setup_fwd_listener_tcpip).
+fn forward_listening(line: &str, port: u16) -> bool {
+    line.contains(&format!(
+        "Local forwarding listening on 127.0.0.1 port {port}."
+    ))
+}
+
+/// The lines `-v` adds to ssh's output, left out of error messages.
+fn ssh_verbose(line: &str) -> bool {
+    [
+        "debug",
+        "OpenSSH_",
+        "Authenticated to ",
+        "Transferred: ",
+        "Bytes per second",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
+}
+
+/// Collects a tunnel's stderr (keeps draining it, so a chatty process never
+/// blocks on a full pipe) and sets `ready` when ssh reports the forward bound.
+async fn read_stderr(
+    pipe: tokio::process::ChildStderr,
+    ssh_port: Option<u16>,
+    ready: Arc<AtomicBool>,
+    output: Arc<parking_lot::Mutex<String>>,
+) {
+    let mut lines = BufReader::new(pipe);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if !matches!(lines.read_until(b'\n', &mut line).await, Ok(n) if n > 0) {
+            return;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end();
+        if ssh_port.is_some_and(|port| forward_listening(text, port)) {
+            ready.store(true, Ordering::Release);
+        }
+        let mut output = output.lock();
+        // Only the start matters for errors; past that, just drain
+        if (ssh_port.is_none() || !ssh_verbose(text)) && output.len() < 64 * 1024 {
+            output.push_str(text);
+            output.push('\n');
+        }
+    }
 }
 
 fn default_port(engine: Engine) -> u16 {
@@ -157,7 +221,10 @@ fn ssh_command(
         "-L",
         &format!("127.0.0.1:{port}:{host}:{db_port}"),
     ])
-    .args(["-o", "ExitOnForwardFailure=yes"])
+    // ssh exits if it can't bind the local port, and -v makes it say when it
+    // has, which is what `start` waits for: a program that got to the port
+    // first must never look like the tunnel
+    .args(["-v", "-o", "ExitOnForwardFailure=yes"])
     .args([
         "-o",
         "ServerAliveInterval=30",
@@ -275,6 +342,7 @@ async fn start(
     port: u16,
 ) -> AppResult<Tunnel> {
     let (mut cmd, label) = command(&target, &config, secret.as_deref(), port)?;
+    check_port_free(port)?;
     let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -285,13 +353,24 @@ async fn start(
             ),
             _ => e.into(),
         })?;
+    let ssh = matches!(target, Target::Ssh(_));
+    let ready = Arc::new(AtomicBool::new(false));
+    let output = Arc::new(parking_lot::Mutex::new(String::new()));
+    let mut reader = child.stderr.take().map(|pipe| {
+        tokio::spawn(read_stderr(
+            pipe,
+            ssh.then_some(port),
+            ready.clone(),
+            output.clone(),
+        ))
+    });
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr).await;
+            if let Some(reader) = reader.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
             }
+            let stderr = output.lock().clone();
             let detail = stderr.trim();
             if let Target::Ssh(ssh) = &target
                 && host_keys::is_unknown_host_key(detail)
@@ -304,17 +383,16 @@ async fn start(
                 format!("{label} failed: {detail}")
             }));
         }
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            // Keep draining so a chatty process never blocks on a full pipe
-            if let Some(mut pipe) = child.stderr.take() {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    while matches!(pipe.read(&mut buf).await, Ok(n) if n > 0) {}
-                });
-            }
+        // ssh says when it holds the port. The Fly proxy doesn't, so it gets a
+        // connection test, after the check above that nothing else was listening.
+        let listening = if ssh {
+            ready.load(Ordering::Acquire)
+        } else {
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+        };
+        if listening && child.try_wait()?.is_none() {
             return Ok(Tunnel {
                 child,
                 port,
@@ -472,7 +550,38 @@ mod tests {
         assert!(a.contains(&"BatchMode=yes".to_string()));
         // Unknown host keys fail and go to the user (host_keys.rs)
         assert!(a.contains(&"StrictHostKeyChecking=yes".to_string()));
+        // Readiness comes from ssh saying it bound the port (see `start`)
+        assert!(a.contains(&"-v".to_string()));
+        assert!(a.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert_eq!(a.last().map(String::as_str), Some("bastion"));
+    }
+
+    #[test]
+    fn ready_only_once_ssh_reports_the_forward() {
+        let line = "debug1: Local forwarding listening on 127.0.0.1 port 40000.";
+        assert!(forward_listening(line, 40000));
+        assert!(!forward_listening(line, 4000));
+        assert!(!forward_listening(
+            "debug1: Connection to port 40000 forwarding to db port 5432 requested.",
+            40000
+        ));
+        assert!(ssh_verbose(
+            "debug1: Reading configuration data /etc/ssh/ssh_config"
+        ));
+        assert!(ssh_verbose("OpenSSH_9.6p1, OpenSSL 3.0.13 30 Jan 2024"));
+        assert!(!ssh_verbose(
+            "bind [127.0.0.1]:40000: Address already in use"
+        ));
+        assert!(!ssh_verbose("Permission denied (publickey)."));
+    }
+
+    #[test]
+    fn a_taken_port_is_refused() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(check_port_free(port).is_err());
+        drop(held);
+        assert!(check_port_free(free_port().unwrap()).is_ok());
     }
 
     #[test]

@@ -74,6 +74,22 @@ fn not_extension_member(catalog: &str, oid: &str) -> String {
     )
 }
 
+/// `EXISTS (...)` for a constraint (alias `c`) whose expression calls a user function.
+const CONSTRAINT_CALLS_FUNCTION: &str = "EXISTS (SELECT 1 FROM pg_depend d \
+     JOIN pg_proc f ON f.oid = d.refobjid JOIN pg_namespace fn ON fn.oid = f.pronamespace \
+     WHERE d.classid = 'pg_constraint'::regclass AND d.objid = c.oid \
+       AND d.refclassid = 'pg_proc'::regclass AND fn.nspname <> 'pg_catalog')";
+
+/// The start of `EXISTS (...)` for a function (alias `p`) that uses a relation
+/// of the kinds listed after it: its row type as an argument or result, or,
+/// with a BEGIN ATOMIC body (which records what it names), the relation itself.
+const FUNCTION_USES_RELATION: &str = "EXISTS (SELECT 1 FROM pg_class r WHERE \
+     (r.reltype = p.prorettype OR r.reltype = ANY (p.proargtypes::oid[]) \
+       OR r.reltype = ANY (coalesce(p.proallargtypes, '{}'::oid[])) \
+       OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid \
+                  AND d.refclassid = 'pg_class'::regclass AND d.refobjid = r.oid)) \
+     AND r.relkind IN";
+
 /// Orders items so each comes after the ones it depends on; cycles keep their input order.
 fn topo_order<K: Copy + Eq + std::hash::Hash>(keys: &[K], deps: &HashMap<K, Vec<K>>) -> Vec<K> {
     let present: HashSet<K> = keys.iter().copied().collect();
@@ -125,6 +141,10 @@ struct Relation {
     /// View or materialized view definition
     definition: Option<String>,
     populated: bool,
+    /// A view's `WITH (...)` options (security_barrier, security_invoker)
+    view_options: Option<String>,
+    /// LOCAL or CASCADED, for a view `WITH ... CHECK OPTION`
+    check_option: Option<String>,
 }
 
 struct Column {
@@ -151,6 +171,8 @@ struct Constraint {
     local: bool,
     /// The table an FK points at
     references: u32,
+    /// False for NOT VALID, which CREATE TABLE would ignore
+    validated: bool,
 }
 
 struct Sequence {
@@ -162,8 +184,10 @@ struct Sequence {
     definition: String,
     /// Table and column whose serial default owns it
     owned_by: Option<(u32, String)>,
-    /// Backs an identity column, so the table creates it
-    identity_of: Option<u32>,
+    /// Backs an identity column (table and column), so the table creates it
+    identity_of: Option<(u32, String)>,
+    /// `SEQUENCE NAME ... START WITH ...`, for the identity column that creates it
+    identity_options: String,
 }
 
 struct Function {
@@ -172,8 +196,11 @@ struct Function {
     kind: String,
     definition: String,
     owner: String,
-    /// Takes or returns a table's row type, so it's created after the tables
+    /// Takes or returns a table's row type, or has a SQL-standard body
+    /// (BEGIN ATOMIC) that names a table, so it's created after the tables
     late: bool,
+    /// The same for a view or materialized view, so it's created after them
+    after_views: bool,
     oid: u32,
 }
 
@@ -184,6 +211,15 @@ struct TypeDef {
     kind: String,
     body: String,
     owner: String,
+}
+
+/// A domain constraint added with ALTER DOMAIN rather than in CREATE DOMAIN
+struct DomainConstraint {
+    schema: String,
+    domain: String,
+    name: String,
+    definition: String,
+    validated: bool,
 }
 
 struct Grant {
@@ -204,6 +240,7 @@ struct Catalog {
     sequences: Vec<Sequence>,
     functions: Vec<Function>,
     types: Vec<TypeDef>,
+    domain_constraints: Vec<DomainConstraint>,
     schemas: Vec<(String, String, Option<String>)>,
     extensions: Vec<(String, String)>,
     view_deps: HashMap<u32, Vec<u32>>,
@@ -249,7 +286,11 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                    CASE WHEN c.relispartition THEN pg_get_expr(c.relpartbound, c.oid) END, \
                    CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END, \
                    obj_description(c.oid, 'pg_class'), c.relrowsecurity, c.relforcerowsecurity, \
-                   CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid) END, c.relispopulated \
+                   CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid) END, c.relispopulated, \
+                   CASE WHEN c.relkind = 'v' THEN array_to_string(array(SELECT o FROM unnest(c.reloptions) o \
+                     WHERE o NOT LIKE 'check\\_option=%'), ', ') END, \
+                   CASE WHEN c.relkind = 'v' THEN (SELECT upper(substr(o, 14)) FROM unnest(c.reloptions) o \
+                     WHERE o LIKE 'check\\_option=%') END \
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind IN ('r', 'p', 'v', 'm') AND {USER_SCHEMA} AND {} \
                  ORDER BY c.oid",
@@ -274,6 +315,8 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
             force_rls: r.get(11),
             definition: r.get(12),
             populated: r.get(13),
+            view_options: r.get::<_, Option<String>>(14).filter(|o| !o.is_empty()),
+            check_option: r.get(15),
         })
         .collect();
 
@@ -331,7 +374,7 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
         .query(
             &format!(
                 "SELECT c.conrelid, quote_ident(c.conname), pg_get_constraintdef(c.oid), c.contype::text, \
-                   c.conislocal, c.confrelid \
+                   c.conislocal, c.confrelid, c.convalidated \
                  FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
                  JOIN pg_namespace n ON n.oid = r.relnamespace \
                  WHERE c.contype IN ('c', 'p', 'u', 'x', 'f') AND {con_root} AND {USER_SCHEMA} \
@@ -348,6 +391,7 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
             kind: r.get(3),
             local: r.get(4),
             references: r.get(5),
+            validated: r.get(6),
         })
         .collect();
 
@@ -416,7 +460,10 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                    format('CREATE SEQUENCE %I.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s%s;', \
                      n.nspname, c.relname, format_type(s.seqtypid, NULL), s.seqincrement, s.seqmin, s.seqmax, \
                      s.seqstart, s.seqcache, CASE WHEN s.seqcycle THEN ' CYCLE' ELSE '' END), \
-                   d.refobjid, d.deptype::text, quote_ident(a.attname) \
+                   d.refobjid, d.deptype::text, quote_ident(a.attname), \
+                   format('SEQUENCE NAME %I.%I START WITH %s INCREMENT BY %s MINVALUE %s MAXVALUE %s CACHE %s%s', \
+                     n.nspname, c.relname, s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, \
+                     CASE WHEN s.seqcycle THEN ' CYCLE' ELSE ' NO CYCLE' END) \
                  FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  LEFT JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
@@ -440,14 +487,15 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                 owner: r.get(3),
                 name: r.get(4),
                 definition: r.get(5),
+                identity_of: match (table, dep.as_deref(), &column) {
+                    (Some(t), Some("i"), Some(c)) => Some((t, c.clone())),
+                    _ => None,
+                },
                 owned_by: match (table, dep.as_deref(), column) {
                     (Some(t), Some("a"), Some(c)) => Some((t, c)),
                     _ => None,
                 },
-                identity_of: match (table, dep.as_deref()) {
-                    (Some(t), Some("i")) => Some(t),
-                    _ => None,
-                },
+                identity_options: r.get(9),
             }
         })
         .collect();
@@ -458,13 +506,11 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                 "SELECT p.oid, n.nspname::text, \
                    format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)), \
                    {prokind}, pg_get_functiondef(p.oid), pg_get_userbyid(p.proowner)::text, \
-                   EXISTS (SELECT 1 FROM pg_type t JOIN pg_class r ON r.oid = t.typrelid \
-                           WHERE r.relkind IN ('r', 'p', 'v', 'm', 'f') \
-                             AND (t.oid = p.prorettype OR t.oid = ANY (p.proargtypes::oid[]) \
-                                  OR t.oid = ANY (coalesce(p.proallargtypes, '{{}}'::oid[])))) \
+                   {uses} ('r', 'p', 'f')), {uses} ('v', 'm')) \
                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
                  WHERE {USER_SCHEMA} AND {} AND {prokind} IN ('f', 'p') ORDER BY p.oid",
-                not_extension_member("pg_proc", "p.oid")
+                not_extension_member("pg_proc", "p.oid"),
+                uses = FUNCTION_USES_RELATION,
             ),
             &[],
         )
@@ -478,6 +524,7 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
             definition: r.get(4),
             owner: r.get(5),
             late: r.get(6),
+            after_views: r.get(7),
         })
         .collect();
 
@@ -496,7 +543,8 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                        || CASE WHEN t.typnotnull AND NOT EXISTS (SELECT 1 FROM pg_constraint n \
                             WHERE n.contypid = t.oid AND n.contype = 'n') THEN ' NOT NULL' ELSE '' END \
                        || coalesce((SELECT string_agg(' CONSTRAINT ' || quote_ident(c.conname) || ' ' || \
-                         pg_get_constraintdef(c.oid), '') FROM pg_constraint c WHERE c.contypid = t.oid), '') \
+                         pg_get_constraintdef(c.oid), '') FROM pg_constraint c WHERE c.contypid = t.oid \
+                         AND c.convalidated AND NOT {calls}), '') \
                      WHEN 'r' THEN (SELECT 'AS RANGE (subtype = ' || format_type(r.rngsubtype, NULL) || ')' \
                        FROM pg_range r WHERE r.rngtypid = t.oid) \
                    END, pg_get_userbyid(t.typowner)::text \
@@ -505,7 +553,8 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
                  WHERE {USER_SCHEMA} AND {} \
                    AND (t.typtype IN ('e', 'd', 'r') OR (t.typtype = 'c' AND c.relkind = 'c')) \
                  ORDER BY CASE t.typtype WHEN 'e' THEN 0 WHEN 'r' THEN 1 WHEN 'd' THEN 2 ELSE 3 END, t.oid",
-                not_extension_member("pg_type", "t.oid")
+                not_extension_member("pg_type", "t.oid"),
+                calls = CONSTRAINT_CALLS_FUNCTION,
             ),
             &[],
         )
@@ -517,6 +566,32 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
             kind: r.get(2),
             body: r.get::<_, Option<String>>(3).unwrap_or_default(),
             owner: r.get(4),
+        })
+        .collect();
+
+    // Domain checks CREATE DOMAIN can't carry: NOT VALID ones, and ones that
+    // call a function, which doesn't exist yet when the types are created
+    let domain_constraints = client
+        .query(
+            &format!(
+                "SELECT n.nspname::text, format('%I.%I', n.nspname, t.typname), quote_ident(c.conname), \
+                   pg_get_constraintdef(c.oid), c.convalidated \
+                 FROM pg_constraint c JOIN pg_type t ON t.oid = c.contypid \
+                 JOIN pg_namespace n ON n.oid = t.typnamespace \
+                 WHERE {USER_SCHEMA} AND {} AND (NOT c.convalidated OR {CONSTRAINT_CALLS_FUNCTION}) \
+                 ORDER BY t.oid, c.conname",
+                not_extension_member("pg_type", "t.oid")
+            ),
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|r| DomainConstraint {
+            schema: r.get(0),
+            domain: r.get(1),
+            name: r.get(2),
+            definition: r.get(3),
+            validated: r.get(4),
         })
         .collect();
 
@@ -621,6 +696,7 @@ async fn read_catalog(client: &Client) -> AppResult<Catalog> {
         sequences,
         functions,
         types,
+        domain_constraints,
         schemas,
         extensions,
         view_deps,
@@ -646,6 +722,9 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
     client
         .batch_execute("SELECT pg_catalog.set_config('search_path', '', false)")
         .await?;
+    // Row-level security would quietly leave out the rows the user's policies
+    // hide; off, reading such a table fails instead, as pg_dump arranges
+    client.batch_execute("SET row_security = off").await?;
     let version_text: String = client
         .query_one("SELECT current_setting('server_version')", &[])
         .await?
@@ -767,7 +846,7 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
             Scope::Relations(r) => {
                 r.contains(&s.oid)
                     || s.owned_by.as_ref().is_some_and(|(t, _)| r.contains(t))
-                    || s.identity_of.is_some_and(|t| r.contains(&t))
+                    || s.identity_of.as_ref().is_some_and(|(t, _)| r.contains(t))
             }
             _ => scope.schema(&s.schema),
         })
@@ -781,6 +860,11 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
         .types
         .iter()
         .filter(|t| scope.schema(&t.schema))
+        .collect();
+    let domain_constraints: Vec<&DomainConstraint> = catalog
+        .domain_constraints
+        .iter()
+        .filter(|c| scope.schema(&c.schema))
         .collect();
     let schemas: Vec<&(String, String, Option<String>)> = catalog
         .schemas
@@ -808,6 +892,13 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
                 ))?;
             }
         }
+        for f in functions.iter().filter(|f| f.after_views).rev() {
+            w(&format!(
+                "DROP {} IF EXISTS {};\n",
+                routine_kind(f),
+                f.signature
+            ))?;
+        }
         for v in views.iter().rev() {
             let kind = if v.kind == "m" {
                 "MATERIALIZED VIEW"
@@ -816,7 +907,7 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
             };
             w(&format!("DROP {kind} IF EXISTS {};\n", v.qname))?;
         }
-        for f in functions.iter().filter(|f| f.late).rev() {
+        for f in functions.iter().filter(|f| f.late && !f.after_views).rev() {
             w(&format!(
                 "DROP {} IF EXISTS {};\n",
                 routine_kind(f),
@@ -829,7 +920,14 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
         for s in sequences.iter().rev().filter(|s| s.identity_of.is_none()) {
             w(&format!("DROP SEQUENCE IF EXISTS {};\n", s.qname))?;
         }
-        for f in functions.iter().filter(|f| !f.late).rev() {
+        // Domains whose checks call functions go before those functions do
+        let mut dropped = HashSet::new();
+        for c in domain_constraints.iter().rev() {
+            if dropped.insert(&c.domain) {
+                w(&format!("DROP DOMAIN IF EXISTS {};\n", c.domain))?;
+            }
+        }
+        for f in functions.iter().filter(|f| !f.late && !f.after_views).rev() {
             w(&format!(
                 "DROP {} IF EXISTS {};\n",
                 routine_kind(f),
@@ -889,8 +987,12 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
                 ))?;
             }
         }
-        for f in functions.iter().filter(|f| !f.late) {
+        for f in functions.iter().filter(|f| !f.late && !f.after_views) {
             write_function(&mut w, f, job.no_owner)?;
+        }
+        // Domain checks that call those functions; NOT VALID ones wait for the data
+        for c in domain_constraints.iter().filter(|c| c.validated) {
+            w(&domain_constraint_sql(c))?;
         }
         for s in sequences.iter().filter(|s| s.identity_of.is_none()) {
             w(&format!("{}\n", s.definition))?;
@@ -932,7 +1034,7 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
             }
             w("\n")?;
         }
-        for f in functions.iter().filter(|f| f.late) {
+        for f in functions.iter().filter(|f| f.late && !f.after_views) {
             write_function(&mut w, f, job.no_owner)?;
         }
         for v in &views {
@@ -955,7 +1057,7 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
                     ))?;
                 }
             } else {
-                w(&format!("CREATE VIEW {} AS\n{definition};\n", v.qname))?;
+                w(&create_view(v, definition))?;
                 if !job.no_owner {
                     w(&format!(
                         "ALTER VIEW {} OWNER TO {};\n",
@@ -966,6 +1068,10 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
             }
             write_comments(&mut w, v, columns_of(v.oid))?;
             w("\n")?;
+        }
+        // Functions on a view's row type (RETURNS SETOF view) or naming one in a BEGIN ATOMIC body
+        for f in functions.iter().filter(|f| f.after_views) {
+            write_function(&mut w, f, job.no_owner)?;
         }
     }
 
@@ -1061,6 +1167,20 @@ pub async fn dump(server: &Server, job: &PgDumpJob, report: &Report<'_>) -> AppR
                     c.definition
                 ))?;
             }
+        }
+        // NOT VALID checks: CREATE TABLE would make them valid, and then old
+        // rows that break them wouldn't load. Without ONLY, so inheritance
+        // children get their copy too.
+        for t in &tables {
+            for c in constraints_of(t.oid).filter(|c| c.kind == "c" && c.local && !c.validated) {
+                w(&format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} {};\n",
+                    t.qname, c.name, c.definition
+                ))?;
+            }
+        }
+        for c in domain_constraints.iter().filter(|c| !c.validated) {
+            w(&domain_constraint_sql(c))?;
         }
         for (rel, definition) in &catalog.triggers {
             if table_oids.contains(rel) || views.iter().any(|v| v.oid == *rel) {
@@ -1172,6 +1292,31 @@ fn grant_sql(g: &Grant, on: &str, name: &str) -> String {
     )
 }
 
+/// `CREATE VIEW`, with the options it was made with (security_invoker left
+/// out would make the restored view bypass the caller's row-level security).
+fn create_view(v: &Relation, definition: &str) -> String {
+    let options = match &v.view_options {
+        Some(o) => format!(" WITH ({o})"),
+        None => String::new(),
+    };
+    let check = match &v.check_option {
+        Some(c) => format!("\n  WITH {c} CHECK OPTION"),
+        None => String::new(),
+    };
+    format!(
+        "CREATE VIEW {}{options} AS\n{definition}{check};\n",
+        v.qname
+    )
+}
+
+fn domain_constraint_sql(c: &DomainConstraint) -> String {
+    // The definition ends in NOT VALID when the constraint isn't validated
+    format!(
+        "ALTER DOMAIN {} ADD CONSTRAINT {} {};\n",
+        c.domain, c.name, c.definition
+    )
+}
+
 fn write_function(
     w: &mut impl FnMut(&str) -> AppResult<()>,
     f: &Function,
@@ -1253,9 +1398,26 @@ fn create_table<'a>(
                 if let Some(coll) = &c.collation {
                     def.push_str(&format!(" COLLATE {coll}"));
                 }
+                // The sequence's own name and settings, so setval finds it under that name
+                let identity = || {
+                    catalog
+                        .sequences
+                        .iter()
+                        .find(|s| {
+                            s.identity_of
+                                .as_ref()
+                                .is_some_and(|(rel, col)| *rel == c.rel && *col == c.name)
+                        })
+                        .map(|s| format!(" ({})", s.identity_options))
+                        .unwrap_or_default()
+                };
                 match (c.identity.as_str(), c.generated.as_str(), &c.default) {
-                    ("a", _, _) => def.push_str(" GENERATED ALWAYS AS IDENTITY"),
-                    ("d", _, _) => def.push_str(" GENERATED BY DEFAULT AS IDENTITY"),
+                    ("a", _, _) => {
+                        def.push_str(&format!(" GENERATED ALWAYS AS IDENTITY{}", identity()))
+                    }
+                    ("d", _, _) => {
+                        def.push_str(&format!(" GENERATED BY DEFAULT AS IDENTITY{}", identity()))
+                    }
                     (_, "s", Some(expr)) => {
                         def.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"))
                     }
@@ -1270,7 +1432,7 @@ fn create_table<'a>(
             .collect();
         parts.extend(
             constraints
-                .filter(|c| c.kind == "c" && c.local)
+                .filter(|c| c.kind == "c" && c.local && c.validated)
                 .map(|c| format!("    CONSTRAINT {} {}", c.name, c.definition)),
         );
         sql.push_str(&format!(
@@ -1346,7 +1508,9 @@ async fn insert_rows(
 type CopySink = Pin<Box<CopyInSink<Cursor<Vec<u8>>>>>;
 
 pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> AppResult<()> {
-    let mut session = connect(server, job.database.trim()).await?;
+    let mut current = job.database.trim().to_string();
+    let mut session = connect(server, &current).await?;
+    let mut encoding = ScriptEncoding::Utf8;
     let single = job.single_transaction;
     let stop = job.stop_on_error || single;
     if single {
@@ -1383,7 +1547,13 @@ pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> App
                     if statements.is_multiple_of(200) {
                         report.check()?;
                     }
-                    let sql = String::from_utf8_lossy(&sql);
+                    let sql = encoding.decode(&sql);
+                    // The session stays UTF-8, which the driver needs; the
+                    // script's text is converted from what it declares instead
+                    if let Some(name) = set_client_encoding(&sql) {
+                        encoding = ScriptEncoding::named(&name)?;
+                        continue;
+                    }
                     if let Err(e) = session.client().batch_execute(&sql).await {
                         fail(report, &sql, describe_error(&e))?;
                     }
@@ -1400,7 +1570,10 @@ pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> App
                     // A COPY that failed has the rest of its data skipped
                     let mut failed = None;
                     if let Some((sink, sql, buf)) = &mut copy {
-                        buf.extend_from_slice(&data);
+                        match encoding {
+                            ScriptEncoding::Utf8 => buf.extend_from_slice(&data),
+                            _ => buf.extend_from_slice(encoding.decode(&data).as_bytes()),
+                        }
                         if buf.len() >= 1 << 20 {
                             let chunk = std::mem::take(buf);
                             if let Err(e) = sink.send(Cursor::new(chunk)).await {
@@ -1428,13 +1601,12 @@ pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> App
                     }
                 }
                 Item::Meta(command) => {
-                    let mut words = command.split_whitespace();
-                    match words.next().unwrap_or_default() {
+                    let (name, args) = command
+                        .split_once(char::is_whitespace)
+                        .unwrap_or((command.as_str(), ""));
+                    match name {
                         "\\connect" | "\\c" => {
-                            let target = words
-                                .find(|w| !w.starts_with('-'))
-                                .map(|w| w.trim_matches('"').replace("\"\"", "\""))
-                                .unwrap_or_default();
+                            let target = connect_target(args).unwrap_or_else(|| current.clone());
                             if single {
                                 return Err(AppError::msg(
                                     "The script switches databases, which can't happen inside one transaction",
@@ -1442,9 +1614,15 @@ pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> App
                             }
                             report.line(format!("connecting to {target}"));
                             session = connect(server, &target).await?;
+                            current = target;
+                        }
+                        "\\encoding" => {
+                            if let Some(name) = meta_args(args).first() {
+                                encoding = ScriptEncoding::named(name)?;
+                            }
                         }
                         // pg_dump 17.6+ fences scripts with \restrict; nothing to do here
-                        "\\restrict" | "\\unrestrict" | "\\set" | "\\encoding" => {}
+                        "\\restrict" | "\\unrestrict" | "\\set" => {}
                         other => report.line(format!("skipping psql command {other}")),
                     }
                 }
@@ -1466,9 +1644,300 @@ pub async fn restore(server: &Server, job: &PsqlJob, report: &Report<'_>) -> App
     Ok(())
 }
 
+/// A psql meta-command's arguments the way psql reads them: `'...'`
+/// (backslash escapes, `''` for a quote) and `"..."` (`""` for a quote)
+/// stretches join the text around them and lose their quotes.
+fn meta_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return args;
+        }
+        let mut word = String::new();
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+            match c {
+                '\'' => loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\'') if chars.next_if_eq(&'\'').is_some() => word.push('\''),
+                        Some('\'') => break,
+                        Some('\\') => match chars.next() {
+                            Some('n') => word.push('\n'),
+                            Some('t') => word.push('\t'),
+                            Some(e) => word.push(e),
+                            None => break,
+                        },
+                        Some(c) => word.push(c),
+                    }
+                },
+                '"' => loop {
+                    match chars.next() {
+                        None => break,
+                        Some('"') if chars.next_if_eq(&'"').is_some() => word.push('"'),
+                        Some('"') => break,
+                        Some(c) => word.push(c),
+                    }
+                },
+                c => word.push(c),
+            }
+        }
+        args.push(word);
+    }
+}
+
+/// The database `\connect <args>` names; None keeps the current one (no
+/// name, `-`, or a connection string without a dbname). Options such as
+/// pg_dump's `-reuse-previous=on` are skipped, and a connection string
+/// (`dbname='my-app'` or a postgresql:// URI) gives its dbname.
+fn connect_target(args: &str) -> Option<String> {
+    let target = meta_args(args)
+        .into_iter()
+        .find(|a| !(a.starts_with('-') && a.len() > 1))?;
+    let name = if let Some(rest) = target
+        .strip_prefix("postgresql://")
+        .or_else(|| target.strip_prefix("postgres://"))
+    {
+        let path = rest.split_once('/')?.1;
+        percent_decode(path.split(['?', '#']).next().unwrap_or_default())
+    } else if target.contains('=') {
+        conninfo_value(&target, "dbname")?
+    } else if target == "-" {
+        return None;
+    } else {
+        target
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// A keyword's value in a libpq `key=value` connection string, where values
+/// may be single-quoted with backslash escapes.
+fn conninfo_value(conninfo: &str, key: &str) -> Option<String> {
+    let mut chars = conninfo.chars().peekable();
+    let mut found = None;
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return found;
+        }
+        let mut k = String::new();
+        while let Some(c) = chars.next_if(|c| *c != '=' && !c.is_whitespace()) {
+            k.push(c);
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        chars.next_if_eq(&'=')?;
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if chars.next_if_eq(&'\'').is_some() {
+            loop {
+                match chars.next()? {
+                    '\'' => break,
+                    '\\' => value.push(chars.next()?),
+                    c => value.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                value.push(if c == '\\' { chars.next()? } else { c });
+            }
+        }
+        if k == key {
+            found = Some(value);
+        }
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The encoding a script's text is in, from its `SET client_encoding`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScriptEncoding {
+    /// Also SQL_ASCII, whose bytes pass through as they are
+    Utf8,
+    /// Byte for byte; encoding_rs reads "latin1" as windows-1252
+    Latin1,
+    Other(&'static encoding_rs::Encoding),
+}
+
+impl ScriptEncoding {
+    fn named(name: &str) -> AppResult<Self> {
+        let key: String = name
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        let label = match key.as_str() {
+            "UTF8" | "UNICODE" | "SQLASCII" | "DEFAULT" => return Ok(Self::Utf8),
+            "LATIN1" | "ISO88591" => return Ok(Self::Latin1),
+            "LATIN2" | "ISO88592" => "iso-8859-2",
+            "LATIN3" | "ISO88593" => "iso-8859-3",
+            "LATIN4" | "ISO88594" => "iso-8859-4",
+            "LATIN5" | "ISO88599" => "iso-8859-9",
+            "LATIN6" | "ISO885910" => "iso-8859-10",
+            "LATIN7" | "ISO885913" => "iso-8859-13",
+            "LATIN8" | "ISO885914" => "iso-8859-14",
+            "LATIN9" | "ISO885915" => "iso-8859-15",
+            "LATIN10" | "ISO885916" => "iso-8859-16",
+            "ISO88595" => "iso-8859-5",
+            "ISO88596" => "iso-8859-6",
+            "ISO88597" => "iso-8859-7",
+            "ISO88598" => "iso-8859-8",
+            "WIN866" | "ALT" => "ibm866",
+            "WIN874" => "windows-874",
+            "WIN1250" => "windows-1250",
+            "WIN1251" | "WIN" => "windows-1251",
+            "WIN1252" => "windows-1252",
+            "WIN1253" => "windows-1253",
+            "WIN1254" => "windows-1254",
+            "WIN1255" => "windows-1255",
+            "WIN1256" => "windows-1256",
+            "WIN1257" => "windows-1257",
+            "WIN1258" => "windows-1258",
+            "KOI8" | "KOI8R" => "koi8-r",
+            "KOI8U" => "koi8-u",
+            "EUCJP" => "euc-jp",
+            "EUCKR" | "UHC" => "euc-kr",
+            "EUCCN" | "GBK" | "WIN936" => "gbk",
+            "GB18030" => "gb18030",
+            "SJIS" | "SHIFTJIS" | "MSKANJI" | "WIN932" => "shift_jis",
+            "BIG5" | "WIN950" => "big5",
+            _ => "",
+        };
+        encoding_rs::Encoding::for_label(label.as_bytes())
+            .map(Self::Other)
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "The script is in the {name} encoding, which the built-in engine can't read; restore it with psql"
+                ))
+            })
+    }
+
+    fn decode(self, bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes),
+            Self::Latin1 => bytes.iter().map(|&b| b as char).collect::<String>().into(),
+            Self::Other(e) => e.decode_without_bom_handling(bytes).0,
+        }
+    }
+}
+
+/// The encoding named by `SET client_encoding = 'X'` (also `TO`, `SET NAMES`,
+/// and `RESET client_encoding`, which mean the default).
+fn set_client_encoding(sql: &str) -> Option<String> {
+    let text = sql.trim().trim_end_matches(';').replace('=', " = ");
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let lower: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+    let value = match lower.as_slice() {
+        ["reset", "client_encoding"] => return Some("DEFAULT".into()),
+        ["set", "names", _] => words[2],
+        ["set", "session", "client_encoding", "=" | "to", _] => words[4],
+        ["set", "client_encoding", "=" | "to", _] => words[3],
+        _ => return None,
+    };
+    Some(value.trim_matches(['\'', '"']).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_connect_arguments_like_psql() {
+        // pg_dump --create
+        assert_eq!(
+            connect_target("-reuse-previous=on \"dbname='my-app'\""),
+            Some("my-app".into())
+        );
+        assert_eq!(
+            connect_target("-reuse-previous=on \"dbname='it\\'s'\""),
+            Some("it's".into())
+        );
+        // This engine's own dumps quote the name as an identifier
+        assert_eq!(connect_target("\"my db\""), Some("my db".into()));
+        assert_eq!(connect_target("\"a\"\"b\""), Some("a\"b".into()));
+        assert_eq!(connect_target("shop"), Some("shop".into()));
+        assert_eq!(connect_target("'it''s'"), Some("it's".into()));
+        assert_eq!(
+            connect_target("postgresql://u@h:5432/my%20db?sslmode=require"),
+            Some("my db".into())
+        );
+        assert_eq!(
+            connect_target("\"host=h port=1 dbname = x\""),
+            Some("x".into())
+        );
+        assert_eq!(connect_target("host=h"), None);
+        assert_eq!(connect_target("-"), None);
+        assert_eq!(connect_target(""), None);
+    }
+
+    #[test]
+    fn script_encodings() {
+        assert_eq!(
+            set_client_encoding("SET client_encoding = 'LATIN1';"),
+            Some("LATIN1".into())
+        );
+        assert_eq!(
+            set_client_encoding("set client_encoding to \"WIN1252\""),
+            Some("WIN1252".into())
+        );
+        assert_eq!(set_client_encoding("SET NAMES 'UTF8'"), Some("UTF8".into()));
+        assert_eq!(
+            set_client_encoding("SET standard_conforming_strings = on"),
+            None
+        );
+        let latin1 = ScriptEncoding::named("LATIN1").unwrap();
+        assert_eq!(latin1.decode(b"caf\xe9 \x80"), "café \u{80}");
+        let win1251 = ScriptEncoding::named("WIN1251").unwrap();
+        assert_eq!(win1251.decode(b"\xcf\xf0\xe8"), "При");
+        assert_eq!(ScriptEncoding::named("utf8").unwrap(), ScriptEncoding::Utf8);
+        assert!(ScriptEncoding::named("MULE_INTERNAL").is_err());
+    }
+
+    #[test]
+    fn view_options_and_check_option() {
+        let v = Relation {
+            oid: 1,
+            schema: "s".into(),
+            name: "v".into(),
+            qname: "s.v".into(),
+            kind: "v".into(),
+            unlogged: false,
+            owner: "o".into(),
+            partition_bound: None,
+            partition_key: None,
+            comment: None,
+            rls: false,
+            force_rls: false,
+            definition: None,
+            populated: true,
+            view_options: Some("security_invoker=true".into()),
+            check_option: Some("LOCAL".into()),
+        };
+        assert_eq!(
+            create_view(&v, " SELECT 1 AS a"),
+            "CREATE VIEW s.v WITH (security_invoker=true) AS\n SELECT 1 AS a\n  WITH LOCAL CHECK OPTION;\n"
+        );
+    }
 
     #[test]
     fn dependencies_come_first() {

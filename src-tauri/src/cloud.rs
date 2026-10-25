@@ -271,9 +271,59 @@ fn workdir(key: &str) -> AppResult<PathBuf> {
     {
         return Err(AppError::msg("Invalid working directory key"));
     }
-    let dir = std::env::temp_dir().join("dbms-tool-cloud").join(key);
-    std::fs::create_dir_all(&dir)?;
+    let base = match WORKDIR_BASE.get() {
+        Some(base) => base.clone(),
+        None => std::env::temp_dir().join("dbms-tool-cloud"),
+    };
+    private_dir(&base)?;
+    let dir = base.join(key);
+    private_dir(&dir)?;
     Ok(dir)
+}
+
+/// Where `workdir` folders go: the app's cache folder, set at startup. Not a
+/// shared temp folder, where on Linux another user could create the folder
+/// first and see or change what the CLIs store in it (`railway link` state).
+static WORKDIR_BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_workdir_base(dir: PathBuf) {
+    let _ = WORKDIR_BASE.set(dir);
+}
+
+/// Creates `dir` (and its parents) if needed; on Unix the folder itself is
+/// readable by this user only, and one someone else made, or a link, is refused.
+fn private_dir(dir: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let meta = std::fs::symlink_metadata(dir)?;
+        // The home folder's owner stands in for this user, without libc
+        let me = std::env::home_dir().and_then(|h| std::fs::metadata(h).ok());
+        if !meta.is_dir() || me.is_some_and(|m| m.uid() != meta.uid()) {
+            return Err(AppError::msg(format!(
+                "{} belongs to someone else; remove it and try again",
+                dir.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // The temp and app folders are already the user's own
+        std::fs::create_dir_all(dir)?;
+        Ok(())
+    }
 }
 
 /// Runs the provider's CLI and returns its standard output.

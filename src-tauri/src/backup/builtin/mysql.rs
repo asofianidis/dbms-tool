@@ -298,12 +298,22 @@ pub async fn dump(server: &Server, job: &MysqlDumpJob, report: &Report<'_>) -> A
             .await?;
         for name in events {
             let sql = format!("SHOW CREATE EVENT {}.{}", ident(db), ident(&name));
-            match show_create(conn, sql, 3).await? {
-                Some((mode, create)) => {
+            // STARTS and ENDS are times in the event's own time zone (column 2)
+            let row: Option<mysql_async::Row> = conn.query_first(sql).await?;
+            let event = row.and_then(|r| {
+                let create = r.get::<Option<String>, _>(3).flatten()?;
+                let mode = r.get::<Option<String>, _>(1).flatten().unwrap_or_default();
+                let zone = r.get::<Option<String>, _>(2).flatten();
+                Some((mode, zone.unwrap_or_else(|| "SYSTEM".into()), create))
+            });
+            match event {
+                Some((mode, zone, create)) => {
                     out.write_all(
                         format!("/*!50106 DROP EVENT IF EXISTS {} */;\n", ident(&name)).as_bytes(),
                     )?;
+                    out.write_all(time_zone_block(&zone).as_bytes())?;
                     write_block(&mut out, &mode, &create)?;
+                    out.write_all(b"/*!50106 SET time_zone = @saved_time_zone */;\n\n")?;
                 }
                 _ => report.error(format!("Can't read event {name}; it's left out")),
             }
@@ -366,7 +376,7 @@ pub async fn dump(server: &Server, job: &MysqlDumpJob, report: &Report<'_>) -> A
     Ok(())
 }
 
-/// The sql_mode and statement from `SHOW CREATE TRIGGER / PROCEDURE / EVENT`,
+/// The sql_mode and statement from `SHOW CREATE TRIGGER / PROCEDURE`,
 /// whose column counts vary by kind and server; None when it's hidden from us.
 async fn show_create(
     conn: &mut Conn,
@@ -380,6 +390,16 @@ async fn show_create(
     let mode: Option<String> = row.get::<Option<String>, _>(1).flatten();
     let create: Option<String> = row.get::<Option<String>, _>(column).flatten();
     Ok(create.map(|c| (mode.unwrap_or_default(), c)))
+}
+
+/// Sets an event's time zone for its CREATE EVENT, as mysqldump does; the
+/// caller puts the saved one back after it.
+fn time_zone_block(zone: &str) -> String {
+    format!(
+        "/*!50106 SET @saved_time_zone = @@time_zone */;\n\
+         /*!50106 SET time_zone = '{}' */;\n",
+        zone.replace('\\', "\\\\").replace('\'', "''")
+    )
 }
 
 /// A routine, trigger or event under its own sql_mode, between DELIMITER lines.
@@ -573,5 +593,15 @@ mod tests {
     fn views_follow_the_views_they_use() {
         let deps = HashMap::from([("a", vec!["b"]), ("b", vec!["c"])]);
         assert_eq!(order_views(&["a", "b", "c"], &deps), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn events_keep_their_time_zone() {
+        assert_eq!(
+            time_zone_block("Europe/Athens"),
+            "/*!50106 SET @saved_time_zone = @@time_zone */;\n\
+             /*!50106 SET time_zone = 'Europe/Athens' */;\n"
+        );
+        assert!(time_zone_block("a'b").contains("'a''b'"));
     }
 }

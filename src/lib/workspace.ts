@@ -315,12 +315,18 @@ const pending = new Map<string, Promise<boolean>>()
 export async function confirmSshHostKey(e: unknown): Promise<boolean> {
   if (!isAppError(e, 'host_key_unknown') || !e.hostKey) return false
   const key = e.hostKey
+  const check = `Trust it only if this fingerprint matches the one the server's administrator gave you (ssh-keygen -lf on the server's host key).`
   const ok = await confirm({
-    title: 'Trust this SSH server?',
-    message: `This is the first connection to ${key.host}, so its identity can't be checked yet. Trust it only if this fingerprint matches the one the server's administrator gave you (ssh-keygen -lf on the server's host key).`,
+    title: key.otherKeyTypesKnown
+      ? 'This SSH server offered a different key type'
+      : 'Trust this SSH server?',
+    message: key.otherKeyTypesKnown
+      ? `Warning: known_hosts already has a key of another type for ${key.host}, but the server now offers a ${key.keyType} key that isn't recorded. Its keys may have been replaced, or someone may be impersonating it. ${check}`
+      : `This is the first connection to ${key.host}, so its identity can't be checked yet. ${check}`,
     code: `${key.keyType} key fingerprint
 ${key.fingerprint}`,
-    confirmLabel: 'Trust and connect'
+    confirmLabel: 'Trust and connect',
+    danger: key.otherKeyTypesKnown
   })
   if (!ok) return false
   await api.sshTrustHostKey(key.token)
