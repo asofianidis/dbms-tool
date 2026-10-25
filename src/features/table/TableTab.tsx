@@ -31,6 +31,7 @@ import {
 } from '@/lib/api'
 import { modifyScript } from '@/lib/routines'
 import { cn } from '@/lib/cn'
+import { browseColumns, isInvisible, tableColumnTypes } from '@/lib/column-types'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { copyText, EXPORT_MAX_ROWS, type FetchedRows } from '@/lib/export'
 import {
@@ -208,8 +209,13 @@ function DataView({
   const [exporting, setExporting] = useState(false)
 
   const set = output?.results[0]
-  const columns: ColumnMeta[] = set?.columns ?? []
+  const columns: ColumnMeta[] = useMemo(
+    () => tableColumnTypes(set?.columns ?? [], info.data),
+    [set, info.data]
+  )
   const pk = info.data?.primaryKey ?? []
+  // SELECT * leaves invisible columns out, so name them all
+  const listed = browseColumns(info.data)
   const canEdit = !readOnly && pk.length > 0 && !!info.data
   const appliedWhere = useMemo(
     () =>
@@ -251,7 +257,8 @@ function DataView({
         orderBy,
         limit: pageSize + 1,
         offset: page * pageSize,
-        keyColumns: pk
+        keyColumns: pk,
+        columns: listed
       })
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
         maxRows: pageSize + 1
@@ -275,7 +282,8 @@ function DataView({
     appliedOrder,
     page,
     pageSize,
-    pk.join(',')
+    pk.join(','),
+    listed?.join(',')
   ])
 
   useEffect(() => {
@@ -408,7 +416,8 @@ function DataView({
         where: appliedWhere,
         orderBy,
         limit: EXPORT_MAX_ROWS + 1,
-        keyColumns: pk
+        keyColumns: pk,
+        columns: listed
       })
       const out = await api.execute(tab.connectionId, session, tab.database, sql, {
         maxRows: EXPORT_MAX_ROWS,
@@ -701,6 +710,11 @@ function StructureView({
                     {c.isGenerated && (
                       <Badge className="ml-2" tone="info">
                         generated
+                      </Badge>
+                    )}
+                    {isInvisible(c.extra) && (
+                      <Badge className="ml-2" title="SELECT * leaves it out">
+                        invisible
                       </Badge>
                     )}
                   </td>

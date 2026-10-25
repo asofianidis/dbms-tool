@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { columnFeatures, serverTypes, type ColumnFeatures } from '@/lib/column-types'
 import {
   checkChange,
   checkName,
@@ -53,6 +54,7 @@ import {
 } from '@/lib/ddl'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
+import { connectedInfo } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
 import { createStore } from '@/lib/store'
 import { loadTableExtras } from '@/lib/table-extras'
@@ -62,10 +64,12 @@ import {
   newQueryTab,
   openTable,
   refreshConnection,
+  statusStore,
   tabsStore,
   updateTab
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
+import { ColumnAttributes, hasColumnAttributes } from './ColumnAttributes'
 import {
   Badge,
   Button,
@@ -249,6 +253,8 @@ function DesignerForm({
   const [error, setError] = useState<string | null>(null)
   const creating = !draft.original
 
+  const info = connectedInfo(statusStore.use()[connectionId])
+  const features = useMemo(() => columnFeatures(dialect, info), [dialect, info])
   const babelfish = connection?.engine === 'babelfish'
   const d1 = sqlite && connection?.cloud?.provider === 'cloudflare'
   const options = useMemo(() => ({ babelfish, d1 }), [babelfish, d1])
@@ -431,9 +437,20 @@ function DesignerForm({
         )}
         <div className="min-h-[22rem]">
           {view === 'columns' ? (
-            <ColumnsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+            <ColumnsEditor
+              dialect={dialect}
+              draft={draft}
+              setDraft={setDraft}
+              types={serverTypes(dialect, TYPES[dialect], info)}
+              features={features}
+            />
           ) : view === 'indexes' ? (
-            <IndexesEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+            <IndexesEditor
+              dialect={dialect}
+              draft={draft}
+              setDraft={setDraft}
+              vector={features.vectorIndex}
+            />
           ) : view === 'foreignKeys' ? (
             <ForeignKeysEditor
               connectionId={connectionId}
@@ -464,11 +481,16 @@ const checkbox = 'size-3.5 accent-accent disabled:opacity-40'
 function ColumnsEditor({
   dialect,
   draft,
-  setDraft
+  setDraft,
+  types,
+  features
 }: {
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
+  /** Type suggestions for the connected server */
+  types: string[]
+  features: ColumnFeatures
 }): React.JSX.Element {
   const creating = !draft.original
   // SQL Server keeps comments as extended properties; SQLite has none
@@ -523,18 +545,23 @@ function ColumnsEditor({
     })
   const add = (): void => setDraft((d) => ({ ...d, columns: [...d.columns, newColumn(dialect)] }))
 
+  // INVISIBLE / COMPRESSED toggles, on servers that have them or columns that use them
+  const attributes =
+    hasColumnAttributes(features) || draft.columns.some((c) => c.invisible || c.compressed)
   const grid = cn(
     'grid items-center gap-x-2',
-    comments
-      ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
-      : 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1.4fr)_3.75rem]'
+    attributes
+      ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
+      : comments
+        ? 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1fr)_minmax(0,1fr)_3.75rem]'
+        : 'grid-cols-[1.25rem_minmax(0,1.2fr)_minmax(0,1.1fr)_2rem_3.5rem_3.5rem_minmax(0,1.4fr)_3.75rem]'
   )
   const identityLabel = dialect === 'mysql' || dialect === 'sqlite' ? 'Auto inc.' : 'Identity'
 
   return (
     <div>
       <datalist id={`ddl-types-${dialect}`}>
-        {TYPES[dialect].map((t) => (
+        {types.map((t) => (
           <option key={t} value={t} />
         ))}
       </datalist>
@@ -547,6 +574,11 @@ function ColumnsEditor({
         </span>
         <span className="text-center">Not null</span>
         <span className="text-center">{identityLabel}</span>
+        {attributes && (
+          <span className="text-center" title="Invisible, compressed">
+            Options
+          </span>
+        )}
         <span>Default</span>
         {comments && <span>Comment</span>}
         <span />
@@ -638,6 +670,14 @@ function ColumnsEditor({
                   />
                 )}
               </span>
+              {attributes && (
+                <ColumnAttributes
+                  column={c}
+                  features={features}
+                  disabled={locked}
+                  onChange={(change) => patch(c.id, change)}
+                />
+              )}
               <Input
                 mono
                 className={cellInput}
@@ -886,11 +926,14 @@ const columnLabels = (draft: TableDraft, ids: string[]): string =>
 function IndexesEditor({
   dialect,
   draft,
-  setDraft
+  setDraft,
+  vector
 }: {
   dialect: Dialect
   draft: TableDraft
   setDraft: SetDraft
+  /** MariaDB 11.7+ VECTOR indexes */
+  vector: boolean
 }): React.JSX.Element {
   const [editing, toggleEditing] = useEditing()
   const patch = (id: string, change: Partial<IndexDraft>): void =>
@@ -900,7 +943,7 @@ function IndexesEditor({
     }))
   const existing = draft.indexes.filter((ix) => ix.original)
   const added = draft.indexes.filter((ix) => !ix.original)
-  const methods = indexMethods(dialect)
+  const methods = [...indexMethods(dialect), ...(vector ? ['VECTOR'] : [])]
   const features = indexFeatures(dialect)
 
   const form = (ix: IndexDraft): React.JSX.Element => (
@@ -936,8 +979,8 @@ function IndexesEditor({
             type="checkbox"
             className={checkbox}
             checked={ix.unique}
-            // MySQL full-text and spatial indexes can't be unique
-            disabled={ix.method === 'FULLTEXT' || ix.method === 'SPATIAL'}
+            // MySQL full-text, spatial and vector indexes can't be unique
+            disabled={ix.method === 'FULLTEXT' || ix.method === 'SPATIAL' || ix.method === 'VECTOR'}
             onChange={(e) => patch(ix.id, { unique: e.target.checked })}
           />
           Unique
