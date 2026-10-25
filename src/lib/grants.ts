@@ -688,9 +688,9 @@ function changes(
   )
 }
 
-/** A MySQL database name as a grant pattern, with the _ and % wildcards escaped. */
+/** A MySQL database name as a grant pattern, with `\` and the _ and % wildcards escaped. */
 export function mysqlDatabasePattern(name: string): string {
-  return name.replace(/[_%]/g, '\\$&')
+  return name.replace(/[\\_%]/g, '\\$&')
 }
 
 /** The ON clause target; null for SQL Server database permissions, which have none. */

@@ -345,6 +345,13 @@ describe('MySQL database grant patterns', () => {
     ])
   })
 
+  it('escapes a backslash so it is not read as an escape', () => {
+    const odd: Securable = { ...db, name: 'a\\b_c' }
+    expect(grantStatements('mysql', app, odd, state({}), state({ SELECT: 'grant' }))).toEqual([
+      "GRANT SELECT ON `a\\\\b\\_c`.* TO 'app'@'%'"
+    ])
+  })
+
   it('reads both forms and revokes a grant as the server stores it', () => {
     expect(grantQuery('mysql', app, db)).toContain("TABLE_SCHEMA IN ('my\\\\_db', 'my_db')")
     const legacy = parseGrantRows('mysql', db, [
