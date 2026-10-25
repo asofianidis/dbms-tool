@@ -138,6 +138,16 @@ import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 import { routineSignature } from '@/lib/pg-objects'
 import { PgDatabaseFolders } from './PgObjects'
+import { Inbox, Send } from 'lucide-react'
+import { logicalQueries, type Publication, type Subscription } from '@/lib/pg-logical'
+import {
+  openPublicationDetails,
+  openSubscriptionDetails,
+  publicationMenuItems,
+  publicationTooltip,
+  subscriptionMenuItems,
+  subscriptionTooltip
+} from './logical-replication'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -847,6 +857,8 @@ function DatabaseNode({
             <SchemaList connection={connection} database={database} depth={depth + 1} />
             <ExtensionsFolder connection={connection} database={database} depth={depth + 1} />
             <PgDatabaseFolders connection={connection} database={database} depth={depth + 1} />
+            <PublicationsFolder connection={connection} database={database} depth={depth + 1} />
+            <SubscriptionsFolder connection={connection} database={database} depth={depth + 1} />
           </>
         ) : (
           <>
@@ -1990,6 +2002,89 @@ function ExtensionsFolder({
                 `DROP EXTENSION ${quoteIdent('postgres', x.name)};`
               ),
               copyName(x.name)
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/** PostgreSQL logical replication publications of the database. */
+function PublicationsFolder({
+  connection,
+  database,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  depth: number
+}): React.JSX.Element {
+  const id = `c:${connection.id}/d:${database}/publications`
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label="Publications"
+      options={logicalQueries.publications(connection.id, database)}
+      itemKey={(p: Publication) => p.name}
+      searchText={(p) => [p.name]}
+      render={(p) => (
+        <Row
+          id={`${id}/${p.name}`}
+          depth={depth + 1}
+          icon={<Send className="text-syn-fn" />}
+          label={p.name}
+          detail={p.allTables ? 'all tables' : `${p.tableCount ?? 0} tables`}
+          title={publicationTooltip(p)}
+          onOpen={() => openPublicationDetails(connection.id, database, p)}
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: p.name },
+              ...publicationMenuItems(connection.id, database, p)
+            ])
+          }
+        />
+      )}
+    />
+  )
+}
+
+/** PostgreSQL logical replication subscriptions of the database. */
+function SubscriptionsFolder({
+  connection,
+  database,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  depth: number
+}): React.JSX.Element {
+  const id = `c:${connection.id}/d:${database}/subscriptions`
+  return (
+    <CatalogFolder
+      id={id}
+      depth={depth}
+      label="Subscriptions"
+      options={logicalQueries.subscriptions(connection.id, database)}
+      itemKey={(s: Subscription) => s.name}
+      searchText={(s) => [s.name, ...s.publications]}
+      render={(s) => (
+        <Row
+          id={`${id}/${s.name}`}
+          depth={depth + 1}
+          muted={!s.enabled}
+          icon={<Inbox className="text-syn-fn" />}
+          label={s.name}
+          detail={[s.enabled ? null : 'disabled', s.publications.join(', ')]
+            .filter(Boolean)
+            .join(' · ')}
+          title={subscriptionTooltip(s)}
+          onOpen={() => openSubscriptionDetails(connection.id, database, s)}
+          onMenu={(e) =>
+            showContextMenu(e, [
+              { heading: s.name },
+              ...subscriptionMenuItems(connection.id, database, s)
             ])
           }
         />

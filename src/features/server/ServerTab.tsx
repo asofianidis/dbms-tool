@@ -38,6 +38,7 @@ import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/com
 import { ClusterPanel } from '../mongo/ClusterPanel'
 import { AuroraPanel, useAurora } from './AuroraPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
+import { PgReplicationPanel, usePgReplication } from './PgReplicationPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
 import {
@@ -161,6 +162,11 @@ function ServerDashboard({
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
+  const replication = usePgReplication(
+    connection,
+    connection.engine === 'postgres' && !babelfish,
+    active && visible ? refresh : 0
+  )
   const aurora = useAurora(
     connection,
     connection.engine === 'postgres' && !babelfish,
@@ -329,6 +335,8 @@ function ServerDashboard({
         />
 
         <GaleraPanel galera={galera} />
+
+        <PgReplicationPanel connection={connection} replication={replication} />
 
         <AuroraPanel aurora={aurora} />
 
