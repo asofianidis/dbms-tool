@@ -119,12 +119,15 @@ import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPolicyDesigner } from '../table/PolicyDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
+import { RlsBadge, hasRls, policyMenuItems, rlsActionItems, useRlsFlags } from './rls-actions'
+import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -1387,6 +1390,7 @@ function ObjectNode({
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>
               )}
+            <RlsBadge connection={connection} database={database} obj={obj} />
           </>
         }
         detail={
@@ -1636,6 +1640,9 @@ function TableChildren({
         (connection.engine === 'postgres' || connection.engine === 'mysql') && (
           <PartitionsFolder connection={connection} database={database} obj={obj} depth={depth} />
         )}
+      {hasRls(connection, obj.kind) && (
+        <PoliciesFolder connection={connection} database={database} obj={obj} depth={depth} />
+      )}
     </>
   )
 }
@@ -2193,6 +2200,66 @@ function PartitionsFolder({
           }
         />
       )}
+    </>
+  )
+}
+
+/** A PostgreSQL table's row-level security policies; shown when it has some or RLS is on. */
+function PoliciesFolder({
+  connection,
+  database,
+  obj,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  obj: DbObject
+  depth: number
+}): React.JSX.Element | null {
+  const id = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}/policies`
+  const [open, setOpen] = useExpanded(id)
+  const flags = useRlsFlags(connection, database, obj)
+  const q = useQuery(rlsQueries.table(connection.id, database, obj.schema, obj.name))
+  if (!q.data || (!q.data.policies.length && !flags?.enabled && !flags?.forced)) return null
+  const table = { schema: obj.schema, name: obj.name }
+  const state = rlsLabel(q.data)
+  return (
+    <>
+      <Row
+        id={id}
+        depth={depth}
+        expandable
+        open={open}
+        onToggle={() => setOpen()}
+        muted
+        icon={<ShieldCheck className="text-faint" />}
+        label="Policies"
+        detail={`${q.data.policies.length}${state === 'on' ? '' : ` · RLS ${state}`}`}
+        onMenu={(e) => showContextMenu(e, rlsActionItems(connection.id, database, table, q.data))}
+      />
+      {open &&
+        q.data.policies.map((p) => (
+          <Row
+            key={p.name}
+            id={`${id}/${p.name}`}
+            depth={depth + 1}
+            icon={<ShieldCheck className={p.permissive ? 'text-syn-fn' : 'text-warn'} />}
+            label={p.name}
+            title={[
+              `${p.permissive ? 'PERMISSIVE' : 'RESTRICTIVE'} FOR ${p.command}`,
+              `TO ${p.roles.map((r) => (r === 'public' ? 'PUBLIC' : r)).join(', ')}`,
+              p.using && `USING (${p.using})`,
+              p.withCheck && `WITH CHECK (${p.withCheck})`
+            ]
+              .filter(Boolean)
+              .join('\n')}
+            detail={`${p.command.toLowerCase()}${p.permissive ? '' : ' restrictive'} · ${p.roles
+              .map((r) => (r === 'public' ? 'PUBLIC' : r))
+              .join(', ')}`}
+            onOpen={() => openPolicyDesigner(connection.id, database, obj.schema, obj.name, p.name)}
+            onMenu={(e) => showContextMenu(e, policyMenuItems(connection.id, database, table, p))}
+          />
+        ))}
     </>
   )
 }

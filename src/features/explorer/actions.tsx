@@ -63,6 +63,7 @@ import { runnableCreate, runnableModify } from './packages'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { versioningScriptItems } from './Versioning'
 import { eventMenuItems } from './events'
+import { rlsMenuItems } from './rls-actions'
 import { mariaDbSequenceItems } from './sequence-actions'
 
 export function tableRef(connectionId: string, database: string, obj: DbObject): TableRef {
@@ -219,6 +220,7 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
             }
           ]
         : []),
+      ...rlsMenuItems(connectionId, database, obj),
       {
         label: isView ? 'Definition' : 'DDL',
         icon: <ScrollText />,
