@@ -478,10 +478,11 @@ async fn mariadb_packages() {
     };
     let db = "mdb_packages";
     let opts = crate::model::ExecOptions::with_max_rows(100);
-    let exec = async |sql: &str| {
+    // `what` labels the assert: the SQL itself can hold DDL the server returned,
+    // which CodeQL treats as secret
+    let exec = async |what: &str, sql: &str| {
         let out = server.execute("t", db, sql, &opts).await.unwrap();
-        // Messages leave out what the server returns: CodeQL treats it as secret
-        assert!(out.error.is_none(), "{sql}");
+        assert!(out.error.is_none(), "{what}");
         out
     };
     let mut admin = match session(&server, "").await.unwrap() {
@@ -497,6 +498,7 @@ async fn mariadb_packages() {
         .unwrap();
     // Sent like the editor sends a script: one multi-statement batch, no DELIMITER
     exec(
+        "setup script",
         "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = 'ORACLE';\n\
          CREATE PACKAGE pkg_o AS\n  FUNCTION f1(a INT) RETURN INT;\n  PROCEDURE p1(a INT);\nEND;\n\
          CREATE PACKAGE BODY pkg_o AS\n  cnt INT := 0;\n  \
@@ -563,8 +565,12 @@ async fn mariadb_packages() {
         )
     };
     let modify = wrap(pkg_o.replace("CREATE DEFINER", "CREATE OR REPLACE DEFINER"));
-    exec(&modify).await;
-    let out = exec("SELECT pkg_o.f1(1), @@sql_mode LIKE '%ORACLE%'").await;
+    exec("package Modify script", &modify).await;
+    let out = exec(
+        "call pkg_o.f1",
+        "SELECT pkg_o.f1(1), @@sql_mode LIKE '%ORACLE%'",
+    )
+    .await;
     assert_eq!(out.results[0].rows[0][0], serde_json::json!("2"));
     assert_eq!(out.results[0].rows[0][1], serde_json::json!("0"));
 
@@ -574,11 +580,14 @@ async fn mariadb_packages() {
         .await
         .unwrap()
         .unwrap();
-    exec(&wrap(format!(
-        "DROP PROCEDURE IF EXISTS `{db}`.`ora_proc`;\n\n{proc}"
-    )))
+    exec(
+        "routine Modify script",
+        &wrap(format!(
+            "DROP PROCEDURE IF EXISTS `{db}`.`ora_proc`;\n\n{proc}"
+        )),
+    )
     .await;
-    exec("CALL ora_proc(1)").await;
+    exec("call ora_proc", "CALL ora_proc(1)").await;
 
     // Backup and restore: packages are dumped with their own sql_mode
     let routines = async |conn: &mut mysql_async::Conn| -> Vec<(String, String, String, String)> {
@@ -614,7 +623,7 @@ async fn mariadb_packages() {
         "DROP PACKAGE spec_only",
         "DROP PROCEDURE ora_proc",
     ] {
-        exec(drop).await;
+        exec(drop, drop).await;
     }
     let restored = run(
         &server,
