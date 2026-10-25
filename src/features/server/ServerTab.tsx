@@ -49,6 +49,7 @@ import {
 } from './PerformancePanels'
 import { ReplicationPanel } from './ReplicationPanel'
 import { SlowLogPanel } from './SlowLogPanel'
+import { PgSettingsPanel } from './PgSettingsPanel'
 import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
@@ -436,6 +437,10 @@ function ServerDashboard({
         />
 
         {connection.engine === 'mysql' && <SlowLogPanel connection={connection} />}
+
+        {connection.engine === 'postgres' && !babelfish && (
+          <PgSettingsPanel connection={connection} />
+        )}
       </div>
     </div>
   )
