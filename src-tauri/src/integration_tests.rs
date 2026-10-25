@@ -1118,10 +1118,11 @@ async fn mysql_events_end_to_end() {
             .await
             .unwrap()
             .unwrap_or_default();
-        assert!(ddl.starts_with("CREATE DEFINER="), "{var}: {ddl}");
+        // Messages name the server only: CodeQL treats what this connection reads as secret
+        assert!(ddl.starts_with("CREATE DEFINER="), "{var}");
         assert!(
             ddl.contains("EVENT `ev_every` ON SCHEDULE EVERY 1 HOUR"),
-            "{var}: {ddl}"
+            "{var}"
         );
 
         // Script as ALTER, then Disable, then the New event template (sent without DELIMITER)
