@@ -4,6 +4,7 @@
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
+//! DBMS_TEST_MARIADB_AUTH=localhost:3308:root:password   # disposable: loads plugins, creates users
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
@@ -212,6 +213,133 @@ async fn mariadb_end_to_end() {
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
     m.close(&c.id);
+}
+
+/// Signs in as `user`, on a connection config of its own.
+async fn sign_in(
+    c: &ConnectionConfig,
+    user: &str,
+    password: &str,
+) -> Result<ServerInfo, crate::error::AppError> {
+    let mut c = c.clone();
+    c.id = format!("{}-{user}", c.id);
+    c.user = user.into();
+    let m = Manager::default();
+    let result = m.open(c.clone(), Some(password.into())).await;
+    m.close(&c.id);
+    result
+}
+
+/// Runs root's SQL, failing the test on an error.
+async fn run_sql(m: &Manager, id: &str, sql: &str) -> ExecOutput {
+    let out = m
+        .get(id)
+        .unwrap()
+        .execute("tab1", "", sql, &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+    out
+}
+
+#[tokio::test]
+async fn mariadb_auth_plugins() {
+    // mysql_async can't answer ed25519 or parsec and panics trying; the connect has to fail
+    // with a message first
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB_AUTH") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let plugins = "SELECT PLUGIN_NAME FROM information_schema.PLUGINS \
+                   WHERE PLUGIN_TYPE = 'AUTHENTICATION' AND PLUGIN_STATUS = 'ACTIVE'";
+    let s = m.get(&c.id).unwrap();
+    for soname in ["auth_ed25519", "auth_parsec"] {
+        // Already loaded, or not shipped (parsec is 11.6+): either is fine
+        let _ = s
+            .execute("tab1", "", &format!("INSTALL SONAME '{soname}'"), &opts())
+            .await;
+    }
+    let out = run_sql(&m, &c.id, plugins).await;
+    let active: Vec<Value> = out.results[0].rows.iter().map(|r| r[0].clone()).collect();
+    assert!(active.contains(&json!("ed25519")), "{active:?}");
+
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let pw = "Auth_pw1";
+    let users = [
+        ("ed", format!("ed25519 USING PASSWORD('{pw}')")),
+        ("pa", format!("parsec USING PASSWORD('{pw}')")),
+        (
+            "na",
+            format!("mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+        (
+            "or",
+            format!("unix_socket OR mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+    ];
+    let mut created = vec![];
+    for (kind, via) in &users {
+        if *kind == "pa" && !active.contains(&json!("parsec")) {
+            continue;
+        }
+        let name = format!("dbms_auth_{kind}_{tag}");
+        run_sql(
+            &m,
+            &c.id,
+            &format!("CREATE USER '{name}'@'%' IDENTIFIED VIA {via}"),
+        )
+        .await;
+        created.push((*kind, name));
+    }
+
+    for (kind, name) in &created {
+        let result = sign_in(&c, name, pw).await;
+        match *kind {
+            "ed" | "pa" => {
+                let plugin = if *kind == "ed" { "ed25519" } else { "parsec" };
+                let message = result.expect_err("signed in").to_string();
+                assert!(
+                    message.contains(&format!("its {plugin} authentication plugin")),
+                    "{message}"
+                );
+            }
+            _ => {
+                result.unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+    // A wrong password is the server's plain refusal
+    let wrong = sign_in(&c, &created[0].1.replace("_ed_", "_na_"), "nope").await;
+    assert!(wrong.unwrap_err().to_string().contains("1045"));
+
+    for (_, name) in &created {
+        run_sql(&m, &c.id, &format!("DROP USER '{name}'@'%'")).await;
+    }
+    m.close(&c.id);
+}
+
+#[tokio::test]
+async fn mysql_caching_sha2_sign_in() {
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MYSQL") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let name = format!(
+        "mdb_auth_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    run_sql(
+        &m,
+        &c.id,
+        &format!("CREATE USER '{name}'@'%' IDENTIFIED WITH caching_sha2_password BY 'Auth_pw1'"),
+    )
+    .await;
+    let result = sign_in(&c, &name, "Auth_pw1").await;
+    run_sql(&m, &c.id, &format!("DROP USER '{name}'@'%'")).await;
+    m.close(&c.id);
+    assert!(result.expect("sign in").product.starts_with("MySQL"));
 }
 
 #[tokio::test]

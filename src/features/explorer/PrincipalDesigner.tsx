@@ -2,6 +2,13 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, FilePlus2, Save, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
+import {
+  AUTH_PLUGINS_QUERIES,
+  authPluginChoices,
+  parseAuthPluginRows,
+  takesPassword,
+  type AuthPluginChoice
+} from '@/lib/authPlugins'
 import { catalogQueries, catalogRows } from '@/lib/catalog'
 import { ddlScript, draftId } from '@/lib/ddl'
 import { ENGINES, type Dialect } from '@/lib/engines'
@@ -14,7 +21,7 @@ import {
   type GrantMap,
   type Principal
 } from '@/lib/grants'
-import { connectedInfo, isMariaDb } from '@/lib/mariadb'
+import { connectedInfo, isMariaDb, mariaDbAtLeast } from '@/lib/mariadb'
 import {
   TSQL_LOGINS_QUERY,
   canRenamePrincipal,
@@ -52,6 +59,7 @@ import {
   Spinner,
   Toggle
 } from '@/components/ui'
+import { AuthPluginFields } from './AuthPluginFields'
 import { Hint, Loading, MembershipList, roleCandidates } from './PermissionsDesigner'
 
 interface Request {
@@ -256,6 +264,26 @@ function PrincipalForm({
     ...queries.schemas(connectionId, database),
     enabled: dialect === 'tsql' && !isRole
   })
+  // Authentication plugins: MySQL, and MariaDB 10.4+ (mysql.global_priv, USING PASSWORD())
+  const info = connectedInfo(status)
+  const pickPlugin =
+    dialect === 'mysql' && !isRole && (!options.mariadb || mariaDbAtLeast(info, 10, 4))
+  const authPlugins = useQuery({
+    queryKey: ['conn', connectionId, 'authPlugins'],
+    enabled: pickPlugin,
+    queryFn: async () =>
+      parseAuthPluginRows(await catalogRows(connectionId, database, AUTH_PLUGINS_QUERIES)),
+    staleTime: 0
+  })
+  const auth = pickPlugin
+    ? {
+        choices: authPluginChoices(info, !!options.mariadb, authPlugins.data ?? null, [
+          ...draft.plugins,
+          ...(original?.plugins ?? [])
+        ]),
+        multiple: !!options.mariadb
+      }
+    : null
 
   const build = (mask: boolean): string[] => {
     if (dropping && principal) {
@@ -423,6 +451,7 @@ function PrincipalForm({
                   principals={principals}
                   logins={logins.data ?? []}
                   schemas={(schemas.data ?? []).map((s) => s.name)}
+                  auth={auth}
                 />
               )
             ) : section === 'memberOf' ? (
@@ -524,7 +553,8 @@ function GeneralFields({
   options,
   principals,
   logins,
-  schemas
+  schemas,
+  auth
 }: {
   dialect: Dialect
   draft: PrincipalDraft
@@ -533,6 +563,8 @@ function GeneralFields({
   principals: Principal[]
   logins: string[]
   schemas: string[]
+  /** MySQL and MariaDB 10.4+ users: the authentication plugins to offer */
+  auth: { choices: AuthPluginChoice[]; multiple: boolean } | null
 }): React.JSX.Element {
   const creating = !draft.original
   const isRole = draft.type === 'role'
@@ -543,7 +575,7 @@ function GeneralFields({
     dialect === 'postgres'
       ? !isRole
       : dialect === 'mysql'
-        ? !isRole
+        ? !isRole && (!draft.plugins.length || takesPassword(draft.plugins, !!options.mariadb))
         : !isRole &&
           (draft.auth === 'password' ||
             (draft.auth === 'login' && (creating ? draft.createLogin : !options.babelfish)))
@@ -553,7 +585,9 @@ function GeneralFields({
       : undefined
     : dialect === 'tsql' && draft.auth === 'login'
       ? `Changes the password of the login ${draft.login || draft.original?.login}; leave empty to keep it`
-      : 'Leave empty to keep the current password'
+      : dialect === 'mysql' && draft.plugins.join() !== draft.original?.plugins.join()
+        ? 'The new sign-in method needs the password'
+        : 'Leave empty to keep the current password'
 
   return (
     <div className="space-y-4">
@@ -589,6 +623,16 @@ function GeneralFields({
           </Field>
         )}
       </div>
+
+      {auth && (
+        <AuthPluginFields
+          draft={draft}
+          set={set}
+          choices={auth.choices}
+          mariadb={!!options.mariadb}
+          multiple={auth.multiple}
+        />
+      )}
 
       {dialect === 'tsql' && !isRole && (
         <TsqlUserFields

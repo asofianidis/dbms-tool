@@ -2,6 +2,7 @@ pub mod mongo;
 pub mod mongo_srv;
 pub mod mssql;
 pub mod mysql;
+pub mod mysql_auth;
 pub mod postgres;
 pub mod redis;
 pub mod sqlite;

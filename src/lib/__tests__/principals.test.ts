@@ -160,6 +160,89 @@ describe('MySQL accounts', () => {
   })
 })
 
+describe('MySQL and MariaDB authentication plugins', () => {
+  const mariadb = { mariadb: true }
+  const user = (plugins: string[]): PrincipalDraft =>
+    draft(newPrincipalDraft('mysql', 'user', mariadb), { name: 'app', plugins })
+
+  it('creates MariaDB users with one or more sign-in methods', () => {
+    expect(principalStatements('mysql', { ...user(['ed25519']), password: 'pw' }, mariadb)).toEqual(
+      ["CREATE USER 'app'@'%' IDENTIFIED VIA ed25519 USING PASSWORD('pw')"]
+    )
+    expect(principalStatements('mysql', user(['unix_socket']), mariadb)).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED VIA unix_socket"
+    ])
+    const both = { ...user(['unix_socket', 'mysql_native_password']), password: "it's" }
+    expect(principalStatements('mysql', both, mariadb)).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('it''s')"
+    ])
+    // The script preview hides the password
+    expect(principalStatements('mysql', both, { ...mariadb, maskPasswords: true })).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('********')"
+    ])
+    // The server default stays IDENTIFIED BY
+    expect(principalStatements('mysql', { ...user([]), password: 'pw' }, mariadb)).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED BY 'pw'"
+    ])
+  })
+
+  it('creates MySQL users with a plugin', () => {
+    const d = draft(newPrincipalDraft('mysql', 'user'), {
+      name: 'app',
+      plugins: ['caching_sha2_password'],
+      password: 'pw'
+    })
+    expect(principalStatements('mysql', d)).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY 'pw'"
+    ])
+    expect(principalStatements('mysql', d, { maskPasswords: true })).toEqual([
+      "CREATE USER 'app'@'%' IDENTIFIED WITH caching_sha2_password BY '********'"
+    ])
+    expect(validatePrincipal('mysql', { ...d, plugins: ['a', 'b'] })).toMatch(/one/)
+  })
+
+  it('reads the methods back and restates them with a new MariaDB password', () => {
+    // mysql.global_priv's plugin and auth_or, as MariaDB 11.8 returns them
+    const loaded = parsePrincipalState('mysql', principal('app', { host: '%' }), [
+      ['n', '0', 'mysql_native_password', '[{"plugin":"unix_socket"},{}]']
+    ])!
+    expect(loaded.plugins).toEqual(['unix_socket', 'mysql_native_password'])
+    expect(principalStatements('mysql', principalDraftFrom(loaded), mariadb)).toEqual([])
+    // IDENTIFIED BY would reset the account to mysql_native_password alone
+    const d = { ...principalDraftFrom(loaded), password: 'new' }
+    expect(principalStatements('mysql', d, mariadb)).toEqual([
+      "ALTER USER 'app'@'%' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('new')"
+    ])
+    const socketOnly = { ...principalDraftFrom(loaded), plugins: ['unix_socket'] }
+    expect(validatePrincipal('mysql', socketOnly, mariadb)).toBeNull()
+    expect(principalStatements('mysql', socketOnly, mariadb)).toEqual([
+      "ALTER USER 'app'@'%' IDENTIFIED VIA unix_socket"
+    ])
+  })
+
+  it('keeps the MySQL plugin on a password change, and switches it when asked', () => {
+    const loaded = parsePrincipalState('mysql', principal('app', { host: '%' }), [
+      ['n', '0', 'caching_sha2_password']
+    ])!
+    expect(loaded.plugins).toEqual(['caching_sha2_password'])
+    expect(principalStatements('mysql', { ...principalDraftFrom(loaded), password: 'x' })).toEqual([
+      "ALTER USER 'app'@'%' IDENTIFIED BY 'x'"
+    ])
+    const native = { ...principalDraftFrom(loaded), plugins: ['mysql_native_password'] }
+    expect(validatePrincipal('mysql', native)).toMatch(/password for mysql_native_password/)
+    expect(principalStatements('mysql', { ...native, password: 'x' })).toEqual([
+      "ALTER USER 'app'@'%' IDENTIFIED WITH mysql_native_password BY 'x'"
+    ])
+  })
+
+  it('needs a password for new password methods, and plain plugin names', () => {
+    expect(validatePrincipal('mysql', user(['ed25519']), mariadb)).toMatch(/password for ed25519/)
+    expect(validatePrincipal('mysql', user(['unix_socket']), mariadb)).toBeNull()
+    expect(validatePrincipal('mysql', user(["x' OR 1"]), mariadb)).toMatch(/plugin name/)
+    expect(validatePrincipal('mysql', user(['ed25519', 'ed25519']), mariadb)).toMatch(/once/)
+  })
+})
+
 describe('SQL Server users and roles', () => {
   it('creates a login and a user for it', () => {
     const d = draft(newPrincipalDraft('tsql', 'user'), {

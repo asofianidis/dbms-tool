@@ -81,8 +81,12 @@ fn build_opts(
 }
 
 async fn open(opts: Opts) -> AppResult<Conn> {
+    let user = opts.user().unwrap_or_default().to_string();
     match tokio::time::timeout(crate::limits::connect_timeout(), Conn::new(opts)).await {
-        Ok(conn) => Ok(conn?),
+        Ok(conn) => conn.map_err(|e| match super::mysql_auth::connect_error(&e, &user) {
+            Some(message) => AppError::Message(message),
+            None => e.into(),
+        }),
         Err(_) => Err(AppError::msg("Timed out connecting to the server")),
     }
 }
@@ -92,6 +96,11 @@ pub async fn connect(
     password: Option<&str>,
     database: &str,
 ) -> AppResult<MySession> {
+    // mysql_async panics on ed25519 and parsec accounts; see mysql_auth
+    if password.is_some_and(|p| !p.is_empty()) && cfg.auth != AuthMode::Cloud {
+        let port = if cfg.port == 0 { 3306 } else { cfg.port };
+        super::mysql_auth::check_account(&cfg.host, port, &cfg.user).await?;
+    }
     let (conn, opts) = match cfg.ssl {
         SslMode::Disable => {
             let opts = build_opts(cfg, password, database, false)?;
