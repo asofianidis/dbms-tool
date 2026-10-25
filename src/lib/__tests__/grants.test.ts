@@ -334,3 +334,36 @@ describe('securables', () => {
     ).toBe('Pick a database')
   })
 })
+
+describe('MySQL database grant patterns', () => {
+  const app = role('app', { host: '%', kind: 'user' })
+  const db: Securable = { kind: 'database', schema: null, name: 'my_db', args: null }
+
+  it('escapes _ and % so the grant covers only that database', () => {
+    expect(grantStatements('mysql', app, db, state({}), state({ SELECT: 'grant' }))).toEqual([
+      "GRANT SELECT ON `my\\_db`.* TO 'app'@'%'"
+    ])
+  })
+
+  it('reads both forms and revokes a grant as the server stores it', () => {
+    expect(grantQuery('mysql', app, db)).toContain("TABLE_SCHEMA IN ('my\\\\_db', 'my_db')")
+    const legacy = parseGrantRows('mysql', db, [
+      ['SELECT', 'NO', 'my_db'],
+      ['INSERT', 'NO', 'my_db']
+    ])
+    expect(legacy).toEqual(
+      state({ SELECT: 'grant', INSERT: 'grant' }, { databasePattern: 'my_db' })
+    )
+    expect(
+      grantStatements('mysql', app, db, legacy, { ...legacy, privileges: { SELECT: 'grant' } })
+    ).toEqual(["REVOKE INSERT ON `my_db`.* FROM 'app'@'%'"])
+    const escaped = parseGrantRows('mysql', db, [
+      ['SELECT', 'NO', 'my_db'],
+      ['DELETE', 'NO', 'my\\_db']
+    ])
+    expect(escaped).toEqual(state({ DELETE: 'grant' }))
+    expect(grantStatements('mysql', app, db, escaped, state({}))).toEqual([
+      "REVOKE DELETE ON `my\\_db`.* FROM 'app'@'%'"
+    ])
+  })
+})

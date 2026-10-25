@@ -598,6 +598,7 @@ impl PgSession {
                         is_generated: r.get(5),
                         is_identity: r.get(6),
                         extra: None,
+                        ..Default::default()
                     }
                 })
                 .collect(),

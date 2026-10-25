@@ -678,14 +678,14 @@ impl MsSession {
                      ELSE '' END, \
                    CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, c.COLUMN_DEFAULT, \
                    CAST(ISNULL(sc.is_identity, 0) | ISNULL(sc.is_computed, 0) AS int), \
-                   CAST(ISNULL(sc.is_identity, 0) AS int) \
+                   CAST(ISNULL(sc.is_identity, 0) AS int), c.COLLATION_NAME \
                  FROM INFORMATION_SCHEMA.COLUMNS c \
                  LEFT JOIN sys.columns sc ON sc.object_id = OBJECT_ID(@P1) AND sc.name = c.COLUMN_NAME \
                  WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 \
                  ORDER BY c.ORDINAL_POSITION",
                 Some(
                     "SELECT c.COLUMN_NAME, c.DATA_TYPE, CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END, \
-                       c.COLUMN_DEFAULT, 0, 0, @P1 \
+                       c.COLUMN_DEFAULT, 0, 0, CAST(NULL AS nvarchar(128)), @P1 \
                      FROM INFORMATION_SCHEMA.COLUMNS c \
                      WHERE c.TABLE_SCHEMA = @P2 AND c.TABLE_NAME = @P3 ORDER BY c.ORDINAL_POSITION",
                 ),
@@ -830,6 +830,8 @@ impl MsSession {
                         is_identity: flag(r, 5),
                         comment: None,
                         extra: None,
+                        collation: text(r, 6),
+                        ..Default::default()
                     }
                 })
                 .collect(),

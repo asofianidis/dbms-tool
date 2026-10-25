@@ -420,3 +420,79 @@ describe('schema designer', () => {
     )
   })
 })
+
+describe('restated column collations', () => {
+  const info = (dialect: Dialect): TableInfo => ({
+    columns: [
+      column({ name: 'id', nullable: false, isPrimaryKey: true }),
+      column({
+        name: 'code',
+        dataType: 'varchar(20)',
+        ...(dialect === 'mysql'
+          ? { charset: 'utf8mb4', collation: 'utf8mb4_bin' }
+          : { collation: 'Latin1_General_BIN2' })
+      })
+    ],
+    primaryKey: ['id'],
+    indexes: [],
+    foreignKeys: [],
+    triggers: []
+  })
+
+  it('keeps a MySQL column charset and collation in MODIFY and CHANGE COLUMN', () => {
+    const d = draftFromTable('mysql', 'app', 't', info('mysql'))
+    col(d, 'code').comment = 'sku'
+    expect(tableStatements('mysql', d)).toEqual([
+      'ALTER TABLE `app`.`t`\n' +
+        "  MODIFY COLUMN `code` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL COMMENT 'sku'"
+    ])
+    col(d, 'code').name = 'sku'
+    expect(tableStatements('mysql', d)[0]).toContain(
+      'CHANGE COLUMN `code` `sku` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL'
+    )
+    // A type that's no longer text takes no collation
+    Object.assign(col(d, 'sku'), { dataType: 'int', comment: '' })
+    expect(tableStatements('mysql', d)[0]).toContain('CHANGE COLUMN `code` `sku` int NULL')
+  })
+
+  it('keeps a SQL Server collation in ALTER COLUMN', () => {
+    const d = draftFromTable('tsql', 'dbo', 't', info('tsql'))
+    col(d, 'code').nullable = false
+    expect(tableStatements('tsql', d)).toEqual([
+      'ALTER TABLE [dbo].[t] ALTER COLUMN [code] varchar(20) COLLATE Latin1_General_BIN2 NOT NULL'
+    ])
+  })
+})
+
+describe('SQL Server identity changes', () => {
+  it("blocks turning IDENTITY on or off, which ALTER COLUMN can't do", () => {
+    const d = load('tsql')
+    col(d, 'id').identity = false
+    expect(validateDraft('tsql', d)).toMatch(/can't add or remove IDENTITY.*id/)
+    col(d, 'id').identity = true
+    expect(validateDraft('tsql', d)).toBeNull()
+    const n = draftFromTable('tsql', 'dbo', 't', {
+      ...usersTable('tsql'),
+      columns: [column({ name: 'n', nullable: false })]
+    })
+    col(n, 'n').identity = true
+    expect(validateDraft('tsql', n)).toMatch(/IDENTITY.*n can't change/)
+  })
+})
+
+describe('mysqlDefaultExpr expressions', () => {
+  it('keeps MySQL 8 DEFAULT_GENERATED and MariaDB expressions verbatim', () => {
+    expect(mysqlDefaultExpr('(curdate() + interval 1 day)', 'date', 'DEFAULT_GENERATED')).toBe(
+      '((curdate() + interval 1 day))'
+    )
+    expect(mysqlDefaultExpr('rand() * 10', 'double', 'DEFAULT_GENERATED')).toBe('(rand() * 10)')
+    // MariaDB: literals are quoted, expressions bare
+    expect(mysqlDefaultExpr('curdate() + interval 1 day', 'date')).toBe(
+      '(curdate() + interval 1 day)'
+    )
+    expect(mysqlDefaultExpr('1 + rand()', 'double')).toBe('(1 + rand())')
+    expect(mysqlDefaultExpr("'curdate()'", 'varchar(20)')).toBe("'curdate()'")
+    // MySQL 8 literals have no DEFAULT_GENERATED
+    expect(mysqlDefaultExpr('abc', 'varchar(10)', '')).toBe("'abc'")
+  })
+})

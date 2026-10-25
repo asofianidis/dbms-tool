@@ -599,6 +599,9 @@ function alterTable(
     const want = wanted.columns.find((w) => sameName(dialect, w.name, c.name))
     if (!want) {
       c.dropped = true
+      item.warnings.push(
+        `Drops column ${c.name} and its data; if it was renamed, rename it in the target first`
+      )
       changes.push({ action: 'drop', what: 'column', name: c.name, from: describeColumn(c) })
       continue
     }
@@ -616,11 +619,17 @@ function alterTable(
       }
       continue
     }
+    // SQL Server can't add or remove IDENTITY on an existing column
+    const keepIdentity = dialect === 'tsql' && want.identity !== c.identity
+    if (keepIdentity)
+      item.warnings.push(
+        `Column ${c.name}'s IDENTITY differs; SQL Server can't change it on an existing column, so it isn't scripted`
+      )
     Object.assign(c, {
       dataType: want.dataType,
       nullable: want.nullable,
       default: want.default,
-      identity: want.identity,
+      identity: keepIdentity ? c.identity : want.identity,
       comment: want.comment,
       onUpdate: want.onUpdate
     })
@@ -992,10 +1001,22 @@ function emptyItem(
   }
 }
 
-/** Items selected by default: everything that differs except drops, which are opt-in. */
+/** How many objects or columns, with their data, the item drops. */
+export function dropCount(item: DiffItem): number {
+  if (item.action === 'drop') return 1
+  if (item.action !== 'alter') return 0
+  return item.changes.filter((c) => c.action === 'drop' && c.what === 'column').length
+}
+
+/**
+ * Items selected by default: everything that differs except drops, which are opt-in,
+ * as are alters that drop columns (a renamed column looks like a drop and an add).
+ */
 export function defaultSelection(items: DiffItem[]): Set<string> {
   return new Set(
-    items.filter((i) => i.action === 'create' || i.action === 'alter').map((i) => i.id)
+    items
+      .filter((i) => (i.action === 'create' || i.action === 'alter') && !dropCount(i))
+      .map((i) => i.id)
   )
 }
 
