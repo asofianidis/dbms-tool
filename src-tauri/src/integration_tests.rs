@@ -1263,7 +1263,8 @@ async fn postgres_aggregates_and_old_servers() {
             .await
             .unwrap()
             .unwrap_or_default();
-        assert!(ddl.contains("WINDOW"), "{var}: {ddl}");
+        // Messages name the server only: CodeQL treats what this connection reads as secret
+        assert!(ddl.contains("WINDOW"), "{var}");
         let routine = s
             .describe_routine(db, Some("public"), "plain", "function", Some("a integer"))
             .await
@@ -1285,11 +1286,11 @@ async fn postgres_aggregates_and_old_servers() {
             let definition =
                 || s.object_definition(db, Some("public"), name, "aggregate", Some(args));
             let ddl = definition().await.unwrap().unwrap_or_default();
-            assert!(ddl.contains(expect), "{var}: {ddl}");
+            assert!(ddl.contains(expect), "{var}: {name}");
             let signature = if args.is_empty() { "*" } else { args };
             let sql = format!("DROP AGGREGATE public.{name}({signature}); {ddl}");
             let out = s.execute("t", db, &sql, &opts()).await.unwrap();
-            assert!(out.error.is_none(), "{var}: {sql}\n{:?}", out.error);
+            assert!(out.error.is_none(), "{var}: {name}");
             assert_eq!(
                 definition().await.unwrap().unwrap_or_default(),
                 ddl,
@@ -1301,7 +1302,7 @@ async fn postgres_aggregates_and_old_servers() {
             .await
             .unwrap()
             .unwrap_or_default();
-        assert!(parallel.contains("PARALLEL = SAFE"), "{var}: {parallel}");
+        assert!(parallel.contains("PARALLEL = SAFE"), "{var}");
 
         m.close(&id);
         let (m, id) = open(Engine::Postgres, var).await.unwrap();
