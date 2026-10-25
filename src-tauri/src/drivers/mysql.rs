@@ -83,8 +83,12 @@ fn build_opts(
 }
 
 async fn open(opts: Opts) -> AppResult<Conn> {
+    let user = opts.user().unwrap_or_default().to_string();
     match tokio::time::timeout(crate::limits::connect_timeout(), Conn::new(opts)).await {
-        Ok(conn) => Ok(conn?),
+        Ok(conn) => conn.map_err(|e| match super::mysql_auth::connect_error(&e, &user) {
+            Some(message) => AppError::Message(message),
+            None => e.into(),
+        }),
         Err(_) => Err(AppError::msg("Timed out connecting to the server")),
     }
 }

@@ -4,6 +4,7 @@
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
+//! DBMS_TEST_MARIADB_AUTH=localhost:3308:root:password   # disposable: loads plugins, creates users
 //! DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password
 //! DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
@@ -342,6 +343,155 @@ async fn mariadb_end_to_end() {
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
     m.close(&c.id);
+}
+
+/// Signs in as `user`, on a connection config of its own.
+async fn sign_in(
+    c: &ConnectionConfig,
+    user: &str,
+    password: &str,
+) -> Result<ServerInfo, crate::error::AppError> {
+    let mut c = c.clone();
+    c.id = format!("{}-{user}", c.id);
+    c.user = user.into();
+    let m = Manager::default();
+    let result = m.open(c.clone(), Some(password.into())).await;
+    m.close(&c.id);
+    result
+}
+
+/// A password for a test account, made up per run
+fn test_password() -> String {
+    format!("Pw_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+}
+
+/// Runs root's SQL, failing the test on an error. `what` labels the assert: the SQL can
+/// hold a password, and CodeQL treats what the server returns as secret.
+async fn run_sql(m: &Manager, id: &str, what: &str, sql: &str) -> ExecOutput {
+    let out = m
+        .get(id)
+        .unwrap()
+        .execute("tab1", "", sql, &opts())
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{what}");
+    out
+}
+
+#[tokio::test]
+async fn mariadb_auth_plugins() {
+    // Every method signs in, through mysql_async's client_ed25519 / client_parsec for those two
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB_AUTH") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let plugins = "SELECT PLUGIN_NAME FROM information_schema.PLUGINS \
+                   WHERE PLUGIN_TYPE = 'AUTHENTICATION' AND PLUGIN_STATUS = 'ACTIVE'";
+    let s = m.get(&c.id).unwrap();
+    for soname in ["auth_ed25519", "auth_parsec"] {
+        // Already loaded, or not shipped (parsec is 11.6+): either is fine
+        let _ = s
+            .execute("tab1", "", &format!("INSTALL SONAME '{soname}'"), &opts())
+            .await;
+    }
+    let out = run_sql(&m, &c.id, "list plugins", plugins).await;
+    let active: Vec<Value> = out.results[0].rows.iter().map(|r| r[0].clone()).collect();
+    assert!(active.contains(&json!("ed25519")), "{active:?}");
+
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let pw = test_password();
+    let users = [
+        ("ed", format!("ed25519 USING PASSWORD('{pw}')")),
+        ("pa", format!("parsec USING PASSWORD('{pw}')")),
+        (
+            "na",
+            format!("mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+        (
+            "or",
+            format!("unix_socket OR mysql_native_password USING PASSWORD('{pw}')"),
+        ),
+        // A wrong password falls through to ed25519, which used to panic the driver
+        (
+            "ne",
+            format!(
+                "mysql_native_password USING PASSWORD('{pw}') OR ed25519 USING PASSWORD('{pw}')"
+            ),
+        ),
+    ];
+    let mut created = vec![];
+    for (kind, via) in &users {
+        if *kind == "pa" && !active.contains(&json!("parsec")) {
+            continue;
+        }
+        let name = format!("dbms_auth_{kind}_{tag}");
+        run_sql(
+            &m,
+            &c.id,
+            &format!("create {kind} user"),
+            &format!("CREATE USER '{name}'@'%' IDENTIFIED VIA {via}"),
+        )
+        .await;
+        created.push((*kind, name));
+    }
+
+    // Messages name the account kind only: CodeQL treats the sign-in's output as secret
+    for (kind, name) in &created {
+        let signed_in = sign_in(&c, name, &pw).await;
+        assert!(
+            signed_in.is_ok_and(|info| info.product.contains("MariaDB")),
+            "{kind} user didn't sign in"
+        );
+    }
+    // A wrong password is the server's plain refusal, whichever method gets it last
+    let wrong_pw = format!("{pw}_wrong");
+    for (kind, name) in &created {
+        let refused = sign_in(&c, name, &wrong_pw).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("1045")),
+            "{kind} user: no ERROR 1045 for a wrong password"
+        );
+    }
+
+    for (kind, name) in &created {
+        run_sql(
+            &m,
+            &c.id,
+            &format!("drop {kind} user"),
+            &format!("DROP USER '{name}'@'%'"),
+        )
+        .await;
+    }
+    m.close(&c.id);
+}
+
+#[tokio::test]
+async fn mysql_caching_sha2_sign_in() {
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MYSQL") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password).await.expect("connect");
+    let name = format!(
+        "mdb_auth_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let pw = test_password();
+    run_sql(
+        &m,
+        &c.id,
+        "create user",
+        &format!("CREATE USER '{name}'@'%' IDENTIFIED WITH caching_sha2_password BY '{pw}'"),
+    )
+    .await;
+    let result = sign_in(&c, &name, &pw).await;
+    run_sql(&m, &c.id, "drop user", &format!("DROP USER '{name}'@'%'")).await;
+    m.close(&c.id);
+    assert!(
+        result.is_ok_and(|info| info.product.starts_with("MySQL")),
+        "caching_sha2_password user didn't sign in"
+    );
 }
 
 /// The server tab's replication panel reads these through the driver. Point the variables at
