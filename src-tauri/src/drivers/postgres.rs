@@ -18,11 +18,15 @@ use crate::config::{ConnectionConfig, SslMode};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
 
+mod compat;
+
 pub struct PgSession {
     client: Client,
     tls: MakeTlsConnector,
     notices: Arc<Mutex<Vec<(String, String)>>>,
     pub database: String,
+    /// `server_version_num`, for catalog columns older servers lack
+    version: i32,
     task: JoinHandle<()>,
 }
 
@@ -131,15 +135,20 @@ pub async fn connect(
             .batch_execute("SET default_transaction_read_only = on")
             .await?;
     }
-    let database = client
-        .query_one("SELECT current_database()::text", &[])
-        .await?
-        .get::<_, String>(0);
+    let row = client
+        .query_one(
+            "SELECT current_database()::text, current_setting('server_version_num')::int",
+            &[],
+        )
+        .await?;
+    let database = row.get::<_, String>(0);
+    let version = row.get::<_, i32>(1);
     Ok(PgSession {
         client,
         tls,
         notices,
         database,
+        version,
         task,
     })
 }
@@ -362,6 +371,7 @@ impl PgSession {
     pub async fn list_objects(&self, schema: &str) -> AppResult<Vec<DbObject>> {
         let rows = self
             .strings(
+                &format!(
                 "SELECT c.relname::text, \
                    CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' \
                      WHEN 'f' THEN 'foreign_table' WHEN 'S' THEN 'sequence' ELSE 'table' END, \
@@ -371,11 +381,13 @@ impl PgSession {
                  WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
                    AND NOT c.relispartition \
                  UNION ALL \
-                 SELECT p.proname::text, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, \
+                 SELECT p.proname::text, {}, \
                    pg_get_function_identity_arguments(p.oid), obj_description(p.oid, 'pg_proc'), NULL \
                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                 WHERE n.nspname = $1 AND p.prokind IN ('f', 'p') \
+                 WHERE n.nspname = $1 \
                  ORDER BY 2, 1",
+                compat::routine_kind(self.version)
+                ),
                 &[&schema],
             )
             .await?;
@@ -395,29 +407,35 @@ impl PgSession {
     pub async fn describe_table(&self, schema: &str, table: &str) -> AppResult<TableInfo> {
         let columns = self
             .strings(
+                &format!(
                 "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
                    pg_get_expr(d.adbin, d.adrelid), col_description(a.attrelid, a.attnum), \
-                   a.attidentity <> '' OR a.attgenerated <> '' OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%', \
+                   a.attidentity <> '' OR {} OR coalesce(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%', \
                    a.attidentity <> '' \
                  FROM pg_attribute a \
                  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
                  WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass \
                    AND a.attnum > 0 AND NOT a.attisdropped \
                  ORDER BY a.attnum",
+                compat::is_generated(self.version)
+                ),
                 &[&schema, &table],
             )
             .await?;
         let indexes = self
             .strings(
-                "SELECT i.relname::text, ix.indisunique, ix.indisprimary, am.amname::text, \
+                &format!(
+                    "SELECT i.relname::text, ix.indisunique, ix.indisprimary, am.amname::text, \
                    ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true) \
-                         FROM generate_series(1, ix.indnkeyatts) k)::text[], \
+                         FROM generate_series(1, {}) k)::text[], \
                    pg_get_indexdef(ix.indexrelid) \
                  FROM pg_index ix \
                  JOIN pg_class i ON i.oid = ix.indexrelid \
                  JOIN pg_am am ON am.oid = i.relam \
                  WHERE ix.indrelid = format('%I.%I', $1::text, $2::text)::regclass \
                  ORDER BY ix.indisprimary DESC, i.relname",
+                    compat::index_key_columns(self.version)
+                ),
                 &[&schema, &table],
             )
             .await?;
@@ -548,7 +566,16 @@ impl PgSession {
                 "SELECT 'CREATE MATERIALIZED VIEW ' || format('%I.%I', $1::text, $2::text) || ' AS' || chr(10) \
                  || pg_get_viewdef(format('%I.%I', $1::text, $2::text)::regclass, true)"
             }
-            "function" | "procedure" => {
+            "aggregate" => {
+                let rows = self
+                    .strings(
+                        &compat::aggregate_definition(self.version),
+                        &[&schema, &name, &detail.unwrap_or("")],
+                    )
+                    .await?;
+                return Ok(rows.first().map(|r| r.get(0)));
+            }
+            "function" | "procedure" | "window_function" => {
                 let rows = self
                     .strings(
                         "SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
@@ -583,9 +610,10 @@ impl PgSession {
         let head = self
             .strings(
                 &format!(
-                    "SELECT CASE WHEN p.prokind = 'p' THEN NULL ELSE pg_get_function_result(p.oid) END, l.lanname::text \
+                    "SELECT {}, l.lanname::text \
                      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                     JOIN pg_language l ON l.oid = p.prolang WHERE {FILTER}"
+                     JOIN pg_language l ON l.oid = p.prolang WHERE {FILTER}",
+                    compat::routine_result(self.version)
                 ),
                 &[&schema, &name, &identity_args],
             )

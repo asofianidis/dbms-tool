@@ -121,6 +121,8 @@ import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDe
 import { openSchemaDesigner } from './SchemaDesigner'
 import { EventSchedulerBadge, newEvent } from './events'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
+import { routineSignature } from '@/lib/pg-objects'
+import { PgDatabaseFolders } from './PgObjects'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -819,6 +821,7 @@ function DatabaseNode({
           <>
             <SchemaList connection={connection} database={database} depth={depth + 1} />
             <ExtensionsFolder connection={connection} database={database} depth={depth + 1} />
+            <PgDatabaseFolders connection={connection} database={database} depth={depth + 1} />
           </>
         ) : (
           <>
@@ -1071,7 +1074,8 @@ const FOLDERS: {
   { kinds: ['view'], label: 'Views', always: true },
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
-  { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['function', 'window_function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['aggregate'], label: 'Aggregates' },
   { kinds: ['sequence'], label: 'Sequences', newSequence: true },
   { kinds: ['synonym'], label: 'Synonyms' },
   { kinds: ['event'], label: 'Events', always: true, event: true }
@@ -1289,6 +1293,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
       return <Eye className="text-syn-type" />
     case 'function':
     case 'procedure':
+    case 'aggregate':
+    case 'window_function':
       return <FunctionSquare className="text-syn-fn" />
     case 'sequence':
       return <ListOrdered className="text-syn-number" />
@@ -1316,6 +1322,8 @@ function ObjectNode({
   const [open, setOpen] = useExpanded(id)
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(obj.kind)
   const isRoutine = obj.kind === 'procedure' || obj.kind === 'function'
+  // Aggregates and window functions show their arguments, but can't be executed alone
+  const hasArgs = isRoutine || obj.kind === 'aggregate' || obj.kind === 'window_function'
   const showSchema =
     (connection.engine === 'mssql' || connection.engine === 'babelfish') && obj.schema
   return (
@@ -1323,7 +1331,7 @@ function ObjectNode({
       <Row
         id={id}
         depth={depth}
-        expandable={browsable || isRoutine}
+        expandable={browsable || hasArgs}
         open={open}
         onToggle={() => setOpen()}
         onOpen={() =>
@@ -1348,10 +1356,10 @@ function ObjectNode({
           <>
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
-            {(obj.kind === 'function' || obj.kind === 'procedure') &&
-              connection.engine === 'postgres' && (
-                <span className="text-faint">({obj.detail})</span>
-              )}
+            {hasArgs && connection.engine === 'postgres' && (
+              <span className="text-faint">({routineSignature(obj)})</span>
+            )}
+            {obj.kind === 'window_function' && <span className="ml-1 text-faint">window</span>}
           </>
         }
         detail={
@@ -1377,7 +1385,7 @@ function ObjectNode({
       {open && browsable && (
         <TableChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
       )}
-      {open && isRoutine && (
+      {open && hasArgs && (
         <RoutineChildren connection={connection} database={database} obj={obj} depth={depth + 1} />
       )}
     </>
@@ -1793,6 +1801,9 @@ function CatalogFolder<T>({
     </>
   )
 }
+
+// For the PostgreSQL folders in PgObjects.tsx
+export { CatalogFolder, EmptyRow, Row, useExpanded }
 
 const copyName = (name: string): MenuItem => ({
   label: 'Copy name',

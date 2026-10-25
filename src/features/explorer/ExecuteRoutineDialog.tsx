@@ -6,6 +6,7 @@ import { ENGINES, type Dialect } from '@/lib/engines'
 import { queries } from '@/lib/queries'
 import { callScript, isInput, isOutput, type ArgMode, type RoutineArg } from '@/lib/routines'
 import { createStore } from '@/lib/store'
+import { toast } from '@/lib/toast'
 import { connectionsStore, newQueryTab } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import { Badge, Button, ErrorText, Modal, Spinner } from '@/components/ui'
@@ -20,6 +21,14 @@ interface Request {
 const executeStore = createStore<Request | null>(null)
 
 export function openExecuteRoutine(connectionId: string, database: string, obj: DbObject): void {
+  // An aggregate or window function only runs inside a query, over rows
+  if (obj.kind === 'aggregate' || obj.kind === 'window_function') {
+    toast(
+      `${obj.name} is ${obj.kind === 'aggregate' ? 'an aggregate' : 'a window function'}; call it in a query`,
+      'info'
+    )
+    return
+  }
   executeStore.set({ connectionId, database, obj })
 }
 

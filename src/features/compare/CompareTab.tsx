@@ -478,7 +478,9 @@ const KIND_LABELS: Record<DiffItem['kind'], string> = {
   synonym: 'Synonyms',
   collection: 'Collections',
   timeseries: 'Time series',
-  event: 'Events'
+  event: 'Events',
+  aggregate: 'Aggregates',
+  window_function: 'Window functions'
 }
 
 function KindIcon({ kind }: { kind: DiffItem['kind'] }): React.JSX.Element {

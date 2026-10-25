@@ -103,7 +103,12 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       if (tab.objectKind === 'view' || tab.objectKind === 'materialized_view') {
         return <Eye className={cn(c, 'text-syn-type')} />
       }
-      if (tab.objectKind === 'function' || tab.objectKind === 'procedure') {
+      if (
+        tab.objectKind === 'function' ||
+        tab.objectKind === 'procedure' ||
+        tab.objectKind === 'aggregate' ||
+        tab.objectKind === 'window_function'
+      ) {
         return <FunctionSquare className={cn(c, 'text-syn-fn')} />
       }
       if (tab.objectKind === 'event') return <CalendarClock className={cn(c, 'text-syn-fn')} />
