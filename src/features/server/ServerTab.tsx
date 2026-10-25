@@ -45,6 +45,7 @@ import {
   SlowQueriesSection,
   useLocks
 } from './PerformancePanels'
+import { SlowLogPanel } from './SlowLogPanel'
 import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
 const ACTIVITY_SQL: Record<string, string> = {
@@ -408,6 +409,8 @@ function ServerDashboard({
           engineKey={engineKey}
           databases={dbs.data?.filter((d) => !d.isSystem).map((d) => d.name) ?? []}
         />
+
+        {connection.engine === 'mysql' && <SlowLogPanel connection={connection} />}
       </div>
     </div>
   )
