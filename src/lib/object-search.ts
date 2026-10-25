@@ -66,7 +66,8 @@ LIMIT ${limit}`
       const system = "('mysql', 'information_schema', 'performance_schema', 'sys')"
       return `SELECT * FROM (
   SELECT table_schema AS db_name, NULL AS schema_name, table_name AS object_name,
-    CASE WHEN table_type LIKE '%VIEW%' THEN 'view' ELSE 'table' END AS kind, NULL AS detail
+    CASE WHEN table_type LIKE '%VIEW%' THEN 'view' WHEN table_type = 'SEQUENCE' THEN 'sequence'
+      ELSE 'table' END AS kind, NULL AS detail
   FROM information_schema.tables
   WHERE table_schema NOT IN ${system} AND lower(table_name) LIKE ${pattern}
   UNION ALL
