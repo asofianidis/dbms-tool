@@ -6,7 +6,9 @@ import {
   type SnapshotObject
 } from '@/lib/compare'
 import type { Dialect } from '@/lib/engines'
+import { catalogRows } from '@/lib/catalog'
 import { queries, queryClient } from '@/lib/queries'
+import { loadPgExtras } from './load-pg'
 
 export interface SideRef {
   connectionId: string
@@ -94,6 +96,11 @@ export async function loadSnapshot(
   }
   // A few at a time keeps big databases from flooding the connection
   await Promise.all(Array.from({ length: Math.min(6, objects.length) }, worker))
+  if (dialect === 'postgres') {
+    const inScope = scope === 'database' ? schemas : [side.schema ?? 'public']
+    const rows = (sql: string) => catalogRows(connectionId, database, [sql])
+    await loadPgExtras(rows, inScope, scope !== 'table', loaded, failed)
+  }
   return {
     snapshot: {
       database,

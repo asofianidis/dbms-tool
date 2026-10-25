@@ -34,6 +34,12 @@ export function mariaDbAtLeast(info: InfoLike, major: number, minor = 0): boolea
   return version[0] > major || (version[0] === major && version[1] >= minor)
 }
 
+/** Whether a connection is MariaDB, or undefined while it isn't connected and so unknown. */
+export function knownMariaDb(status: ConnectionStatus | undefined): boolean | undefined {
+  const info = connectedInfo(status)
+  return info ? isMariaDb(info) : undefined
+}
+
 /** The server info of a connected status, for the helpers above. */
 export function connectedInfo(status: ConnectionStatus | undefined): ServerInfo | null {
   return status?.state === 'connected' ? status.info : null

@@ -9,8 +9,12 @@ export interface SqlPanel {
   reload: () => void
 }
 
-/** Runs `sql` on the connection's metadata session, and again on `reload`. */
-export function useSqlPanel(connection: ConnectionConfig, sql: string | null): SqlPanel {
+/** Runs `sql` on the connection's metadata session (in `database`, else the default), and again on `reload`. */
+export function useSqlPanel(
+  connection: ConnectionConfig,
+  sql: string | null,
+  database = ''
+): SqlPanel {
   const [set, setSet] = useState<ResultSet | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -37,7 +41,9 @@ export function useSqlPanel(connection: ConnectionConfig, sql: string | null): S
         }
         try {
           // Listings only; `EXEC sp_babelfish_configure` reads settings, so no production prompt
-          const out = await api.execute(connection.id, '__meta', '', text, { confirmed: true })
+          const out = await api.execute(connection.id, '__meta', database, text, {
+            confirmed: true
+          })
           // Results for SQL that has since changed are stale
           if (queued.current) continue
           if (out.error) setError(out.error.message)
@@ -53,7 +59,7 @@ export function useSqlPanel(connection: ConnectionConfig, sql: string | null): S
       busy.current = false
       setLoading(false)
     }
-  }, [connection.id])
+  }, [connection.id, database])
   useEffect(() => {
     void reload()
   }, [reload, sql])

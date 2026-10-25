@@ -585,6 +585,75 @@ pub fn redis_unsubscribe(state: State<'_, AppState>, id: String, subscription: S
     }
 }
 
+/// LISTENs on PostgreSQL channels from the listener's own session; notifications
+/// arrive as `pg-notify` events tagged with `listener`.
+#[tauri::command]
+pub async fn pg_listen(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    listener: String,
+    database: String,
+    channels: Vec<String>,
+) -> AppResult<Vec<String>> {
+    use tauri::Emitter as _;
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .pg_listen(&listener, &database, channels, move |batch| {
+                let _ = app.emit("pg-notify", batch);
+            })
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!("LISTEN on {} failed", connection_label(&state, &id))
+    })
+}
+
+/// UNLISTENs `channels`, or every channel when empty; returns the ones left.
+#[tauri::command]
+pub async fn pg_unlisten(
+    state: State<'_, AppState>,
+    id: String,
+    listener: String,
+    channels: Vec<String>,
+) -> AppResult<Vec<String>> {
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server.pg_unlisten(&listener, channels).await
+    }
+    .await;
+    logged(result, || {
+        format!("UNLISTEN on {} failed", connection_label(&state, &id))
+    })
+}
+
+#[tauri::command]
+pub async fn pg_notify(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    listener: String,
+    database: String,
+    channel: String,
+    payload: String,
+) -> AppResult<()> {
+    use tauri::Emitter as _;
+    let result = async {
+        let server = state.manager.get(&id)?;
+        server
+            .pg_notify(&listener, &database, &channel, &payload, move |batch| {
+                let _ = app.emit("pg-notify", batch);
+            })
+            .await
+    }
+    .await;
+    logged(result, || {
+        format!("NOTIFY on {} failed", connection_label(&state, &id))
+    })
+}
+
 #[tauri::command]
 pub async fn file_write_text(
     app: tauri::AppHandle,

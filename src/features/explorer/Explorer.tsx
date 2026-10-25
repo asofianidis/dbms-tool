@@ -41,6 +41,7 @@ import {
   ListOrdered,
   Lock,
   Network,
+  Package,
   Pencil,
   Plug,
   Puzzle,
@@ -51,6 +52,7 @@ import {
   Sprout,
   Server,
   Shapes,
+  ShieldAlert,
   ShieldCheck,
   Table2,
   Terminal,
@@ -72,10 +74,17 @@ import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
+import { supportsPackages } from '@/lib/mariadb-packages'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
+import { knownMariaDb } from '@/lib/mariadb'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
+import {
+  routineSearchPath,
+  searchPathWarning,
+  SECURITY_DEFINER_TITLE
+} from '@/lib/routine-attributes'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
 import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
@@ -101,6 +110,7 @@ import {
   openTable,
   openRedisKeys,
   openRedisPubsub,
+  openPgNotify,
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
@@ -111,16 +121,21 @@ import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
 import { newSequence as newSequenceScript } from './sequence-actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
+import { newPackage } from './packages'
 import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPolicyDesigner } from '../table/PolicyDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
 import { MatviewRowDetail } from './matviews'
+import { RlsBadge, hasRls, policyMenuItems, rlsActionItems, useRlsFlags } from './rls-actions'
+import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -382,6 +397,16 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <RadioTower />,
               disabled: !connected,
               onSelect: () => openRedisPubsub(connection.id)
+            }
+          ]
+        : []),
+      ...(connection.engine === 'postgres'
+        ? [
+            {
+              label: 'Notifications (LISTEN / NOTIFY)',
+              icon: <RadioTower />,
+              disabled: !connected,
+              onSelect: () => openPgNotify(connection.id)
             }
           ]
         : []),
@@ -1063,6 +1088,8 @@ const FOLDERS: {
   always?: boolean
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  /** MariaDB 10.3+ only, shown even when empty */
+  packages?: boolean
   /** MySQL / MariaDB scheduled events */
   event?: boolean
   /** Shown, with a New sequence action, on MariaDB 10.3+ */
@@ -1073,6 +1100,7 @@ const FOLDERS: {
   { kinds: ['materialized_view'], label: 'Materialized views' },
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
+  { kinds: ['package'], label: 'Packages', packages: true },
   { kinds: ['sequence'], label: 'Sequences', newSequence: true },
   { kinds: ['synonym'], label: 'Synonyms' },
   { kinds: ['event'], label: 'Events', always: true, event: true }
@@ -1090,15 +1118,18 @@ function ObjectFolders({
   depth: number
 }): React.JSX.Element {
   const q = useQuery(queries.objects(connection.id, database, schema))
-  const sequences = mariaDbAtLeast(connectedInfo(statusStore.use()[connection.id]), 10, 3)
+  const info = connectedInfo(statusStore.use()[connection.id])
+  const packages = supportsPackages(info)
+  const sequences = mariaDbAtLeast(info, 10, 3)
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   return (
     <>
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
+        if (folder.packages && !packages) return null
         const newSequence = folder.newSequence && sequences
-        if (!objects.length && !folder.always && !newSequence) return null
+        if (!objects.length && !folder.always && !folder.packages && !newSequence) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
         if (folder.event && connection.engine !== 'mysql') return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
@@ -1112,6 +1143,7 @@ function ObjectFolders({
             label={tsql && folder.routine === 'procedure' ? 'Stored procedures' : folder.label}
             routine={folder.routine}
             newTable={folder.newTable}
+            newPackage={folder.packages}
             event={folder.event}
             newSequence={newSequence}
             objects={objects}
@@ -1134,6 +1166,7 @@ function ObjectFolder({
   label,
   routine,
   newTable,
+  newPackage: canAddPackage,
   event,
   newSequence,
   objects,
@@ -1146,6 +1179,7 @@ function ObjectFolder({
   label: string
   routine?: 'procedure' | 'function'
   newTable?: boolean
+  newPackage?: boolean
   event?: boolean
   newSequence?: boolean
   objects: DbObject[]
@@ -1186,6 +1220,15 @@ function ObjectFolder({
                     label: routine === 'procedure' ? 'New procedure' : 'New function',
                     icon: <Plus />,
                     onSelect: () => newRoutine(connection.id, database, schema, routine)
+                  }
+                ]
+              : []),
+            ...(canAddPackage
+              ? [
+                  {
+                    label: 'New package',
+                    icon: <Plus />,
+                    onSelect: () => newPackage(connection.id, database)
                   }
                 ]
               : []),
@@ -1233,6 +1276,15 @@ function ObjectFolder({
               variant="ghost"
               title={routine === 'procedure' ? 'New procedure' : 'New function'}
               onClick={() => newRoutine(connection.id, database, schema, routine)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : canAddPackage ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New package"
+              onClick={() => newPackage(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>
@@ -1291,6 +1343,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
     case 'function':
     case 'procedure':
       return <FunctionSquare className="text-syn-fn" />
+    case 'package':
+      return <Package className="text-syn-fn" />
     case 'sequence':
       return <ListOrdered className="text-syn-number" />
     case 'synonym':
@@ -1353,10 +1407,12 @@ function ObjectNode({
           <>
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
+            <VersionedMark connection={connection} database={database} obj={obj} />
             {(obj.kind === 'function' || obj.kind === 'procedure') &&
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>
               )}
+            <RlsBadge connection={connection} database={database} obj={obj} />
           </>
         }
         detail={
@@ -1607,6 +1663,9 @@ function TableChildren({
         (connection.engine === 'postgres' || connection.engine === 'mysql') && (
           <PartitionsFolder connection={connection} database={database} obj={obj} depth={depth} />
         )}
+      {hasRls(connection, obj.kind) && (
+        <PoliciesFolder connection={connection} database={database} obj={obj} depth={depth} />
+      )}
     </>
   )
 }
@@ -1666,6 +1725,25 @@ function RoutineChildren({
           label="returns"
           muted
           detail={<span className="font-mono">{returns}</span>}
+        />
+      )}
+      {q.data.attributes?.securityDefiner && (
+        <Row
+          id={`${base}/security`}
+          depth={depth}
+          icon={<ShieldAlert className="text-warn" />}
+          label="security definer"
+          muted
+          title={searchPathWarning(q.data.attributes) ?? SECURITY_DEFINER_TITLE}
+          detail={
+            searchPathWarning(q.data.attributes) && (
+              <span className="text-warn">
+                {routineSearchPath(q.data.attributes) === null
+                  ? 'no search_path'
+                  : 'pg_temp not last'}
+              </span>
+            )
+          }
         />
       )}
       {!params.length && !returns && <EmptyRow depth={depth}>No parameters</EmptyRow>}
@@ -1942,7 +2020,8 @@ function PrincipalsFolder({
       p.kind === 'role' ? 'role' : 'user',
       drop
     )
-  const options = catalogQueries.principals(connection.id, dialect, database)
+  const mariadb = knownMariaDb(statusStore.use()[connection.id])
+  const options = catalogQueries.principals(connection.id, dialect, database, mariadb)
   return (
     <CatalogFolder
       id={id}
@@ -2163,6 +2242,66 @@ function PartitionsFolder({
           }
         />
       )}
+    </>
+  )
+}
+
+/** A PostgreSQL table's row-level security policies; shown when it has some or RLS is on. */
+function PoliciesFolder({
+  connection,
+  database,
+  obj,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  obj: DbObject
+  depth: number
+}): React.JSX.Element | null {
+  const id = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}/policies`
+  const [open, setOpen] = useExpanded(id)
+  const flags = useRlsFlags(connection, database, obj)
+  const q = useQuery(rlsQueries.table(connection.id, database, obj.schema, obj.name))
+  if (!q.data || (!q.data.policies.length && !flags?.enabled && !flags?.forced)) return null
+  const table = { schema: obj.schema, name: obj.name }
+  const state = rlsLabel(q.data)
+  return (
+    <>
+      <Row
+        id={id}
+        depth={depth}
+        expandable
+        open={open}
+        onToggle={() => setOpen()}
+        muted
+        icon={<ShieldCheck className="text-faint" />}
+        label="Policies"
+        detail={`${q.data.policies.length}${state === 'on' ? '' : ` · RLS ${state}`}`}
+        onMenu={(e) => showContextMenu(e, rlsActionItems(connection.id, database, table, q.data))}
+      />
+      {open &&
+        q.data.policies.map((p) => (
+          <Row
+            key={p.name}
+            id={`${id}/${p.name}`}
+            depth={depth + 1}
+            icon={<ShieldCheck className={p.permissive ? 'text-syn-fn' : 'text-warn'} />}
+            label={p.name}
+            title={[
+              `${p.permissive ? 'PERMISSIVE' : 'RESTRICTIVE'} FOR ${p.command}`,
+              `TO ${p.roles.map((r) => (r === 'public' ? 'PUBLIC' : r)).join(', ')}`,
+              p.using && `USING (${p.using})`,
+              p.withCheck && `WITH CHECK (${p.withCheck})`
+            ]
+              .filter(Boolean)
+              .join('\n')}
+            detail={`${p.command.toLowerCase()}${p.permissive ? '' : ' restrictive'} · ${p.roles
+              .map((r) => (r === 'public' ? 'PUBLIC' : r))
+              .join(', ')}`}
+            onOpen={() => openPolicyDesigner(connection.id, database, obj.schema, obj.name, p.name)}
+            onMenu={(e) => showContextMenu(e, policyMenuItems(connection.id, database, table, p))}
+          />
+        ))}
     </>
   )
 }
