@@ -88,7 +88,9 @@ import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
 import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
+import { SequenceDetails } from './SequenceDetails'
 import { openTableDesigner } from './TableDesigner'
+import { StorageSummary } from './StorageOptions'
 import { openTriggerDesigner } from './TriggerDesigner'
 
 /** Where a foreign key points. MySQL reports the referenced database as its schema. */
@@ -122,6 +124,8 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
       ? { schema: tab.database, name: tab.name }
       : { schema: tab.schema, name: tab.name }
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(tab.objectKind)
+  // Only MariaDB has sequences on the MySQL engine; they get a details view, never a data grid
+  const sequenceDetails = tab.objectKind === 'sequence' && connection?.engine === 'mysql'
 
   useEffect(() => {
     if (!connected && connection) void connect(connection.id)
@@ -133,7 +137,12 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
         { value: 'structure', label: 'Structure' },
         { value: 'definition', label: tab.objectKind === 'table' ? 'DDL' : 'Definition' }
       ]
-    : [{ value: 'definition', label: 'Definition' }]
+    : sequenceDetails
+      ? [
+          { value: 'structure', label: 'Details' },
+          { value: 'definition', label: 'DDL' }
+        ]
+      : [{ value: 'definition', label: 'Definition' }]
 
   if (!connection) return <EmptyState title="This connection no longer exists" />
 
@@ -175,6 +184,8 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
         />
       ) : tab.view === 'structure' && browsable ? (
         <StructureView tab={tab} engine={connection.engine} dialect={dialect} />
+      ) : tab.view === 'structure' && sequenceDetails ? (
+        <SequenceDetails tab={tab} tableRef={ref} />
       ) : (
         <DefinitionView tab={tab} dialect={dialect} tableRef={ref} />
       )}
@@ -687,6 +698,13 @@ function StructureView({
         </Toolbar>
       )}
       <div className="min-h-0 flex-1 overflow-auto p-4">
+        {engine === 'mysql' && tab.objectKind === 'table' && (
+          <StorageSummary
+            connectionId={tab.connectionId}
+            database={tab.database}
+            table={tab.name}
+          />
+        )}
         <Section title="Columns" count={info.columns.length}>
           <table className="w-full text-left text-[12.5px]">
             <thead className="text-[11px] text-muted">

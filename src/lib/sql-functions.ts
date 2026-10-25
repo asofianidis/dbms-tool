@@ -1,4 +1,6 @@
 import type { Dialect } from './engines'
+import type { ServerVersion } from './mariadb'
+import { MARIADB_FUNCTIONS } from './sql-functions-mariadb'
 
 /** A built-in function, for completion and the signature tooltip. */
 export interface SqlFunction {
@@ -9,6 +11,14 @@ export interface SqlFunction {
   description: string
   /** Dialects that have it; all when absent */
   dialects?: Dialect[]
+  /** Only on MariaDB servers (of the MySQL dialect) */
+  onlyMariaDb?: boolean
+  /** Not on MariaDB servers: MySQL has it, MariaDB lacks it or takes other arguments */
+  notMariaDb?: boolean
+  /** The MariaDB version that added it */
+  minMariaDb?: [major: number, minor: number]
+  /** Inserted instead of `name()`, with `${field}` placeholders */
+  snippet?: string
 }
 
 const PG: Dialect[] = ['postgres']
@@ -279,7 +289,15 @@ const FUNCTIONS: SqlFunction[] = [
     params: ['string', 'pattern', 'replacement', 'flags'],
     returns: 'text',
     description: 'Replaces regular expression matches',
-    dialects: [...PG, ...MY]
+    dialects: PG
+  },
+  {
+    name: 'regexp_replace',
+    params: ['string', 'pattern', 'replacement', 'position', 'occurrence', 'match_type'],
+    returns: 'text',
+    description: 'Replaces regular expression matches',
+    dialects: MY,
+    notMariaDb: true
   },
   {
     name: 'lpad',
@@ -606,11 +624,21 @@ const FUNCTIONS: SqlFunction[] = [
   { name: 'uuid', params: [], returns: 'text', description: 'A UUID', dialects: MY }
 ]
 
-/** The built-in functions of a dialect, one per name. */
-export function functionsFor(dialect: Dialect): SqlFunction[] {
+/**
+ * The built-in functions of a dialect, one per name. `mariaDb` is the server's version when a
+ * MySQL-dialect connection is MariaDB; its own functions (and its variants of shared ones,
+ * listed first) then replace the MySQL-only ones.
+ */
+export function functionsFor(dialect: Dialect, mariaDb?: ServerVersion | null): SqlFunction[] {
   const seen = new Set<string>()
-  return FUNCTIONS.filter((f) => {
+  const maria = dialect === 'mysql' ? mariaDb : null
+  return [...MARIADB_FUNCTIONS, ...FUNCTIONS].filter((f) => {
     if (f.dialects && !f.dialects.includes(dialect)) return false
+    if (maria ? f.notMariaDb : f.onlyMariaDb) return false
+    if (maria && f.minMariaDb) {
+      const [major, minor] = f.minMariaDb
+      if (maria[0] < major || (maria[0] === major && maria[1] < minor)) return false
+    }
     if (seen.has(f.name)) return false
     seen.add(f.name)
     return true
