@@ -4,6 +4,8 @@
 //! DBMS_TEST_PG=localhost:5432:postgres:password
 //! DBMS_TEST_MYSQL=localhost:3306:root:password
 //! DBMS_TEST_MARIADB=localhost:3307:root:password
+//! DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password
+//! DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password
 //! DBMS_TEST_MSSQL=localhost:1433:sa:Password!23
 //! DBMS_TEST_BABELFISH=localhost:1434:babelfish_user:password
 //! DBMS_TEST_MONGO=mongodb://localhost:27017
@@ -197,8 +199,9 @@ async fn mariadb_end_to_end() {
     };
     let m = Manager::default();
     let info = m.open(c.clone(), password).await.expect("connect");
-    assert!(info.product.starts_with("MariaDB "), "{}", info.product);
-    assert!(info.version.contains("MariaDB"), "{}", info.version);
+    // No message arguments: the info comes from a password-bearing connect
+    assert!(info.product.starts_with("MariaDB "));
+    assert!(info.version.contains("MariaDB"));
     let s = m.get(&c.id).unwrap();
     let out = s
         .execute(
@@ -211,6 +214,230 @@ async fn mariadb_end_to_end() {
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
     assert_eq!(cell(&out, 0, 0, 0), json!("yes"));
+    m.close(&c.id);
+}
+
+/// The server tab's replication panel reads these through the driver. Point the variables at
+/// a replica: `DBMS_TEST_MARIADB_REPLICA=localhost:53329:root:password` (with a named
+/// connection) or `DBMS_TEST_MYSQL_REPLICA=localhost:53331:root:password` (8.0.22+).
+#[tokio::test]
+async fn replica_status() {
+    for (var, sql, running) in [
+        (
+            "DBMS_TEST_MARIADB_REPLICA",
+            "SHOW ALL REPLICAS STATUS",
+            "Slave_IO_Running",
+        ),
+        (
+            "DBMS_TEST_MYSQL_REPLICA",
+            "SHOW REPLICA STATUS",
+            "Replica_IO_Running",
+        ),
+    ] {
+        let Some((m, id)) = open(Engine::Mysql, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let out = s.execute(META, "", sql, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let set = &out.results[0];
+        assert!(!set.rows.is_empty(), "{var} is not a replica");
+        let col = |name: &str| set.columns.iter().position(|c| c.name == name);
+        let io = col(running).expect(running);
+        assert!(
+            ["Yes", "No", "Connecting"].contains(&set.rows[0][io].as_str().unwrap_or("")),
+            "{:?}",
+            set.rows[0][io]
+        );
+        // NULL lag (SQL thread stopped) arrives as null, not the string "NULL"
+        let lag = col("Seconds_Behind_Master")
+            .or(col("Seconds_Behind_Source"))
+            .unwrap();
+        for row in &set.rows {
+            assert!(
+                row[lag].is_null() || row[lag].as_str().is_some_and(|v| v.parse::<u64>().is_ok())
+            );
+        }
+        m.close(&id);
+    }
+}
+
+#[tokio::test]
+async fn mariadb_sequences() {
+    let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MARIADB").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "DROP DATABASE IF EXISTS mdb_sequences; CREATE DATABASE mdb_sequences; USE mdb_sequences;              CREATE SEQUENCE seq START WITH 10 INCREMENT BY 5 CACHE 20 CYCLE; CREATE TABLE t (id INT)",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let objects = s.list_objects("mdb_sequences", None).await.unwrap();
+    let seq = objects.iter().find(|o| o.name == "seq").unwrap();
+    assert_eq!(seq.kind, "sequence");
+    assert_eq!(seq.row_estimate, None);
+    assert!(objects.iter().any(|o| o.name == "t" && o.kind == "table"));
+    let ddl = s
+        .object_definition("mdb_sequences", None, "seq", "sequence", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ddl.starts_with("CREATE SEQUENCE `seq`"), "{ddl}");
+    assert!(
+        ddl.contains("increment by 5") && ddl.contains(" cycle"),
+        "{ddl}"
+    );
+    // The details view reads the sequence's single row
+    let out = s
+        .execute("tab1", "", "SELECT * FROM mdb_sequences.seq", &opts())
+        .await
+        .unwrap();
+    assert_eq!(out.results[0].columns[0].name, "next_not_cached_value");
+    assert_eq!(cell(&out, 0, 0, 0), json!("10"));
+    s.execute("tab1", "", "DROP DATABASE mdb_sequences", &opts())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mariadb_column_types() {
+    // INET4 / INET6 / UUID / VECTOR, INVISIBLE and COMPRESSED columns as the grid and designer see them
+    let Some((m, id)) = open(Engine::Mysql, "DBMS_TEST_MARIADB").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "DROP DATABASE IF EXISTS mdb_coltypes; CREATE DATABASE mdb_coltypes; USE mdb_coltypes; \
+             CREATE TABLE t (id INT PRIMARY KEY, ip4 INET4, ip6 INET6, u UUID, v VECTOR(2) NOT NULL, \
+               secret INT INVISIBLE, notes TEXT COMPRESSED, VECTOR INDEX vix (v)); \
+             INSERT INTO t (id, ip4, ip6, u, v, secret, notes) VALUES \
+               (1, '10.0.0.1', '2001:db8::1', '123e4567-e89b-12d3-a456-426614174000', VEC_FromText('[1,-2.5]'), 7, 'hi'); \
+             SELECT ip4, ip6, u, v FROM t",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let set = &out.results[0];
+    let types: Vec<&str> = set.columns.iter().map(|c| c.type_name.as_str()).collect();
+    println!("DBMS_TEST_MARIADB: wire types {types:?}");
+    assert_eq!(set.rows[0][0], json!("10.0.0.1"));
+    assert_eq!(set.rows[0][1], json!("2001:db8::1"));
+    assert_eq!(
+        set.rows[0][2],
+        json!("123e4567-e89b-12d3-a456-426614174000")
+    );
+    // Little-endian float32s: 1.0, -2.5
+    assert_eq!(set.rows[0][3], json!("0x0000803F000020C0"));
+
+    // SELECT * leaves invisible columns out
+    let out = s
+        .execute("tab1", "", "SELECT * FROM t", &opts())
+        .await
+        .unwrap();
+    assert!(!out.results[0].columns.iter().any(|c| c.name == "secret"));
+
+    // Edits the grid writes: hex and VEC_FromText for vectors, text for the others
+    let out = s
+        .execute(
+            "tab1",
+            "",
+            "UPDATE t SET v = 0x00000040000080BF, ip6 = '::ffff:1.2.3.4' WHERE id = 1; \
+             SELECT VEC_ToText(v), ip6 FROM t; \
+             UPDATE t SET v = VEC_FromText('[3,4]') WHERE id = 1; SELECT VEC_ToText(v) FROM t",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(cell(&out, 0, 0, 0), json!("[2,-1]"));
+    assert_eq!(cell(&out, 0, 0, 1), json!("::ffff:1.2.3.4"));
+    assert_eq!(cell(&out, 1, 0, 0), json!("[3,4]"));
+
+    let info = s.describe_table("mdb_coltypes", None, "t").await.unwrap();
+    let column = |name: &str| info.columns.iter().find(|c| c.name == name).unwrap();
+    assert_eq!(column("secret").extra.as_deref(), Some("INVISIBLE"));
+    assert_eq!(column("notes").data_type, "text /*M!100301 COMPRESSED*/");
+    assert_eq!(column("v").data_type, "vector(2)");
+    let vix = info.indexes.iter().find(|i| i.name == "vix").unwrap();
+    assert_eq!(vix.method.as_deref(), Some("VECTOR"));
+
+    s.execute("tab1", "", "DROP DATABASE mdb_coltypes", &opts())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mariadb_explain_json() {
+    // The plan viewer reads MariaDB's EXPLAIN/ANALYZE FORMAT=JSON out of a single text cell
+    let Some((c, password)) = config(Engine::Mysql, "DBMS_TEST_MARIADB") else {
+        return;
+    };
+    let m = Manager::default();
+    m.open(c.clone(), password.clone()).await.expect("connect");
+    let s = m.get(&c.id).unwrap();
+    let run = |sql: &'static str| {
+        let s = s.clone();
+        async move {
+            let out = s.execute("tab1", "", sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+            out
+        }
+    };
+    run(
+        "DROP DATABASE IF EXISTS mdb_explain; CREATE DATABASE mdb_explain; USE mdb_explain; \
+         CREATE TABLE t (id INT PRIMARY KEY, a INT); \
+         INSERT INTO t SELECT seq, seq % 10 FROM seq_1_to_100",
+    )
+    .await;
+    let plan = |out: &ExecOutput| -> Value {
+        let text = cell(out, 0, 0, 0);
+        serde_json::from_str(text.as_str().expect("plan is a text cell")).expect("plan is JSON")
+    };
+
+    let doc = plan(&run("EXPLAIN FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["access_type"], json!("ALL"), "{doc}");
+    assert!(table.get("r_rows").is_none(), "{doc}");
+
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nSELECT * FROM mdb_explain.t WHERE a = 3").await);
+    let table = &doc["query_block"]["nested_loop"][0]["table"];
+    assert_eq!(table["r_rows"].as_f64(), Some(100.0), "{doc}");
+    assert_eq!(table["r_filtered"].as_f64(), Some(10.0), "{doc}");
+
+    // ANALYZE runs the statement: a read-only connection refuses it for a write...
+    let (mut ro, _) = config(Engine::Mysql, "DBMS_TEST_MARIADB").unwrap();
+    ro.read_only = true;
+    ro.id = "ro".into();
+    m.open(ro, password).await.unwrap();
+    let blocked = m
+        .get("ro")
+        .unwrap()
+        .execute(
+            "tab",
+            "",
+            "ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t",
+            &opts(),
+        )
+        .await;
+    assert!(blocked.is_err());
+    // ...and a writable one really deletes the rows
+    let doc = plan(&run("ANALYZE FORMAT=JSON\nDELETE FROM mdb_explain.t WHERE a = 3").await);
+    assert_eq!(doc["query_block"]["table"]["delete"], json!(1), "{doc}");
+    let out = run("SELECT COUNT(*) FROM mdb_explain.t").await;
+    assert_eq!(cell(&out, 0, 0, 0), json!("90"));
+
+    run("DROP DATABASE mdb_explain").await;
+    m.close("ro");
     m.close(&c.id);
 }
 
@@ -1021,4 +1248,111 @@ async fn postgres_through_ssh_tunnel() {
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
     m.close("ssh-tunnel");
+}
+
+/// Scheduled events are listed with their status and schedule, and the scripts
+/// the explorer builds for them (see events.test.ts) run on MySQL and MariaDB.
+#[tokio::test]
+async fn mysql_events_end_to_end() {
+    for var in ["DBMS_TEST_MYSQL", "DBMS_TEST_MARIADB"] {
+        let Some((m, id)) = open(Engine::Mysql, var).await else {
+            continue;
+        };
+        let s = m.get(&id).unwrap();
+        let db = "mdb_events";
+        let setup = "DROP DATABASE IF EXISTS mdb_events; CREATE DATABASE mdb_events; USE mdb_events; \
+            CREATE TABLE t (id INT); \
+            CREATE EVENT ev_every ON SCHEDULE EVERY 1 HOUR STARTS '2026-01-01 00:00:00' ENDS '2030-01-01 00:00:00' \
+              DISABLE COMMENT 'hourly cleanup' DO DELETE FROM t; \
+            CREATE EVENT ev_once ON SCHEDULE AT '2030-05-01 12:00:00' DO INSERT INTO t VALUES (1);";
+        let out = s.execute("t", "", setup, &opts()).await.unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+
+        let objects = s.list_objects(db, None).await.unwrap();
+        let find = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+                .clone()
+        };
+        let every = find("ev_every");
+        assert_eq!(every.kind, "event", "{var}");
+        assert_eq!(every.comment.as_deref(), Some("hourly cleanup"), "{var}");
+        let detail = every.detail.clone().unwrap_or_default();
+        assert!(
+            detail.starts_with(
+                "DISABLED · EVERY 1 HOUR STARTS 2026-01-01 00:00:00 ENDS 2030-01-01 00:00:00"
+            ),
+            "{var}: {detail}"
+        );
+        assert!(detail.contains("definer root@"), "{var}: {detail}");
+        let once = find("ev_once");
+        assert!(
+            once.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("ENABLED · AT 2030-05-01 12:00:00")),
+            "{var}: {:?}",
+            once.detail
+        );
+
+        let ddl = s
+            .object_definition(db, None, "ev_every", "event", None)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        // Messages name the server only: CodeQL treats what this connection reads as secret
+        assert!(ddl.starts_with("CREATE DEFINER="), "{var}");
+        assert!(
+            ddl.contains("EVENT `ev_every` ON SCHEDULE EVERY 1 HOUR"),
+            "{var}"
+        );
+
+        // Script as ALTER, then Disable, then the New event template (sent without DELIMITER)
+        let alter =
+            format!("ALTER{};", &ddl["CREATE".len()..]).replace("EVERY 1 HOUR", "EVERY 2 HOUR");
+        let template = "CREATE EVENT new_event\nON SCHEDULE EVERY 1 DAY\nSTARTS CURRENT_TIMESTAMP + INTERVAL 1 HOUR\n\
+            ON COMPLETION PRESERVE\nENABLE\nCOMMENT 'What this event does'\nDO\nBEGIN\n  \
+            -- event body, e.g. DELETE FROM sessions WHERE expires_at < NOW();\n  SET @new_event_ran_at = NOW();\nEND;";
+        for sql in [
+            alter.as_str(),
+            "ALTER EVENT `mdb_events`.`ev_once` DISABLE;",
+            template,
+        ] {
+            let out = s.execute("t", db, sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{var}: {sql}\n{:?}", out.error);
+        }
+        let objects = s.list_objects(db, None).await.unwrap();
+        let detail = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .and_then(|o| o.detail.clone())
+                .unwrap_or_else(|| panic!("{var}: {name} not listed"))
+        };
+        assert!(detail("ev_every").contains("EVERY 2 HOUR"), "{var}");
+        assert!(detail("ev_once").starts_with("DISABLED"), "{var}");
+        assert!(
+            detail("new_event").starts_with("ENABLED · EVERY 1 DAY"),
+            "{var}"
+        );
+
+        let out = s
+            .execute("t", db, "SELECT @@event_scheduler", &opts())
+            .await
+            .unwrap();
+        let scheduler = cell(&out, 0, 0, 0);
+        assert!(
+            ["ON", "OFF", "DISABLED"].contains(&scheduler.as_str().unwrap_or_default()),
+            "{var}: {scheduler}"
+        );
+        println!("{var}: event_scheduler = {scheduler}");
+
+        let out = s
+            .execute("t", "", "DROP DATABASE mdb_events", &opts())
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "{var}: {:?}", out.error);
+        m.close(&id);
+    }
 }

@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import {
   ArchiveRestore,
   Braces,
+  CalendarClock,
   Cloud,
   Code2,
   DatabaseBackup,
@@ -109,6 +110,7 @@ export function TabIcon({ tab, className }: { tab: Tab; className?: string }): R
       ) {
         return <FunctionSquare className={cn(c, 'text-syn-fn')} />
       }
+      if (tab.objectKind === 'event') return <CalendarClock className={cn(c, 'text-syn-fn')} />
       return <Table2 className={cn(c, 'text-syn-prop')} />
     case 'collection':
       return tab.view === 'aggregation' ? (

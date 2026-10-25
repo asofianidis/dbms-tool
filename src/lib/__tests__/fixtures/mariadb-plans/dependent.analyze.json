@@ -1,0 +1,76 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.095372965
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.06031992,
+    "r_loops": 1,
+    "r_total_time_ms": 1102.716246,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "ref",
+          "possible_keys": ["idx_country"],
+          "key": "idx_country",
+          "key_length": "9",
+          "used_key_parts": ["country"],
+          "ref": ["const"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 400,
+          "r_rows": 400,
+          "cost": 0.06031992,
+          "r_table_time_ms": 0.207081576,
+          "r_other_time_ms": 0.60186803,
+          "r_engine_stats": {
+            "pages_accessed": 4
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "attached_condition": "c.country = 'JP'",
+          "r_filtered": 100,
+          "using_index": true
+        }
+      }
+    ],
+    "subqueries": [
+      {
+        "subquery_cache": {
+          "state": "disabled",
+          "r_loops": 200,
+          "r_hit_ratio": 0,
+          "query_block": {
+            "select_id": 2,
+            "cost": 3.3279766,
+            "r_loops": 400,
+            "r_total_time_ms": 1101.39768,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "o",
+                  "access_type": "ALL",
+                  "loops": 1,
+                  "r_loops": 400,
+                  "rows": 19847,
+                  "r_rows": 20000,
+                  "cost": 3.3279766,
+                  "r_table_time_ms": 841.5684376,
+                  "r_other_time_ms": 259.4590245,
+                  "r_engine_stats": {
+                    "pages_accessed": 22000
+                  },
+                  "filtered": 100,
+                  "r_total_filtered": 0.05,
+                  "attached_condition": "o.customer_id = c.`id`",
+                  "r_filtered": 0.05
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

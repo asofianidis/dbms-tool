@@ -52,11 +52,17 @@ import {
 import { tags as t } from '@lezer/highlight'
 import type { CompletionTable } from '@/lib/api'
 import type { Dialect } from '@/lib/engines'
+import type { ServerVersion } from '@/lib/mariadb'
 import { allSnippets, snippetsStore, type Snippet } from '@/lib/snippets'
+import { MariaDbSQL, mariaDbCompletion } from './mariadb-completion'
 import { signatureHelp, sqlAssistCompletion, tableAwareCompletion } from './sql-completion'
 
 export type EditorLanguage =
-  { kind: 'sql'; dialect: Dialect } | { kind: 'mongo' } | { kind: 'json' } | { kind: 'text' }
+  /** `mariaDb` is the server's version when a MySQL-dialect connection is MariaDB */
+  | { kind: 'sql'; dialect: Dialect; mariaDb?: ServerVersion }
+  | { kind: 'mongo' }
+  | { kind: 'json' }
+  | { kind: 'text' }
 
 export interface CodeEditorHandle {
   view: () => EditorView | null
@@ -235,7 +241,8 @@ function languageExtension(
   sqlTables: CompletionTable[] | undefined
 ): Extension {
   if (language.kind === 'sql') {
-    const dialect = DIALECTS[language.dialect]
+    const mariaDb = language.dialect === 'mysql' ? language.mariaDb : undefined
+    const dialect = mariaDb ? MariaDbSQL : DIALECTS[language.dialect]
     const ext = sql({ dialect, upperCaseKeywords: true })
     const names = tableAwareCompletion(
       schemaCompletionSource({ dialect, schema: completion, defaultSchema })
@@ -244,13 +251,15 @@ function languageExtension(
       tables: sqlTables ?? [],
       dialect: language.dialect,
       defaultSchema,
+      mariaDb,
       snippets
     })
     return [
       ext,
       ext.language.data.of({ autocomplete: names }),
       ext.language.data.of({ autocomplete: assist }),
-      signatureHelp(language.dialect),
+      signatureHelp(language.dialect, mariaDb),
+      ...(mariaDb ? [ext.language.data.of({ autocomplete: mariaDbCompletion(mariaDb) })] : []),
       ...(extra ? [ext.language.data.of({ autocomplete: extra })] : [])
     ]
   }
@@ -376,6 +385,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, Props>(function CodeEdito
   }, [
     language.kind,
     language.kind === 'sql' ? language.dialect : '',
+    language.kind === 'sql' ? language.mariaDb?.join('.') : '',
     completion,
     defaultSchema,
     extraCompletion,

@@ -22,6 +22,7 @@ import {
   Code2,
   Columns3,
   ArchiveRestore,
+  CalendarClock,
   Copy,
   Database,
   DatabaseBackup,
@@ -72,7 +73,6 @@ import { catalogQueries, type CatalogItem } from '@/lib/catalog'
 import { cn } from '@/lib/cn'
 import { ENGINES, connectionLabel, connectionSubtitle, supports } from '@/lib/engines'
 import { compactCount, formatBytes } from '@/lib/format'
-import { connectedInfo } from '@/lib/mariadb'
 import { supportsPackages } from '@/lib/mariadb-packages'
 import { principalKey, principalLabel, type Principal } from '@/lib/grants'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
@@ -80,6 +80,7 @@ import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
+import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
 import { quoteIdent } from '@/lib/sql'
 import { canHaveTriggers } from '@/lib/triggers'
 import { toast, toastError, errorMessage } from '@/lib/toast'
@@ -109,6 +110,7 @@ import { showContextMenu, showMenuAt, type MenuItem } from '@/components/Context
 import { exportConnectionsToFile, openImportConnections } from '../connections/ImportConnections'
 import { Button, EngineMark, Spinner } from '@/components/ui'
 import { collectionMenu, dropDatabase, newRoutine, objectMenu } from './actions'
+import { newSequence as newSequenceScript } from './sequence-actions'
 import { openCreateCollection } from '../mongo/CreateCollectionDialog'
 import { openExecuteRoutine } from './ExecuteRoutineDialog'
 import { newPackage } from './packages'
@@ -120,6 +122,9 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { VersionedMark } from './Versioning'
+import { EventSchedulerBadge, newEvent } from './events'
+import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
 
@@ -1063,6 +1068,10 @@ const FOLDERS: {
   newTable?: boolean
   /** MariaDB 10.3+ only, shown even when empty */
   packages?: boolean
+  /** MySQL / MariaDB scheduled events */
+  event?: boolean
+  /** Shown, with a New sequence action, on MariaDB 10.3+ */
+  newSequence?: boolean
 }[] = [
   { kinds: ['table', 'foreign_table'], label: 'Tables', always: true, newTable: true },
   { kinds: ['view'], label: 'Views', always: true },
@@ -1070,8 +1079,9 @@ const FOLDERS: {
   { kinds: ['procedure'], label: 'Procedures', always: true, routine: 'procedure' },
   { kinds: ['function'], label: 'Functions', always: true, routine: 'function' },
   { kinds: ['package'], label: 'Packages', packages: true },
-  { kinds: ['sequence'], label: 'Sequences' },
-  { kinds: ['synonym'], label: 'Synonyms' }
+  { kinds: ['sequence'], label: 'Sequences', newSequence: true },
+  { kinds: ['synonym'], label: 'Synonyms' },
+  { kinds: ['event'], label: 'Events', always: true, event: true }
 ]
 
 function ObjectFolders({
@@ -1086,7 +1096,9 @@ function ObjectFolders({
   depth: number
 }): React.JSX.Element {
   const q = useQuery(queries.objects(connection.id, database, schema))
-  const packages = supportsPackages(connectedInfo(statusStore.use()[connection.id]))
+  const info = connectedInfo(statusStore.use()[connection.id])
+  const packages = supportsPackages(info)
+  const sequences = mariaDbAtLeast(info, 10, 3)
   if (q.isPending) return <EmptyRow depth={depth}>Loading…</EmptyRow>
   if (q.isError) return <ErrorRow depth={depth} error={q.error} onRetry={() => void q.refetch()} />
   return (
@@ -1094,8 +1106,10 @@ function ObjectFolders({
       {FOLDERS.map((folder) => {
         const objects = q.data.filter((o) => folder.kinds.includes(o.kind))
         if (folder.packages && !packages) return null
-        if (!objects.length && !folder.always && !folder.packages) return null
+        const newSequence = folder.newSequence && sequences
+        if (!objects.length && !folder.always && !folder.packages && !newSequence) return null
         if (folder.routine && !supports(connection.engine, 'routines')) return null
+        if (folder.event && connection.engine !== 'mysql') return null
         const tsql = connection.engine === 'mssql' || connection.engine === 'babelfish'
         return (
           <ObjectFolder
@@ -1108,6 +1122,8 @@ function ObjectFolders({
             routine={folder.routine}
             newTable={folder.newTable}
             newPackage={folder.packages}
+            event={folder.event}
+            newSequence={newSequence}
             objects={objects}
             depth={depth}
           />
@@ -1129,6 +1145,8 @@ function ObjectFolder({
   routine,
   newTable,
   newPackage: canAddPackage,
+  event,
+  newSequence,
   objects,
   depth
 }: {
@@ -1140,6 +1158,8 @@ function ObjectFolder({
   routine?: 'procedure' | 'function'
   newTable?: boolean
   newPackage?: boolean
+  event?: boolean
+  newSequence?: boolean
   objects: DbObject[]
   depth: number
 }): React.JSX.Element {
@@ -1158,7 +1178,16 @@ function ObjectFolder({
         onToggle={() => setOpen(!isOpen)}
         muted
         icon={isOpen ? <FolderOpen className="text-faint" /> : <Folder className="text-faint" />}
-        label={label}
+        label={
+          event ? (
+            <>
+              {label}
+              <EventSchedulerBadge connectionId={connection.id} />
+            </>
+          ) : (
+            label
+          )
+        }
         detail={filter ? `${visible.length}/${objects.length}` : objects.length}
         onMenu={(e) =>
           showContextMenu(e, [
@@ -1181,12 +1210,30 @@ function ObjectFolder({
                   }
                 ]
               : []),
+            ...(event
+              ? [
+                  {
+                    label: 'New event',
+                    icon: <Plus />,
+                    onSelect: () => newEvent(connection.id, database)
+                  }
+                ]
+              : []),
             ...(newTable && supports(connection.engine, 'tableDesigner')
               ? [
                   {
                     label: 'New table…',
                     icon: <Plus />,
                     onSelect: () => openTableDesigner(connection.id, database, schema)
+                  }
+                ]
+              : []),
+            ...(newSequence
+              ? [
+                  {
+                    label: 'New sequence',
+                    icon: <Plus />,
+                    onSelect: () => newSequenceScript(connection.id, database)
                   }
                 ]
               : []),
@@ -1216,6 +1263,24 @@ function ObjectFolder({
               variant="ghost"
               title="New package"
               onClick={() => newPackage(connection.id, database)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : event ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New event"
+              onClick={() => newEvent(connection.id, database)}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+          ) : newSequence ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              title="New sequence"
+              onClick={() => newSequenceScript(connection.id, database)}
             >
               <Plus className="size-3.5" />
             </Button>
@@ -1262,6 +1327,8 @@ function objectIcon(kind: ObjectKind): ReactNode {
       return <ListOrdered className="text-syn-number" />
     case 'synonym':
       return <Link2 className="text-muted" />
+    case 'event':
+      return <CalendarClock className="text-syn-fn" />
     default:
       return <Table2 className="text-syn-prop" />
   }
@@ -1306,12 +1373,15 @@ function ObjectNode({
         onMenu={(e) => showContextMenu(e, objectMenu(connection.id, database, obj))}
         icon={objectIcon(obj.kind)}
         title={
-          [obj.comment, obj.detail && `(${obj.detail})`].filter(Boolean).join('\n') || undefined
+          obj.kind === 'event'
+            ? eventTooltip(obj)
+            : [obj.comment, obj.detail && `(${obj.detail})`].filter(Boolean).join('\n') || undefined
         }
         label={
           <>
             {showSchema && <span className="text-muted">{obj.schema}.</span>}
             {obj.name}
+            <VersionedMark connection={connection} database={database} obj={obj} />
             {(obj.kind === 'function' || obj.kind === 'procedure') &&
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>
@@ -1319,9 +1389,11 @@ function ObjectNode({
           </>
         }
         detail={
-          obj.rowEstimate != null && obj.rowEstimate >= 0
-            ? compactCount(obj.rowEstimate)
-            : undefined
+          obj.kind === 'event'
+            ? (eventStatusLabel(obj.detail) ?? undefined)
+            : obj.rowEstimate != null && obj.rowEstimate >= 0
+              ? compactCount(obj.rowEstimate)
+              : undefined
         }
         actions={
           isRoutine && (

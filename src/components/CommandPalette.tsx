@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   ArchiveRestore,
   Bookmark,
+  CalendarClock,
   ClipboardCopy,
   BookmarkPlus,
   Cloud,
@@ -109,6 +110,7 @@ function objectIcon(kind: DbObject['kind']): ReactNode {
   if (kind === 'function' || kind === 'procedure') return <FunctionSquare className="text-syn-fn" />
   if (kind === 'collection' || kind === 'timeseries') return <Leaf className="text-mongo" />
   if (kind === 'sequence') return <ListOrdered className="text-syn-number" />
+  if (kind === 'event') return <CalendarClock className="text-syn-fn" />
   return <Table2 className="text-syn-prop" />
 }
 
@@ -416,7 +418,8 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
       if (!connection) return
       const name =
         obj.schema && connection.engine !== 'mysql' ? `${obj.schema}.${obj.name}` : obj.name
-      const id = `obj:${connectionId}:${database}:${name}:${obj.detail ?? ''}`
+      // An event's detail is its status and last run, which search hits don't have
+      const id = `obj:${connectionId}:${database}:${name}:${obj.kind === 'event' ? '' : (obj.detail ?? '')}`
       if (seen.has(id)) return
       seen.add(id)
       objectItems.push({
@@ -435,7 +438,9 @@ function Palette({ initial }: { initial: string }): React.JSX.Element {
                 obj.schema,
                 obj.name,
                 obj.kind,
-                ['function', 'procedure', 'package', 'sequence', 'synonym'].includes(obj.kind)
+                ['function', 'procedure', 'package', 'sequence', 'synonym', 'event'].includes(
+                  obj.kind
+                )
                   ? 'definition'
                   : 'data',
                 obj.detail
