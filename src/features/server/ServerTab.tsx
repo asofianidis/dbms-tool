@@ -47,6 +47,7 @@ import {
   SlowQueriesSection,
   useLocks
 } from './PerformancePanels'
+import { PgHealthSection } from './PgHealthPanels'
 import { ReplicationPanel } from './ReplicationPanel'
 import { SlowLogPanel } from './SlowLogPanel'
 import { PgSettingsPanel } from './PgSettingsPanel'
@@ -437,6 +438,16 @@ function ServerDashboard({
         />
 
         {connection.engine === 'mysql' && <SlowLogPanel connection={connection} />}
+
+        {engineKey === 'postgres' && (
+          <PgHealthSection
+            connection={connection}
+            databases={dbs.data?.filter((d) => !d.isSystem).map((d) => d.name) ?? []}
+            defaultDatabase={info?.currentDatabase ?? ''}
+            active={active && visible}
+            onSessionAction={act}
+          />
+        )}
 
         {connection.engine === 'postgres' && !babelfish && (
           <PgSettingsPanel connection={connection} />
