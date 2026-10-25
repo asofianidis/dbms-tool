@@ -104,14 +104,16 @@ describe('authentication plugins', () => {
     expect(authLoginProblem(['mysql_native_password'], true)).toBeNull()
     expect(authLoginProblem(['caching_sha2_password'], false)).toBeNull()
     expect(authLoginProblem([], true)).toBeNull()
-    expect(authLoginProblem(['ed25519'], true)).toMatch(/can't sign in as ed25519/)
-    expect(authLoginProblem(['parsec', 'mysql_native_password'], true)).toMatch(/parsec/)
+    expect(authLoginProblem(['ed25519'], true)).toBeNull()
+    expect(authLoginProblem(['parsec', 'mysql_native_password'], true)).toBeNull()
+    expect(authLoginProblem(['gssapi'], true)).toMatch(/can't sign in as gssapi/)
     expect(authLoginProblem(['unix_socket'], true)).toMatch(/connects over TCP/)
     // unix_socket fails over TCP and the server moves on
     expect(authLoginProblem(['unix_socket', 'mysql_native_password'], true)).toBeNull()
     expect(authLoginProblem(['mysql_native_password', 'unix_socket'], true)).toBeNull()
-    expect(authLoginProblem(['mysql_native_password', 'ed25519'], true)).toMatch(
-      /mistyped password falls through to ed25519/
+    expect(authLoginProblem(['mysql_native_password', 'ed25519'], true)).toBeNull()
+    expect(authLoginProblem(['mysql_native_password', 'pam'], true)).toMatch(
+      /mistyped password falls through to pam/
     )
     expect(authLoginProblem(['sha256_password'], false)).toMatch(/sha256_password/)
   })

@@ -1,8 +1,8 @@
 /**
  * MySQL and MariaDB authentication plugins: the ones the user designer offers, the
  * IDENTIFIED clause that sets them, and whether this app can sign in as accounts that use
- * them (its driver, mysql_async, only answers mysql_native_password and
- * caching_sha2_password).
+ * them (its driver, mysql_async, answers mysql_native_password, caching_sha2_password,
+ * ed25519 and parsec).
  */
 import type { Cell, ServerInfo } from './api'
 import { mariaDbAtLeast } from './mariadb'
@@ -36,14 +36,12 @@ const MARIADB_PLUGINS: AuthPlugin[] = [
     name: 'ed25519',
     password: true,
     hint: 'Elliptic-curve signature; the password hash never crosses the network',
-    noLogin: noClient('ed25519'),
     install: "INSTALL SONAME 'auth_ed25519'"
   },
   {
     name: 'parsec',
     password: true,
     hint: 'Salted PBKDF2 key with an ed25519 signature (MariaDB 11.6+)',
-    noLogin: noClient('parsec'),
     install: "INSTALL SONAME 'auth_parsec'",
     since: [11, 6]
   },
