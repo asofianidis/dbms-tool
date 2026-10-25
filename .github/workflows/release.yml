@@ -248,7 +248,10 @@ jobs:
         with:
           releaseId: ${{ needs.draft.outputs.release_id }}
           tauriScript: pnpm tauri
-          args: ${{ matrix.args }} ${{ steps.signing.outputs.args }}
+          # RPM versions can't contain '-', so nightlies (0.1.37-412) skip the .rpm
+          args: >-
+            ${{ matrix.args }} ${{ steps.signing.outputs.args }}
+            ${{ runner.os == 'Linux' && needs.prepare.outputs.channel == 'nightly' && '--bundles appimage,deb' || '' }}
           # latest.json is generated once all platforms have uploaded
           uploadUpdaterJson: false
 
@@ -378,6 +381,9 @@ jobs:
             fi
             echo
           } > notes.md
+          # Nightlies have no .rpm (see Build and upload)
+          rpm_x64=", \`*.x86_64.rpm\`" rpm_arm64=", \`*.aarch64.rpm\`"
+          if [ "$CHANNEL" = "nightly" ]; then rpm_x64="" rpm_arm64=""; fi
           cat >> notes.md <<NOTES
           ## Downloads
 
@@ -385,8 +391,8 @@ jobs:
           | --- | --- |
           | Windows (x64) | \`*_x64-setup.exe\` (recommended) or \`*.msi\` |
           | macOS (Apple Silicon and Intel) | \`*_universal.dmg\` |
-          | Linux (x64) | \`*_amd64.AppImage\` (self-updating), \`*_amd64.deb\`, \`*.x86_64.rpm\` |
-          | Linux (arm64) | \`*_aarch64.AppImage\` (self-updating), \`*_arm64.deb\`, \`*.aarch64.rpm\` |
+          | Linux (x64) | \`*_amd64.AppImage\` (self-updating), \`*_amd64.deb\`$rpm_x64 |
+          | Linux (arm64) | \`*_aarch64.AppImage\` (self-updating), \`*_arm64.deb\`$rpm_arm64 |
 
           Installed apps on the $CHANNEL channel update themselves from this release.
 
