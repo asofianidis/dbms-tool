@@ -45,6 +45,7 @@ import {
   SlowQueriesSection,
   useLocks
 } from './PerformancePanels'
+import { ReplicationPanel } from './ReplicationPanel'
 import { SlowLogPanel } from './SlowLogPanel'
 import { useSqlPanel, type SqlPanel } from './useSqlPanel'
 
@@ -403,6 +404,15 @@ function ServerDashboard({
         )}
 
         {locks && <LocksSection locks={locks} engineKey={engineKey} />}
+
+        {connection.engine === 'mysql' && (
+          <ReplicationPanel
+            connection={connection}
+            info={info}
+            refresh={refresh}
+            active={active && visible}
+          />
+        )}
 
         <SlowQueriesSection
           connection={connection}
