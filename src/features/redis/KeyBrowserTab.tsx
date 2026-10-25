@@ -30,9 +30,9 @@ import {
   dataText,
   flattenKeyTree,
   formatTtl,
-  globEscape,
-  quoteArg,
+  quoteData,
   sameData,
+  scanPattern,
   type KeyFolder,
   type KeyRow
 } from '@/lib/redis'
@@ -61,13 +61,6 @@ const prefsStore = createPersistentStore<{ view: 'tree' | 'list'; delimiter: str
   'dbms.redis.browser.v1',
   { view: 'tree', delimiter: ':' }
 )
-
-/** What's typed → a SCAN pattern: plain text matches anywhere in the name. */
-export function scanPattern(text: string): string {
-  const t = text.trim()
-  if (!t) return '*'
-  return /[*?[]/.test(t) ? t : `*${globEscape(t)}*`
-}
 
 export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.Element {
   const connections = connectionsStore.use()
@@ -176,11 +169,11 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
     overscan: 20
   })
 
-  const toggleFolder = (prefix: string): void =>
+  const toggleFolder = (id: string): void =>
     setOpen((o) => {
       const next = new Set(o)
-      if (next.has(prefix)) next.delete(prefix)
-      else next.add(prefix)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
       return next
     })
 
@@ -219,10 +212,10 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
   }
 
   const deleteFolder = async (folder: KeyFolder): Promise<void> => {
-    const match = `${globEscape(folder.prefix)}*`
+    const match = folder.match
     const ok = await confirm({
       title: `Delete everything under ${folder.prefix}?`,
-      message: `Every key matching ${match} in database ${tab.database} is deleted, including keys that aren't loaded here (${plural(folder.count, 'key')} loaded).`,
+      message: `Every key matching ${dataText(match)} in database ${tab.database} is deleted, including keys that aren't loaded here (${plural(folder.count, 'key')} loaded).`,
       confirmLabel: 'Delete keys',
       danger: true
     })
@@ -261,7 +254,7 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
       {
         label: 'Open in console',
         icon: <SquareTerminal />,
-        onSelect: () => newQueryTab(tab.connectionId, tab.database, `TYPE ${quoteArg(name)}`)
+        onSelect: () => newQueryTab(tab.connectionId, tab.database, `TYPE ${quoteData(entry.key)}`)
       },
       ...(readOnly
         ? []
@@ -284,8 +277,7 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
       {
         label: 'Show only this folder',
         icon: <Filter />,
-        onSelect: () =>
-          updateTab(tab.id, { pattern: `${globEscape(folder.prefix)}*` } as Partial<typeof tab>)
+        onSelect: () => updateTab(tab.id, { pattern: folder.filter } as Partial<typeof tab>)
       },
       {
         label: 'Copy prefix',
@@ -534,12 +526,12 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
                       paddingLeft: 8 + row.depth * 14
                     }
                     if (row.kind === 'folder') {
-                      const isOpen = open.has(row.folder.prefix)
+                      const isOpen = open.has(row.folder.id)
                       return (
                         <div
-                          key={`f:${row.folder.prefix}`}
+                          key={`f:${row.folder.id}`}
                           style={style}
-                          onClick={() => toggleFolder(row.folder.prefix)}
+                          onClick={() => toggleFolder(row.folder.id)}
                           onContextMenu={(e) => folderMenu(e, row.folder)}
                           className="flex cursor-default items-center gap-1 pr-2 text-xs text-fg hover:bg-hover"
                         >

@@ -204,11 +204,12 @@ describe('EJSON', () => {
     const text = toShell(doc)
     expect(text).toContain("ObjectId('65a1f0c2e4b0a1b2c3d4e5f6')")
     expect(text).toContain("NumberLong('9007199254740993')")
-    expect(text).toContain('d: 2.0')
+    expect(text).toContain('d: Double(2)')
     const back = parseShellValue(text) as Record<string, unknown>
     expect(back._id).toEqual(doc._id)
     expect(back.at).toEqual(doc.at)
     expect(back.n).toEqual(doc.n)
+    expect(back.d).toEqual(doc.d)
     expect(back.i).toBe(3)
     expect(back.tags).toEqual(['a', 'b'])
   })

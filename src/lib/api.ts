@@ -556,7 +556,7 @@ export type RedisRequest =
       op: 'scan'
       database: string
       cursor?: string | null
-      pattern?: string
+      pattern?: RData
       keyType?: string
       count?: number
     }
@@ -583,7 +583,8 @@ export type RedisRequest =
   | { op: 'listSet'; database: string; key: RData; index: number; value: RData }
   | { op: 'listRemove'; database: string; key: RData; index: number }
   | { op: 'setAdd' | 'setRemove'; database: string; key: RData; members: RData[] }
-  | { op: 'zsetAdd'; database: string; key: RData; member: RData; score: number }
+  /** `score` as text too: `inf`, `-inf`, which JSON numbers can't carry */
+  | { op: 'zsetAdd'; database: string; key: RData; member: RData; score: number | string }
   | { op: 'zsetRemove'; database: string; key: RData; members: RData[] }
   | { op: 'streamAdd'; database: string; key: RData; id?: string; fields: [RData, RData][] }
   | { op: 'streamDelete'; database: string; key: RData; ids: string[] }
@@ -591,9 +592,9 @@ export type RedisRequest =
   | { op: 'expire'; database: string; key: RData; ttlMs?: number | null }
   | { op: 'rename'; database: string; key: RData; newKey: RData }
   | { op: 'delete'; database: string; keys: RData[] }
-  | { op: 'deleteMatching'; database: string; pattern: string }
+  | { op: 'deleteMatching'; database: string; pattern: RData }
   | { op: 'flush'; database: string }
-  | { op: 'command'; database: string; args: string[] }
+  | { op: 'command'; database: string; args: RData[] }
   /** Many commands in one round trip; rejected ones come back in `entries` as { index, error } */
   | { op: 'pipeline'; database: string; commands: RData[][] }
 

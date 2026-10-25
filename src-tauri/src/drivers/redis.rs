@@ -68,6 +68,47 @@ impl Data {
             }
         }
     }
+
+    /// Text for classifying and logging a command; invalid UTF-8 is replaced.
+    pub fn text_lossy(&self) -> String {
+        match self {
+            Data::Text(s) => s.clone(),
+            Data::Hex { .. } => self
+                .bytes()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// A sorted-set score: a number, or text like `inf`, `-inf` or `1.5`, since JSON
+/// numbers can't hold infinities.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Score {
+    Number(f64),
+    Text(String),
+}
+
+impl Score {
+    /// The ZADD argument: `+inf`, `-inf` or the number's shortest text.
+    fn arg(&self) -> AppResult<String> {
+        let n = match self {
+            Score::Number(n) => *n,
+            Score::Text(t) => t
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| AppError::msg(format!("Invalid score: {t}")))?,
+        };
+        if n.is_nan() {
+            return Err(AppError::msg("The score must be a number"));
+        }
+        Ok(match n {
+            f64::INFINITY => "+inf".to_string(),
+            f64::NEG_INFINITY => "-inf".to_string(),
+            n => n.to_string(),
+        })
+    }
 }
 
 /// Bytes → `"text"` or `{"$hex": "…"}`.
@@ -492,7 +533,7 @@ pub enum RedisRequest {
     Scan {
         database: String,
         cursor: Option<String>,
-        pattern: Option<String>,
+        pattern: Option<Data>,
         key_type: Option<String>,
         count: Option<usize>,
     },
@@ -562,7 +603,7 @@ pub enum RedisRequest {
         database: String,
         key: Data,
         member: Data,
-        score: f64,
+        score: Score,
     },
     ZsetRemove {
         database: String,
@@ -604,7 +645,7 @@ pub enum RedisRequest {
     /// Unlinks every key matching `pattern`, a SCAN batch at a time
     DeleteMatching {
         database: String,
-        pattern: String,
+        pattern: Data,
     },
     /// Empties the keyspace
     Flush {
@@ -613,7 +654,7 @@ pub enum RedisRequest {
     /// A raw command from the console
     Command {
         database: String,
-        args: Vec<String>,
+        args: Vec<Data>,
     },
     /// Many commands in one round trip, e.g. seeding; a command the server rejects is
     /// reported, not fatal
@@ -655,7 +696,10 @@ impl RedisRequest {
     pub fn is_write(&self) -> bool {
         match self {
             RedisRequest::Scan { .. } | RedisRequest::Get { .. } => false,
-            RedisRequest::Command { args, .. } => !is_read_command(args),
+            RedisRequest::Command { args, .. } => {
+                let name: Vec<String> = args.iter().take(2).map(Data::text_lossy).collect();
+                !is_read_command(&name)
+            }
             RedisRequest::Pipeline { commands, .. } => commands.iter().any(|c| {
                 let name: Vec<String> = c
                     .iter()
@@ -1145,7 +1189,7 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
                 conn,
                 cmd("ZADD")
                     .arg(key.bytes()?)
-                    .arg(score)
+                    .arg(score.arg()?)
                     .arg(member.bytes()?),
             )
             .await?;
@@ -1215,7 +1259,8 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
             affected(unlink(conn, &keys).await?)
         }
         DeleteMatching { pattern, .. } => {
-            if pattern.trim().is_empty() {
+            let pattern = pattern.bytes()?;
+            if pattern.iter().all(u8::is_ascii_whitespace) {
                 return Err(AppError::msg("Enter a pattern of keys to delete"));
             }
             let mut cursor = "0".to_string();
@@ -1249,15 +1294,19 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
         }
         Pipeline { commands, .. } => pipeline(conn, commands).await?,
         Command { args, .. } => {
-            let Some(name) = args.first() else {
+            let Some((name, rest)) = args.split_first() else {
                 return Err(AppError::msg("Enter a command"));
             };
-            if let Some(reason) = refused_command(&args) {
+            let Data::Text(name) = name else {
+                return Err(AppError::msg("A command name must be text"));
+            };
+            if let Some(reason) = refused_command(std::slice::from_ref(name)) {
                 return Err(AppError::msg(reason));
             }
             let mut c = cmd(name);
-            for a in &args[1..] {
-                c.arg(a);
+            // Byte-exact, so `"\xff"` typed in the console is the byte 0xff
+            for a in rest {
+                c.arg(a.bytes()?);
             }
             // Server errors are replies the console prints, not failures
             let reply = conn.req_packed_command(&c).await?;
@@ -1329,11 +1378,19 @@ fn scan_reply(reply: RValue) -> (String, Vec<RValue>) {
 async fn scan(
     conn: &mut MultiplexedConnection,
     cursor: Option<String>,
-    pattern: Option<String>,
+    pattern: Option<Data>,
     key_type: Option<String>,
     count: usize,
 ) -> AppResult<RedisOutput> {
-    let pattern = pattern.filter(|p| !p.is_empty()).unwrap_or("*".into());
+    let pattern = match pattern {
+        Some(p) => p.bytes()?,
+        None => Vec::new(),
+    };
+    let pattern = if pattern.is_empty() {
+        b"*".to_vec()
+    } else {
+        pattern
+    };
     let key_type = key_type.filter(|t| !t.is_empty());
     let started = Instant::now();
     let mut cursor = cursor.filter(|c| !c.is_empty()).unwrap_or("0".into());
@@ -1577,9 +1634,17 @@ fn zset_entries(reply: RValue, offset: i64) -> Vec<Value> {
         .into_iter()
         .enumerate()
         .map(|(i, (m, s))| {
-            json!({ "rank": offset + i as i64, "value": bytes_json(&m), "score": value_float(&s) })
+            json!({ "rank": offset + i as i64, "value": bytes_json(&m), "score": score_json(&s) })
         })
         .collect()
+}
+
+/// A score as JSON; infinities, which JSON numbers can't hold, as `"inf"` / `"-inf"`.
+fn score_json(v: &RValue) -> Value {
+    match value_float(v) {
+        Some(f) if f.is_infinite() => json!(if f > 0.0 { "inf" } else { "-inf" }),
+        f => json!(f),
+    }
 }
 
 /// `[[id, [field, value, …]], …]` → `[{id, fields: [[field, value], …]}]`
@@ -1802,6 +1867,61 @@ mod tests {
             RValue::Double(3.0),
         ])]);
         assert_eq!(zset_entries(resp3, 0)[0]["score"], json!(3.0));
+        let infinite = RValue::Array(vec![
+            RValue::BulkString(b"a".to_vec()),
+            RValue::BulkString(b"-inf".to_vec()),
+            RValue::BulkString(b"b".to_vec()),
+            RValue::Double(f64::INFINITY),
+        ]);
+        let entries = zset_entries(infinite, 0);
+        assert_eq!(entries[0]["score"], json!("-inf"));
+        assert_eq!(entries[1]["score"], json!("inf"));
+    }
+
+    #[test]
+    fn zadd_scores_accept_infinities() {
+        let request: RedisRequest = serde_json::from_value(json!({
+            "op": "zsetAdd", "database": "0", "key": "z", "member": "m", "score": "-inf"
+        }))
+        .unwrap();
+        let RedisRequest::ZsetAdd { score, .. } = request else {
+            panic!("expected zsetAdd");
+        };
+        assert_eq!(score.arg().unwrap(), "-inf");
+        let arg = |s: Value| serde_json::from_value::<Score>(s).unwrap().arg();
+        assert_eq!(arg(json!("inf")).unwrap(), "+inf");
+        assert_eq!(arg(json!("+inf")).unwrap(), "+inf");
+        assert_eq!(arg(json!(" 1.5 ")).unwrap(), "1.5");
+        assert_eq!(arg(json!(2.0)).unwrap(), "2");
+        assert_eq!(arg(json!(1e300)).unwrap().parse::<f64>().unwrap(), 1e300);
+        assert!(arg(json!("nan")).is_err());
+        assert!(arg(json!("abc")).is_err());
+    }
+
+    #[test]
+    fn console_args_are_byte_exact() {
+        let request: RedisRequest = serde_json::from_value(json!({
+            "op": "command", "database": "0", "args": ["GET", { "$hex": "ff3a31" }]
+        }))
+        .unwrap();
+        assert!(!request.is_write());
+        let RedisRequest::Command { args, .. } = request else {
+            panic!("expected command");
+        };
+        assert_eq!(args[1].bytes().unwrap(), vec![0xff, b':', b'1']);
+        let set: RedisRequest = serde_json::from_value(json!({
+            "op": "command", "database": "0", "args": ["SET", "k", "v"]
+        }))
+        .unwrap();
+        assert!(set.is_write());
+        let pattern: RedisRequest = serde_json::from_value(json!({
+            "op": "deleteMatching", "database": "0", "pattern": { "$hex": "ff3a2a" }
+        }))
+        .unwrap();
+        let RedisRequest::DeleteMatching { pattern, .. } = pattern else {
+            panic!("expected deleteMatching");
+        };
+        assert_eq!(pattern.bytes().unwrap(), vec![0xff, b':', b'*']);
     }
 
     #[test]

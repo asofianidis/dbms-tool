@@ -215,8 +215,10 @@ export function toShell(v: unknown, indent = 2, depth = 0): string {
         : `NumberInt(${shellNumber(o.$numberInt)})`
     case 'Double': {
       const text = typeof v === 'number' ? String(v) : String(o.$numberDouble)
-      if (/^-?\d+$/.test(text)) return `${text}.0`
       if (/^(NaN|-?Infinity)$/.test(text)) return text
+      // A literal like `3.0` reads back as an integer, so whole numbers keep the wrapper
+      if (shellNumber(text) === text && Number.isInteger(Number(text)))
+        return `Double(${text.replace(/\.0*$/, '')})`
       return shellNumber(text) === text ? text : `Double(${JSON.stringify(text)})`
     }
     case 'ObjectId':
@@ -276,6 +278,23 @@ export class Ejson {
   }
 }
 
+/**
+ * A date string read the way mongosh's `ISODate` does: date-times without a zone
+ * designator are UTC, not local time.
+ */
+export function parseIsoDate(s: string): Date {
+  const t = String(s).trim()
+  const local = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(:\d{2}(\.\d+)?)?)$/.exec(t)
+  return new Date(local ? `${local[1]}T${local[2]}Z` : t)
+}
+
+/** `$numberDouble` text; whole numbers keep a `.0` like the backend writes them. */
+function doubleText(n: number): string {
+  if (Object.is(n, -0)) return '-0.0'
+  const s = String(n)
+  return /^-?\d+$/.test(s) ? `${s}.0` : s
+}
+
 let oidCounter = Math.floor(Math.random() * 0xffffff)
 const oidRandom = Array.from({ length: 5 }, () =>
   Math.floor(Math.random() * 256)
@@ -298,7 +317,7 @@ export const shellHelpers = {
     return new Ejson({ $oid: (hex ?? newObjectIdHex()).toLowerCase() })
   },
   ISODate: (s?: string) => {
-    const d = s === undefined ? new Date() : new Date(s)
+    const d = s === undefined ? new Date() : parseIsoDate(s)
     if (Number.isNaN(d.getTime())) throw new Error(`Invalid date: ${s}`)
     return d
   },
@@ -306,7 +325,7 @@ export const shellHelpers = {
   NumberInt: (n: string | number) => new Ejson({ $numberInt: String(Math.trunc(Number(n))) }),
   Int32: (n: string | number) => new Ejson({ $numberInt: String(Math.trunc(Number(n))) }),
   Long: (n: string | number | bigint) => new Ejson({ $numberLong: String(n) }),
-  Double: (n: string | number) => new Ejson({ $numberDouble: String(Number(n)) }),
+  Double: (n: string | number) => new Ejson({ $numberDouble: doubleText(Number(n)) }),
   NumberDecimal: (s: string | number) => new Ejson({ $numberDecimal: String(s) }),
   Decimal128: (s: string | number) => new Ejson({ $numberDecimal: String(s) }),
   UUID: (s?: string) => {
@@ -329,7 +348,8 @@ export function toEjson(v: unknown): Json {
   if (v === null || typeof v === 'string' || typeof v === 'boolean') return v
   if (typeof v === 'number') {
     if (!Number.isFinite(v)) return { $numberDouble: String(v) }
-    if (Number.isInteger(v) && Math.abs(v) > 2 ** 31 - 1) return { $numberLong: String(v) }
+    if (Number.isInteger(v) && (v < -(2 ** 31) || v > 2 ** 31 - 1))
+      return { $numberLong: String(v) }
     return v
   }
   if (typeof v === 'bigint') return { $numberLong: v.toString() }
@@ -365,6 +385,43 @@ export function parseShellValue(text: string): Json {
     return new (Date as unknown as new (...a: unknown[]) => Date)(...args)
   }
   return toEjson(fn(...names.map((n) => shellHelpers[n as keyof typeof shellHelpers]), DateCtor))
+}
+
+function dateMillis(v: unknown): number {
+  if (isObject(v) && typeof v.$numberLong === 'string') return Number(v.$numberLong)
+  return Date.parse(String(v))
+}
+
+/** One spelling per value: dates as epoch millis, numbers tagged with their BSON type. */
+function canonicalEjson(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalEjson)
+  const o = v as Record<string, unknown>
+  switch (bsonType(v)) {
+    case 'Date':
+      return { $date: dateMillis(o.$date) }
+    case 'Int32':
+      return { $numberInt: String(Number(typeof v === 'number' ? v : o.$numberInt)) }
+    case 'Double':
+      return { $numberDouble: String(Number(typeof v === 'number' ? v : o.$numberDouble)) }
+    case 'Int64':
+      try {
+        return { $numberLong: BigInt(String(o.$numberLong)).toString() }
+      } catch {
+        return v
+      }
+    case 'Object':
+      return Object.fromEntries(Object.entries(o).map(([k, val]) => [k, canonicalEjson(val)]))
+    default:
+      return v
+  }
+}
+
+/**
+ * Whether two EJSON values hold the same BSON value, however each is spelled
+ * (`…05Z` or `…05.000Z`, `{ $numberInt: '5' }` or `5`). Field order counts.
+ */
+export function sameEjson(a: unknown, b: unknown): boolean {
+  return JSON.stringify(canonicalEjson(a)) === JSON.stringify(canonicalEjson(b))
 }
 
 /** Value at a dotted path, for table views of documents. */

@@ -31,16 +31,79 @@ export function dataBytes(d: RData): number {
   return isHex(d) ? d.$hex.length / 2 : new TextEncoder().encode(d).length
 }
 
+const encoder = new TextEncoder()
+const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+
+/** The bytes a value stands for. */
+export function toBytes(d: RData): Uint8Array {
+  if (!isHex(d)) return encoder.encode(d)
+  return Uint8Array.from(d.$hex.match(/../g) ?? [], (h) => parseInt(h, 16))
+}
+
+/** Bytes → text when they're UTF-8, hex otherwise (like the backend's `data_json`). */
+export function fromBytes(bytes: ArrayLike<number>): RData {
+  const b = Uint8Array.from(bytes)
+  try {
+    return decoder.decode(b)
+  } catch {
+    return { $hex: Array.from(b, (n) => n.toString(16).padStart(2, '0')).join('') }
+  }
+}
+
+/** Text with `\xNN` escapes, as `dataText` shows binary data, → the bytes it stands for. */
+export function parseEscapes(text: string): RData {
+  if (!/\\x[0-9a-f]{2}/i.test(text)) return text
+  const bytes: number[] = []
+  text.split(/(\\x[0-9a-fA-F]{2})/).forEach((part, i) => {
+    if (i % 2) bytes.push(parseInt(part.slice(2), 16))
+    else bytes.push(...encoder.encode(part))
+  })
+  return fromBytes(bytes)
+}
+
+/**
+ * JSON re-indented without parsing it into JS values, so numbers keep their exact
+ * text (`9007199254740993`, `1.0`) and duplicate keys survive. `indent` 0 gives the
+ * compact form. Null when the text isn't valid JSON.
+ */
+export function formatJson(text: string, indent = 2): string | null {
+  try {
+    JSON.parse(text)
+  } catch {
+    return null
+  }
+  const pad = (depth: number): string => (indent ? '\n' + ' '.repeat(indent * depth) : '')
+  let out = ''
+  let depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (c === '"') {
+      let j = i + 1
+      while (text[j] !== '"') j += text[j] === '\\' ? 2 : 1
+      out += text.slice(i, j + 1)
+      i = j
+    } else if (c === '{' || c === '[') {
+      let j = i + 1
+      while (/\s/.test(text[j])) j++
+      // Empty containers stay `{}` and `[]`
+      if (text[j] === (c === '{' ? '}' : ']')) {
+        out += c + text[j]
+        i = j
+      } else out += c + pad(++depth)
+    } else if (c === '}' || c === ']') out += pad(--depth) + c
+    else if (c === ',') out += ',' + pad(depth)
+    else if (c === ':') out += indent ? ': ' : ':'
+    else if (!/\s/.test(c)) out += c
+  }
+  return out
+}
+
 /** Pretty-printed JSON when a string holds an object or array, else null. */
 export function prettyJson(text: string): string | null {
   const t = text.trim()
   if (!(t.startsWith('{') && t.endsWith('}')) && !(t.startsWith('[') && t.endsWith(']')))
     return null
-  try {
-    return JSON.stringify(JSON.parse(t), null, 2)
-  } catch {
-    return null
-  }
+  return formatJson(t, 2)
 }
 
 /* ---------- Types ---------- */
@@ -80,6 +143,25 @@ export function formatTtl(ms: number | null | undefined): string {
   return ms < 1000 ? `${ms}ms` : `${s}s`
 }
 
+/** Exact TTL text that `parseTtl` reads back: `90061234` → `1d1h1m1s234ms`. */
+export function ttlInput(ms: number): string {
+  const units: [string, number][] = [
+    ['d', 86_400_000],
+    ['h', 3_600_000],
+    ['m', 60_000],
+    ['s', 1000],
+    ['ms', 1]
+  ]
+  let rest = Math.max(0, Math.round(ms))
+  let out = ''
+  for (const [unit, size] of units) {
+    const n = Math.floor(rest / size)
+    rest -= n * size
+    if (n) out += `${n}${unit}`
+  }
+  return out || '0ms'
+}
+
 /** `90`, `90s`, `5m`, `1h30m`, `2d` → milliseconds; empty → null (no expiry). */
 export function parseTtl(text: string): number | null {
   const t = text.trim().toLowerCase().replace(/\s+/g, '')
@@ -97,17 +179,34 @@ export function parseTtl(text: string): number | null {
   return Math.round(total)
 }
 
+/* ---------- Sorted sets ---------- */
+
+/**
+ * A typed score as ZADD text: `+inf`, `-inf` or the number. Sent as text because
+ * JSON numbers can't hold infinities (`Infinity` serializes to null).
+ */
+export function zsetScore(text: string): string {
+  const t = text.trim()
+  const n = Number(t.replace(/^\+?inf$/i, 'Infinity').replace(/^-inf$/i, '-Infinity'))
+  if (t === '' || Number.isNaN(n)) throw new Error('The score must be a number')
+  return Number.isFinite(n) ? String(n) : n > 0 ? '+inf' : '-inf'
+}
+
 /* ---------- Console ---------- */
 
-/** Splits a command line into arguments with redis-cli's quoting rules. */
-export function parseCommandLine(line: string): string[] {
-  const args: string[] = []
+/**
+ * Splits a command line into arguments with redis-cli's quoting rules. `\xNN`
+ * escapes are bytes, so an argument that isn't UTF-8 comes back as hex.
+ */
+export function parseCommandLine(line: string): RData[] {
+  const args: RData[] = []
   let i = 0
   const n = line.length
   while (i < n) {
     while (i < n && /\s/.test(line[i])) i++
     if (i >= n) break
     let arg = ''
+    let bytes: number[] | null = null
     let quoted = false
     while (i < n && !/\s/.test(line[i])) {
       const c = line[i]
@@ -120,7 +219,12 @@ export function parseCommandLine(line: string): string[] {
           if (ch === '\\' && i + 1 < n) {
             const next = line[i + 1]
             if (next === 'x' && /^[0-9a-fA-F]{2}$/.test(line.slice(i + 2, i + 4))) {
-              arg += String.fromCharCode(parseInt(line.slice(i + 2, i + 4), 16))
+              bytes = [
+                ...(bytes ?? []),
+                ...encoder.encode(arg),
+                parseInt(line.slice(i + 2, i + 4), 16)
+              ]
+              arg = ''
               i += 4
               continue
             }
@@ -165,7 +269,8 @@ export function parseCommandLine(line: string): string[] {
         i++
       }
     }
-    if (arg || quoted) args.push(arg)
+    if (bytes) args.push(fromBytes([...bytes, ...encoder.encode(arg)]))
+    else if (arg || quoted) args.push(arg)
   }
   return args
 }
@@ -204,6 +309,11 @@ function quoteBulk(d: RData): string {
   if (!isHex(d)) return cliQuote(d)
   // dataText already escapes the binary bytes; only quotes need adding
   return `"${dataText(d).replace(/"/g, '\\"')}"`
+}
+
+/** A key or value as a console argument; binary data as `"\xNN"` escapes. */
+export function quoteData(d: RData): string {
+  return isHex(d) ? quoteBulk(d) : quoteArg(d)
 }
 
 /** A reply as redis-cli prints it. */
@@ -319,7 +429,7 @@ export function redisIsWrite(request: RedisRequest): boolean {
     case 'get':
       return false
     case 'command':
-      return !isReadCommand(request.args)
+      return !isReadCommand(request.args.slice(0, 2).map((a) => dataText(a)))
     case 'pipeline':
       return request.commands.some((c) => !isReadCommand(c.slice(0, 2).map((a) => dataText(a))))
     default:
@@ -344,15 +454,14 @@ export function describeRedisDanger(request: RedisRequest): string | null {
     case 'flush':
       return `FLUSHDB deletes every key in database ${request.database}`
     case 'deleteMatching':
-      return `deleting every key matching ${request.pattern}`
+      return `deleting every key matching ${dataText(request.pattern)}`
     case 'delete':
       return request.keys.length > 1 ? `deleting ${request.keys.length} keys` : null
     case 'command': {
-      const name = request.args[0]?.toUpperCase() ?? ''
+      const [name = '', sub = ''] = request.args.slice(0, 2).map((a) => dataText(a).toUpperCase())
       if (DANGEROUS[name]) return DANGEROUS[name]
-      if (name === 'CONFIG' && request.args[1]?.toUpperCase() === 'SET')
-        return 'CONFIG SET changes the server configuration'
-      if ((name === 'SCRIPT' || name === 'FUNCTION') && request.args[1]?.toUpperCase() === 'FLUSH')
+      if (name === 'CONFIG' && sub === 'SET') return 'CONFIG SET changes the server configuration'
+      if ((name === 'SCRIPT' || name === 'FUNCTION') && sub === 'FLUSH')
         return `${name} FLUSH removes every cached ${name === 'SCRIPT' ? 'script' : 'function'}`
       if ((name === 'DEL' || name === 'UNLINK') && request.args.length > 2)
         return `${name} of ${request.args.length - 1} keys`
@@ -385,11 +494,11 @@ const OP_COMMANDS: Partial<Record<RedisRequest['op'], string>> = {
 /** What a write does, for the production confirmation. */
 export function redisSummary(request: RedisRequest): string {
   if (request.op === 'command')
-    return `This runs ${request.args.map(quoteArg).join(' ').slice(0, 200)} on database ${request.database}`
+    return `This runs ${request.args.map(quoteData).join(' ').slice(0, 200)} on database ${request.database}`
   if (request.op === 'pipeline')
     return `This runs ${request.commands.length} commands in database ${request.database}`
   if (request.op === 'deleteMatching')
-    return `This deletes keys matching ${request.pattern} in database ${request.database}`
+    return `This deletes keys matching ${dataText(request.pattern)} in database ${request.database}`
   if (request.op === 'listPush')
     return `This runs ${request.head ? 'LPUSH' : 'RPUSH'} on ${dataText(request.key)}`
   const command = OP_COMMANDS[request.op] ?? request.op
@@ -402,6 +511,12 @@ export function redisSummary(request: RedisRequest): string {
 export interface KeyFolder {
   /** Prefix including the trailing delimiter, e.g. `user:` */
   prefix: string
+  /** The prefix's bytes, as a `dataKey`: tells a text `\xff:` from the byte 0xff */
+  id: string
+  /** Filter-box text for keys under the folder (see `scanPattern`) */
+  filter: string
+  /** SCAN pattern for keys under the folder, from the raw bytes */
+  match: RData
   name: string
   folders: Map<string, KeyFolder>
   keys: RedisKeyEntry[]
@@ -413,33 +528,102 @@ export type KeyRow =
   | { kind: 'folder'; depth: number; folder: KeyFolder }
   | { kind: 'key'; depth: number; entry: RedisKeyEntry; label: string }
 
-/** Groups keys into folders on `delimiter`, the way most Redis GUIs show `user:1:name`. */
+const GLOB_BYTES = new Set([0x2a, 0x3f, 0x5b, 0x5d, 0x5c]) // * ? [ ] \
+
+/** Glob for these exact bytes. */
+function globBytes(bytes: ArrayLike<number>): number[] {
+  const out: number[] = []
+  for (const b of Array.from(bytes)) {
+    if (GLOB_BYTES.has(b)) out.push(0x5c)
+    out.push(b)
+  }
+  return out
+}
+
+/** SCAN pattern for keys starting with these bytes. */
+function prefixMatch(prefix: Uint8Array): RData {
+  return fromBytes([...globBytes(prefix), 0x2a])
+}
+
+/** Filter-box text for keys starting with these bytes; `scanPattern` reads it back. */
+function prefixFilter(prefix: Uint8Array): string {
+  const d = fromBytes(prefix)
+  if (!isHex(d)) return globEscape(d) + '*'
+  // Binary text shows bytes (and `\`) as `\xNN`, which the filter reads as bytes;
+  // glob characters get a `\` so they match themselves
+  let text = ''
+  for (const b of prefix) {
+    const c = String.fromCharCode(b)
+    if (b < 0x20 || b >= 0x7f || b === 0x5c) text += `\\x${b.toString(16).padStart(2, '0')}`
+    else text += '*?[]'.includes(c) ? `\\${c}` : c
+  }
+  return text + '*'
+}
+
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
+  outer: for (let i = from; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer
+    return i
+  }
+  return -1
+}
+
+/**
+ * Groups keys into folders on `delimiter`, the way most Redis GUIs show
+ * `user:1:name`. Folders split the raw bytes, so a binary key never shares a
+ * folder with a text key that only looks the same.
+ */
 export function buildKeyTree(keys: RedisKeyEntry[], delimiter: string): KeyFolder {
-  const root: KeyFolder = { prefix: '', name: '', folders: new Map(), keys: [], count: 0 }
+  const root: KeyFolder = {
+    prefix: '',
+    id: '',
+    filter: '*',
+    match: '*',
+    name: '',
+    folders: new Map(),
+    keys: [],
+    count: 0
+  }
+  const delim = encoder.encode(delimiter)
   for (const entry of keys) {
-    const text = dataText(entry.key)
-    const parts = delimiter ? text.split(delimiter) : [text]
+    const bytes = toBytes(entry.key)
+    // Parts of a binary key show the way the whole key does, so labels line up
+    const show = (part: Uint8Array): string =>
+      dataText(isHex(entry.key) ? { $hex: hexOf(part) } : fromBytes(part))
     let node = root
     node.count++
-    for (let i = 0; i < parts.length - 1; i++) {
-      const name = parts[i]
-      let child = node.folders.get(name)
+    let start = 0
+    for (let at = delim.length ? indexOfBytes(bytes, delim, 0) : -1; at >= 0;) {
+      const end = at + delim.length
+      const prefix = bytes.subarray(0, end)
+      const id = dataKey(fromBytes(prefix))
+      let child = node.folders.get(id)
       if (!child) {
+        const name = show(bytes.subarray(start, at))
         child = {
           prefix: node.prefix + name + delimiter,
+          id,
+          filter: prefixFilter(prefix),
+          match: prefixMatch(prefix),
           name,
           folders: new Map(),
           keys: [],
           count: 0
         }
-        node.folders.set(name, child)
+        node.folders.set(id, child)
       }
       child.count++
       node = child
+      start = end
+      at = indexOfBytes(bytes, delim, end)
     }
     node.keys.push(entry)
   }
   return root
+}
+
+function hexOf(bytes: Uint8Array): string {
+  return Array.from(bytes, (n) => n.toString(16).padStart(2, '0')).join('')
 }
 
 /** Visible rows: folders first (sorted), then keys, expanding folders in `open`. */
@@ -448,7 +632,7 @@ export function flattenKeyTree(root: KeyFolder, open: Set<string>, depth = 0): K
   const folders = [...root.folders.values()].sort((a, b) => a.name.localeCompare(b.name))
   for (const folder of folders) {
     rows.push({ kind: 'folder', depth, folder })
-    if (open.has(folder.prefix)) rows.push(...flattenKeyTree(folder, open, depth + 1))
+    if (open.has(folder.id)) rows.push(...flattenKeyTree(folder, open, depth + 1))
   }
   const keys = [...root.keys].sort((a, b) => dataText(a.key).localeCompare(dataText(b.key)))
   for (const entry of keys) {
@@ -461,6 +645,34 @@ export function flattenKeyTree(root: KeyFolder, open: Set<string>, depth = 0): K
 /** A glob pattern matching literal text (escapes `* ? [ ] \`). */
 export function globEscape(text: string): string {
   return text.replace(/[*?[\]\\]/g, '\\$&')
+}
+
+/**
+ * The key filter's text → a SCAN pattern. Plain text matches anywhere in the name;
+ * `* ? [ ]` make it a glob. Either way `\xNN` is a byte, as key names show them.
+ */
+export function scanPattern(text: string): RData {
+  const t = text.trim()
+  if (!t) return '*'
+  if (!/[*?[]/.test(t)) {
+    return fromBytes([0x2a, ...globBytes(toBytes(parseEscapes(t))), 0x2a])
+  }
+  const out: number[] = []
+  for (let i = 0; i < t.length;) {
+    const hex =
+      t[i] === '\\' && t[i + 1] === 'x' ? /^[0-9a-f]{2}$/i.exec(t.slice(i + 2, i + 4)) : null
+    if (hex) {
+      // A byte from an escape is literal, even when it's a glob character
+      out.push(...globBytes([parseInt(hex[0], 16)]))
+      i += 4
+    } else {
+      // Other escapes (`\*`, `\\`) stay as glob escapes
+      const take = t[i] === '\\' && i + 1 < t.length ? 2 : 1
+      out.push(...encoder.encode(t.slice(i, i + take)))
+      i += take
+    }
+  }
+  return fromBytes(out)
 }
 
 /* ---------- Server INFO ---------- */

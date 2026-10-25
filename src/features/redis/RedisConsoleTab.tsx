@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { BookOpen, Copy, Eraser, KeyRound, Play, RotateCcw, Square } from 'lucide-react'
-import { api, type RedisReply } from '@/lib/api'
+import { api, type RData, type RedisReply } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { connectionLabel } from '@/lib/engines'
 import { formatDuration } from '@/lib/format'
@@ -9,6 +9,7 @@ import { isProduction } from '@/lib/production'
 import {
   commandDoc,
   completeCommand,
+  dataText,
   describeRedisDanger,
   formatReply,
   parseCommandLine,
@@ -147,7 +148,7 @@ export function RedisConsoleTab({ tab }: { tab: TabOf<'redis'> }): React.JSX.Ele
   const singleLine = !text.includes('\n')
   const tokens = useMemo(() => {
     try {
-      return parseCommandLine(text)
+      return parseCommandLine(text).map((a) => dataText(a))
     } catch {
       return null
     }
@@ -178,7 +179,7 @@ export function RedisConsoleTab({ tab }: { tab: TabOf<'redis'> }): React.JSX.Ele
     try {
       for (const { text: line } of commands) {
         const base = { id: nextId++, database, command: line }
-        let args: string[]
+        let args: RData[]
         try {
           args = parseCommandLine(line)
         } catch (e) {
@@ -186,21 +187,22 @@ export function RedisConsoleTab({ tab }: { tab: TabOf<'redis'> }): React.JSX.Ele
           break
         }
         if (!args.length) continue
-        const name = args[0].toLowerCase()
+        const words = args.map((a) => dataText(a))
+        const name = words[0].toLowerCase()
         if (name === 'clear' && args.length === 1) {
           scrollbackStore.set((s) => ({ ...s, [tab.id]: [] }))
           continue
         }
         if (name === 'help' || name === '?') {
-          pushEntries(tab.id, [{ ...base, note: helpText(args[1]) }])
+          pushEntries(tab.id, [{ ...base, note: helpText(words[1]) }])
           continue
         }
         if (name === 'select' && args.length === 2) {
-          if (!/^\d+$/.test(args[1])) {
+          if (!/^\d+$/.test(words[1])) {
             pushEntries(tab.id, [{ ...base, error: 'SELECT takes a database number' }])
             break
           }
-          database = args[1]
+          database = words[1]
           updateTab(tab.id, { database })
           pushEntries(tab.id, [{ ...base, reply: { t: 'status', v: 'OK' } }])
           continue
