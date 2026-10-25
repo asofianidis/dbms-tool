@@ -133,6 +133,7 @@ import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDe
 import { openSchemaDesigner } from './SchemaDesigner'
 import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
+import { MatviewRowDetail } from './matviews'
 import { RlsBadge, hasRls, policyMenuItems, rlsActionItems, useRlsFlags } from './rls-actions'
 import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
@@ -1392,6 +1393,10 @@ function ObjectNode({
   const hasArgs = isRoutine || obj.kind === 'aggregate' || obj.kind === 'window_function'
   const showSchema =
     (connection.engine === 'mssql' || connection.engine === 'babelfish') && obj.schema
+  // Row estimate, or "not populated"
+  const matviewDetail = obj.kind === 'materialized_view' && connection.engine === 'postgres' && (
+    <MatviewRowDetail connectionId={connection.id} database={database} obj={obj} />
+  )
   return (
     <>
       <Row
@@ -1431,11 +1436,12 @@ function ObjectNode({
           </>
         }
         detail={
-          obj.kind === 'event'
+          matviewDetail ||
+          (obj.kind === 'event'
             ? (eventStatusLabel(obj.detail) ?? undefined)
             : obj.rowEstimate != null && obj.rowEstimate >= 0
               ? compactCount(obj.rowEstimate)
-              : undefined
+              : undefined)
         }
         actions={
           isRoutine && (

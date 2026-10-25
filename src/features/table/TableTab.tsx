@@ -94,6 +94,7 @@ import {
   ToolbarDivider
 } from '@/components/ui'
 import { selectionSummaryStore } from '@/components/shell/StatusBar'
+import { DataError, MatviewBadge } from './MatviewNotice'
 import { exportMenu } from '../query/ResultsPanel'
 import { modifyRoutine } from '../explorer/actions'
 import { openExecuteRoutine } from '../explorer/ExecuteRoutineDialog'
@@ -173,6 +174,7 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
           {tab.detail != null && <span className="text-faint">({tab.detail})</span>}
         </span>
         <Badge>{tab.objectKind.replace('_', ' ')}</Badge>
+        <MatviewBadge tab={tab} />
         {connection.readOnly && (
           <Badge tone="warning">
             <Lock className="size-3" /> read-only
@@ -713,9 +715,12 @@ function DataView({
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
           {error ? (
-            <div className="p-4">
-              <ErrorText error={error} />
-            </div>
+            <DataError
+              tab={tab}
+              tableRef={tableRef}
+              error={error}
+              onRefreshed={() => void load()}
+            />
           ) : set ? (
             <ResultGrid
               columns={columns}
@@ -1107,7 +1112,10 @@ function DefinitionView({
 }): React.JSX.Element {
   const connection = connectionsStore.use().find((c) => c.id === tab.connectionId)
   const isTable = tab.objectKind === 'table' || tab.objectKind === 'foreign_table'
-  const useServerDdl = !isTable || connection?.engine === 'mysql'
+  // PostgreSQL tables are scripted from the catalog server-side, falling back
+  // to describe_table if that fails (servers older than 13)
+  const pgTable = dialect === 'postgres' && tab.objectKind === 'table'
+  const useServerDdl = !isTable || connection?.engine === 'mysql' || pgTable
   const definition = useQuery({
     ...queries.definition(
       tab.connectionId,
@@ -1119,16 +1127,18 @@ function DefinitionView({
     ),
     enabled: useServerDdl
   })
+  const pgFallback = pgTable && (definition.isError || definition.data === null)
   const info = useQuery({
     ...queries.table(tab.connectionId, tab.database, tab.schema, tab.name),
-    enabled: !useServerDdl
+    enabled: !useServerDdl || pgFallback
   })
-  const text = useServerDdl
+  const serverText = useServerDdl && !pgFallback
+  const text = serverText
     ? (definition.data ?? (definition.isPending ? '' : '-- No definition available'))
     : info.data
       ? scriptCreateTable(dialect, tableRef, info.data)
       : ''
-  const error = useServerDdl ? definition.error : info.error
+  const error = serverText ? definition.error : info.error
   const routineKind =
     tab.objectKind === 'procedure' || tab.objectKind === 'function' ? tab.objectKind : null
   const routine: DbObject = {

@@ -63,6 +63,7 @@ import { runnableCreate, runnableModify } from './packages'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { versioningScriptItems } from './Versioning'
 import { eventMenuItems } from './events'
+import { matviewMenuItems } from './matviews'
 import { pgAggregateMenuItems } from './pg-routine-actions'
 import { rlsMenuItems } from './rls-actions'
 import { mariaDbSequenceItems } from './sequence-actions'
@@ -139,7 +140,15 @@ async function scriptTo(
                   ? ((await queryClient.fetchQuery(
                       queries.definition(connectionId, database, obj.schema, obj.name, 'table')
                     )) ?? scriptCreateTable(dialect, ref, info))
-                  : scriptCreateTable(dialect, ref, info)
+                  : dialect === 'postgres'
+                    ? // Rebuilt from the catalog; describe_table can't tell identity,
+                      // generated columns or exclusion constraints apart
+                      ((await queryClient
+                        .fetchQuery(
+                          queries.definition(connectionId, database, obj.schema, obj.name, 'table')
+                        )
+                        .catch(() => null)) ?? scriptCreateTable(dialect, ref, info))
+                    : scriptCreateTable(dialect, ref, info)
     }
     newQueryTab(connectionId, database, text)
   } catch (e) {
@@ -265,7 +274,13 @@ export function objectMenu(connectionId: string, database: string, obj: DbObject
         label: 'Count rows',
         icon: <Hash />,
         onSelect: () => void countTable(connectionId, database, obj)
-      }
+      },
+      ...(obj.kind === 'materialized_view' && dialect === 'postgres'
+        ? ([
+            'separator',
+            ...matviewMenuItems(connectionId, database, obj, tableRef(connectionId, database, obj))
+          ] as MenuItem[])
+        : [])
     )
   } else if (isRoutine) {
     items.push(

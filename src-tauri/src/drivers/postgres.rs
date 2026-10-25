@@ -21,6 +21,7 @@ use crate::error::{AppError, AppResult};
 use crate::model::*;
 
 mod compat;
+mod table_ddl;
 
 pub struct PgSession {
     client: Client,
@@ -225,6 +226,33 @@ pub async fn connect(
         task,
     })
 }
+
+/// CREATE MATERIALIZED VIEW with its access method, storage parameters and tablespace,
+/// WITH NO DATA when it isn't populated, then its indexes and comments.
+const MATVIEW_DDL: &str = "SELECT concat_ws(chr(10) || chr(10), \
+     'CREATE MATERIALIZED VIEW ' || format('%I.%I', n.nspname, c.relname) \
+       || CASE WHEN am.amname <> 'heap' THEN ' USING ' || quote_ident(am.amname) ELSE '' END \
+       || CASE WHEN c.reloptions IS NOT NULL \
+            THEN ' WITH (' || array_to_string(c.reloptions, ', ') || ')' ELSE '' END \
+       || CASE WHEN c.reltablespace <> 0 THEN ' TABLESPACE ' || quote_ident(ts.spcname) ELSE '' END \
+       || ' AS' || chr(10) || regexp_replace(pg_get_viewdef(c.oid, true), ';\\s*$', '') \
+       || CASE WHEN c.relispopulated THEN ';' ELSE chr(10) || 'WITH NO DATA;' END, \
+     (SELECT string_agg(pg_get_indexdef(i.indexrelid) || ';', chr(10) ORDER BY ic.relname) \
+      FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = c.oid), \
+     (SELECT string_agg(x, chr(10) ORDER BY o) FROM ( \
+        SELECT 0 AS o, format('COMMENT ON MATERIALIZED VIEW %I.%I IS %L;', n.nspname, c.relname, d.description) AS x \
+        FROM pg_description d \
+        WHERE d.objoid = c.oid AND d.classoid = 'pg_class'::regclass AND d.objsubid = 0 \
+        UNION ALL \
+        SELECT a.attnum, format('COMMENT ON COLUMN %I.%I.%I IS %L;', n.nspname, c.relname, a.attname, d.description) \
+        FROM pg_attribute a \
+        JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 'pg_class'::regclass AND d.objsubid = a.attnum \
+        WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) comments)) \
+   FROM pg_class c \
+   JOIN pg_namespace n ON n.oid = c.relnamespace \
+   LEFT JOIN pg_am am ON am.oid = c.relam \
+   LEFT JOIN pg_tablespace ts ON ts.oid = c.reltablespace \
+   WHERE c.oid = format('%I.%I', $1::text, $2::text)::regclass";
 
 impl PgSession {
     pub fn is_closed(&self) -> bool {
@@ -655,14 +683,12 @@ impl PgSession {
         detail: Option<&str>,
     ) -> AppResult<Option<String>> {
         let sql = match kind {
+            "table" => return self.table_definition(schema, name).await,
             "view" => {
                 "SELECT 'CREATE OR REPLACE VIEW ' || format('%I.%I', $1::text, $2::text) || ' AS' || chr(10) \
                  || pg_get_viewdef(format('%I.%I', $1::text, $2::text)::regclass, true)"
             }
-            "materialized_view" => {
-                "SELECT 'CREATE MATERIALIZED VIEW ' || format('%I.%I', $1::text, $2::text) || ' AS' || chr(10) \
-                 || pg_get_viewdef(format('%I.%I', $1::text, $2::text)::regclass, true)"
-            }
+            "materialized_view" => MATVIEW_DDL,
             "aggregate" => {
                 let rows = self
                     .strings(
@@ -765,10 +791,17 @@ impl PgSession {
     pub async fn completion(&self) -> AppResult<Vec<CompletionTable>> {
         let rows = self
             .strings(
-                "SELECT c.table_schema::text, c.table_name::text, \
-                   array_agg(c.column_name::text ORDER BY c.ordinal_position) \
-                 FROM information_schema.columns c \
-                 WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
+                // pg_catalog because information_schema.columns leaves out materialized
+                // views; the privilege check is the same as that view's
+                "SELECT n.nspname::text, c.relname::text, array_agg(a.attname::text ORDER BY a.attnum) \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND a.attnum > 0 AND NOT a.attisdropped \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND NOT pg_is_other_temp_schema(n.oid) \
+                   AND (pg_has_role(c.relowner, 'USAGE') \
+                     OR has_column_privilege(c.oid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES')) \
                  GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 5000",
                 &[],
             )

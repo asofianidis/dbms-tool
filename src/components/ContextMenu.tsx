@@ -11,6 +11,8 @@ export type MenuItem =
       onSelect?: () => void
       danger?: boolean
       disabled?: boolean
+      /** Tooltip, e.g. why the item is disabled */
+      title?: string
       submenu?: MenuItem[]
     }
   | 'separator'
@@ -116,6 +118,7 @@ function MenuList({
           <div
             key={i}
             className="relative"
+            title={item.title}
             onMouseEnter={() => (setOpen(item.submenu ? i : null), setActive(i))}
           >
             <button
