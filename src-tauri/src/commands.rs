@@ -537,7 +537,9 @@ pub async fn redis_execute(
 ) -> AppResult<RedisOutput> {
     // Console arguments can hold values, so only the command name is logged
     let command = match &request {
-        RedisRequest::Command { args, .. } => args.first().cloned().unwrap_or_default(),
+        RedisRequest::Command { args, .. } => {
+            args.first().map(|a| a.text_lossy()).unwrap_or_default()
+        }
         _ => String::new(),
     };
     let result = async {

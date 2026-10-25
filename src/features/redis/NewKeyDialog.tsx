@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api, type RData, type RedisRequest } from '@/lib/api'
-import { KEY_TYPES, parseTtl } from '@/lib/redis'
+import { KEY_TYPES, parseTtl, zsetScore } from '@/lib/redis'
 import { errorMessage } from '@/lib/toast'
 import { Button, Field, Input, Modal, Select, Spinner, Textarea } from '@/components/ui'
 
@@ -53,8 +53,12 @@ export function NewKeyDialog({
         request = { op: 'setAdd', ...base, members: [value] }
         break
       case 'zset': {
-        const n = Number(score)
-        if (score.trim() === '' || Number.isNaN(n)) return setError('The score must be a number')
+        let n: string
+        try {
+          n = zsetScore(score)
+        } catch (e) {
+          return setError(errorMessage(e))
+        }
         request = { op: 'zsetAdd', ...base, member: value, score: n }
         break
       }

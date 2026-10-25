@@ -171,8 +171,8 @@ describe('key tree', () => {
   it('groups keys into folders on the delimiter', () => {
     const root = buildKeyTree(keys, ':')
     expect(root.count).toBe(4)
-    expect(root.folders.get('user')?.count).toBe(3)
-    expect(root.folders.get('user')?.folders.get('1')?.prefix).toBe('user:1:')
+    expect(root.folders.get('str:user:')?.count).toBe(3)
+    expect(root.folders.get('str:user:')?.folders.get('str:user:1:')?.prefix).toBe('user:1:')
   })
 
   it('flattens open folders, folders first', () => {
@@ -182,7 +182,7 @@ describe('key tree', () => {
       'user/',
       'config'
     ])
-    const open = flattenKeyTree(root, new Set(['user:', 'user:1:']))
+    const open = flattenKeyTree(root, new Set(['str:user:', 'str:user:1:']))
     expect(open.map((r) => (r.kind === 'folder' ? r.folder.name + '/' : r.label))).toEqual([
       'user/',
       '1/',

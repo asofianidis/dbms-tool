@@ -13,7 +13,19 @@ import {
 import { api, type RData, type RedisOutput, type RedisRequest } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatBytes, formatCount } from '@/lib/format'
-import { dataBytes, dataText, formatTtl, isHex, parseTtl, prettyJson, quoteArg } from '@/lib/redis'
+import {
+  dataBytes,
+  dataText,
+  formatJson,
+  formatTtl,
+  isHex,
+  parseEscapes,
+  parseTtl,
+  prettyJson,
+  quoteData,
+  ttlInput,
+  zsetScore
+} from '@/lib/redis'
 import { settingsStore } from '@/lib/settings'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import { confirm, newQueryTab, promptText } from '@/lib/workspace'
@@ -112,10 +124,12 @@ export function KeyEditor(props: Props): React.JSX.Element {
       confirmLabel: 'Rename'
     })
     if (!name || name === keyText) return
+    // A binary name shows its bytes as \xNN escapes; turn them back into bytes
+    const newKey = isHex(keyName) ? parseEscapes(name) : name
     try {
-      await request({ op: 'rename', database, key: keyName, newKey: name })
-      toast(`Renamed to ${name}`)
-      props.onRenamed(name)
+      await request({ op: 'rename', database, key: keyName, newKey })
+      toast(`Renamed to ${dataText(newKey)}`)
+      props.onRenamed(newKey)
     } catch (e) {
       toastError(e)
     }
@@ -123,13 +137,15 @@ export function KeyEditor(props: Props): React.JSX.Element {
 
   const setTtl = async (): Promise<void> => {
     const current = data?.ttl ?? -1
+    // Exact, so confirming without an edit doesn't round the expiry
+    const initial = current > 0 ? ttlInput(current) : ''
     const text = await promptText({
       title: 'Time to live',
       label: 'Expire after, e.g. 90s, 15m, 1h30m or 7d. Leave empty to keep the key forever.',
-      initial: current > 0 ? formatTtl(current).replace(/\s/g, '') : '',
+      initial,
       confirmLabel: 'Set TTL'
     })
-    if (text === null) return
+    if (text === null || text.trim() === initial) return
     let ttlMs: number | null
     try {
       ttlMs = parseTtl(text)
@@ -161,7 +177,7 @@ export function KeyEditor(props: Props): React.JSX.Element {
   }
 
   const openInConsole = (): void => {
-    const k = quoteArg(keyText)
+    const k = quoteData(keyName)
     const command: Record<string, string> = {
       string: `GET ${k}`,
       hash: `HGETALL ${k}`,
@@ -409,13 +425,9 @@ function StringValue({
   const save = async (): Promise<void> => {
     let value = draft
     // Pretty-printing is only for reading; store JSON as compactly as it came
-    if (view === 'json' && pretty && !json) {
-      try {
-        const compact = !/\n\s/.test(text)
-        value = compact ? JSON.stringify(JSON.parse(draft)) : draft
-      } catch {
-        value = draft
-      }
+    // (token-based, so numbers and duplicate keys stay exactly as typed)
+    if (view === 'json' && pretty && !json && !/\n\s/.test(text)) {
+      value = formatJson(draft, 0) ?? draft
     }
     setSaving(true)
     await onSave(value)
@@ -963,18 +975,9 @@ function ZsetValue({
   write
 }: CollectionProps): React.JSX.Element {
   const [dialog, edit] = useEditor()
-  const rows = data.entries as { rank: number; value: RData; score: number | null }[]
+  // Infinite scores come as 'inf' / '-inf'
+  const rows = data.entries as { rank: number; value: RData; score: number | string | null }[]
   const [shown, filter, setFilter] = useFiltered(rows, (r) => `${dataText(r.value)} ${r.score}`)
-  const score = (text: string): number => {
-    const n = Number(
-      text
-        .trim()
-        .replace(/^\+?inf$/i, 'Infinity')
-        .replace(/^-inf$/i, '-Infinity')
-    )
-    if (text.trim() === '' || Number.isNaN(n)) throw new Error('The score must be a number')
-    return n
-  }
   const editRow = (row?: (typeof rows)[number]): void =>
     edit({
       title: row ? `Score of ${dataText(row.value)}` : 'Add member',
@@ -992,7 +995,7 @@ function ZsetValue({
             database,
             key: keyName,
             member: row ? row.value : f[0],
-            score: score(row ? f[0] : f[1])
+            score: zsetScore(row ? f[0] : f[1])
           },
           row ? 'Saved' : 'Member added'
         )
