@@ -122,11 +122,40 @@ function looksNumeric(rows: Cell[][], col: number): boolean {
   return seen > 0
 }
 
-function compare(a: Cell, b: Cell, numeric: boolean): number {
+const PLAIN_DECIMAL = /^(-?)(\d+)(?:\.(\d+))?$/
+
+/**
+ * Orders two numbers written as text. Plain decimals compare digit by digit, so
+ * bigints and high-precision numerics past a double's 15-17 digits stay exact;
+ * exponent forms fall back to doubles.
+ */
+export function compareNumericText(a: string, b: string): number {
+  const x = PLAIN_DECIMAL.exec(a.trim())
+  const y = PLAIN_DECIMAL.exec(b.trim())
+  if (!x || !y) return Number(a) - Number(b)
+  const int = (m: RegExpExecArray): string => m[2].replace(/^0+(?=\d)/, '')
+  const frac = (m: RegExpExecArray): string => (m[3] ?? '').replace(/0+$/, '')
+  const zero = (m: RegExpExecArray): boolean => int(m) === '0' && !frac(m)
+  // -0 and 0 are the same number
+  const sign = (m: RegExpExecArray): number => (zero(m) ? 0 : m[1] ? -1 : 1)
+  if (sign(x) !== sign(y)) return sign(x) - sign(y)
+  if (sign(x) === 0) return 0
+  let order = int(x).length - int(y).length
+  if (!order) order = int(x) < int(y) ? -1 : int(x) > int(y) ? 1 : 0
+  if (!order) {
+    const width = Math.max(frac(x).length, frac(y).length)
+    const fx = frac(x).padEnd(width, '0')
+    const fy = frac(y).padEnd(width, '0')
+    order = fx < fy ? -1 : fx > fy ? 1 : 0
+  }
+  return sign(x) * order
+}
+
+export function compareCells(a: Cell, b: Cell, numeric: boolean): number {
   if (a === b) return 0
   if (a === null) return 1
   if (b === null) return -1
-  if (numeric) return Number(a) - Number(b)
+  if (numeric) return compareNumericText(String(a), String(b))
   return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' })
 }
 
@@ -265,7 +294,7 @@ export const ResultGrid = memo(function ResultGrid({
       const { col, dir } = sort
       const num = numeric[col]
       idx.sort((a, b) => {
-        const d = compare(rows[a][col], rows[b][col], num)
+        const d = compareCells(rows[a][col], rows[b][col], num)
         return dir === 'asc' ? d : -d
       })
     }

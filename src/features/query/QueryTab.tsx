@@ -376,37 +376,54 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   }
 
   // Results read straight from one table with a primary key can be edited in place
-  const [editSource, setEditSource] = useState<Omit<
-    ResultEditTarget,
-    'execute' | 'confirmDangerous' | 'blocked' | 'onCommitted'
-  > | null>(null)
+  // Edits commit to the connection and database the rows were read from, whatever the
+  // tab's picker says by then
+  const [editSource, setEditSource] = useState<
+    | (Omit<ResultEditTarget, 'execute' | 'confirmDangerous' | 'blocked' | 'onCommitted'> & {
+        connectionId: string
+        database: string
+      })
+    | null
+  >(null)
   useEffect(() => {
     const output = result?.output
     const set = output?.results[0]
     const source = result && singleTableSource(result.sql, dialect)
-    const table =
-      source && resolveTable(source.parts, completion.data ?? [], defaultSchema, dialect)
+    const connectionId = tab.connectionId
+    const database = output?.database ?? tab.database
+    // The session's search_path isn't known, so a name found in several schemas isn't guessed
+    const table = source && resolveTable(source.parts, completion.data ?? [], undefined, dialect)
     if (!set || output.error || output.results.length !== 1 || connection?.readOnly || !table) {
       setEditSource(null)
       return
     }
     let stale = false
     queryClient
-      .fetchQuery(queries.table(tab.connectionId, tab.database, table.schema, table.name))
+      .fetchQuery(queries.table(connectionId, database, table.schema, table.name))
       .then((info) => {
         if (stale) return
         const names = set.columns.map((c) => c.name)
         const unique = (name: string): boolean => names.indexOf(name) === names.lastIndexOf(name)
+        const passedThrough = (name: string): boolean => source.star || source.columns.has(name)
+        // A key computed under the column's name (id + 1 AS id) would locate the wrong row
         const keyed =
-          info.primaryKey.length > 0 && info.primaryKey.every((k) => names.includes(k) && unique(k))
+          info.primaryKey.length > 0 &&
+          info.primaryKey.every((k) => names.includes(k) && unique(k) && passedThrough(k))
         if (!keyed) return setEditSource(null)
         const readOnly = new Set<number>()
         set.columns.forEach((c, i) => {
           const column = info.columns.find((col) => col.name === c.name)
-          const passedThrough = source.star || source.columns.has(c.name)
-          if (!column || column.isGenerated || !passedThrough || !unique(c.name)) readOnly.add(i)
+          if (!column || column.isGenerated || !passedThrough(c.name) || !unique(c.name))
+            readOnly.add(i)
         })
-        setEditSource({ tableRef: { schema: table.schema, name: table.name }, info, readOnly })
+        setEditSource({
+          tableRef: { schema: table.schema, name: table.name },
+          info,
+          readOnly,
+          scope: `${connectionId}/${database}`,
+          connectionId,
+          database
+        })
       })
       .catch(() => !stale && setEditSource(null))
     return () => {
@@ -415,13 +432,16 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     // Recomputed per run; completions arriving later only matter for the next run
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [result])
+  // Switching the tab's connection or database leaves the rows shown read-only
+  const editHere =
+    editSource?.connectionId === tab.connectionId && editSource.database === tab.database
   const edit = useMemo<ResultEditTarget | undefined>(
     () =>
-      editSource
+      editSource && editHere
         ? {
             ...editSource,
             execute: (sql, options) =>
-              api.execute(tab.connectionId, tab.id, tab.database, sql, options),
+              api.execute(editSource.connectionId, tab.id, editSource.database, sql, options),
             confirmDangerous: settings.confirmDangerous,
             connection,
             blocked: inTransaction
@@ -439,9 +459,8 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       editSource,
-      tab.connectionId,
+      editHere,
       tab.id,
-      tab.database,
       settings.confirmDangerous,
       settings.maxRows,
       inTransaction,

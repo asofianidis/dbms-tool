@@ -404,7 +404,7 @@ CREATE TABLE app."Odd ""name""" ("x.y" int GENERATED ALWAYS AS IDENTITY (SEQUENC
         assert_eq!(&script(name).await, before, "{name}");
     }
 
-    m.close(&id);
+    m.close(&id).await;
     let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
         return;
     };
@@ -2212,7 +2212,7 @@ async fn postgres_aggregates_and_old_servers() {
             .unwrap_or_default();
         assert!(parallel.contains("PARALLEL = SAFE"), "{var}");
 
-        m.close(&id);
+        m.close(&id).await;
         let (m, id) = open(Engine::Postgres, var).await.unwrap();
         let s = m.get(&id).unwrap();
         let mut dropped = false;
@@ -2226,7 +2226,7 @@ async fn postgres_aggregates_and_old_servers() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         assert!(dropped, "{var}: pg_objects not dropped");
-        m.close(&id);
+        m.close(&id).await;
     }
 }
 

@@ -32,6 +32,20 @@ function delimited(columns: ColumnMeta[], rows: Cell[][], sep: string, header = 
   return lines.join('\r\n')
 }
 
+/**
+ * Column names made unique for use as object keys: a repeated name gets `_2`,
+ * `_3`, … (as import.ts does), so `SELECT a.id, b.id` keeps both values.
+ */
+export function uniqueKeys(names: string[]): string[] {
+  const used = new Set<string>()
+  return names.map((name) => {
+    let key = name
+    for (let n = 2; used.has(key); n++) key = `${name}_${n}`
+    used.add(key)
+    return key
+  })
+}
+
 export function toTsv(columns: ColumnMeta[], rows: Cell[][], header = false): string {
   // Spreadsheet paste: tabs between cells, no quoting unless needed
   return delimited(columns, rows, '\t', header)
@@ -48,12 +62,14 @@ export function serialize(
       return delimited(columns, rows, ',')
     case 'tsv':
       return delimited(columns, rows, '\t')
-    case 'json':
+    case 'json': {
+      const keys = uniqueKeys(columns.map((c) => c.name))
       return JSON.stringify(
-        rows.map((r) => Object.fromEntries(columns.map((c, i) => [c.name, r[i]]))),
+        rows.map((r) => Object.fromEntries(keys.map((k, i) => [k, r[i]]))),
         null,
         2
       )
+    }
     case 'markdown': {
       const esc = (s: string): string => s.replace(/[\\|]/g, '\\$&').replace(/\r?\n/g, ' ')
       return [

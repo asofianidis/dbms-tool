@@ -9,6 +9,7 @@ import {
   newSchemaDraft,
   schemaStatements,
   tableStatements,
+  writableIndexMethod,
   type ColumnDraft,
   type ColumnState,
   type DdlOptions,
@@ -22,10 +23,12 @@ import { qualified, quoteIdent, scriptCreateTable } from './sql'
 import {
   extensionDiffers,
   pgConstraintIndexes,
+  pgIndexShape,
   pgIndexSql,
   pgObjectSteps,
   pgTableSteps,
   pgTableText,
+  retargetPartitions,
   withPartitionKey,
   type PgEnv,
   type PgOut,
@@ -34,6 +37,7 @@ import {
   type PgTypeDetail
 } from './compare-pg'
 import { sequenceAlterStatements } from './mariadb-sequences'
+import { sqliteIndexWhere } from './sqlite-schema'
 import { dropTriggerStatement } from './triggers'
 
 /* ---------- Snapshots ---------- */
@@ -289,19 +293,20 @@ function describeColumn(c: ColumnState): string {
 
 const lowerList = (xs: string[]): string => xs.map((x) => x.toLowerCase()).join(', ')
 
-function describeIndex(ix: IndexInfo): string {
-  return `${ix.unique ? 'UNIQUE ' : ''}(${ix.columns.join(', ')})${ix.method ? ` ${ix.method}` : ''}`
+/** A SQLite partial index's predicate, which its sqlite_master definition carries. */
+const indexWhere = (dialect: Dialect, ix: IndexInfo): string =>
+  dialect === 'sqlite' ? (sqliteIndexWhere(ix.definition) ?? '') : ''
+
+function describeIndex(dialect: Dialect, ix: IndexInfo): string {
+  const where = indexWhere(dialect, ix)
+  return `${ix.unique ? 'UNIQUE ' : ''}(${ix.columns.join(', ')})${ix.method ? ` ${ix.method}` : ''}${where ? ` WHERE ${where}` : ''}`
 }
 
-/** What makes two indexes the same apart from their names. */
+/** What makes two indexes the same apart from their names and tables. */
 function indexSignature(dialect: Dialect, ix: IndexInfo): string {
   // PostgreSQL's definition also covers expressions, predicates and operator classes
-  if (dialect === 'postgres' && ix.definition)
-    return ix.definition.replace(
-      /^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(?:CONCURRENTLY\s+)?(?:"(?:[^"]|"")+"|\S+)\s+ON\s+(?:ONLY\s+)?/i,
-      '$1ON '
-    )
-  return `${ix.unique ? 'unique ' : ''}(${lowerList(ix.columns)}) ${(ix.method ?? '').toLowerCase()}`
+  if (dialect === 'postgres' && ix.definition) return pgIndexShape(ix.definition)
+  return `${ix.unique ? 'unique ' : ''}(${lowerList(ix.columns)}) ${(ix.method ?? '').toLowerCase()} ${indexWhere(dialect, ix)}`
 }
 
 type ForeignKey = TableInfo['foreignKeys'][number]
@@ -518,7 +523,8 @@ function newForeignKey(draft: TableDraft, fk: ForeignKey): ForeignKeyDraft {
   }
 }
 
-function newIndex(draft: TableDraft, ix: IndexInfo): IndexDraft {
+/** The source's index as a new draft, keeping its kind (FULLTEXT, CLUSTERED …) and predicate. */
+function newIndex(dialect: Dialect, draft: TableDraft, ix: IndexInfo): IndexDraft {
   return {
     id: draftId(),
     original: null,
@@ -526,12 +532,19 @@ function newIndex(draft: TableDraft, ix: IndexInfo): IndexDraft {
     columns: columnIds(draft, ix.columns),
     unique: ix.unique,
     include: [],
-    where: '',
-    method: '',
+    where: indexWhere(dialect, ix),
+    method: ix.method ?? '',
     initial: null,
     locked: null,
     dropped: false
   }
+}
+
+/** Whether the index's kind can be written; warns about one that can't, e.g. SQL Server's XML indexes. */
+function scriptableIndex(dialect: Dialect, ix: IndexInfo, warnings: string[]): boolean {
+  if (pgDefinitionIndex(dialect, ix) || writableIndexMethod(dialect, ix.method)) return true
+  warnings.push(`Index ${ix.name} is a ${ix.method} index, which isn't scripted; create it by hand`)
+  return false
 }
 
 function addForeignKeySteps(
@@ -559,8 +572,13 @@ function createTable(ctx: CompareContext, o: SnapshotObject, item: DiffItem): vo
     ...loaded,
     columns: loaded.columns.filter((c) => !c.computed).map((c) => ({ ...c, original: null })),
     indexes: info.indexes
-      .filter((ix) => !ix.primary && !pgDefinitionIndex(dialect, ix))
-      .map((ix) => newIndex(loaded, ix)),
+      .filter(
+        (ix) =>
+          !ix.primary &&
+          !pgDefinitionIndex(dialect, ix) &&
+          scriptableIndex(dialect, ix, item.warnings)
+      )
+      .map((ix) => newIndex(dialect, loaded, ix)),
     foreignKeys: [],
     original: null
   }
@@ -570,7 +588,7 @@ function createTable(ctx: CompareContext, o: SnapshotObject, item: DiffItem): vo
     item.steps.push({ phase: Phase.Tables, sql: withPartitionKey(sql, o.pg?.partitionKey ?? null) })
   for (const ix of info.indexes)
     if (!ix.primary && pgDefinitionIndex(dialect, ix) && !constraintIndexes.has(ix.name))
-      item.steps.push({ phase: Phase.Tables, sql: pgIndexSql(ix.definition!) })
+      item.steps.push({ phase: Phase.Tables, sql: pgIndexSql(ix.definition!, table) })
   if (dialect === 'postgres' && o.pg) pgTableSteps(pgEnv(ctx), table, o.pg, undefined, pgOut(item))
   // Added after every table exists, so tables can reference each other in any order
   item.steps.push(...addForeignKeySteps(dialect, draft, table, info.foreignKeys))
@@ -631,6 +649,8 @@ function alterTable(
       default: want.default,
       identity: keepIdentity ? c.identity : want.identity,
       comment: want.comment,
+      invisible: want.invisible,
+      compressed: want.compressed,
       onUpdate: want.onUpdate
     })
   }
@@ -652,7 +672,10 @@ function alterTable(
   const indexes: IndexDraft[] = loaded.indexes.map((ix) => ({ ...ix }))
   const extraIndexSql: string[] = []
   // With PostgreSQL constraints loaded on both sides, their indexes are compared as constraints
-  const pg = dialect === 'postgres' && source.pg && target.pg ? [source.pg, target.pg] : null
+  const pg =
+    dialect === 'postgres' && source.pg && target.pg
+      ? [retargetPartitions(source.pg, source, target.name), target.pg]
+      : null
   const nonPrimary = (info: TableInfo, extras?: PgTableExtras): IndexInfo[] => {
     const skip = pgConstraintIndexes(extras)
     return info.indexes.filter((ix) => !ix.primary && !skip.has(ix.name))
@@ -665,8 +688,9 @@ function alterTable(
     if (draft) draft.dropped = true
   }
   const addIndex = (ix: IndexInfo, draft: TableDraft): void => {
-    if (pgDefinitionIndex(dialect, ix)) extraIndexSql.push(pgIndexSql(ix.definition!))
-    else indexes.push(newIndex(draft, ix))
+    // The source's definition names the source table, which a table comparison may call something else
+    if (pgDefinitionIndex(dialect, ix)) extraIndexSql.push(pgIndexSql(ix.definition!, table))
+    else indexes.push(newIndex(dialect, draft, ix))
   }
   const desired: TableDraft = {
     ...loaded,
@@ -676,7 +700,7 @@ function alterTable(
     foreignKeys: loaded.foreignKeys
   }
   for (const ix of indexPairs.removed) {
-    changes.push({ action: 'drop', what: 'index', name: ix.name, from: describeIndex(ix) })
+    changes.push({ action: 'drop', what: 'index', name: ix.name, from: describeIndex(dialect, ix) })
     dropIndex(ix)
   }
   for (const [si, ti] of indexPairs.matched) {
@@ -685,15 +709,17 @@ function alterTable(
       action: 'change',
       what: 'index',
       name: ti.name,
-      from: describeIndex(ti),
-      to: describeIndex(si)
+      from: describeIndex(dialect, ti),
+      to: describeIndex(dialect, si)
     })
+    // Left alone rather than dropped when its replacement can't be written
+    if (!scriptableIndex(dialect, si, item.warnings)) continue
     dropIndex(ti)
     addIndex(si, desired)
   }
   for (const ix of indexPairs.added) {
-    changes.push({ action: 'add', what: 'index', name: ix.name, to: describeIndex(ix) })
-    addIndex(ix, desired)
+    changes.push({ action: 'add', what: 'index', name: ix.name, to: describeIndex(dialect, ix) })
+    if (scriptableIndex(dialect, ix, item.warnings)) addIndex(ix, desired)
   }
 
   // Foreign keys: dropped up front and added at the end, around every table's changes

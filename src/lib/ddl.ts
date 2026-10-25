@@ -24,8 +24,8 @@ export interface ColumnState {
 
 export interface ColumnDraft extends ColumnState {
   id: string
-  /** The column as loaded; null for a new column */
-  original: ColumnState | null
+  /** The column as loaded, with its MySQL `ON UPDATE`; null for a new column */
+  original: (ColumnState & { onUpdate?: string | null }) | null
   /** Computed / generated columns can be dropped but not altered */
   computed: boolean
   /** MySQL `ON UPDATE` expression a MODIFY COLUMN has to restate */
@@ -186,6 +186,12 @@ function normMethod(dialect: Dialect, method: string | null): string {
   const found = methods.find((m) => m.toLowerCase() === (method ?? '').trim().toLowerCase())
   if (found === undefined) return (method ?? '').trim()
   return found === methods[0] ? '' : found
+}
+
+/** Whether CREATE INDEX can be written for the method or kind, e.g. not for a SQL Server XML index. */
+export function writableIndexMethod(dialect: Dialect, method: string | null): boolean {
+  const found = normMethod(dialect, method)
+  return !found || knownMethods(dialect).includes(found)
 }
 
 export function newColumn(dialect: Dialect, patch: Partial<ColumnState> = {}): ColumnDraft {
@@ -371,12 +377,13 @@ export function draftFromTable(
       invisible: dialect === 'mysql' && isInvisible(c.extra),
       compressed
     }
+    const onUpdate = c.extra?.match(/\bon update (\S+)/i)?.[1] ?? null
     return {
       ...state,
       id: draftId(),
-      original: state,
+      original: { ...state, onUpdate },
       computed: isComputed(dialect, c),
-      onUpdate: c.extra?.match(/\bon update (\S+)/i)?.[1] ?? null,
+      onUpdate,
       charset: c.charset ?? null,
       collation: c.collation ?? null,
       dropped: false
@@ -482,6 +489,10 @@ function effective(draft: TableDraft, c: ColumnState & { id?: string }): ColumnS
 
 const normType = (t: string): string => t.trim().replace(/\s+/g, ' ').toLowerCase()
 
+/** MariaDB spells MySQL's `CURRENT_TIMESTAMP` as `current_timestamp()` */
+const normOnUpdate = (s: string | null | undefined): string =>
+  (s ?? '').trim().toLowerCase().replace(/\(\)$/, '')
+
 interface ColumnDiff {
   renamed: boolean
   type: boolean
@@ -489,7 +500,7 @@ interface ColumnDiff {
   default: boolean
   identity: boolean
   comment: boolean
-  /** INVISIBLE or COMPRESSED */
+  /** INVISIBLE, COMPRESSED or ON UPDATE */
   attributes: boolean
 }
 
@@ -506,7 +517,12 @@ function diffColumn(draft: TableDraft, c: ColumnDraft): ColumnDiff | null {
     default: now.default !== was.default,
     identity: now.identity !== was.identity,
     comment: now.comment !== was.comment,
-    attributes: now.invisible !== was.invisible || now.compressed !== was.compressed
+    attributes:
+      now.invisible !== was.invisible ||
+      now.compressed !== was.compressed ||
+      // Only snapshots from draftFromTable record the loaded ON UPDATE
+      (c.original.onUpdate !== undefined &&
+        normOnUpdate(c.onUpdate) !== normOnUpdate(c.original.onUpdate))
   }
   return Object.values(diff).some(Boolean) ? diff : null
 }
@@ -847,16 +863,38 @@ function columnDefinition(
   return parts.filter(Boolean).join(' ')
 }
 
-/** SQLite wants anything but a literal or CURRENT_* default in parentheses. */
+/**
+ * SQLite wants anything but a literal or CURRENT_* default in parentheses.
+ * PRAGMA table_info drops the outer ones, so `('x'||'y')` comes back as `'x'||'y'`.
+ */
 function sqliteDefault(expr: string): string {
   if (
-    /^\(/.test(expr) ||
-    /^[-+]?(\d|\.\d)/.test(expr) ||
-    /^x?'/i.test(expr) ||
+    sqliteWrapped(expr) ||
+    /^[-+]?(\d+(\.\d*)?|\.\d+)(e[-+]?\d+)?$/i.test(expr) ||
+    /^[-+]?0x[0-9a-f]+$/i.test(expr) ||
+    /^'(?:[^']|'')*'$/.test(expr) ||
+    /^x'[0-9a-f]*'$/i.test(expr) ||
     /^(null|true|false|current_(time|date|timestamp))$/i.test(expr)
   )
     return expr
   return `(${expr})`
+}
+
+/** Whether the whole expression is one parenthesised group, which `(1)+(2)` isn't. */
+function sqliteWrapped(expr: string): boolean {
+  if (!expr.startsWith('(')) return false
+  let depth = 0
+  let quote = ''
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]
+    if (quote) {
+      if (ch === quote) quote = ''
+    } else if (ch === "'" || ch === '"' || ch === '`') quote = ch
+    else if (ch === '[') quote = ']'
+    else if (ch === '(') depth++
+    else if (ch === ')' && --depth === 0) return i === expr.length - 1
+  }
+  return false
 }
 
 /** The SQLite column definition, with the key inline for an AUTOINCREMENT column. */
@@ -1121,7 +1159,7 @@ function alterStatements(dialect: Dialect, draft: TableDraft, options: DdlOption
       )
     }
     for (const c of addedColumns)
-      clauses.push(`ADD COLUMN ${columnDefinition(dialect, effective(draft, c))}`)
+      clauses.push(`ADD COLUMN ${columnDefinition(dialect, effective(draft, c), c.onUpdate)}`)
     if (pkChanged && primaryKeyOf(draft).length)
       clauses.push(`ADD PRIMARY KEY (${columnList(dialect, draft, primaryKeyOf(draft))})`)
     for (const uq of p.createUniques) clauses.push(`ADD ${uniqueClause(dialect, draft, uq)}`)
@@ -1189,10 +1227,13 @@ function alterStatements(dialect: Dialect, draft: TableDraft, options: DdlOption
     const column = q(now.name)
     if (dialect === 'postgres') {
       if (diff.renamed) alter(`RENAME COLUMN ${q(was.name)} TO ${column}`)
+      // The old default may not cast to the new type, so it comes off first and goes back after
+      const resetDefault = diff.type && !!was.default.trim()
+      if (resetDefault) alter(`ALTER COLUMN ${column} DROP DEFAULT`)
       if (diff.type)
         alter(`ALTER COLUMN ${column} TYPE ${now.dataType} USING ${column}::${now.dataType}`)
       if (diff.identity && !now.identity) alter(`ALTER COLUMN ${column} DROP IDENTITY`)
-      if (diff.default)
+      if (resetDefault ? !!now.default : diff.default)
         alter(
           `ALTER COLUMN ${column} ${now.default ? `SET DEFAULT ${now.default}` : 'DROP DEFAULT'}`
         )

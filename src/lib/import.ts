@@ -114,10 +114,10 @@ export function parseFile(text: string, format: ImportFormat, csv: CsvOptions): 
     )
     return { columns: uniqueColumnNames(names), rows, documents: null }
   }
-  const documents = parseJsonDocuments(text, format)
+  const parsed = parseJsonDocuments(text, format)
   const columns: string[] = []
   const known = new Set<string>()
-  for (const doc of documents) {
+  for (const doc of parsed) {
     for (const key of Object.keys(doc)) {
       if (!known.has(key)) {
         known.add(key)
@@ -125,12 +125,16 @@ export function parseFile(text: string, format: ImportFormat, csv: CsvOptions): 
       }
     }
   }
-  const rows = documents.map((doc) => columns.map((c) => jsonCell(doc[c])))
+  const rows = parsed.map((doc) => columns.map((c) => jsonCell(doc[c])))
+  const documents = parsed.map((doc) => mongoValue(doc) as Record<string, unknown>)
   return { columns, rows, documents }
 }
 
 function asDocument(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
+  return value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    !(value instanceof JsonNumber)
     ? (value as Record<string, unknown>)
     : { value }
 }
@@ -139,7 +143,7 @@ function parseJsonDocuments(text: string, format: ImportFormat): Record<string, 
   const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
   if (format === 'json') {
     try {
-      const value: unknown = JSON.parse(src)
+      const value = parseJson(src)
       return Array.isArray(value) ? value.map(asDocument) : [asDocument(value)]
     } catch (e) {
       // mongoexport writes one document per line even to .json files
@@ -150,7 +154,7 @@ function parseJsonDocuments(text: string, format: ImportFormat): Record<string, 
   src.split(/\r?\n/).forEach((line, i) => {
     if (!line.trim()) return
     try {
-      out.push(asDocument(JSON.parse(line)))
+      out.push(asDocument(parseJson(line)))
     } catch (e) {
       throw new Error(`Line ${i + 1}: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -158,21 +162,188 @@ function parseJsonDocuments(text: string, format: ImportFormat): Record<string, 
   return out
 }
 
+/** A JSON number as written in the file, so big integers and long decimals keep every digit. */
+export class JsonNumber {
+  constructor(readonly text: string) {}
+}
+
+const JSON_NUMBER = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][-+]?\d+)?/y
+const JSON_STRING_STOP = /["\\]/g
+const JSON_WORDS = [
+  ['true', true],
+  ['false', false],
+  ['null', null]
+] as const
+
+/**
+ * JSON.parse, except that numbers come back as JsonNumber holding their
+ * source text: JSON.parse rounds them to doubles, and only some engines show
+ * a reviver the source text.
+ */
+export function parseJson(text: string): unknown {
+  let i = 0
+  const fail = (what?: string): never => {
+    throw new SyntaxError(
+      `Unexpected ${what ?? (i < text.length ? `token ${text[i]}` : 'end of JSON input')} at position ${i}`
+    )
+  }
+  const space = (): void => {
+    while (i < text.length) {
+      const c = text.charCodeAt(i)
+      if (c !== 0x20 && c !== 0x0a && c !== 0x0d && c !== 0x09) break
+      i++
+    }
+  }
+  const string = (): string => {
+    const start = i++
+    let escaped = false
+    for (;;) {
+      JSON_STRING_STOP.lastIndex = i
+      const m = JSON_STRING_STOP.exec(text)
+      if (!m) {
+        i = text.length
+        return fail()
+      }
+      i = m.index + 1
+      if (m[0] === '"') break
+      // Skip the escaped character
+      escaped = true
+      i++
+    }
+    const raw = text.slice(start, i)
+    // eslint-disable-next-line no-control-regex
+    if (!escaped && !/[\u0000-\u001f]/.test(raw)) return raw.slice(1, -1)
+    try {
+      return JSON.parse(raw) as string
+    } catch {
+      i = start
+      return fail('string')
+    }
+  }
+  const value = (): unknown => {
+    space()
+    const c = text[i]
+    if (c === '{') {
+      i++
+      const obj: Record<string, unknown> = {}
+      space()
+      if (text[i] === '}') {
+        i++
+        return obj
+      }
+      for (;;) {
+        space()
+        if (text[i] !== '"') fail()
+        const key = string()
+        space()
+        if (text[i] !== ':') fail()
+        i++
+        const v = value()
+        // Assigning __proto__ would set the prototype rather than a field
+        if (key === '__proto__')
+          Object.defineProperty(obj, key, {
+            value: v,
+            enumerable: true,
+            writable: true,
+            configurable: true
+          })
+        else obj[key] = v
+        space()
+        if (text[i] === ',') i++
+        else if (text[i] === '}') {
+          i++
+          return obj
+        } else fail()
+      }
+    }
+    if (c === '[') {
+      i++
+      const arr: unknown[] = []
+      space()
+      if (text[i] === ']') {
+        i++
+        return arr
+      }
+      for (;;) {
+        arr.push(value())
+        space()
+        if (text[i] === ',') i++
+        else if (text[i] === ']') {
+          i++
+          return arr
+        } else fail()
+      }
+    }
+    if (c === '"') return string()
+    if (c === '-' || (c >= '0' && c <= '9')) {
+      JSON_NUMBER.lastIndex = i
+      const m = JSON_NUMBER.exec(text) ?? fail()
+      i += m[0].length
+      return new JsonNumber(m[0])
+    }
+    for (const [word, v] of JSON_WORDS) {
+      if (text.startsWith(word, i)) {
+        i += word.length
+        return v
+      }
+    }
+    return fail()
+  }
+  const result = value()
+  space()
+  if (i < text.length) fail()
+  return result
+}
+
+/** Parsed JSON as text, numbers as written. */
+function stringifyJson(value: unknown): string {
+  if (value instanceof JsonNumber) return value.text
+  if (Array.isArray(value)) return `[${value.map(stringifyJson).join(',')}]`
+  if (value && typeof value === 'object')
+    return `{${Object.entries(value)
+      .map(([k, v]) => `${JSON.stringify(k)}:${stringifyJson(v)}`)
+      .join(',')}}`
+  return JSON.stringify(value) ?? 'null'
+}
+
+const INT64_MAX = 9223372036854775807n
+
+/**
+ * A parsed JSON value as a MongoDB document value: integers past 2^53 become
+ * Int64 or Decimal128 extended JSON so they stay exact; other numbers are doubles.
+ */
+export function mongoValue(value: unknown): unknown {
+  if (value instanceof JsonNumber) {
+    const n = Number(value.text)
+    if (!INT.test(value.text) || Number.isSafeInteger(n)) return n
+    const big = BigInt(value.text)
+    if (big <= INT64_MAX && big >= -INT64_MAX - 1n) return { $numberLong: big.toString() }
+    // Decimal128 holds 34 significant digits
+    return value.text.replace(/^-/, '').length <= 34 ? { $numberDecimal: value.text } : n
+  }
+  if (Array.isArray(value)) return value.map(mongoValue)
+  if (value && typeof value === 'object')
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mongoValue(v)]))
+  return value
+}
+
 /** A JSON value as a grid cell; extended JSON wrappers ({ $oid }, { $date }) unwrap to their value. */
 export function jsonCell(value: unknown): Cell {
   if (value === null || value === undefined) return null
   if (typeof value === 'string' || typeof value === 'boolean') return value
+  if (value instanceof JsonNumber) return value.text
   if (typeof value === 'number' || typeof value === 'bigint') return String(value)
   if (typeof value === 'object' && !Array.isArray(value)) {
     const entries = Object.entries(value as Record<string, unknown>)
     if (entries.length === 1 && entries[0][0].startsWith('$')) {
       const inner = entries[0][1]
+      if (inner instanceof JsonNumber) return inner.text
       if (typeof inner === 'string' || typeof inner === 'number') return String(inner)
       if (inner && typeof inner === 'object' && '$numberLong' in inner)
-        return String((inner as { $numberLong: unknown }).$numberLong)
+        return jsonCell((inner as { $numberLong: unknown }).$numberLong)
     }
   }
-  return JSON.stringify(value)
+  return stringifyJson(value)
 }
 
 /* ---------- Type inference ---------- */
@@ -347,8 +518,10 @@ export function sqlType(dialect: Dialect, p: ColumnProfile): string {
       switch (kind) {
         case 'integer':
         case 'bigint':
-        case 'boolean':
           return 'INTEGER'
+        // Numeric affinity like INTEGER, but named so true/false convert to 1/0 on insert
+        case 'boolean':
+          return 'BOOLEAN'
         case 'numeric':
         case 'float':
           return 'REAL'
@@ -459,7 +632,12 @@ export function insertBatches(
   }
   for (const row of rows) {
     const tuple = `(${columns
-      .map((c, i) => literal(dialect, toCell(row[i] ?? null, c.dataType, emptyAsNull), c.dataType))
+      .map((c, i) => {
+        const cell = toCell(row[i] ?? null, c.dataType, emptyAsNull)
+        // SQLite stores booleans as 1/0; TRUE/FALSE keywords need 3.23+
+        if (dialect === 'sqlite' && typeof cell === 'boolean') return cell ? '1' : '0'
+        return literal(dialect, cell, c.dataType)
+      })
       .join(', ')})`
     if (values.length && bytes + tuple.length + 2 > limits.maxBytes) flush()
     values.push(tuple)

@@ -123,6 +123,90 @@ pub fn describe_error(e: &tokio_postgres::Error) -> String {
     s
 }
 
+/// Whether the script is at most one statement: no `;` outside quotes,
+/// comments and dollar quotes is followed by anything but whitespace and
+/// comments. Errs towards `false`, which only costs the column types.
+fn is_single_statement(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let mut ended = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0u32;
+                while i < b.len() {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            _ if c.is_ascii_whitespace() => {}
+            _ if ended => return false,
+            b';' => ended = true,
+            b'\'' | b'"' => {
+                // E'…' strings take backslash escapes
+                let backslash = c == b'\''
+                    && i > 0
+                    && b[i - 1].eq_ignore_ascii_case(&b'e')
+                    && (i < 2 || !ident(b[i - 2]));
+                i += 1;
+                while i < b.len() {
+                    if backslash && b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == c {
+                        // A doubled quote stays inside
+                        if b.get(i + 1) == Some(&c) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' if i == 0 || !ident(b[i - 1]) => {
+                let tag_end = b[i + 1..]
+                    .iter()
+                    .position(|&t| !ident(t))
+                    .map(|p| i + 1 + p);
+                let is_tag = tag_end.is_some_and(|e| {
+                    b[e] == b'$' && !b.get(i + 1).is_some_and(|d| d.is_ascii_digit())
+                });
+                if let (true, Some(e)) = (is_tag, tag_end) {
+                    let tag = &b[i..=e];
+                    match b[e + 1..].windows(tag.len()).position(|w| w == tag) {
+                        Some(p) => i = e + 1 + p + tag.len() - 1,
+                        None => return true,
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
 fn error_position(e: &tokio_postgres::Error) -> Option<u32> {
     match e.as_db_error()?.position()? {
         ErrorPosition::Original(p) => Some(*p),
@@ -367,19 +451,49 @@ impl PgSession {
 
         // The simple protocol doesn't carry column types; a prepare (which never
         // executes) recovers them for the common single-statement case.
-        if out.results.len() == 1 && out.error.is_none() {
-            let prepared =
-                tokio::time::timeout(Duration::from_secs(2), self.client.prepare(sql)).await;
-            if let Ok(Ok(stmt)) = prepared {
-                let set = &mut out.results[0];
-                if stmt.columns().len() == set.columns.len() {
-                    for (meta, col) in set.columns.iter_mut().zip(stmt.columns()) {
-                        meta.type_name = col.type_().name().to_string();
-                    }
+        if out.results.len() == 1
+            && out.error.is_none()
+            && !out.cancelled
+            && is_single_statement(sql)
+            && let Some(stmt) = self.prepare_guarded(sql).await
+        {
+            let set = &mut out.results[0];
+            if stmt.columns().len() == set.columns.len() {
+                for (meta, col) in set.columns.iter_mut().zip(stmt.columns()) {
+                    meta.type_name = col.type_().name().to_string();
                 }
             }
         }
         out.finish(Some(self.database.clone()))
+    }
+
+    /// Prepares `sql` without running it. A failed prepare aborts an open
+    /// transaction block, so inside one it runs under a savepoint that's
+    /// rolled back on failure; when the state is unknown it isn't tried.
+    async fn prepare_guarded(&self, sql: &str) -> Option<tokio_postgres::Statement> {
+        const SAVEPOINT: &str = "dbms_tool_column_types";
+        let in_transaction = self.in_transaction().await?;
+        if in_transaction {
+            self.client
+                .simple_query(&format!("SAVEPOINT {SAVEPOINT}"))
+                .await
+                .ok()?;
+        }
+        let prepared = tokio::time::timeout(Duration::from_secs(2), self.client.prepare(sql))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if in_transaction {
+            // Queued behind the prepare even if it timed out, so it always
+            // sees the prepare's outcome
+            let undo = if prepared.is_some() {
+                format!("RELEASE SAVEPOINT {SAVEPOINT}")
+            } else {
+                format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}; RELEASE SAVEPOINT {SAVEPOINT}")
+            };
+            let _ = self.client.simple_query(&undo).await;
+        }
+        prepared
     }
 
     async fn run(
@@ -547,12 +661,17 @@ impl PgSession {
                 &[&schema, &table],
             )
             .await?;
+        // Key columns by their raw names (pg_get_indexdef quotes them), and
+        // expressions as the server prints them
         let indexes = self
             .strings(
                 &format!(
                     "SELECT i.relname::text, ix.indisunique, ix.indisprimary, am.amname::text, \
-                   ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true) \
-                         FROM generate_series(1, {}) k)::text[], \
+                   ARRAY(SELECT coalesce(a.attname::text, pg_get_indexdef(ix.indexrelid, k, true)) \
+                         FROM generate_series(1, {}) k \
+                         LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid \
+                           AND a.attnum = ix.indkey[k - 1] AND ix.indkey[k - 1] <> 0 \
+                         ORDER BY k)::text[], \
                    pg_get_indexdef(ix.indexrelid) \
                  FROM pg_index ix \
                  JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -889,5 +1008,29 @@ mod tests {
         let (items, dropped) = inbox.take();
         assert!(items.is_empty());
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn single_statements_for_the_type_prepare() {
+        for sql in [
+            "SELECT 1",
+            "SELECT 1;",
+            "  SELECT 1 ;  \n-- done; really\n/* a; /* nested; */ b; */ ",
+            "SELECT 'a;b', \"x;y\", 'it''s; ok'",
+            "SELECT E'it\\'s; ok'",
+            "SELECT $$a; b$$, $t$ c; $$ d $t$, $1, a$b",
+            "SELECT 1 -- trailing; comment",
+        ] {
+            assert!(is_single_statement(sql), "{sql}");
+        }
+        for sql in [
+            "BEGIN; UPDATE t SET a = 1; SELECT * FROM t;",
+            "SELECT 1; SELECT 2",
+            "SELECT 'a'; SELECT 'b'",
+            "SELECT $$x$$; SELECT 2",
+            "SELECT 1;\n-- c\nSELECT 2",
+        ] {
+            assert!(!is_single_statement(sql), "{sql}");
+        }
     }
 }

@@ -1069,12 +1069,15 @@ impl Job {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
+                // A chosen source database is all that restores, even from a folder holding others
+                if let Some(from) = from
+                    && j.namespaces.is_empty()
+                {
+                    plan.args.push(format!("--nsInclude={}.*", ns_escape(from)));
+                }
                 if let (Some(from), Some(to)) = (from, to)
                     && from != to
                 {
-                    if j.namespaces.is_empty() {
-                        plan.args.push(format!("--nsInclude={}.*", ns_escape(from)));
-                    }
                     plan.args.push(format!("--nsFrom={}.*", ns_escape(from)));
                     plan.args.push(format!("--nsTo={}.*", ns_escape(to)));
                 }
@@ -1277,42 +1280,60 @@ pub fn parse_mysql_dump(text: &str, out: &mut Inspection) {
     }
 }
 
+/// What a mongodump database folder holds: `(name, view, gzip)` per collection,
+/// by the names mongodump escaped into file names (`a%3Ab.bson` is `a:b`).
+/// Views have only a `.metadata.json`.
+fn mongo_collections(dir: &Path) -> Vec<(String, bool, bool)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // name -> (has data, gzip)
+    let mut found: HashMap<String, (bool, bool)> = HashMap::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let (plain, gz) = match file.strip_suffix(".gz") {
+            Some(plain) => (plain, true),
+            None => (file.as_str(), false),
+        };
+        let (name, data) = if let Some(c) = plain.strip_suffix(".bson") {
+            (c, true)
+        } else if let Some(c) = plain.strip_suffix(".metadata.json") {
+            (c, false)
+        } else {
+            continue;
+        };
+        let seen = found.entry(builtin::mongo_unescape_name(name)).or_default();
+        seen.0 |= data;
+        seen.1 |= gz;
+    }
+    let mut found: Vec<(String, bool, bool)> = found
+        .into_iter()
+        .map(|(name, (data, gz))| (name, !data, gz))
+        .collect();
+    found.sort();
+    found
+}
+
 /// Collections in a mongodump folder: `<dump>/<db>/<coll>.bson[.gz]`, or the database folder itself.
 fn scan_mongo_dir(path: &Path, out: &mut Inspection) -> AppResult<()> {
-    let collections = |dir: &Path| -> Vec<(String, bool)> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut found: Vec<(String, bool)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(c) = name.strip_suffix(".bson.gz") {
-                    Some((c.to_string(), true))
-                } else {
-                    name.strip_suffix(".bson").map(|c| (c.to_string(), false))
-                }
-            })
-            .collect();
-        found.sort();
-        found
+    let db_name = |dir: &Path| {
+        dir.file_name()
+            .map(|n| builtin::mongo_unescape_name(&n.to_string_lossy()))
+            .unwrap_or_default()
     };
-    let push = |db: &str, found: Vec<(String, bool)>, out: &mut Inspection| {
-        for (name, gz) in found {
+    let push = |db: &str, found: Vec<(String, bool, bool)>, out: &mut Inspection| {
+        for (name, view, gz) in found {
             out.gzip |= gz;
             out.entries.push(Entry {
-                kind: "collection".into(),
+                kind: if view { "view" } else { "collection" }.into(),
                 schema: Some(db.to_string()),
                 name,
             });
         }
     };
-    let direct = collections(path);
+    let direct = mongo_collections(path);
     if !direct.is_empty() {
-        let db = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let db = db_name(path);
         out.database = Some(db.clone());
         if let Some(parent) = path.parent() {
             out.path = parent.display().to_string();
@@ -1327,11 +1348,7 @@ fn scan_mongo_dir(path: &Path, out: &mut Inspection) -> AppResult<()> {
         .collect();
     dbs.sort();
     for dir in dbs {
-        let db = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        push(&db, collections(&dir), out);
+        push(&db_name(&dir), mongo_collections(&dir), out);
     }
     if out.entries.is_empty() {
         return Err(AppError::msg(
@@ -2265,6 +2282,31 @@ mod tests {
                 "--dir=/b/dump"
             ]
         );
+
+        // The same name still limits a folder holding other databases to the chosen one
+        let restore = job(serde_json::json!({
+            "tool": "mongorestore", "path": "/b/dump", "fromDatabase": "a*b", "toDatabase": "a*b"
+        }));
+        let plan = restore
+            .plan(&c, None, &tool(ToolKind::Mongorestore, "100"))
+            .unwrap();
+        assert_eq!(plan.args[1..], ["--nsInclude=a\\*b.*", "--dir=/b/dump"]);
+        let restore = job(serde_json::json!({
+            "tool": "mongorestore", "path": "/b/dump", "namespaces": ["shop.a:b"],
+            "fromDatabase": "shop", "toDatabase": "copy"
+        }));
+        let plan = restore
+            .plan(&c, None, &tool(ToolKind::Mongorestore, "100"))
+            .unwrap();
+        assert_eq!(
+            plan.args[1..],
+            [
+                "--nsInclude=shop.a:b",
+                "--nsFrom=shop.*",
+                "--nsTo=copy.*",
+                "--dir=/b/dump"
+            ]
+        );
     }
 
     #[test]
@@ -2397,6 +2439,44 @@ SET x = 1;\nCREATE DATABASE \"Shop\" WITH TEMPLATE = template0;\n",
 
         std::fs::create_dir_all(root.join("empty")).unwrap();
         assert!(scan_mongo_dir(&root.join("empty"), &mut Inspection::default()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mongo_dump_folders_list_escaped_names_and_views() {
+        let root = std::env::temp_dir().join(format!("dbms-mongo-{}", uuid::Uuid::new_v4()));
+        let db = root.join("my%3Adb");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("a%3Ab.bson"), b"").unwrap();
+        std::fs::write(db.join("a%3Ab.metadata.json"), b"").unwrap();
+        std::fs::write(db.join("recent.metadata.json.gz"), b"").unwrap();
+        std::fs::write(db.join("prelude.json"), b"").unwrap();
+
+        let mut inner = Inspection::default();
+        scan_mongo_dir(&db, &mut inner).unwrap();
+        assert_eq!(inner.database.as_deref(), Some("my:db"));
+        assert_eq!(inner.path, root.display().to_string());
+        assert!(inner.gzip);
+        let entries: Vec<(&str, &str, &str)> = inner
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.kind.as_str(),
+                    e.schema.as_deref().unwrap(),
+                    e.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [("collection", "my:db", "a:b"), ("view", "my:db", "recent")]
+        );
+
+        let mut top = Inspection::default();
+        scan_mongo_dir(&root, &mut top).unwrap();
+        assert_eq!(top.database.as_deref(), Some("my:db"));
+        assert_eq!(top.entries.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

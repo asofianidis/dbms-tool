@@ -100,6 +100,9 @@ export interface ResultEditTarget {
   info: TableInfo
   /** Result columns that don't map onto a table column */
   readOnly: Set<number>
+  /** Where the rows were read (connection and database), so pending edits never carry over to
+   *  a same-named table elsewhere */
+  scope?: string
   /** Runs SQL on the tab's session */
   execute: (sql: string, options?: ExecOptions) => Promise<ExecOutput>
   confirmDangerous: boolean
@@ -610,7 +613,7 @@ export function ResultsPanel({
             <EmptyState title="No columns" />
           ) : editable && edit ? (
             <EditableResult
-              key={qualified(dialect, edit.tableRef)}
+              key={`${edit.scope ?? ''}:${qualified(dialect, edit.tableRef)}`}
               set={set}
               edit={edit}
               dialect={dialect}

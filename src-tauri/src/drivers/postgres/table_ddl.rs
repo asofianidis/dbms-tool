@@ -9,7 +9,7 @@ use tokio_postgres::types::Oid;
 
 use crate::error::AppResult;
 
-use super::PgSession;
+use super::{PgSession, compat};
 
 /// Columns: oid, relkind, relpersistence, qualified name, parent (partitions),
 /// partition bound, partition key, INHERITS parents, access method, reloptions,
@@ -41,9 +41,11 @@ const TABLE_SQL: &str = "SELECT c.oid, c.relkind::text, c.relpersistence::text, 
 /// not null and default, and the sequence the column owns (serial or identity):
 /// qualified name, raw name, type, start, increment, min, max, cache, cycle,
 /// and whether the default is `nextval` of it.
-const COLUMNS_SQL: &str = "SELECT quote_ident(a.attname), a.attname::text, \
+fn columns_sql(version: i32) -> String {
+    format!(
+        "SELECT quote_ident(a.attname), a.attname::text, \
        format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity::text, \
-       a.attgenerated::text, pg_get_expr(d.adbin, d.adrelid, true), \
+       {}, pg_get_expr(d.adbin, d.adrelid, true), \
        CASE WHEN a.attcollation <> t.typcollation AND co.oid IS NOT NULL THEN format('%I.%I', cn.nspname, co.collname) END, \
        quote_literal(col_description(a.attrelid, a.attnum)), a.attislocal, \
        pa.attnotnull, pg_get_expr(pd.adbin, pd.adrelid, true), \
@@ -66,17 +68,25 @@ const COLUMNS_SQL: &str = "SELECT quote_ident(a.attname), a.attname::text, \
             AND dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum AND dep.deptype IN ('a', 'i') \
           LIMIT 1) sq ON true \
      LEFT JOIN pg_sequence s ON s.seqrelid = sq.oid \
-     WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum";
+     WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        compat::generated_kind(version)
+    )
+}
 
 /// The table's own constraints (not inherited or cloned onto a partition), in
 /// the order pg_dump lists them. NOT NULL is part of the column.
-const CONSTRAINTS_SQL: &str = "SELECT quote_ident(con.conname), con.contype::text, \
+fn constraints_sql(version: i32) -> String {
+    format!(
+        "SELECT quote_ident(con.conname), con.contype::text, \
        pg_get_constraintdef(con.oid, true), NOT con.convalidated, \
        quote_literal(obj_description(con.oid, 'pg_constraint')) \
      FROM pg_constraint con \
      WHERE con.conrelid = $1 AND con.contype IN ('p', 'u', 'x', 'c', 'f') \
-       AND con.conislocal AND con.conparentid = 0 \
-     ORDER BY array_position(ARRAY['p', 'u', 'x', 'c', 'f'], con.contype::text), con.conname";
+       AND con.conislocal AND {} \
+     ORDER BY array_position(ARRAY['p', 'u', 'x', 'c', 'f'], con.contype::text), con.conname",
+        compat::constraint_not_cloned(version)
+    )
+}
 
 /// Indexes no constraint owns and that aren't a partition's copy of a parent index.
 const INDEXES_SQL: &str = "SELECT pg_get_indexdef(x.indexrelid, 0, true), \
@@ -92,10 +102,15 @@ const INDEXES_SQL: &str = "SELECT pg_get_indexdef(x.indexrelid, 0, true), \
      ORDER BY i.relname";
 
 /// User triggers, without the copies a partitioned table's triggers get (PG 13+).
-const TRIGGERS_SQL: &str = "SELECT pg_get_triggerdef(t.oid, true), quote_ident(t.tgname), \
+fn triggers_sql(version: i32) -> String {
+    format!(
+        "SELECT pg_get_triggerdef(t.oid, true), quote_ident(t.tgname), \
        t.tgenabled::text, quote_literal(obj_description(t.oid, 'pg_trigger')) \
-     FROM pg_trigger t WHERE t.tgrelid = $1 AND NOT t.tgisinternal AND t.tgparentid = 0 \
-     ORDER BY t.tgname";
+     FROM pg_trigger t WHERE t.tgrelid = $1 AND NOT t.tgisinternal AND {} \
+     ORDER BY t.tgname",
+        compat::trigger_not_cloned(version)
+    )
+}
 
 const POLICIES_SQL: &str = "SELECT quote_ident(p.polname), p.polpermissive, p.polcmd::text, \
        CASE WHEN p.polroles = '{0}' THEN 'PUBLIC' ELSE (SELECT string_agg(quote_ident(r.rolname), ', ' \
@@ -237,13 +252,13 @@ impl PgSession {
             replica_index: r.get(16),
         };
         let columns = self
-            .strings(COLUMNS_SQL, &[&oid])
+            .strings(&columns_sql(self.version), &[&oid])
             .await?
             .iter()
             .map(column)
             .collect();
         let constraints = self
-            .strings(CONSTRAINTS_SQL, &[&oid])
+            .strings(&constraints_sql(self.version), &[&oid])
             .await?
             .iter()
             .map(|r| Constraint {
@@ -265,7 +280,7 @@ impl PgSession {
             })
             .collect();
         let triggers = self
-            .strings(TRIGGERS_SQL, &[&oid])
+            .strings(&triggers_sql(self.version), &[&oid])
             .await?
             .iter()
             .map(|r| Trigger {

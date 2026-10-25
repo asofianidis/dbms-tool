@@ -148,9 +148,14 @@ export function singleTableSource(sql: string, dialect: Dialect): SingleTableSou
   return { parts, alias, star, columns }
 }
 
+/** Schemas holding session-local temporary tables, which shadow permanent ones. */
+const TEMP_SCHEMA = /^(pg_temp(_\d+)?|temp)$/i
+
 /**
  * The completion entry for a table named by `parts`, preferring the default
- * schema when an unqualified name exists in several.
+ * schema when an unqualified name exists in several. Without a default schema
+ * an ambiguous name resolves to null rather than a guess, as it does whenever
+ * a temporary table shares the name (it shadows whatever search_path finds).
  */
 export function resolveTable(
   parts: string[],
@@ -168,5 +173,6 @@ export function resolveTable(
   const schema = parts.length === 2 ? parts[0] : null
   const matches = tables.filter((t) => same(t.name, name) && (!schema || same(t.schema, schema)))
   if (matches.length <= 1) return matches[0] ?? null
+  if (!schema && matches.some((t) => t.schema && TEMP_SCHEMA.test(t.schema))) return null
   return matches.find((t) => defaultSchema && same(t.schema, defaultSchema)) ?? null
 }

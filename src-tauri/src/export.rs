@@ -40,7 +40,8 @@ fn text(value: &Value) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// CSV or TSV with a header row, quoting like the grid's own export (export.ts).
+/// CSV or TSV with a header row, quoting like the grid's own export (export.ts):
+/// NULL is an empty unquoted field and an empty string is `""`.
 struct Delimited<W: Write> {
     out: BufWriter<W>,
     sep: u8,
@@ -54,17 +55,20 @@ impl<W: Write> Delimited<W> {
         }
     }
 
+    /// `None` is NULL.
     fn line<'a>(
         &mut self,
-        cells: impl Iterator<Item = std::borrow::Cow<'a, str>>,
+        cells: impl Iterator<Item = Option<std::borrow::Cow<'a, str>>>,
     ) -> std::io::Result<()> {
         for (i, cell) in cells.enumerate() {
             if i > 0 {
                 self.out.write_all(&[self.sep])?;
             }
-            let needs_quotes = cell
-                .bytes()
-                .any(|b| b == self.sep || b == b'"' || b == b'\n' || b == b'\r');
+            let Some(cell) = cell else { continue };
+            let needs_quotes = cell.is_empty()
+                || cell
+                    .bytes()
+                    .any(|b| b == self.sep || b == b'"' || b == b'\n' || b == b'\r');
             if needs_quotes {
                 self.out.write_all(b"\"")?;
                 self.out.write_all(cell.replace('"', "\"\"").as_bytes())?;
@@ -79,16 +83,35 @@ impl<W: Write> Delimited<W> {
 
 impl<W: Write + Send> RowSink for Delimited<W> {
     fn begin(&mut self, columns: &[ColumnMeta]) -> std::io::Result<()> {
-        self.line(columns.iter().map(|c| c.name.as_str().into()))
+        self.line(columns.iter().map(|c| Some(c.name.as_str().into())))
     }
 
     fn row(&mut self, row: &[Value]) -> std::io::Result<()> {
-        self.line(row.iter().map(text))
+        self.line(row.iter().map(|v| (!v.is_null()).then(|| text(v))))
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
         self.out.flush()
     }
+}
+
+/// Column names made unique for use as object keys: a repeated name gets
+/// `_2`, `_3`, … (as import.ts does), so `SELECT a.id, b.id` keeps both values.
+fn unique_keys<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut used = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut key = name.to_string();
+            let mut n = 1;
+            while used.contains(&key) {
+                n += 1;
+                key = format!("{name}_{n}");
+            }
+            used.insert(key.clone());
+            key
+        })
+        .collect()
 }
 
 /// A JSON array of objects keyed by column name, one object per line.
@@ -110,9 +133,9 @@ impl<W: Write> Json<W> {
 
 impl<W: Write + Send> RowSink for Json<W> {
     fn begin(&mut self, columns: &[ColumnMeta]) -> std::io::Result<()> {
-        self.keys = columns
+        self.keys = unique_keys(columns.iter().map(|c| c.name.as_str()))
             .iter()
-            .map(|c| serde_json::to_string(&c.name).unwrap_or_else(|_| "\"\"".into()))
+            .map(|k| serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into()))
             .collect();
         self.out.write_all(b"[")
     }
@@ -268,7 +291,8 @@ impl<W: Write + Seek> Xlsx<W> {
                 .map_err(std::io::Error::other)?;
             zip.write_all(body.as_bytes())?;
         }
-        zip.start_file("xl/worksheets/sheet1.xml", options)
+        // The sheet can pass 4 GiB, which needs ZIP64
+        zip.start_file("xl/worksheets/sheet1.xml", options.large_file(true))
             .map_err(std::io::Error::other)?;
         zip.write_all(SHEET_START.as_bytes())?;
         Ok(Self {
@@ -426,6 +450,46 @@ mod tests {
     }
 
     #[test]
+    fn csv_tells_null_from_an_empty_string() {
+        let mut out = Vec::new();
+        {
+            let mut sink = Delimited::new(&mut out, b'\t');
+            sink.begin(&columns()).unwrap();
+            sink.row(&[json!(null), json!("")]).unwrap();
+            sink.row(&[json!(""), json!(null)]).unwrap();
+            sink.finish().unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "id\tnote\r\n\t\"\"\r\n\"\"\t\r\n"
+        );
+    }
+
+    #[test]
+    fn json_keeps_columns_with_the_same_name() {
+        let cols: Vec<ColumnMeta> = ["id", "id", "id_2", "name", "id"]
+            .into_iter()
+            .map(|n| ColumnMeta {
+                name: n.into(),
+                type_name: "text".into(),
+            })
+            .collect();
+        let mut out = Vec::new();
+        {
+            let mut sink = Json::new(&mut out);
+            sink.begin(&cols).unwrap();
+            sink.row(&[json!("1"), json!("2"), json!("3"), json!("n"), json!("4")])
+                .unwrap();
+            sink.finish().unwrap();
+        }
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed,
+            json!([{"id": "1", "id_2": "2", "id_2_2": "3", "name": "n", "id_3": "4"}])
+        );
+    }
+
+    #[test]
     fn json_is_an_array_of_objects() {
         let mut out = Vec::new();
         {
@@ -471,6 +535,12 @@ mod tests {
         // Too many digits for a double stays text
         assert!(sheet.contains(">12345678901234567890</t>"));
         assert!(archive.by_name("xl/workbook.xml").is_ok());
+        assert!(
+            archive
+                .by_name("xl/worksheets/sheet1.xml")
+                .unwrap()
+                .is_file()
+        );
     }
 
     #[test]

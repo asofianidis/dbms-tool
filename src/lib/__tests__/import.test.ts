@@ -7,8 +7,11 @@ import {
   documentBatches,
   insertBatches,
   jsonCell,
+  JsonNumber,
+  mongoValue,
   parseCsv,
   parseFile,
+  parseJson,
   profileColumn,
   sqlType,
   tableNameFromPath,
@@ -80,6 +83,51 @@ describe('parseFile', () => {
 
   it('reports the line of a bad JSON line', () => {
     expect(() => parseFile('{"a":1}\n{oops', 'jsonl', DEFAULT_CSV)).toThrow(/Line 2/)
+  })
+
+  it('keeps every digit of JSON numbers', () => {
+    const text =
+      '[{"id":12345678901234567890,"amount":0.1000000000000000055,"n":7,"big":9007199254740993,"e":1.5e3,"nested":{"x":123456789012345678901234567890}}]'
+    const parsed = parseFile(text, 'json', DEFAULT_CSV)
+    expect(parsed.rows).toEqual([
+      [
+        '12345678901234567890',
+        '0.1000000000000000055',
+        '7',
+        '9007199254740993',
+        '1.5e3',
+        '{"x":123456789012345678901234567890}'
+      ]
+    ])
+    // MongoDB gets Int64 / Decimal128 for integers a double can't hold
+    expect(parsed.documents).toEqual([
+      {
+        id: { $numberDecimal: '12345678901234567890' },
+        amount: 0.1,
+        n: 7,
+        big: { $numberLong: '9007199254740993' },
+        e: 1500,
+        nested: { x: { $numberDecimal: '123456789012345678901234567890' } }
+      }
+    ])
+  })
+})
+
+describe('parseJson', () => {
+  it('reads what JSON.parse reads', () => {
+    const text =
+      ' {"s":"a\\"b\\u00e9\\n","t":true,"f":false,"z":null,"a":[1,-2.5,[]],"o":{},"__proto__":1} '
+    const value = parseJson(text) as Record<string, unknown>
+    expect(value.s).toBe('a"bé\n')
+    expect(value.a).toEqual([new JsonNumber('1'), new JsonNumber('-2.5'), []])
+    expect(Object.keys(value)).toEqual(['s', 't', 'f', 'z', 'a', 'o', '__proto__'])
+    expect(Object.getPrototypeOf(value)).toBe(Object.prototype)
+    expect(mongoValue(value)).toEqual(JSON.parse(text))
+  })
+
+  it('rejects malformed JSON', () => {
+    for (const bad of ['', '{', '[1,]', '{"a" 1}', '01', '"open', 'tru', '1 2', '"tab\there"'])
+      expect(() => parseJson(bad), bad).toThrow(SyntaxError)
   })
 })
 
@@ -214,6 +262,19 @@ describe('insertBatches', () => {
     expect(toCell('no', 'boolean', true)).toBe(false)
     expect(toCell('yes', 'text', true)).toBe('yes')
     expect(toCell('', 'text', false)).toBe('')
+  })
+
+  it('stores inferred SQLite booleans as 1/0', () => {
+    const dataType = sqlType('sqlite', profileColumn([['true'], ['FALSE']], 0))
+    expect(dataType).toBe('BOOLEAN')
+    const [batch] = insertBatches(
+      'sqlite',
+      { schema: null, name: 't' },
+      [{ name: 'flag', dataType }],
+      [['true'], ['FALSE'], [true]],
+      true
+    )
+    expect(batch.sql).toBe('INSERT INTO t (flag) VALUES\n(1),\n(0),\n(1)')
   })
 })
 

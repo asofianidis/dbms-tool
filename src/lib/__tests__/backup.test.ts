@@ -331,6 +331,9 @@ describe('SQL Server', () => {
       'L:\\Logs\\shop_copy_log.ldf',
       'D:\\Data\\shop_copy_extra.ndf'
     ])
+    expect(defaultMoves(files, 'shop', 'shop$&$1', server)[0].physical).toBe(
+      'D:\\Data\\shop$&$1.mdf'
+    )
     const noDefaults = { ...server, dataDir: '', logDir: '' }
     expect(defaultMoves(files, 'shop', 'shop', noDefaults).map((f) => f.physical)).toEqual([
       'C:\\Old\\Shop.mdf',

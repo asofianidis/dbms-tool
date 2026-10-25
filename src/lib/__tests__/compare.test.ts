@@ -674,3 +674,210 @@ describe('column drops in altered tables', () => {
     expect(defaultSelection(items).size).toBe(1)
   })
 })
+
+describe('index kinds and column attributes outside PostgreSQL', () => {
+  const index = (patch: Partial<IndexInfo> & { name: string }): IndexInfo => ({
+    columns: ['body'],
+    unique: false,
+    primary: false,
+    method: null,
+    definition: null,
+    ...patch
+  })
+  const withBody = (dialect: 'mysql' | 'tsql', indexes: IndexInfo[]): TableInfo =>
+    table({
+      columns: [
+        column({ name: 'id', nullable: false, isPrimaryKey: true }),
+        column({ name: 'body', dataType: dialect === 'mysql' ? 'text' : 'nvarchar(400)' })
+      ],
+      indexes
+    })
+  const mysql = (source: TableInfo, target: TableInfo): CompareContext => ({
+    dialect: 'mysql',
+    scope: 'database',
+    source: snapshot([obj('posts', { schema: null, table: source })], { schema: null }),
+    target: snapshot([obj('posts', { schema: null, table: target })], { schema: null })
+  })
+  const tsql = (source: TableInfo, target: TableInfo): CompareContext => ({
+    dialect: 'tsql',
+    scope: 'schema',
+    source: snapshot([obj('posts', { schema: 'dbo', table: source })], { schema: 'dbo' }),
+    target: snapshot([obj('posts', { schema: 'dbo', table: target })], { schema: 'dbo' })
+  })
+  const statementsOf = (items: ReturnType<typeof compareSnapshots>): string[] =>
+    migrationStatements(items, new Set(items.map((i) => i.id)))
+
+  it('keeps MySQL FULLTEXT indexes, and leaves matching ones alone', () => {
+    const fulltext = index({ name: 'ft_body', method: 'FULLTEXT' })
+    const [item] = compareSnapshots(mysql(withBody('mysql', [fulltext]), withBody('mysql', [])))
+    expect(statementsOf([item])).toEqual([
+      'ALTER TABLE `app`.`posts`\n  ADD FULLTEXT INDEX `ft_body` (`body`)'
+    ])
+    const [same] = compareSnapshots(
+      mysql(withBody('mysql', [fulltext]), withBody('mysql', [{ ...fulltext }]))
+    )
+    expect(same.action).toBe('same')
+    const [changed] = compareSnapshots(
+      mysql(
+        withBody('mysql', [fulltext]),
+        withBody('mysql', [index({ name: 'ft_body', method: 'BTREE' })])
+      )
+    )
+    expect(changed.changes).toMatchObject([
+      { what: 'index', from: '(body) BTREE', to: '(body) FULLTEXT' }
+    ])
+    expect(statementsOf([changed])).toEqual([
+      'ALTER TABLE `app`.`posts`\n  DROP INDEX `ft_body`,\n  ADD FULLTEXT INDEX `ft_body` (`body`)'
+    ])
+  })
+
+  it('keeps SQL Server CLUSTERED indexes and warns about kinds it cannot write', () => {
+    const [item] = compareSnapshots(
+      tsql(
+        withBody('tsql', [index({ name: 'cx_body', method: 'clustered' })]),
+        withBody('tsql', [])
+      )
+    )
+    expect(statementsOf([item]).join('\n')).toContain(
+      'CREATE CLUSTERED INDEX [cx_body] ON [dbo].[posts] ([body])'
+    )
+    const nonclustered = index({ name: 'ix_body', method: 'nonclustered' })
+    const [same] = compareSnapshots(
+      tsql(withBody('tsql', [nonclustered]), withBody('tsql', [{ ...nonclustered }]))
+    )
+    expect(same.action).toBe('same')
+    const [xml] = compareSnapshots(
+      tsql(withBody('tsql', [index({ name: 'xml_body', method: 'xml' })]), withBody('tsql', []))
+    )
+    expect(statementsOf([xml]).join('\n')).not.toContain('xml_body')
+    expect(xml.warnings).toContainEqual(expect.stringMatching(/xml_body is a xml index/))
+  })
+
+  it('restates MySQL columns whose INVISIBLE, COMPRESSED or ON UPDATE differs', () => {
+    const info = (body: Partial<ColumnInfo>, updated: Partial<ColumnInfo>): TableInfo =>
+      table({
+        columns: [
+          column({ name: 'id', nullable: false, isPrimaryKey: true }),
+          column({ name: 'body', dataType: 'text', ...body }),
+          column({
+            name: 'updated',
+            dataType: 'timestamp',
+            default: 'CURRENT_TIMESTAMP',
+            ...updated
+          })
+        ]
+      })
+    const [item] = compareSnapshots(
+      mysql(
+        info(
+          { dataType: 'text /*M!100301 COMPRESSED*/', extra: 'INVISIBLE' },
+          { extra: 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP' }
+        ),
+        info({}, { extra: 'DEFAULT_GENERATED' })
+      )
+    )
+    expect(item.changes.map((c) => c.name).sort()).toEqual(['body', 'updated'])
+    const [statement] = statementsOf([item])
+    expect(statement).toMatch(/MODIFY COLUMN `body` text .*COMPRESSED.* INVISIBLE/)
+    expect(statement).toMatch(/MODIFY COLUMN `updated` .*ON UPDATE CURRENT_TIMESTAMP/)
+
+    const same = info({ extra: 'INVISIBLE' }, { extra: 'on update CURRENT_TIMESTAMP' })
+    expect(compareSnapshots(mysql(same, same)).map((i) => i.action)).toEqual(['same'])
+  })
+})
+
+describe('comparing two differently named PostgreSQL tables', () => {
+  const ix = (t: string, name = `${t}_x_idx`): IndexInfo => ({
+    name,
+    columns: ['x'],
+    unique: false,
+    primary: false,
+    method: 'btree',
+    definition: `CREATE INDEX ${name} ON public.${t} USING btree (x)`
+  })
+  const tableCompare = (source: SnapshotObject, target: SnapshotObject): CompareContext => ({
+    dialect: 'postgres',
+    scope: 'table',
+    source: snapshot([source]),
+    target: snapshot([target])
+  })
+  const withX = (indexes: IndexInfo[]): TableInfo =>
+    table({ columns: [column({ name: 'id', nullable: false }), column({ name: 'x' })], indexes })
+
+  it("doesn't flag matching indexes and creates new ones on the target table", () => {
+    const [same] = compareSnapshots(
+      tableCompare(obj('a', { table: withX([ix('a')]) }), obj('b', { table: withX([ix('b')]) }))
+    )
+    expect(same.action).toBe('same')
+
+    const [item] = compareSnapshots(
+      tableCompare(obj('a', { table: withX([ix('a')]) }), obj('b', { table: withX([]) }))
+    )
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'CREATE INDEX a_x_idx ON public.b USING btree (x)'
+    ])
+  })
+
+  it('attaches partitions to the target table', () => {
+    const extras = (parent: string, bound: string): PgTableExtras => ({
+      constraints: [],
+      partitionKey: 'LIST (x)',
+      partitions: [
+        { schema: 'public', name: 'p1', parentSchema: 'public', parent, bound, key: null }
+      ]
+    })
+    const [same] = compareSnapshots(
+      tableCompare(
+        obj('a', { table: withX([]), pg: extras('a', 'FOR VALUES IN (1)') }),
+        obj('b', { table: withX([]), pg: extras('b', 'FOR VALUES IN (1)') })
+      )
+    )
+    expect(same.action).toBe('same')
+
+    const [item] = compareSnapshots(
+      tableCompare(
+        obj('a', { table: withX([]), pg: extras('a', 'FOR VALUES IN (1, 2)') }),
+        obj('b', { table: withX([]), pg: extras('b', 'FOR VALUES IN (1)') })
+      )
+    )
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'ALTER TABLE public.b DETACH PARTITION public.p1',
+      'ALTER TABLE public.b ATTACH PARTITION public.p1 FOR VALUES IN (1, 2)'
+    ])
+  })
+})
+
+describe('SQLite partial indexes', () => {
+  it('keeps the predicate and compares it', () => {
+    const partial = (where: string): IndexInfo => ({
+      name: 'ix_x',
+      columns: ['x'],
+      unique: false,
+      primary: false,
+      method: null,
+      definition: `CREATE INDEX ix_x ON t (x) WHERE ${where}`
+    })
+    const withX = (indexes: IndexInfo[]): TableInfo =>
+      table({
+        columns: [
+          column({ name: 'id', dataType: 'INTEGER', nullable: false, isPrimaryKey: true }),
+          column({ name: 'x', dataType: 'INTEGER' })
+        ],
+        indexes
+      })
+    const ctx = (source: TableInfo, target: TableInfo): CompareContext => ({
+      dialect: 'sqlite',
+      scope: 'schema',
+      source: snapshot([obj('t', { schema: null, table: source })], { schema: null }),
+      target: snapshot([obj('t', { schema: null, table: target })], { schema: null })
+    })
+    const [added] = compareSnapshots(ctx(withX([partial('x > 0')]), withX([])))
+    expect(migrationStatements([added], new Set([added.id]))).toEqual([
+      'CREATE INDEX ix_x ON t (x) WHERE x > 0'
+    ])
+    const [same] = compareSnapshots(ctx(withX([partial('x > 0')]), withX([partial('x > 0')])))
+    expect(same.action).toBe('same')
+    const [changed] = compareSnapshots(ctx(withX([partial('x > 0')]), withX([partial('x < 0')])))
+    expect(changed.changes).toMatchObject([{ what: 'index', to: '(x) WHERE x > 0' }])
+  })
+})

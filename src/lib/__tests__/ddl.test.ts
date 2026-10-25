@@ -496,3 +496,67 @@ describe('mysqlDefaultExpr expressions', () => {
     expect(mysqlDefaultExpr('abc', 'varchar(10)', '')).toBe("'abc'")
   })
 })
+
+describe('PostgreSQL type changes around a default', () => {
+  it('drops the default before the type change and sets it after', () => {
+    const d = load('postgres')
+    Object.assign(col(d, 'status'), { dataType: 'integer', default: '0' })
+    expect(tableStatements('postgres', d)).toEqual([
+      'ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT',
+      'ALTER TABLE public.users ALTER COLUMN status TYPE integer USING status::integer',
+      'ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 0'
+    ])
+  })
+
+  it('puts an unchanged default back after the type change', () => {
+    const d = load('postgres')
+    col(d, 'status').dataType = 'text'
+    expect(tableStatements('postgres', d)).toEqual([
+      'ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT',
+      'ALTER TABLE public.users ALTER COLUMN status TYPE text USING status::text',
+      "ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 'new'::text"
+    ])
+  })
+
+  it('drops a removed default once, and leaves columns without one as they were', () => {
+    const d = load('postgres')
+    Object.assign(col(d, 'status'), { dataType: 'integer', default: '' })
+    col(d, 'legacy').dataType = 'varchar(20)'
+    expect(tableStatements('postgres', d)).toEqual([
+      'ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT',
+      'ALTER TABLE public.users ALTER COLUMN status TYPE integer USING status::integer',
+      'ALTER TABLE public.users ALTER COLUMN legacy TYPE varchar(20) USING legacy::varchar(20)'
+    ])
+  })
+})
+
+describe('MySQL column attributes', () => {
+  const info = (extra: string): TableInfo => ({
+    ...usersTable('mysql'),
+    columns: [
+      ...usersTable('mysql').columns,
+      column({ name: 'updated', dataType: 'timestamp', default: 'CURRENT_TIMESTAMP', extra })
+    ]
+  })
+
+  it('restates a column whose ON UPDATE changed', () => {
+    const d = draftFromTable('mysql', 'app', 'users', info('DEFAULT_GENERATED'))
+    expect(tableStatements('mysql', d)).toEqual([])
+    col(d, 'updated').onUpdate = 'CURRENT_TIMESTAMP'
+    expect(countChanges(d)).toBe(1)
+    expect(tableStatements('mysql', d)).toEqual([
+      'ALTER TABLE `app`.`users`\n  MODIFY COLUMN `updated` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'
+    ])
+  })
+
+  it("doesn't see MariaDB's current_timestamp() as a different ON UPDATE", () => {
+    const d = draftFromTable(
+      'mysql',
+      'app',
+      'users',
+      info('DEFAULT_GENERATED on update current_timestamp()')
+    )
+    col(d, 'updated').onUpdate = 'CURRENT_TIMESTAMP'
+    expect(countChanges(d)).toBe(0)
+  })
+})

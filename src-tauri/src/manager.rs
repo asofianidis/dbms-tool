@@ -114,8 +114,9 @@ impl Server {
                 let mut guard = slot.lock().await;
                 let stale = guard.session.is_broken()
                     || (guard.last_used.elapsed() > IDLE_CHECK && !guard.session.is_alive().await);
-                let wrong_db = !database.is_empty()
-                    && !guard.session.database().eq_ignore_ascii_case(database);
+                // Exact: PostgreSQL and MySQL names can differ only by case. SQL
+                // Server's use_database ignores a switch that only changes case
+                let wrong_db = !database.is_empty() && guard.session.database() != database;
                 if stale || (wrong_db && matches!(guard.session, Session::Pg(_))) {
                     // A dropped SSH or Fly tunnel comes back on the same port
                     tunnel::ensure(&self.config.id).await?;

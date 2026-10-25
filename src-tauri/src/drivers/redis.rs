@@ -30,6 +30,11 @@ const MAX_STRING_BYTES: usize = 1024 * 1024;
 const SCAN_BUDGET: Duration = Duration::from_millis(1500);
 
 pub fn describe_error(e: &::redis::RedisError) -> String {
+    if let Some((addr, slot)) = e.redirect_node() {
+        return format!(
+            "The key is on another cluster node (hash slot {slot} is served by {addr}); this connection reaches only the node it's connected to, so connect to {addr} to work with it"
+        );
+    }
     match (e.code(), e.detail()) {
         (Some(code), Some(detail)) => format!("{code} {detail}"),
         _ => e.to_string(),
@@ -345,6 +350,9 @@ pub struct RedisClient {
     info: ConnectionInfo,
     /// The keyspace a connection lands in when it names none
     pub default_db: i64,
+    /// The server is a Redis Cluster node: multi-key commands must stay within
+    /// one hash slot, and SCAN only sees this node's keys
+    cluster: bool,
     conns: tokio::sync::Mutex<HashMap<(String, i64), MultiplexedConnection>>,
     subscriptions: parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
@@ -404,9 +412,10 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     } else {
         database_index(&cfg.database)?
     };
-    let client = RedisClient {
+    let mut client = RedisClient {
         info,
         default_db,
+        cluster: false,
         conns: tokio::sync::Mutex::new(HashMap::new()),
         subscriptions: parking_lot::Mutex::new(HashMap::new()),
     };
@@ -414,6 +423,11 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     ::redis::cmd("PING")
         .query_async::<RValue>(&mut conn)
         .await?;
+    // An ACL may deny INFO; treat that as standalone (a CROSSSLOT reply still
+    // switches deletes to per-slot commands)
+    client.cluster = self::info(&mut conn, "cluster")
+        .await
+        .is_ok_and(|i| i.get("cluster_enabled").is_some_and(|v| v == "1"));
     Ok(client)
 }
 
@@ -975,6 +989,8 @@ pub struct RedisOutput {
     pub truncated: bool,
     /// Console reply, or the result of a write
     pub reply: Option<Value>,
+    /// Caveat about the result, e.g. that a cluster node lists only its own keys
+    pub notice: Option<String>,
     pub elapsed_ms: u64,
     pub cancelled: bool,
 }
@@ -1009,7 +1025,7 @@ pub async fn execute(
     let result = tokio::select! {
         biased;
         _ = cancel.wait() => None,
-        r = run(&mut conn, request) => Some(r),
+        r = run(&mut conn, request, client.cluster) => Some(r),
     };
     let mut out = match result {
         Some(Err(e)) => {
@@ -1047,7 +1063,14 @@ async fn query(conn: &mut MultiplexedConnection, c: &::redis::Cmd) -> AppResult<
     Ok(c.query_async::<RValue>(conn).await?)
 }
 
-async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResult<RedisOutput> {
+/// Shown with key lists on a cluster node.
+const CLUSTER_SCAN_NOTICE: &str = "Redis Cluster: only keys stored on the connected node are listed; connect to each primary to browse the rest";
+
+async fn run(
+    conn: &mut MultiplexedConnection,
+    request: RedisRequest,
+    cluster: bool,
+) -> AppResult<RedisOutput> {
     use RedisRequest::*;
     Ok(match request {
         Scan {
@@ -1057,14 +1080,18 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
             count,
             ..
         } => {
-            scan(
+            let mut out = scan(
                 conn,
                 cursor,
                 pattern,
                 key_type,
                 count.unwrap_or(500).clamp(1, 10_000),
             )
-            .await?
+            .await?;
+            if cluster {
+                out.notice = Some(CLUSTER_SCAN_NOTICE.into());
+            }
+            out
         }
         Get {
             key,
@@ -1256,7 +1283,7 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
                 .iter()
                 .map(Data::bytes)
                 .collect::<AppResult<Vec<_>>>()?;
-            affected(unlink(conn, &keys).await?)
+            affected(unlink(conn, &keys, cluster).await?)
         }
         DeleteMatching { pattern, .. } => {
             let pattern = pattern.bytes()?;
@@ -1279,14 +1306,21 @@ async fn run(conn: &mut MultiplexedConnection, request: RedisRequest) -> AppResu
                 let (next, batch) = scan_reply(reply);
                 let keys: Vec<Vec<u8>> = batch.iter().filter_map(value_bytes).collect();
                 if !keys.is_empty() {
-                    deleted += unlink(conn, &keys).await?;
+                    deleted += unlink(conn, &keys, cluster).await?;
                 }
                 cursor = next;
                 if cursor == "0" {
                     break;
                 }
             }
-            affected(deleted)
+            let mut out = affected(deleted);
+            if cluster {
+                out.notice = Some(
+                    "Redis Cluster: only matching keys stored on the connected node were deleted"
+                        .into(),
+                );
+            }
+            out
         }
         Flush { .. } => {
             query(conn, &cmd("FLUSHDB")).await?;
@@ -1355,13 +1389,101 @@ async fn pipeline(
     Ok(out)
 }
 
+/// Number of hash slots a Redis Cluster splits the keyspace into.
+const CLUSTER_SLOTS: u16 = 16384;
+
+/// CRC16-XMODEM (polynomial 0x1021, initial value 0), the checksum Redis
+/// Cluster hashes keys with.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= u16::from(b) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// The cluster hash slot of `key`. A non-empty `{tag}` (from the first `{` to
+/// the first `}` after it) hashes in place of the whole key, so related keys
+/// can share a slot.
+fn key_slot(key: &[u8]) -> u16 {
+    let hashed = key
+        .iter()
+        .position(|&b| b == b'{')
+        .and_then(|open| {
+            let rest = &key[open + 1..];
+            let close = rest.iter().position(|&b| b == b'}')?;
+            (close > 0).then(|| &rest[..close])
+        })
+        .unwrap_or(key);
+    crc16(hashed) % CLUSTER_SLOTS
+}
+
+fn is_cross_slot(e: &::redis::RedisError) -> bool {
+    e.kind() == ::redis::ErrorKind::Server(::redis::ServerErrorKind::CrossSlot)
+}
+
 /// UNLINK frees memory in the background; servers before 4.0 only have DEL.
-async fn unlink(conn: &mut MultiplexedConnection, keys: &[Vec<u8>]) -> AppResult<i64> {
-    let reply = match query(conn, cmd("UNLINK").arg(keys)).await {
+async fn unlink_once(
+    conn: &mut MultiplexedConnection,
+    keys: &[Vec<u8>],
+) -> ::redis::RedisResult<i64> {
+    let reply = match cmd("UNLINK").arg(keys).query_async::<RValue>(conn).await {
         Ok(r) => r,
-        Err(_) => query(conn, cmd("DEL").arg(keys)).await?,
+        // DEL would be refused the same way
+        Err(e) if e.redirect_node().is_some() || is_cross_slot(&e) => return Err(e),
+        Err(_) => cmd("DEL").arg(keys).query_async::<RValue>(conn).await?,
     };
     Ok(value_int(&reply).unwrap_or(0))
+}
+
+/// Deletes `keys`. A cluster node refuses keys from different hash slots in one
+/// command (CROSSSLOT), so there each slot's keys go in a command of their own,
+/// and keys stored on other nodes are reported rather than failing the lot.
+async fn unlink(
+    conn: &mut MultiplexedConnection,
+    keys: &[Vec<u8>],
+    cluster: bool,
+) -> AppResult<i64> {
+    if !cluster {
+        match unlink_once(conn, keys).await {
+            // Cluster detection missed (INFO denied): delete slot by slot
+            Err(e) if is_cross_slot(&e) => {}
+            r => return Ok(r?),
+        }
+    }
+    let mut slots: std::collections::BTreeMap<u16, Vec<Vec<u8>>> = Default::default();
+    for k in keys {
+        slots.entry(key_slot(k)).or_default().push(k.clone());
+    }
+    let mut deleted = 0;
+    let mut elsewhere = 0;
+    let mut node = None;
+    for group in slots.values() {
+        match unlink_once(conn, group).await {
+            Ok(n) => deleted += n,
+            Err(e) => match e.redirect_node() {
+                Some((addr, _)) => {
+                    elsewhere += group.len();
+                    node.get_or_insert_with(|| addr.to_string());
+                }
+                None => return Err(e.into()),
+            },
+        }
+    }
+    match node {
+        Some(node) => Err(AppError::msg(format!(
+            "Deleted {deleted} of {} keys; {elsewhere} are stored on other cluster nodes (such as {node}), which this connection doesn't reach. Connect to those nodes to delete them.",
+            keys.len()
+        ))),
+        None => Ok(deleted),
+    }
 }
 
 /// `[cursor, [items…]]` → (cursor, items)
@@ -1790,6 +1912,45 @@ pub async fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computes_cluster_key_slots() {
+        // CRC16-XMODEM check value
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+        assert_eq!(key_slot(b"foo"), 12182);
+        assert_eq!(key_slot(b"bar"), 5061);
+        assert_eq!(key_slot(b"hello"), 866);
+        assert_eq!(key_slot(b""), 0);
+        // A hash tag hashes alone
+        assert_eq!(
+            key_slot(b"{user1000}.following"),
+            key_slot(b"{user1000}.followers")
+        );
+        assert_eq!(key_slot(b"{user1000}.following"), key_slot(b"user1000"));
+        assert_eq!(key_slot(b"foo{bar}{zap}"), key_slot(b"bar"));
+        assert_eq!(key_slot(b"foo{{bar}}zap"), key_slot(b"{bar"));
+        // An empty or unclosed tag hashes the whole key
+        assert_eq!(
+            key_slot(b"foo{}{bar}"),
+            crc16(b"foo{}{bar}") % CLUSTER_SLOTS
+        );
+        assert_eq!(key_slot(b"foo{bar"), crc16(b"foo{bar") % CLUSTER_SLOTS);
+        assert!(key_slot(&[0xff; 64]) < CLUSTER_SLOTS);
+    }
+
+    #[test]
+    fn explains_cluster_redirects() {
+        let moved = ::redis::RedisError::from((
+            ::redis::ErrorKind::Server(::redis::ServerErrorKind::Moved),
+            "An error was signalled by the server",
+            "3999 127.0.0.1:6381".to_string(),
+        ));
+        let text = describe_error(&moved);
+        assert!(
+            text.contains("hash slot 3999") && text.contains("127.0.0.1:6381"),
+            "{text}"
+        );
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
