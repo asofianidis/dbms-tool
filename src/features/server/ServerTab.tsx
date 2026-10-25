@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Activity, Database, OctagonX, RefreshCw, ShieldCheck, Snail, Square } from 'lucide-react'
 import { api, type Cell, type ConnectionConfig, type ResultSet } from '@/lib/api'
 import { ENGINES } from '@/lib/engines'
+import { extensionFlavor } from '@/lib/extensions'
 import { formatBytes } from '@/lib/format'
 import { withGaleraMetrics } from '@/lib/galera'
 import { isMariaDb } from '@/lib/mariadb'
@@ -35,6 +36,7 @@ import type { MenuItem } from '@/components/ContextMenu'
 import { ResultGrid } from '@/components/grid/ResultGrid'
 import { Badge, Button, EmptyState, EngineMark, ErrorText, Spinner } from '@/components/ui'
 import { ClusterPanel } from '../mongo/ClusterPanel'
+import { ExtensionsPanel } from './ExtensionsPanel'
 import { GaleraPanel, useGalera } from './GaleraPanel'
 import { documentsToGrid } from '../mongo/DocumentsView'
 import { LiveMetrics, useDocumentVisible } from './LiveMetrics'
@@ -156,6 +158,7 @@ function ServerDashboard({
   const [refresh, setRefresh] = useState<RefreshInterval>(5)
   const visible = useDocumentVisible()
   const galera = useGalera(connection, isMariaDb(info), active && visible ? refresh : 0)
+  const extensions = extensionFlavor(connection.engine, info)
 
   // Blocking chains from the activity list's blocked-by column and the lock list's
   const forest = useMemo(() => {
@@ -411,6 +414,17 @@ function ServerDashboard({
         />
 
         {connection.engine === 'mysql' && <SlowLogPanel connection={connection} />}
+
+        {extensions && (
+          <ExtensionsPanel
+            // A different flavor (MariaDB detected after connecting) starts with fresh state
+            key={extensions}
+            connection={connection}
+            flavor={extensions}
+            databases={dbs.data?.filter((d) => !d.isSystem).map((d) => d.name) ?? []}
+            defaultDatabase={info?.currentDatabase ?? ''}
+          />
+        )}
       </div>
     </div>
   )
