@@ -52,6 +52,7 @@ import {
   Sprout,
   Server,
   Shapes,
+  ShieldAlert,
   ShieldCheck,
   Table2,
   Terminal,
@@ -79,6 +80,11 @@ import { knownMariaDb } from '@/lib/mariadb'
 import { mongoPrincipalKey, type MongoPrincipal } from '@/lib/mongo-users'
 import { shellCollection } from '@/lib/mongo-shell'
 import { queries, queryClient } from '@/lib/queries'
+import {
+  routineSearchPath,
+  searchPathWarning,
+  SECURITY_DEFINER_TITLE
+} from '@/lib/routine-attributes'
 import { settingsStore } from '@/lib/settings'
 import { createPersistentStore } from '@/lib/store'
 import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
@@ -104,6 +110,7 @@ import {
   openTable,
   openRedisKeys,
   openRedisPubsub,
+  openPgNotify,
   refreshConnection,
   statusStore
 } from '@/lib/workspace'
@@ -119,12 +126,15 @@ import { openSeed } from '../seed/SeedDialog'
 import { newDashboard } from '../dashboard/actions'
 import { openTableDesigner } from '../table/TableDesigner'
 import { openTriggerDesigner } from '../table/TriggerDesigner'
+import { openPolicyDesigner } from '../table/PolicyDesigner'
 import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
 import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
+import { RlsBadge, hasRls, policyMenuItems, rlsActionItems, useRlsFlags } from './rls-actions'
+import { rlsLabel, rlsQueries } from '@/lib/rls'
 import { eventStatusLabel, eventTooltip } from '@/lib/events'
 
 const expandedStore = createPersistentStore<Record<string, boolean>>('dbms.tree.v1', {})
@@ -386,6 +396,16 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <RadioTower />,
               disabled: !connected,
               onSelect: () => openRedisPubsub(connection.id)
+            }
+          ]
+        : []),
+      ...(connection.engine === 'postgres'
+        ? [
+            {
+              label: 'Notifications (LISTEN / NOTIFY)',
+              icon: <RadioTower />,
+              disabled: !connected,
+              onSelect: () => openPgNotify(connection.id)
             }
           ]
         : []),
@@ -1387,6 +1407,7 @@ function ObjectNode({
               connection.engine === 'postgres' && (
                 <span className="text-faint">({obj.detail})</span>
               )}
+            <RlsBadge connection={connection} database={database} obj={obj} />
           </>
         }
         detail={
@@ -1636,6 +1657,9 @@ function TableChildren({
         (connection.engine === 'postgres' || connection.engine === 'mysql') && (
           <PartitionsFolder connection={connection} database={database} obj={obj} depth={depth} />
         )}
+      {hasRls(connection, obj.kind) && (
+        <PoliciesFolder connection={connection} database={database} obj={obj} depth={depth} />
+      )}
     </>
   )
 }
@@ -1695,6 +1719,25 @@ function RoutineChildren({
           label="returns"
           muted
           detail={<span className="font-mono">{returns}</span>}
+        />
+      )}
+      {q.data.attributes?.securityDefiner && (
+        <Row
+          id={`${base}/security`}
+          depth={depth}
+          icon={<ShieldAlert className="text-warn" />}
+          label="security definer"
+          muted
+          title={searchPathWarning(q.data.attributes) ?? SECURITY_DEFINER_TITLE}
+          detail={
+            searchPathWarning(q.data.attributes) && (
+              <span className="text-warn">
+                {routineSearchPath(q.data.attributes) === null
+                  ? 'no search_path'
+                  : 'pg_temp not last'}
+              </span>
+            )
+          }
         />
       )}
       {!params.length && !returns && <EmptyRow depth={depth}>No parameters</EmptyRow>}
@@ -2193,6 +2236,66 @@ function PartitionsFolder({
           }
         />
       )}
+    </>
+  )
+}
+
+/** A PostgreSQL table's row-level security policies; shown when it has some or RLS is on. */
+function PoliciesFolder({
+  connection,
+  database,
+  obj,
+  depth
+}: {
+  connection: ConnectionConfig
+  database: string
+  obj: DbObject
+  depth: number
+}): React.JSX.Element | null {
+  const id = `c:${connection.id}/d:${database}/o:${obj.schema ?? ''}.${obj.name}/policies`
+  const [open, setOpen] = useExpanded(id)
+  const flags = useRlsFlags(connection, database, obj)
+  const q = useQuery(rlsQueries.table(connection.id, database, obj.schema, obj.name))
+  if (!q.data || (!q.data.policies.length && !flags?.enabled && !flags?.forced)) return null
+  const table = { schema: obj.schema, name: obj.name }
+  const state = rlsLabel(q.data)
+  return (
+    <>
+      <Row
+        id={id}
+        depth={depth}
+        expandable
+        open={open}
+        onToggle={() => setOpen()}
+        muted
+        icon={<ShieldCheck className="text-faint" />}
+        label="Policies"
+        detail={`${q.data.policies.length}${state === 'on' ? '' : ` · RLS ${state}`}`}
+        onMenu={(e) => showContextMenu(e, rlsActionItems(connection.id, database, table, q.data))}
+      />
+      {open &&
+        q.data.policies.map((p) => (
+          <Row
+            key={p.name}
+            id={`${id}/${p.name}`}
+            depth={depth + 1}
+            icon={<ShieldCheck className={p.permissive ? 'text-syn-fn' : 'text-warn'} />}
+            label={p.name}
+            title={[
+              `${p.permissive ? 'PERMISSIVE' : 'RESTRICTIVE'} FOR ${p.command}`,
+              `TO ${p.roles.map((r) => (r === 'public' ? 'PUBLIC' : r)).join(', ')}`,
+              p.using && `USING (${p.using})`,
+              p.withCheck && `WITH CHECK (${p.withCheck})`
+            ]
+              .filter(Boolean)
+              .join('\n')}
+            detail={`${p.command.toLowerCase()}${p.permissive ? '' : ' restrictive'} · ${p.roles
+              .map((r) => (r === 'public' ? 'PUBLIC' : r))
+              .join(', ')}`}
+            onOpen={() => openPolicyDesigner(connection.id, database, obj.schema, obj.name, p.name)}
+            onMenu={(e) => showContextMenu(e, policyMenuItems(connection.id, database, table, p))}
+          />
+        ))}
     </>
   )
 }

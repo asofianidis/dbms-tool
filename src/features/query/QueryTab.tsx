@@ -68,6 +68,7 @@ import {
 } from '@/lib/workspace'
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { editorMariaDb } from '@/components/editor/mariadb-completion'
+import { editorPostgres } from '@/components/editor/postgres-completion'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
 import { SavedButton } from '../saved/SavedButton'
@@ -747,7 +748,12 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
             ref={editor}
             value={tab.text}
             onChange={(text) => updateTab(tab.id, { text })}
-            language={{ kind: 'sql', dialect, mariaDb: editorMariaDb(connectedInfo(status)) }}
+            language={{
+              kind: 'sql',
+              dialect,
+              mariaDb: editorMariaDb(connectedInfo(status)),
+              postgres: editorPostgres(connectedInfo(status))
+            }}
             completion={namespace}
             defaultSchema={defaultSchema}
             sqlTables={completion.data}

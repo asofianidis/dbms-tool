@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::config::{ConnectionConfig, Engine};
-use crate::drivers::{Session, mongo, redis};
+use crate::drivers::{Session, mongo, pg_listen, redis};
 use crate::error::{AppError, AppResult};
 use crate::guard;
 use crate::model::*;
@@ -63,6 +63,8 @@ pub struct Server {
     redis: Option<redis::RedisClient>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
     running: parking_lot::Mutex<HashMap<String, Arc<CancelSignal>>>,
+    /// Notifications tabs' LISTEN sessions
+    pg_listeners: pg_listen::Listeners,
 }
 
 impl Server {
@@ -149,6 +151,7 @@ impl Server {
             client.close_session(key).await;
             client.unsubscribe(key);
         }
+        self.pg_listeners.close(key).await;
     }
 
     fn begin(&self, key: &str) -> Arc<CancelSignal> {
@@ -295,6 +298,67 @@ impl Server {
         if let Some(client) = &self.redis {
             client.unsubscribe(id);
         }
+    }
+
+    /// LISTENs on `channels` from listener `id`'s own session, opened on `database`;
+    /// notifications go to `emit`. Returns every channel the listener has.
+    pub async fn pg_listen(
+        &self,
+        id: &str,
+        database: &str,
+        channels: Vec<String>,
+        emit: impl Fn(pg_listen::NotifyBatch) + Send + 'static,
+    ) -> AppResult<Vec<String>> {
+        let database = if database.is_empty() {
+            self.default_database()
+        } else {
+            database
+        };
+        self.pg_listeners
+            .listen(
+                &self.config,
+                self.password.as_deref(),
+                id,
+                database,
+                channels,
+                emit,
+            )
+            .await
+    }
+
+    pub async fn pg_unlisten(&self, id: &str, channels: Vec<String>) -> AppResult<Vec<String>> {
+        self.pg_listeners.unlisten(id, channels).await
+    }
+
+    pub async fn pg_notify(
+        &self,
+        id: &str,
+        database: &str,
+        channel: &str,
+        payload: &str,
+        emit: impl Fn(pg_listen::NotifyBatch) + Send + 'static,
+    ) -> AppResult<()> {
+        if self.config.read_only {
+            return Err(AppError::msg(
+                "This connection is read-only, so sending notifications is blocked.                  Turn off \"Read-only\" in the connection settings to send them.",
+            ));
+        }
+        let database = if database.is_empty() {
+            self.default_database()
+        } else {
+            database
+        };
+        self.pg_listeners
+            .notify(
+                &self.config,
+                self.password.as_deref(),
+                id,
+                database,
+                channel,
+                payload,
+                emit,
+            )
+            .await
     }
 
     /// Streams a whole find or pipeline result to `path`; cancelled like a query on `key`.
@@ -548,6 +612,7 @@ impl Manager {
             redis,
             sessions: Mutex::new(sessions),
             running: parking_lot::Mutex::new(HashMap::new()),
+            pg_listeners: pg_listen::Listeners::default(),
         });
         let id = server.config.id.clone();
         self.servers.lock().insert(id, server);

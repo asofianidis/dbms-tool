@@ -34,11 +34,15 @@ const MARIADB_ONLY = [
 
 describe('MariaDB function catalog', () => {
   it('keeps MariaDB-only functions out of MySQL and other dialects', () => {
-    for (const name of MARIADB_ONLY) {
-      expect(names()).not.toContain(name)
-      expect(names(undefined, 'postgres')).not.toContain(name)
-      // A MariaDB version only applies to the MySQL dialect
-      expect(names([11, 8, 0], 'postgres')).not.toContain(name)
+    for (const name of MARIADB_ONLY) expect(names()).not.toContain(name)
+    // PostgreSQL has its own nextval, json_table…; MariaDB's entries stay out, even with a
+    // MariaDB version, which only applies to the MySQL dialect
+    const maria = new Set(MARIADB_FUNCTIONS)
+    for (const version of [undefined, [11, 8, 0] as ServerVersion]) {
+      const leaked = functionsFor('postgres', version).filter(
+        (f) => maria.has(f) && MARIADB_ONLY.includes(f.name)
+      )
+      expect(leaked).toEqual([])
     }
   })
 
