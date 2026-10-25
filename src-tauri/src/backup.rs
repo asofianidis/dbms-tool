@@ -999,10 +999,11 @@ impl Job {
                     }
                 }
                 plan.args.push(format!("--result-file={file}"));
+                // "--" ends the options, so a name like `--where=0` stays a name
                 if j.create_database && j.tables.is_empty() {
-                    args(&mut plan, &["--databases", db]);
+                    args(&mut plan, &["--databases", "--", db]);
                 } else {
-                    plan.args.push(db.to_string());
+                    args(&mut plan, &["--", db]);
                     plan.args.extend(j.tables.iter().cloned());
                 }
                 plan.output = Some(PathBuf::from(file));
@@ -1016,7 +1017,7 @@ impl Job {
                 if j.force {
                     args(&mut plan, &["--force"]);
                 }
-                plan.args.push(db.to_string());
+                args(&mut plan, &["--", db]);
                 plan.stdin = Some(PathBuf::from(file));
             }
             Job::Mongodump(j) => {
@@ -1692,6 +1693,29 @@ impl Jobs {
     }
 }
 
+/// Copies the backup at `path` into the tool's standard input. Fails if the
+/// file can't be read to the end, or the tool stops reading before it.
+async fn feed(
+    path: PathBuf,
+    mut stdin: impl tokio::io::AsyncWrite + Unpin,
+    sent: Arc<AtomicU64>,
+) -> Result<(), String> {
+    let read_failed = |e: std::io::Error| format!("Reading {} failed: {e}", path.display());
+    let mut file = tokio::fs::File::open(&path).await.map_err(read_failed)?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let written = |e: std::io::Error| format!("The restore stopped reading its input: {e}");
+    loop {
+        let n = file.read(&mut buf).await.map_err(read_failed)?;
+        if n == 0 {
+            break;
+        }
+        // Fails once the tool exits early; when it failed, its own error says why
+        stdin.write_all(&buf[..n]).await.map_err(written)?;
+        sent.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    stdin.shutdown().await.map_err(written)
+}
+
 pub async fn run(
     app: &tauri::AppHandle,
     jobs: &Jobs,
@@ -1731,23 +1755,10 @@ pub async fn run(
     if let Some(err) = child.stderr.take() {
         readers.push(tokio::spawn(pump(err, log.clone())));
     }
-    if let (Some(path), Some(mut stdin)) = (plan.stdin.clone(), child.stdin.take()) {
-        let sent = sent.clone();
-        tokio::spawn(async move {
-            let mut file = tokio::fs::File::open(path).await?;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                // Fails once the tool exits early; its own error says why
-                stdin.write_all(&buf[..n]).await?;
-                sent.fetch_add(n as u64, Ordering::Relaxed);
-            }
-            stdin.shutdown().await
-        });
-    }
+    let feeder = match (plan.stdin.clone(), child.stdin.take()) {
+        (Some(path), Some(stdin)) => Some(tokio::spawn(feed(path, stdin, sent.clone()))),
+        _ => None,
+    };
 
     let emit = |log: &parking_lot::Mutex<Log>| {
         let lines = std::mem::take(&mut log.lock().pending);
@@ -1776,6 +1787,16 @@ pub async fn run(
     for reader in readers {
         let _ = reader.await;
     }
+    // A backup that couldn't be read to the end closes the tool's input early,
+    // and psql or mysql then exit cleanly having restored only part of it
+    let fed = match feeder {
+        Some(task) if status.is_some() => task.await.unwrap_or_else(|e| Err(e.to_string())),
+        Some(task) => {
+            task.abort();
+            Ok(())
+        }
+        None => Ok(()),
+    };
     emit(&log);
     jobs.0.lock().remove(job_id);
     drop(secret);
@@ -1802,12 +1823,15 @@ pub async fn run(
             let tail: Vec<&String> = log.tail.iter().collect();
             Err(AppError::msg(summarize_failure(&tail, s.code())))
         }
-        Some(Ok(_)) => Ok(Outcome {
-            cancelled: false,
-            elapsed_ms,
-            size: plan.output.as_deref().map(size_of),
-            errors: log.lock().errors,
-        }),
+        Some(Ok(_)) => {
+            fed.map_err(AppError::msg)?;
+            Ok(Outcome {
+                cancelled: false,
+                elapsed_ms,
+                size: plan.output.as_deref().map(size_of),
+                errors: log.lock().errors,
+            })
+        }
     }
 }
 
@@ -2098,7 +2122,10 @@ mod tests {
         ] {
             assert!(plan.args.contains(&flag.to_string()), "{flag}");
         }
-        assert!(plan.args.ends_with(&["--databases".into(), "shop".into()]));
+        assert!(
+            plan.args
+                .ends_with(&["--databases".into(), "--".into(), "shop".into()])
+        );
         assert!(!plan.args.contains(&"--skip-add-drop-table".to_string()));
 
         let tables = job(serde_json::json!({
@@ -2113,10 +2140,12 @@ mod tests {
         c.ssl = SslMode::Require;
         c.trust_server_certificate = true;
         let plan = tables.plan(&c, None, &mariadb).unwrap();
-        assert!(
-            plan.args
-                .ends_with(&["shop".into(), "orders".into(), "items".into()])
-        );
+        assert!(plan.args.ends_with(&[
+            "--".into(),
+            "shop".into(),
+            "orders".into(),
+            "items".into()
+        ]));
         for flag in [
             "--ssl",
             "--skip-ssl-verify-server-cert",
@@ -2141,8 +2170,46 @@ mod tests {
                 &tool(ToolKind::Mysql, "mysql  Ver 8.4.0"),
             )
             .unwrap();
-        assert!(plan.args.ends_with(&["--force".into(), "copy".into()]));
+        assert!(
+            plan.args
+                .ends_with(&["--force".into(), "--".into(), "copy".into()])
+        );
         assert!(plan.stdin.is_some());
+    }
+
+    #[tokio::test]
+    async fn feeding_stdin_fails_when_the_backup_cant_be_read() {
+        let dir = std::env::temp_dir().join(format!("dbms-tool-feed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("in.sql");
+        std::fs::write(&file, b"SELECT 1;\n").unwrap();
+        let sent = Arc::new(AtomicU64::new(0));
+        let mut out = Vec::new();
+        feed(file.clone(), &mut out, sent.clone()).await.unwrap();
+        assert_eq!(out, b"SELECT 1;\n");
+        assert_eq!(sent.load(Ordering::Relaxed), 10);
+        // A folder opens but can't be read
+        let err = feed(dir.clone(), Vec::new(), sent).await.unwrap_err();
+        assert!(err.starts_with("Reading"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mysql_names_that_look_like_options_stay_names() {
+        let j = job(serde_json::json!({
+            "tool": "mysqldump", "database": "-x", "file": "t.sql", "tables": ["--where=0"]
+        }));
+        let plan = j
+            .plan(
+                &cfg(Engine::Mysql),
+                None,
+                &tool(ToolKind::Mysqldump, "mysqldump  Ver 8.4.0"),
+            )
+            .unwrap();
+        assert!(
+            plan.args
+                .ends_with(&["--".into(), "-x".into(), "--where=0".into()])
+        );
     }
 
     #[test]
