@@ -88,6 +88,7 @@ import { ChangesPanel } from './ChangesPanel'
 import { commitPendingChanges, fetchCellValue, usePendingEdits } from './usePendingEdits'
 import { QueryBuilder, QuerySummary } from './QueryBuilder'
 import { openTableDesigner } from './TableDesigner'
+import { StorageSummary } from './StorageOptions'
 import { openTriggerDesigner } from './TriggerDesigner'
 
 /** Where a foreign key points. MySQL reports the referenced database as its schema. */
@@ -678,6 +679,13 @@ function StructureView({
         </Toolbar>
       )}
       <div className="min-h-0 flex-1 overflow-auto p-4">
+        {engine === 'mysql' && tab.objectKind === 'table' && (
+          <StorageSummary
+            connectionId={tab.connectionId}
+            database={tab.database}
+            table={tab.name}
+          />
+        )}
         <Section title="Columns" count={info.columns.length}>
           <table className="w-full text-left text-[12.5px]">
             <thead className="text-[11px] text-muted">

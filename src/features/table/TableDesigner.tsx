@@ -55,6 +55,14 @@ import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
 import { queries } from '@/lib/queries'
 import { createStore } from '@/lib/store'
+import {
+  countOptionChanges,
+  DEFAULT_TABLE_OPTIONS,
+  tableOptionProblem,
+  tableOptionWarnings,
+  withTableOptions,
+  type TableOptions
+} from '@/lib/storage-engines'
 import { loadTableExtras } from '@/lib/table-extras'
 import { errorMessage, toast } from '@/lib/toast'
 import {
@@ -66,6 +74,7 @@ import {
   updateTab
 } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
+import { TableOptionsEditor, useTableOptionsContext } from './StorageOptions'
 import {
   Badge,
   Button,
@@ -228,7 +237,7 @@ function TableDesigner(request: Request): React.JSX.Element {
   return <DesignerForm request={request} dialect={dialect} initial={initial} />
 }
 
-type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'sql'
+type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'options' | 'sql'
 
 function DesignerForm({
   request,
@@ -252,17 +261,30 @@ function DesignerForm({
   const babelfish = connection?.engine === 'babelfish'
   const d1 = sqlite && connection?.cloud?.provider === 'cloudflare'
   const options = useMemo(() => ({ babelfish, d1 }), [babelfish, d1])
-  const statements = useMemo(
-    () => tableStatements(dialect, draft, options),
-    [dialect, draft, options]
-  )
+  // MySQL / MariaDB table options: engine, charset, row format
+  const storage = useTableOptionsContext(connectionId, database, request.name, mysql)
+  const [optionEdits, setOptionEdits] = useState<TableOptions | null>(null)
+  const tableOptions = optionEdits ?? storage.context?.original ?? DEFAULT_TABLE_OPTIONS
+  const statements = useMemo(() => {
+    const out = tableStatements(dialect, draft, options)
+    const ctx = storage.context
+    return mysql && ctx ? withTableOptions(out, draft, tableOptions, ctx.original) : out
+  }, [dialect, draft, options, mysql, storage.context, tableOptions])
   const script = useMemo(
     () => ddlScript(dialect, statements, options),
     [dialect, statements, options]
   )
-  const problem = validateDraft(dialect, draft)
-  const warnings = draftWarnings(draft, dialect, options)
-  const changes = countChanges(draft, dialect)
+  const optionsContext = mysql ? storage.context : null
+  const problem =
+    validateDraft(dialect, draft) ??
+    (optionsContext && tableOptionProblem(draft, tableOptions, optionsContext))
+  const warnings = [
+    ...draftWarnings(draft, dialect, options),
+    ...(optionsContext ? tableOptionWarnings(draft, tableOptions, optionsContext) : [])
+  ]
+  const changes =
+    countChanges(draft, dialect) +
+    countOptionChanges(tableOptions, optionsContext?.original ?? null)
   const destructive = draft.columns.some((c) => c.original && c.dropped)
 
   const schemas = useQuery({
@@ -335,6 +357,7 @@ function DesignerForm({
         draft.checks.filter((ck) => !ck.dropped).length +
         draft.uniques.filter((uq) => !uq.dropped).length
     },
+    ...(mysql ? [{ value: 'options' as const, label: 'Options' }] : []),
     { value: 'sql', label: 'SQL', count: statements.length }
   ]
 
@@ -445,6 +468,8 @@ function DesignerForm({
             />
           ) : view === 'constraints' ? (
             <ConstraintsEditor dialect={dialect} draft={draft} setDraft={setDraft} />
+          ) : view === 'options' ? (
+            <TableOptionsEditor {...storage} options={tableOptions} onChange={setOptionEdits} />
           ) : (
             <SqlPreview dialect={dialect} d1={d1} script={script} warnings={warnings} />
           )}
