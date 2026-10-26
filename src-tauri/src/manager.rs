@@ -275,8 +275,16 @@ impl Server {
                 "Only reads can run here: find, aggregate, count or distinct.",
             ));
         }
-        let client = self.mongo().await?;
+        // Registered first so a cancel during the idle ping or reconnect counts;
+        // `execute` returns at once on a signal that has already fired
         let signal = self.begin(key);
+        let client = match self.mongo().await {
+            Ok(client) => client,
+            Err(e) => {
+                self.end(key, &signal);
+                return Err(e);
+            }
+        };
         let deadline = Deadline::arm(opts, &signal);
         let result = mongo::execute(&client, request, opts, &signal).await;
         self.end(key, &signal);
@@ -394,8 +402,14 @@ impl Server {
         request: mongo::ExportRequest,
         path: &std::path::Path,
     ) -> AppResult<mongo::ExportSummary> {
-        let client = self.mongo().await?;
         let signal = self.begin(key);
+        let client = match self.mongo().await {
+            Ok(client) => client,
+            Err(e) => {
+                self.end(key, &signal);
+                return Err(e);
+            }
+        };
         let result = mongo::export(&client, request, path, &signal).await;
         self.end(key, &signal);
         result
