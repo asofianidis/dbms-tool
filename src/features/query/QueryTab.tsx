@@ -86,12 +86,14 @@ const XLSX_ROWS = 1_048_575
 function completionNamespace(tables: CompletionTable[] | undefined): SQLNamespace | undefined {
   if (!tables) return undefined
   const ns: Record<string, Record<string, string[]> | string[]> = {}
+  // lang-sql reads a dot in a key as a path separator unless it's escaped
+  const key = (name: string): string => name.replaceAll('.', '\\.')
   for (const t of tables) {
     if (t.schema) {
-      const schema = (ns[t.schema] ??= {}) as Record<string, string[]>
-      schema[t.name] = t.columns
+      const schema = (ns[key(t.schema)] ??= {}) as Record<string, string[]>
+      schema[key(t.name)] = t.columns
     } else {
-      ns[t.name] = t.columns
+      ns[key(t.name)] = t.columns
     }
   }
   return ns as SQLNamespace

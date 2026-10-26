@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CompletionContext } from '@codemirror/autocomplete'
-import { PostgreSQL, schemaCompletionSource, sql } from '@codemirror/lang-sql'
+import { MSSQL, PostgreSQL, schemaCompletionSource, sql } from '@codemirror/lang-sql'
 import { EditorState } from '@codemirror/state'
 import type { CompletionTable } from '@/lib/api'
 import {
@@ -45,6 +45,32 @@ describe('SQL name completion', () => {
     )
     expect(await labels('SELECT a')).toEqual([])
     expect(await labels('SELECT * FROM orders WHERE g')).toEqual([])
+  })
+
+  it('finds a table outside the default schema by its name', async () => {
+    const tsql: CompletionTable[] = [
+      { schema: 'dbo', name: 'users', columns: ['id'], foreignKeys: [] },
+      { schema: 'event', name: 'session', columns: ['id'], foreignKeys: [] },
+      { schema: 'dbo', name: 'odd.name', columns: ['id'], foreignKeys: [] }
+    ]
+    const ns = { dbo: { users: ['id'], 'odd\\.name': ['id'] }, event: { session: ['id'] } }
+    const run = async (doc: string) => {
+      const state = EditorState.create({ doc, extensions: sql({ dialect: MSSQL }) })
+      const source = tableAwareCompletion(
+        schemaCompletionSource({ dialect: MSSQL, schema: ns, defaultSchema: 'dbo' }),
+        { tables: tsql, dialect: 'tsql', defaultSchema: 'dbo' }
+      )
+      return (await source(new CompletionContext(state, doc.length, false)))?.options ?? []
+    }
+    const plain = await run('SELECT * FROM sess')
+    expect(plain.map((o) => o.label)).toEqual(
+      expect.arrayContaining(['users', 'odd.name', 'event', 'event.session'])
+    )
+    expect(plain.map((o) => o.label)).not.toContain('dbo.users')
+    expect(plain.find((o) => o.label === 'odd.name')?.apply).toBe('"odd.name"')
+    expect((await run('SELECT * FROM [sess')).map((o) => o.label)).toContain('[event].[session]')
+    expect((await run('SELECT * FROM event.')).map((o) => o.label)).toEqual(['session'])
+    expect(await run('SELECT sess')).toEqual([])
   })
 
   it('still completes qualified names and aliases anywhere', async () => {

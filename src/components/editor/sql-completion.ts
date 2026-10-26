@@ -37,13 +37,48 @@ export function expectsTable(before: string): boolean {
   return TABLE_POSITION.test(statement)
 }
 
-export function tableAwareCompletion(source: CompletionSource): CompletionSource {
+export interface QualifiedTables {
+  tables: CompletionTable[]
+  dialect: Dialect
+  defaultSchema?: string
+}
+
+/**
+ * `schema.table` for every table outside the default schema, so typing a
+ * table's name finds it without knowing its schema first.
+ */
+function qualifiedOptions(q: QualifiedTables, quote: string | null): Completion[] {
+  const close = quote === '[' ? ']' : quote
+  const out: Completion[] = []
+  for (const t of q.tables) {
+    if (!t.schema || t.schema === q.defaultSchema) continue
+    if (quote) {
+      out.push({ label: `${quote}${t.schema}${close}.${quote}${t.name}${close}`, type: 'type' })
+      continue
+    }
+    const label = `${t.schema}.${t.name}`
+    const apply = `${ident(q.dialect, t.schema)}.${ident(q.dialect, t.name)}`
+    out.push(apply === label ? { label, type: 'type' } : { label, type: 'type', apply })
+  }
+  return out
+}
+
+export function tableAwareCompletion(
+  source: CompletionSource,
+  qualified?: QualifiedTables
+): CompletionSource {
   return async (context: CompletionContext): Promise<CompletionResult | null> => {
     const result = await source(context)
     if (!result) return result
     const before = context.state.sliceDoc(0, result.from)
     // Qualified (`schema.`, `alias.`) or quoted after a dot: what's listed belongs there
-    if (/\.["`[]?$/.test(before) || expectsTable(before)) return result
+    if (/\.["`[]?$/.test(before)) return result
+    if (expectsTable(before)) {
+      if (!qualified) return result
+      const first = context.state.sliceDoc(result.from, result.from + 1)
+      const quote = /["`[]/.test(first) ? first : null
+      return { ...result, options: [...result.options, ...qualifiedOptions(qualified, quote)] }
+    }
     // Elsewhere keep only the statement's aliases, which lang-sql types "constant"
     const options = result.options.filter((o) => o.type === 'constant')
     return options.length ? { ...result, options } : null
