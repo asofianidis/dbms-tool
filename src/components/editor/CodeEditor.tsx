@@ -261,7 +261,8 @@ function languageExtension(
         : DIALECTS[language.dialect]
     const ext = sql({ dialect, upperCaseKeywords: true })
     const names = tableAwareCompletion(
-      schemaCompletionSource({ dialect, schema: completion, defaultSchema })
+      schemaCompletionSource({ dialect, schema: completion, defaultSchema }),
+      { tables: sqlTables ?? [], dialect: language.dialect, defaultSchema }
     )
     const assist = sqlAssistCompletion({
       tables: sqlTables ?? [],

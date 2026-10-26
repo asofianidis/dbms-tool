@@ -1046,7 +1046,7 @@ impl MsSession {
             )
             .await?;
         let mut tables: Vec<CompletionTable> = Vec::new();
-        for r in rows.iter().take(50_000) {
+        for r in rows.iter().take(250_000) {
             let (schema, table, column) = (
                 text(r, 0),
                 text(r, 1).unwrap_or_default(),
