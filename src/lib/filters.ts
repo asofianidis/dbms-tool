@@ -134,9 +134,10 @@ export function conditionSql(dialect: Dialect, c: FilterCondition, dataType = ''
   if (operands >= 1 && c.value === '' && !emptyText) return null
   if (operands === 2 && c.value2 === '') return null
   const like = (prefix: string, suffix: string, negate = false): string =>
-    // PostgreSQL LIKE is case-sensitive and text-only; MySQL and SQL Server collations usually aren't
+    // PostgreSQL LIKE is case-sensitive and text-only; MySQL and SQL Server collations usually aren't.
+    // ILIKE rejects nondeterministic collations, so match under the (always deterministic) default.
     dialect === 'postgres'
-      ? `${column}::text ${negate ? 'NOT ' : ''}ILIKE ${likePattern(dialect, c.value, prefix, suffix)}`
+      ? `${column}::text COLLATE "default" ${negate ? 'NOT ' : ''}ILIKE ${likePattern(dialect, c.value, prefix, suffix)}`
       : `${column} ${negate ? 'NOT ' : ''}LIKE ${likePattern(dialect, c.value, prefix, suffix)}`
   const list = (): string[] =>
     c.value
