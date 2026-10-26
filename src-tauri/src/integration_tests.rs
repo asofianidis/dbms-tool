@@ -875,11 +875,9 @@ async fn mariadb_sequences() {
         .await
         .unwrap()
         .unwrap();
-    assert!(ddl.starts_with("CREATE SEQUENCE `seq`"), "{ddl}");
-    assert!(
-        ddl.contains("increment by 5") && ddl.contains(" cycle"),
-        "{ddl}"
-    );
+    // No DDL in the messages: CodeQL traces the session's password into anything it returns
+    assert!(ddl.starts_with("CREATE SEQUENCE `seq`"));
+    assert!(ddl.contains("increment by 5") && ddl.contains(" cycle"));
     // The details view reads the sequence's single row
     let out = s
         .execute("tab1", "", "SELECT * FROM mdb_sequences.seq", &opts())
@@ -1712,10 +1710,7 @@ async fn routines_end_to_end() {
                 .await
                 .unwrap();
             assert_eq!(tvf.returns.as_deref(), Some("TABLE"), "{var}: {tvf:?}");
-            assert!(
-                p.params[1].data_type.starts_with("nvarchar"),
-                "{var}: {p:?}"
-            );
+            assert!(p.params[1].data_type.starts_with("nvarchar"), "{var}");
         }
         // PostgreSQL reports security and planner attributes; other engines leave them out
         if engine == Engine::Postgres {

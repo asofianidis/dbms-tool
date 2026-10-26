@@ -66,6 +66,9 @@ strip = true
 # surfaced through QueryItem (see vendor/tiberius/PATCHES.md)
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+# Vendored winauth (tiberius's NTLM auth on Windows) on rand 0.8 for RUSTSEC-2026-0097
+# (see vendor/winauth/PATCHES.md)
+winauth = { path = "vendor/winauth" }
 
 # tiberius's TLS backend: SChannel on Windows; rustls elsewhere, because macOS
 # Secure Transport fails some SQL Server handshakes even with certificate checks off
