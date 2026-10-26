@@ -1009,3 +1009,137 @@ async fn restores_the_real_tools_backups() {
         }
     }
 }
+
+/* ---------- SQL Server ---------- */
+
+#[tokio::test]
+async fn mssql_copies_a_backup_to_this_computer() {
+    let Some(server) = open(Engine::Mssql, "DBMS_TEST_MSSQL").await else {
+        return;
+    };
+    let mut ms = match session(&server, "master").await.unwrap() {
+        Session::Ms(s) => s,
+        _ => unreachable!(),
+    };
+    let client = ms.client();
+    let setup = "IF DB_ID('dbms_tool_copy') IS NOT NULL DROP DATABASE dbms_tool_copy;\n\
+                 CREATE DATABASE dbms_tool_copy;";
+    client
+        .simple_query(setup)
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    let fill = "USE dbms_tool_copy;\n\
+                CREATE TABLE t (id int IDENTITY PRIMARY KEY, body nvarchar(max));\n\
+                INSERT INTO t (body) SELECT TOP 5000 REPLICATE(N'x', 900) FROM sys.all_objects a, sys.all_objects b;\n\
+                USE master;";
+    client
+        .simple_query(fill)
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    let dir: String = client
+        .simple_query("SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS nvarchar(4000))")
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .and_then(|r| r.get::<&str, _>(0).map(str::to_string))
+        .unwrap();
+    let sep = if dir.contains('\\') { '\\' } else { '/' };
+    let source = format!(
+        "{}{sep}dbms_tool_copy.bak",
+        dir.trim_end_matches(['/', '\\'])
+    );
+    let backup = format!(
+        "BACKUP DATABASE dbms_tool_copy TO DISK = N'{}' WITH INIT, FORMAT",
+        source.replace('\'', "''")
+    );
+    client
+        .simple_query(backup)
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+
+    let file = temp("dbms_tool_copy.bak");
+    let report = super::Report::new(None, "test", Arc::new(Default::default()), None);
+    super::mssql::copy(&server, &source, &file, &report)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let bytes = std::fs::read(&file).unwrap();
+    // Microsoft Tape Format, which every backup starts with
+    assert_eq!(&bytes[..4], b"TAPE");
+    let size: i64 = client
+        .simple_query(format!(
+            "SELECT DATALENGTH(BulkColumn) FROM OPENROWSET(BULK N'{}', SINGLE_BLOB) AS f",
+            source.replace('\'', "''")
+        ))
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .and_then(|r| r.get(0))
+        .unwrap();
+    assert_eq!(bytes.len() as i64, size);
+    // More than one 4 MB chunk
+    assert!(bytes.len() > 4 << 20, "{} bytes", bytes.len());
+
+    let missing = format!("{source}.missing");
+    let report = super::Report::new(None, "test", Arc::new(Default::default()), None);
+    assert!(
+        super::mssql::copy(&server, &missing, &temp("missing.bak"), &report)
+            .await
+            .is_err()
+    );
+
+    // And back: a Linux server can't take the file; a Windows one with OLE
+    // Automation gets a copy RESTORE can read
+    let report = super::Report::new(None, "test", Arc::new(Default::default()), None);
+    match super::mssql::upload(&server, &file, &report).await {
+        Ok(staged) => {
+            let header = format!(
+                "RESTORE HEADERONLY FROM DISK = N'{}'",
+                staged.path.replace('\'', "''")
+            );
+            let sets = client
+                .simple_query(header)
+                .await
+                .unwrap()
+                .into_first_result()
+                .await
+                .unwrap();
+            assert!(!sets.is_empty());
+            if staged.uploaded {
+                super::mssql::discard(&server, &staged.path).await.unwrap();
+            }
+        }
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("Linux") || text.contains("OLE Automation"),
+                "{text}"
+            );
+        }
+    }
+    assert!(
+        super::mssql::discard(&server, &source)
+            .await
+            .is_err_and(|e| e.to_string().contains("Only backups"))
+    );
+
+    client
+        .simple_query("DROP DATABASE dbms_tool_copy")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+}

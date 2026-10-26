@@ -925,6 +925,53 @@ pub async fn backup_run(
     crate::backup::run(&app, &state.backups, &job_id, &tool, plan).await
 }
 
+/// Copies a SQL Server backup from the server's disk to `file` on this
+/// computer, emitting `backup-progress` events tagged with `job_id`.
+#[tauri::command]
+pub async fn backup_mssql_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    job_id: String,
+    source: String,
+    file: String,
+) -> AppResult<crate::backup::Outcome> {
+    let server = state.manager.get(&id)?;
+    crate::backup::builtin::mssql_download(&app, &state.backups, &job_id, &server, &source, &file)
+        .await
+}
+
+/// Makes a backup on this computer readable by SQL Server for RESTORE,
+/// emitting `backup-progress` events tagged with `job_id`; null if cancelled.
+#[tauri::command]
+pub async fn backup_mssql_upload(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    job_id: String,
+    file: String,
+) -> AppResult<Option<crate::backup::builtin::MssqlStaged>> {
+    let server = state.manager.get(&id)?;
+    if server.config.read_only {
+        return Err(AppError::msg(
+            "This connection is read-only, so restoring is blocked. \
+             Turn off \"Read-only\" in the connection settings to restore.",
+        ));
+    }
+    crate::backup::builtin::mssql_upload(&app, &state.backups, &job_id, &server, &file).await
+}
+
+/// Deletes a backup `backup_mssql_upload` sent to the server.
+#[tauri::command]
+pub async fn backup_mssql_discard_upload(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> AppResult<()> {
+    let server = state.manager.get(&id)?;
+    crate::backup::builtin::mssql_discard_upload(&server, &path).await
+}
+
 #[tauri::command]
 pub fn backup_cancel(state: State<'_, AppState>, job_id: String) {
     state.backups.cancel(&job_id);

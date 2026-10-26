@@ -1692,17 +1692,15 @@ pub struct Outcome {
 pub struct Jobs(parking_lot::Mutex<HashMap<String, Arc<CancelSignal>>>);
 
 impl Jobs {
+    /// Cancels `id`, even before it registers: the frontend can cancel between
+    /// choosing a job's id and the command reaching `register`.
     pub fn cancel(&self, id: &str) {
-        if let Some(signal) = self.0.lock().get(id) {
-            signal.fire();
-        }
+        self.0.lock().entry(id.to_string()).or_default().fire();
     }
 
-    /// Tracks a job run without a client tool (the built-in engine).
+    /// Tracks a running job; one cancelled early starts out cancelled.
     pub(crate) fn register(&self, id: &str) -> Arc<CancelSignal> {
-        let signal = Arc::new(CancelSignal::default());
-        self.0.lock().insert(id.to_string(), signal.clone());
-        signal
+        self.0.lock().entry(id.to_string()).or_default().clone()
     }
 
     pub(crate) fn unregister(&self, id: &str) {
@@ -1761,8 +1759,7 @@ pub async fn run(
         .spawn()
         .map_err(|e| AppError::msg(format!("Couldn't start {}: {e}", tool.kind.programs()[0])))?;
 
-    let signal = Arc::new(CancelSignal::default());
-    jobs.0.lock().insert(job_id.to_string(), signal.clone());
+    let signal = jobs.register(job_id);
     let log = Arc::new(parking_lot::Mutex::new(Log::default()));
     let sent = Arc::new(AtomicU64::new(0));
     let mut readers = Vec::new();
