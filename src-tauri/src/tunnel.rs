@@ -561,9 +561,11 @@ pub async fn close(key: &str) {
     TUNNELS.lock().await.remove(key);
 }
 
-/// Stops every tunnel as the app exits, so Kubernetes tunnel pods are deleted.
-/// Skipped if a tunnel is starting; its pod is cleaned up on the next run.
+/// Stops every tunnel as the app exits. Kubernetes tunnel pods are deleted
+/// even while a tunnel is starting; the processes of the others are only
+/// stopped if no tunnel is.
 pub fn shutdown() {
+    kube::shutdown();
     if let Ok(mut tunnels) = TUNNELS.try_lock() {
         tunnels.clear();
     }

@@ -5,9 +5,12 @@
 //!
 //! The pod is deleted when its tunnel closes or the app exits. Pods a crashed
 //! run left behind are deleted the next time this machine opens a tunnel in the
-//! same namespace, and every pod ends itself after `DEADLINE` regardless.
+//! same namespace, and every pod ends itself after `DEADLINE` regardless. Each
+//! run holds a lock file while it lives (see `SESSION_LOCK`), so the pods of
+//! another copy of the app that is still running are never taken for leftovers.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -63,8 +66,110 @@ static OWNER: LazyLock<String> = LazyLock::new(|| {
     format!("{:016x}", fnv1a(format!("{user}@{host}").as_bytes()))
 });
 
-/// This run of the app; pods with the owner label but another session are leftovers
+/// This run of the app
 static SESSION: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
+
+/// Locked for as long as this run lives: another run that can lock a session's
+/// file knows that session ended, and that its pods are leftovers.
+static SESSION_LOCK: LazyLock<Option<std::fs::File>> = LazyLock::new(|| {
+    let dir = lock_dir();
+    let held = std::fs::create_dir_all(&dir).and_then(|()| {
+        let file = std::fs::File::create(lock_path(&dir, &SESSION))?;
+        file.lock()?;
+        Ok(file)
+    });
+    held.inspect_err(|e| log::warn!("Couldn't create the tunnel session lock: {e}"))
+        .ok()
+});
+
+/// Tunnel pods that exist, so they can be deleted on exit (see `shutdown`)
+static LIVE: LazyLock<parking_lot::Mutex<HashMap<String, KubeConfig>>> =
+    LazyLock::new(Default::default);
+
+fn lock_dir() -> PathBuf {
+    std::env::temp_dir().join("dbms-tool-kube-sessions")
+}
+
+fn lock_path(dir: &Path, session: &str) -> PathBuf {
+    dir.join(format!("{session}.lock"))
+}
+
+/// Whether the run that labelled pods with `session` has ended: its lock file
+/// is gone or no longer locked.
+fn session_ended(dir: &Path, session: &str) -> bool {
+    // Only ever a uuid; anything else is no path to open
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(lock_path(dir, session))
+    {
+        Ok(file) => file.try_lock().is_ok(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The pods in a `kubectl get pods -o json` list whose run has ended, and
+/// those runs' sessions.
+fn leftovers(list: &Value, ended: impl Fn(&str) -> bool) -> (Vec<String>, Vec<String>) {
+    let (mut pods, mut sessions) = (Vec::new(), Vec::<String>::new());
+    for pod in list["items"].as_array().into_iter().flatten() {
+        let (Some(name), Some(session)) = (
+            pod["metadata"]["name"].as_str(),
+            pod["metadata"]["labels"][SESSION_LABEL].as_str(),
+        ) else {
+            continue;
+        };
+        if session != SESSION.as_str() && ended(session) {
+            pods.push(name.to_string());
+            if !sessions.iter().any(|s| s == session) {
+                sessions.push(session.to_string());
+            }
+        }
+    }
+    (pods, sessions)
+}
+
+/// Deletes the pods that ended runs of the app on this machine left in the
+/// namespace. Best effort: listing or deleting may be forbidden where creating
+/// isn't.
+async fn delete_leftovers(kube: &KubeConfig) {
+    let selector = format!("{OWNER_LABEL}={},{SESSION_LABEL}!={}", *OWNER, *SESSION);
+    let Ok(json) = run(
+        kube,
+        &[
+            "get",
+            "pods",
+            "-l",
+            &selector,
+            "-o",
+            "json",
+            REQUEST_TIMEOUT,
+        ],
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(list) = serde_json::from_str::<Value>(&json) else {
+        return;
+    };
+    let dir = lock_dir();
+    let (pods, sessions) = leftovers(&list, |s| session_ended(&dir, s));
+    if pods.is_empty() {
+        return;
+    }
+    let mut args = vec!["delete", "pod"];
+    args.extend(pods.iter().map(String::as_str));
+    args.extend(["--wait=false", "--ignore-not-found", REQUEST_TIMEOUT]);
+    if run(kube, &args, None).await.is_ok() {
+        for session in sessions {
+            let _ = std::fs::remove_file(lock_path(&dir, &session));
+        }
+    }
+}
 
 /// Stable across Rust releases, unlike `DefaultHasher`
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -237,7 +342,13 @@ const FATAL_REASONS: &[&str] = &[
 
 fn pod_state(pod: &Value) -> PodState {
     let status = &pod["status"];
-    let container = &status["containerStatuses"][0];
+    // An injected sidecar may come first
+    let container = status["containerStatuses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["name"] == "relay")
+        .unwrap_or(&Value::Null);
     let detail = |v: &Value| {
         let reason = v["reason"].as_str().unwrap_or_default();
         match v["message"]
@@ -283,43 +394,98 @@ fn pod_state(pod: &Value) -> PodState {
 /// A tunnel pod, deleted when dropped.
 pub struct Pod {
     pub name: String,
+    /// With the context and namespace resolved (see `resolve`)
     kube: KubeConfig,
+}
+
+impl Pod {
+    fn new(name: String, kube: KubeConfig) -> Self {
+        LIVE.lock().insert(name.clone(), kube.clone());
+        Self { name, kube }
+    }
 }
 
 impl Drop for Pod {
     fn drop(&mut self) {
-        // Synchronous to start, so it still runs when the app is exiting; only
-        // the wait for kubectl to finish happens on another thread
-        let Ok(program) = kubectl_path() else { return };
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(global_args(&self.kube))
-            .args([
-                "delete",
-                "pod",
-                &self.name,
-                "--wait=false",
-                "--ignore-not-found",
-                REQUEST_TIMEOUT,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(path) = cloud::search_path() {
-            cmd.env("PATH", path);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match cmd.spawn() {
-            Ok(mut child) => {
-                std::thread::spawn(move || child.wait());
-            }
-            Err(e) => log::warn!("Couldn't delete tunnel pod {}: {e}", self.name),
-        }
+        LIVE.lock().remove(&self.name);
+        delete_pod(&self.name, &self.kube);
     }
+}
+
+/// Deletes every tunnel pod as the app exits, including any still starting.
+pub fn shutdown() {
+    for (name, kube) in LIVE.lock().drain() {
+        delete_pod(&name, &kube);
+    }
+    if SESSION_LOCK.is_some() {
+        let _ = std::fs::remove_file(lock_path(&lock_dir(), &SESSION));
+    }
+}
+
+/// Starts `kubectl delete pod` without waiting for it. Synchronous to start, so
+/// it still runs when the app is exiting; kubectl outlives the app.
+fn delete_pod(name: &str, kube: &KubeConfig) {
+    let Ok(program) = kubectl_path() else { return };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(global_args(kube))
+        .args([
+            "delete",
+            "pod",
+            name,
+            "--wait=false",
+            "--ignore-not-found",
+            REQUEST_TIMEOUT,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(path) = cloud::search_path() {
+        cmd.env("PATH", path);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => log::warn!("Couldn't delete tunnel pod {name}: {e}"),
+    }
+}
+
+/// Pins the context and namespace kubectl would default to, so polling,
+/// forwarding and deleting the pod all reach it even if the current context
+/// changes meanwhile.
+async fn resolve(kube: &KubeConfig) -> AppResult<KubeConfig> {
+    let mut kube = kube.clone();
+    if kube.context.trim().is_empty() {
+        let current = run(&kube, &["config", "current-context"], None)
+            .await
+            .map_err(|e| AppError::msg(format!("Choose a Kubernetes context: {e}")))?;
+        kube.context = current.trim().to_string();
+    }
+    if kube.namespace.trim().is_empty() {
+        let namespace = run(
+            &kube,
+            &[
+                "config",
+                "view",
+                "--minify",
+                "-o",
+                "jsonpath={.contexts[0].context.namespace}",
+            ],
+            None,
+        )
+        .await?;
+        kube.namespace = match namespace.trim() {
+            "" => "default".to_string(),
+            ns => ns.to_string(),
+        };
+    }
+    Ok(kube)
 }
 
 /// Starts a relay pod for `config` and waits until it's running.
@@ -331,22 +497,10 @@ pub async fn start_pod(kube: &KubeConfig, config: &ConnectionConfig) -> AppResul
     }
     super::check_forwardable(config, "a Kubernetes tunnel pod")?;
     let target = relay_target(config)?;
-    // Ignored: listing or deleting may be forbidden where creating isn't
-    let leftovers = format!("{OWNER_LABEL}={},{SESSION_LABEL}!={}", *OWNER, *SESSION);
-    let _ = run(
-        kube,
-        &[
-            "delete",
-            "pod",
-            "-l",
-            &leftovers,
-            "--wait=false",
-            "--ignore-not-found",
-            REQUEST_TIMEOUT,
-        ],
-        None,
-    )
-    .await;
+    let kube = &resolve(kube).await?;
+    // Locked before this run labels a pod, so no other run takes its pods for leftovers
+    LazyLock::force(&SESSION_LOCK);
+    delete_leftovers(kube).await;
 
     let name = format!(
         "dbms-tool-tunnel-{}",
@@ -357,14 +511,12 @@ pub async fn start_pod(kube: &KubeConfig, config: &ConnectionConfig) -> AppResul
         i => i,
     };
     let spec = manifest(&name, image, &target).to_string();
+    // Deleted from here on if anything fails, including a create that timed
+    // out here after the cluster had made the pod
+    let pod = Pod::new(name, kube.clone());
     run(kube, &["create", "-f", "-", REQUEST_TIMEOUT], Some(&spec))
         .await
         .map_err(|e| AppError::msg(format!("Couldn't create the tunnel pod: {e}")))?;
-    // Deleted from here on if anything fails
-    let pod = Pod {
-        name,
-        kube: kube.clone(),
-    };
 
     let started = Instant::now();
     let mut last = None;
@@ -508,11 +660,11 @@ mod tests {
     #[test]
     fn pod_states() {
         let running = json!({ "status": { "phase": "Running",
-            "containerStatuses": [{ "ready": true, "state": { "running": {} } }] } });
+            "containerStatuses": [{ "name": "relay", "ready": true, "state": { "running": {} } }] } });
         assert_eq!(pod_state(&running), PodState::Ready);
 
         let pull = json!({ "status": { "phase": "Pending",
-            "containerStatuses": [{ "ready": false, "state": { "waiting": {
+            "containerStatuses": [{ "name": "relay", "ready": false, "state": { "waiting": {
                 "reason": "ImagePullBackOff", "message": "Back-off pulling image" } } }] } });
         assert_eq!(
             pod_state(&pull),
@@ -520,7 +672,7 @@ mod tests {
         );
 
         let creating = json!({ "status": { "phase": "Pending",
-            "containerStatuses": [{ "state": { "waiting": { "reason": "ContainerCreating" } } }] } });
+            "containerStatuses": [{ "name": "relay", "state": { "waiting": { "reason": "ContainerCreating" } } }] } });
         assert_eq!(
             pod_state(&creating),
             PodState::Pending(Some("ContainerCreating".into()))
@@ -534,9 +686,50 @@ mod tests {
             PodState::Pending(Some("Unschedulable: 0/3 nodes are available".into()))
         );
 
-        let exited = json!({ "status": { "phase": "Failed", "containerStatuses": [{
+        let exited = json!({ "status": { "phase": "Failed", "containerStatuses": [{ "name": "relay",
             "state": { "terminated": { "reason": "Error", "exitCode": 1 } } }] } });
         assert!(matches!(pod_state(&exited), PodState::Failed(_)));
+
+        // An injected sidecar listed first is not the relay
+        let sidecar_first = json!({ "status": { "phase": "Running", "containerStatuses": [
+            { "name": "istio-proxy", "ready": true, "state": { "running": {} } },
+            { "name": "relay", "ready": false, "state": { "terminated": { "reason": "Error" } } }
+        ] } });
+        assert!(matches!(pod_state(&sidecar_first), PodState::Failed(_)));
+        let sidecar_exited = json!({ "status": { "phase": "Running", "containerStatuses": [
+            { "name": "sidecar", "state": { "terminated": { "reason": "Completed" } } },
+            { "name": "relay", "ready": true, "state": { "running": {} } }
+        ] } });
+        assert_eq!(pod_state(&sidecar_exited), PodState::Ready);
+    }
+
+    #[test]
+    fn leftovers_are_pods_of_ended_runs_only() {
+        let pod = |name: &str, session: &str| json!({ "metadata": { "name": name, "labels": { SESSION_LABEL: session } } });
+        let list = json!({ "items": [
+            pod("a", "dead"), pod("b", "dead"), pod("c", "alive"), pod("d", &SESSION),
+        ] });
+        let (pods, sessions) = leftovers(&list, |s| s != "alive");
+        assert_eq!(pods, ["a", "b"]);
+        assert_eq!(sessions, ["dead"]);
+    }
+
+    #[test]
+    fn a_session_ends_when_its_lock_is_released() {
+        let dir = std::env::temp_dir().join(format!("dbms-tool-kube-test-{}", *SESSION));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = uuid::Uuid::new_v4().simple().to_string();
+        let held = std::fs::File::create(lock_path(&dir, &session)).unwrap();
+        held.lock().unwrap();
+        assert!(!session_ended(&dir, &session));
+        drop(held);
+        assert!(session_ended(&dir, &session));
+        std::fs::remove_file(lock_path(&dir, &session)).unwrap();
+        // A crashed run whose lock file is gone too
+        assert!(session_ended(&dir, &session));
+        // Never a path outside the lock directory
+        assert!(!session_ended(&dir, "../x"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
