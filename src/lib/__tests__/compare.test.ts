@@ -753,6 +753,47 @@ describe('index kinds and column attributes outside PostgreSQL', () => {
     expect(xml.warnings).toContainEqual(expect.stringMatching(/xml_body is a xml index/))
   })
 
+  it('writes a NONCLUSTERED SQL Server key when another index is clustered', () => {
+    const key = (method: string): IndexInfo => ({ ...pk('PK_posts', ['id']), method })
+    const cx = index({ name: 'cx_body', method: 'clustered' })
+    const source = withBody('tsql', [key('nonclustered'), cx])
+
+    // A new table: a plain PRIMARY KEY would take the clustered slot cx_body needs
+    const [created] = compareSnapshots({
+      ...tsql(source, source),
+      target: snapshot([], { schema: 'dbo' })
+    })
+    const script = statementsOf([created]).join('\n')
+    expect(script).toContain('PRIMARY KEY NONCLUSTERED ([id])')
+    expect(script).toContain('CREATE CLUSTERED INDEX [cx_body] ON [dbo].[posts] ([body])')
+
+    // An existing table with a clustered key: the key is rebuilt NONCLUSTERED before cx_body
+    const [item] = compareSnapshots(tsql(source, withBody('tsql', [key('clustered')])))
+    expect(item.changes).toContainEqual(
+      expect.objectContaining({
+        what: 'primary key',
+        from: '(id) CLUSTERED',
+        to: '(id) NONCLUSTERED'
+      })
+    )
+    const statements = statementsOf([item])
+    const at = (pattern: RegExp): number => statements.findIndex((s) => pattern.test(s))
+    const drop = at(/DROP CONSTRAINT \[PK_posts\]/)
+    const add = at(/ADD CONSTRAINT \[PK_posts\] PRIMARY KEY NONCLUSTERED \(\[id\]\)/)
+    expect(drop).toBeGreaterThanOrEqual(0)
+    expect(add).toBeGreaterThan(drop)
+    expect(at(/CREATE CLUSTERED INDEX \[cx_body\]/)).toBeGreaterThan(add)
+
+    // Matching keys and indexes stay as they are
+    const [same] = compareSnapshots(
+      tsql(source, withBody('tsql', [key('nonclustered'), { ...cx }]))
+    )
+    expect(same.action).toBe('same')
+    const clustered = withBody('tsql', [key('clustered')])
+    const [plain] = compareSnapshots(tsql(clustered, withBody('tsql', [key('clustered')])))
+    expect(plain.action).toBe('same')
+  })
+
   it('restates MySQL columns whose INVISIBLE, COMPRESSED or ON UPDATE differs', () => {
     const info = (body: Partial<ColumnInfo>, updated: Partial<ColumnInfo>): TableInfo =>
       table({
@@ -813,8 +854,104 @@ describe('comparing two differently named PostgreSQL tables', () => {
     const [item] = compareSnapshots(
       tableCompare(obj('a', { table: withX([ix('a')]) }), obj('b', { table: withX([]) }))
     )
+    // a_x_idx is taken in the schema by a's own index, so b's copy follows b's name
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'CREATE INDEX b_x_idx ON public.b USING btree (x)'
+    ])
+    expect(item.changes).toMatchObject([{ action: 'add', what: 'index', name: 'b_x_idx' }])
+  })
+
+  const withXZ = (indexes: IndexInfo[]): TableInfo =>
+    table({
+      columns: [
+        column({ name: 'id', nullable: false }),
+        column({ name: 'x' }),
+        column({ name: 'z' })
+      ],
+      indexes
+    })
+  const on = (t: string, name: string, col: string): IndexInfo => ({
+    ...ix(t, name),
+    columns: [col],
+    definition: `CREATE INDEX ${name} ON public.${t} USING btree (${col})`
+  })
+
+  it('names copied indexes so they cannot collide with ones already in the schema', () => {
+    // b_x_idx stays on b (it matches a's zz by shape), and idx_x2 has no table prefix
+    const [item] = compareSnapshots(
+      tableCompare(
+        obj('a', { table: withXZ([ix('a'), on('a', 'zz', 'z'), on('a', 'idx_x2', 'x')]) }),
+        obj('b', { table: withXZ([on('b', 'b_x_idx', 'z')]) })
+      )
+    )
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'CREATE INDEX b_x_idx_2 ON public.b USING btree (x)',
+      'CREATE INDEX idx_x2_b ON public.b USING btree (x)'
+    ])
+  })
+
+  it('pairs indexes by shape rather than by name', () => {
+    // b's b_x_idx is on z, not x: it's dropped and a's copy takes its name
+    const [item] = compareSnapshots(
+      tableCompare(
+        obj('a', { table: withXZ([ix('a')]) }),
+        obj('b', { table: withXZ([on('b', 'b_x_idx', 'z')]) })
+      )
+    )
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'DROP INDEX public.b_x_idx',
+      'CREATE INDEX b_x_idx ON public.b USING btree (x)'
+    ])
+    // Same shape, so nothing to do whatever the target's index is called
+    const [renamed] = compareSnapshots(
+      tableCompare(
+        obj('a', { table: withXZ([on('a', 'shared', 'x')]) }),
+        obj('b', { table: withXZ([on('b', 'shared', 'x')]) })
+      )
+    )
+    expect(renamed.action).toBe('same')
+  })
+
+  it('keeps index names when the tables are in different schemas', () => {
+    const [item] = compareSnapshots({
+      dialect: 'postgres',
+      scope: 'table',
+      source: snapshot([obj('a', { schema: 'dev', table: withX([ix('a')]) })], { schema: 'dev' }),
+      target: snapshot([obj('b', { table: withX([]) })])
+    })
     expect(migrationStatements([item], new Set([item.id]))).toEqual([
       'CREATE INDEX a_x_idx ON public.b USING btree (x)'
+    ])
+  })
+
+  it('renames SQLite indexes copied between two tables', () => {
+    const sqliteIx = (t: string): IndexInfo => ({
+      name: `${t}_x_idx`,
+      columns: ['x'],
+      unique: false,
+      primary: false,
+      method: null,
+      definition: `CREATE INDEX ${t}_x_idx ON ${t} (x)`
+    })
+    const withSqliteX = (indexes: IndexInfo[]): TableInfo =>
+      table({
+        columns: [
+          column({ name: 'id', dataType: 'INTEGER', nullable: false, isPrimaryKey: true }),
+          column({ name: 'x', dataType: 'INTEGER' })
+        ],
+        indexes
+      })
+    const ctx = (source: TableInfo, target: TableInfo): CompareContext => ({
+      dialect: 'sqlite',
+      scope: 'table',
+      source: snapshot([obj('A', { schema: null, table: source })], { schema: null }),
+      target: snapshot([obj('b', { schema: null, table: target })], { schema: null })
+    })
+    const [same] = compareSnapshots(ctx(withSqliteX([sqliteIx('A')]), withSqliteX([sqliteIx('b')])))
+    expect(same.action).toBe('same')
+    const [item] = compareSnapshots(ctx(withSqliteX([sqliteIx('A')]), withSqliteX([])))
+    expect(migrationStatements([item], new Set([item.id]))).toEqual([
+      'CREATE INDEX b_x_idx ON b (x)'
     ])
   })
 

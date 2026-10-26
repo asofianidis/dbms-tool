@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
+  existsFlag,
+  existsText,
   fieldPaths,
+  formText,
+  isWriteStage,
   parsePipeline,
   formBody,
   stageForm,
@@ -124,5 +128,46 @@ describe('parsePipeline', () => {
       { operator: '$limit', body: '5' }
     ])
     expect(() => parsePipeline('[{ a: 1 }]')).toThrow(/Stage 1/)
+  })
+})
+
+describe('$exists in the match form', () => {
+  it('reads falsy arguments the way MongoDB does', () => {
+    for (const v of [false, 0, null, { $numberLong: '0' }, { $numberDouble: '0.0' }])
+      expect(existsFlag(v as never)).toBe(false)
+    for (const v of [true, 1, -1, '', 'no', { $numberInt: '2' }])
+      expect(existsFlag(v as never)).toBe(true)
+    expect(existsText('0')).toBe(false)
+    expect(existsText('null')).toBe(false)
+    expect(existsText('false')).toBe(false)
+    expect(existsText('true')).toBe(true)
+  })
+
+  it('keeps $exists: 0 meaning "missing" when the form rewrites the stage', () => {
+    const form = stageForm('$match', parseShellValue('{ a: { $exists: 0 }, b: 1 }'))
+    expect(form).toMatchObject({
+      conditions: [
+        { field: 'a', op: 'exists', value: 'false' },
+        { field: 'b', op: 'eq', value: '1' }
+      ]
+    })
+    // Editing another condition writes the stage back
+    const edited = form as Extract<StageForm, { kind: 'match' }>
+    edited.conditions[1] = { ...edited.conditions[1], value: '2' }
+    expect(formBody(edited)).toEqual({ a: { $exists: false }, b: 2 })
+    expect(formText(edited)).toContain('$exists: false')
+    const nulls = stageForm('$match', parseShellValue('{ a: { $exists: null } }'))
+    expect(formBody(nulls!)).toEqual({ a: { $exists: false } })
+  })
+})
+
+describe('isWriteStage', () => {
+  it('spots $out and $merge by the built stage keys', () => {
+    expect(isWriteStage({ $out: 'x' })).toBe(true)
+    expect(isWriteStage({ $merge: { into: 'x' } })).toBe(true)
+    expect(isWriteStage({ $match: {} })).toBe(false)
+    expect(isWriteStage(null)).toBe(false)
+    // The view builds stages from the trimmed operator, so `$out ` is caught too
+    expect(isWriteStage({ ['$out '.trim()]: 'x' })).toBe(true)
   })
 })

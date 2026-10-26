@@ -196,8 +196,16 @@ export function railwayCredentials(engine: Engine, stdout: string): Credentials 
   return {
     host,
     port: Number(v('RAILWAY_TCP_PROXY_PORT')) || undefined,
-    username: v(`${prefix}USER`) || v('MONGOINITDB_ROOT_USERNAME') || undefined,
-    password: v(`${prefix}PASSWORD`) || v('MONGOINITDB_ROOT_PASSWORD') || undefined,
+    username:
+      v(`${prefix}USER`) ||
+      v('MONGO_INITDB_ROOT_USERNAME') ||
+      v('MONGOINITDB_ROOT_USERNAME') ||
+      undefined,
+    password:
+      v(`${prefix}PASSWORD`) ||
+      v('MONGO_INITDB_ROOT_PASSWORD') ||
+      v('MONGOINITDB_ROOT_PASSWORD') ||
+      undefined,
     database: v(`${prefix}DATABASE`) || undefined
   }
 }
@@ -292,11 +300,23 @@ function railwayPlan(d: ProvisionDraft): ProvisionPlan {
   }
 }
 
+/**
+ * Each row is one service instance (ref.region is its environment), so the
+ * delete is scoped to that environment: without environmentId, serviceDelete
+ * removes the service from every environment.
+ */
 function railwayDelete(db: CloudDatabase): PlanStep[] {
+  const env = db.ref.region
+  const where = env ? `, environmentId: ${JSON.stringify(env)}` : ''
+  const location = db.location ?? ''
+  const label = location.includes(' / ') ? location.split(' / ').pop() : ''
   return [
     {
-      title: `Delete service ${db.name}`,
-      args: () => ['api', `mutation { serviceDelete(id: ${JSON.stringify(db.ref.resource)}) }`]
+      title: label ? `Delete service ${db.name} in ${label}` : `Delete service ${db.name}`,
+      args: () => [
+        'api',
+        `mutation { serviceDelete(id: ${JSON.stringify(db.ref.resource)}${where}) }`
+      ]
     }
   ]
 }

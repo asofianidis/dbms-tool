@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  applyCredentials,
+  connectionFor,
   newProvisionDraft,
   stepsScript,
   validateProvision,
@@ -198,6 +200,40 @@ describe('Railway', () => {
     ).toEqual({})
   })
 
+  it('connects to MongoDB through the TCP proxy without a public URL', () => {
+    const mongo = railwayDatabases(railwayProjects, '')[2]
+    const config = connectionFor(mongo)
+    expect(config.uri).toBe('')
+    const credentials = railwayCredentials(
+      'mongo',
+      JSON.stringify({
+        data: {
+          variables: {
+            RAILWAY_TCP_PROXY_DOMAIN: 'y.proxy.rlwy.net',
+            RAILWAY_TCP_PROXY_PORT: '23456',
+            MONGO_INITDB_ROOT_USERNAME: 'mongo',
+            MONGO_INITDB_ROOT_PASSWORD: 'pw'
+          }
+        }
+      })
+    )
+    expect(credentials).toMatchObject({ host: 'y.proxy.rlwy.net', port: 23456, username: 'mongo' })
+    applyCredentials(config, credentials)
+    expect(config).toMatchObject({ uri: '', host: 'y.proxy.rlwy.net', port: 23456, user: 'mongo' })
+    // Plain TCP: TLS isn't forced
+    expect(config.ssl).toBe('prefer')
+
+    // A URI saved earlier is pointed at the proxy, keeping its options
+    const saved = { ...connectionFor(mongo), uri: 'mongodb://old@:27017/?retryWrites=false' }
+    applyCredentials(saved, credentials)
+    expect(saved.uri).toBe('mongodb://mongo@y.proxy.rlwy.net:23456/?retryWrites=false')
+  })
+
+  it('builds Railway MongoDB URIs without forcing TLS', () => {
+    const mongo = { ...railwayDatabases(railwayProjects, '')[2], host: 'h.rlwy.net', port: 1234 }
+    expect(connectionFor(mongo).uri).toBe('mongodb://h.rlwy.net:1234/?retryWrites=false')
+  })
+
   it('plans adding a database to an existing project', () => {
     const draft = withEngine({ ...newProvisionDraft('railway', 'p1', 'e-prod') }, 'postgres')
     expect(validateProvision(draft)).toBeNull()
@@ -262,11 +298,13 @@ describe('Railway', () => {
     expect(plan.steps[2].args({})).toEqual(['add', '--database', 'mongo'])
   })
 
-  it('deletes services through the GraphQL API', () => {
-    const [pg] = railwayDatabases(railwayProjects, '')
-    expect(planDelete(pg, { finalSnapshot: false, disableProtection: false })[0].args({})).toEqual([
+  it('deletes services through the GraphQL API, only in their environment', () => {
+    const [, staging] = railwayDatabases(railwayProjects, '')
+    const [step] = planDelete(staging, { finalSnapshot: false, disableProtection: false })
+    expect(step.title).toBe('Delete service Postgres in staging')
+    expect(step.args({})).toEqual([
       'api',
-      'mutation { serviceDelete(id: "s-pg") }'
+      'mutation { serviceDelete(id: "s-pg", environmentId: "e-stage") }'
     ])
   })
 })

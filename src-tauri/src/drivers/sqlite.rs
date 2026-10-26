@@ -761,13 +761,15 @@ impl SqSession {
 fn trigger_shape(sql: &str) -> (String, Vec<String>) {
     let upper = sql.to_ascii_uppercase();
     let words: Vec<&str> = upper.split_whitespace().collect();
-    let timing = if upper.contains(" INSTEAD OF ") {
+    // Timing comes before the table's ON, so words in the body don't count
+    let header = &words[..words.iter().position(|w| *w == "ON").unwrap_or(words.len())];
+    let timing = if header.windows(2).any(|w| w == ["INSTEAD", "OF"]) {
         "INSTEAD OF"
-    } else if words.contains(&"BEFORE") {
-        "BEFORE"
+    } else if header.contains(&"AFTER") {
+        "AFTER"
     } else {
         // SQLite's default timing
-        "AFTER"
+        "BEFORE"
     };
     let event = ["INSERT", "UPDATE", "DELETE"]
         .into_iter()
@@ -1036,6 +1038,10 @@ DELETE FROM t WHERE b = 2"
         assert_eq!(
             trigger_shape("create trigger t after insert on x begin update x set a = 1; end"),
             ("AFTER".into(), vec!["INSERT".into()])
+        );
+        assert_eq!(
+            trigger_shape("CREATE TRIGGER t DELETE ON x BEGIN SELECT 'after'; END"),
+            ("BEFORE".into(), vec!["DELETE".into()])
         );
     }
 

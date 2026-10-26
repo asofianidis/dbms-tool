@@ -280,14 +280,15 @@ export const pgIndexShape = (definition: string): string => definition.replace(I
 
 /**
  * The index as it's created on `table`, which a comparison of two differently
- * named tables needs. A partitioned table's index definition replays `ON ONLY`,
- * which wouldn't reach the partitions, so that's dropped too.
+ * named tables needs, under `name` when it can't keep its own. A partitioned
+ * table's index definition replays `ON ONLY`, which wouldn't reach the
+ * partitions, so that's dropped too.
  */
-export const pgIndexSql = (definition: string, table?: string): string =>
+export const pgIndexSql = (definition: string, table?: string, name?: string): string =>
   table
     ? definition.replace(
         INDEX_HEAD,
-        (_, head: string, index: string) => `${head}${index} ON ${table}`
+        (_, head: string, index: string) => `${head}${name ? q(name) : index} ON ${table}`
       )
     : definition.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+.*?\s+ON\s+)ONLY\s+/i, '$1')
 

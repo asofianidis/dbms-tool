@@ -93,7 +93,7 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
   const loadToken = useRef(0)
   const stopAll = useRef(false)
 
-  const pattern = scanPattern(tab.pattern ?? '')
+  const pattern = useMemo(() => scanPattern(tab.pattern ?? ''), [tab.pattern])
   const dbs = useQuery({ ...queries.databases(tab.connectionId), enabled: connected })
   const total = dbs.data?.find((d) => d.name === tab.database)?.keys
 

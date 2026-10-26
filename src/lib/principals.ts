@@ -133,9 +133,13 @@ export function draftPrincipal(dialect: Dialect, d: PrincipalState): Principal {
   }
 }
 
-/** MySQL and MariaDB refuse to rename roles. */
-export function canRenamePrincipal(dialect: Dialect, type: PrincipalType): boolean {
-  return !(dialect === 'mysql' && type === 'role')
+/** MariaDB refuses to rename roles; MySQL 8 renames them like any account. */
+export function canRenamePrincipal(
+  dialect: Dialect,
+  type: PrincipalType,
+  options: PrincipalOptions = {}
+): boolean {
+  return !(dialect === 'mysql' && type === 'role' && options.mariadb)
 }
 
 /* ---------- Catalog queries ---------- */
@@ -339,8 +343,13 @@ function pgStatements(d: PrincipalDraft, options: PrincipalOptions): string[] {
 function mysqlStatements(d: PrincipalDraft, options: PrincipalOptions): string[] {
   const who = granteeSql('mysql', draftPrincipal('mysql', d))
   const o = d.original
-  // Roles can't be renamed, and have no attributes of their own
-  if (d.type === 'role') return o ? [] : [`CREATE ROLE ${who}`]
+  const before = o && granteeSql('mysql', draftPrincipal('mysql', o))
+  // Roles have no attributes of their own. MySQL roles are accounts, so RENAME USER renames
+  // them and moves them to another host; MariaDB can't rename roles
+  if (d.type === 'role') {
+    if (!before) return [`CREATE ROLE ${who}`]
+    return before !== who && !options.mariadb ? [`RENAME USER ${before} TO ${who}`] : []
+  }
   const limit = d.connectionLimit.trim()
   const tail = [
     ...((o ? limit !== o.connectionLimit : limit)
@@ -355,7 +364,6 @@ function mysqlStatements(d: PrincipalDraft, options: PrincipalOptions): string[]
   const rest = `${identified}${tail.length ? ` ${tail.join(' ')}` : ''}`
   if (!o) return [`CREATE USER ${who}${rest}`]
   const statements: string[] = []
-  const before = granteeSql('mysql', draftPrincipal('mysql', o))
   if (before !== who) statements.push(`RENAME USER ${before} TO ${who}`)
   if (rest) statements.push(`ALTER USER ${who}${rest}`)
   return statements

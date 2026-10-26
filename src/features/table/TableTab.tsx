@@ -142,6 +142,10 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
   const browsable = ['table', 'view', 'materialized_view', 'foreign_table'].includes(tab.objectKind)
   // Only MariaDB has sequences on the MySQL engine; they get a details view, never a data grid
   const sequenceDetails = tab.objectKind === 'sequence' && connection?.engine === 'mysql'
+  // The data view stays mounted once shown, so its pending edits, filter, sort and page
+  // survive a look at the structure or DDL
+  const [dataShown, setDataShown] = useState(tab.view === 'data')
+  if (tab.view === 'data' && !dataShown) setDataShown(true)
 
   useEffect(() => {
     if (!connected && connection) void connect(connection.id)
@@ -189,17 +193,21 @@ export function TableTab({ tab }: { tab: TabOf<'table'> }): React.JSX.Element {
           />
         )}
       </div>
+      {connected && browsable && dataShown && (
+        <div className={cn('flex min-h-0 flex-1 flex-col', tab.view !== 'data' && 'hidden')}>
+          <DataView
+            tab={tab}
+            engine={connection.engine}
+            dialect={dialect}
+            tableRef={ref}
+            readOnly={connection.readOnly || tab.objectKind !== 'table'}
+            active={tab.view === 'data'}
+          />
+        </div>
+      )}
       {!connected ? (
         <EmptyState title="Connecting…" icon={<Spinner className="size-5" />} />
-      ) : tab.view === 'data' && browsable ? (
-        <DataView
-          tab={tab}
-          engine={connection.engine}
-          dialect={dialect}
-          tableRef={ref}
-          readOnly={connection.readOnly || tab.objectKind !== 'table'}
-        />
-      ) : tab.view === 'structure' && browsable ? (
+      ) : tab.view === 'data' && browsable ? null : tab.view === 'structure' && browsable ? (
         <StructureView tab={tab} engine={connection.engine} dialect={dialect} />
       ) : tab.view === 'structure' && sequenceDetails ? (
         <SequenceDetails tab={tab} tableRef={ref} />
@@ -215,13 +223,16 @@ function DataView({
   engine,
   dialect,
   tableRef,
-  readOnly
+  readOnly,
+  active
 }: {
   tab: TabOf<'table'>
   engine: Engine
   dialect: Dialect
   tableRef: TableRef
   readOnly: boolean
+  /** False while the structure or DDL is shown in its place */
+  active: boolean
 }): React.JSX.Element {
   const { pageSize, confirmDangerous } = settingsStore.use()
   const info = useQuery(queries.table(tab.connectionId, tab.database, tab.schema, tab.name))
@@ -345,7 +356,11 @@ function DataView({
     applyQuery(tab.query)
   }, [tab.query])
 
+  // Only the latest load shows its rows, so a slow one for an older filter can't win
+  const loadSeq = useRef(0)
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
+    const latest = (): boolean => seq === loadSeq.current
     setLoading(true)
     setError(null)
     setRunning(tab.id, true)
@@ -355,14 +370,17 @@ function DataView({
       const out = await api.execute(tab.connectionId, tab.id, tab.database, sql, {
         maxRows: pageSize + 1
       })
+      if (!latest()) return
       // Pending changes are keyed by primary key, so they survive reloads and paging
       if (out.error) setError(out.error.message)
       else setOutput(out)
     } catch (e) {
-      setError(errorMessage(e))
+      if (latest()) setError(errorMessage(e))
     } finally {
-      setLoading(false)
-      setRunning(tab.id, false)
+      if (latest()) {
+        setLoading(false)
+        setRunning(tab.id, false)
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -450,6 +468,11 @@ function DataView({
     readOnlyColumns: generatedColumns,
     hidden
   })
+
+  // The status bar's selection summary belongs to the visible grid
+  useEffect(() => {
+    if (!active) selectionSummaryStore.set(null)
+  }, [active])
 
   // Open the panel when the first change is made
   const hadChanges = useRef(false)

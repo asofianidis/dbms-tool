@@ -18,8 +18,10 @@ import {
 import {
   FORM_OPERATORS,
   STAGE_INFO,
+  WRITE_STAGES,
   fieldPaths,
   formText,
+  isWriteStage,
   parsePipeline,
   stageForm,
   type StageCategory,
@@ -94,7 +96,6 @@ const TEMPLATES: Record<string, string> = {
 }
 
 const OPERATORS = Object.keys(TEMPLATES)
-const WRITE_STAGES = new Set(['$out', '$merge'])
 const CATEGORIES: StageCategory[] = ['Filter & shape', 'Group & sort', 'Join & reshape', 'Output']
 /** Documents each stage preview shows */
 const SAMPLE = 10
@@ -180,7 +181,7 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
       if (parsed[i].error)
         throw new Error(`Stage ${i + 1} (${stages[i].operator}): ${parsed[i].error}`)
       // Previews never write
-      if (preview && WRITE_STAGES.has(stages[i].operator)) continue
+      if (preview && isWriteStage(parsed[i].stage)) continue
       list.push(parsed[i].stage)
     }
     return list
@@ -256,7 +257,8 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
       setError(errorMessage(e))
       return
     }
-    if (!preview && stages.some((s) => s.enabled && WRITE_STAGES.has(s.operator))) {
+    // Checks the stages that will actually run, by their parsed (trimmed) names
+    if (!preview && pipeline.some(isWriteStage)) {
       const ok = await confirm({
         title: 'Run a pipeline that writes?',
         message: 'This pipeline ends in $out or $merge and will write to a collection.',
@@ -287,9 +289,10 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
 
   /** The full pipeline, refusing $out and $merge, which explain and export mustn't run. */
   const readPipeline = (what: string): unknown[] => {
-    if (stages.some((s) => s.enabled && WRITE_STAGES.has(s.operator)))
+    const pipeline = pipelineUpTo(stages.length - 1, false)
+    if (pipeline.some(isWriteStage))
       throw new Error(`Disable the $out or $merge stage to ${what} the pipeline`)
-    return pipelineUpTo(stages.length - 1, false)
+    return pipeline
   }
 
   const explain = async (): Promise<void> => {
@@ -337,7 +340,7 @@ export function AggregationView({ tab }: { tab: TabOf<'collection'> }): React.JS
   const exportToShell = (): void => {
     const body = stages
       .filter((s) => s.enabled)
-      .map((s) => `  { ${s.operator}: ${s.body.replace(/\n/g, '\n    ')} }`)
+      .map((s) => `  { ${s.operator.trim()}: ${s.body.replace(/\n/g, '\n    ')} }`)
       .join(',\n')
     newQueryTab(
       tab.connectionId,
@@ -656,7 +659,7 @@ function StageCard({
           spellCheck={false}
           className={cn(
             'h-6 w-36 rounded border border-line-strong bg-canvas px-2 font-mono text-[12px] focus:border-accent/50 focus:outline-none',
-            WRITE_STAGES.has(stage.operator) ? 'text-warn' : 'text-syn-keyword'
+            WRITE_STAGES.has(stage.operator.trim()) ? 'text-warn' : 'text-syn-keyword'
           )}
         />
         {parseError ? (

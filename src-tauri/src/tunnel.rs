@@ -29,6 +29,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(45);
 /// password or key passphrase; see `answer_askpass`.
 const ASKPASS_ENV: &str = "DBMS_TOOL_SSH_ASKPASS";
 
+/// Set to `PASSPHRASE` when the secret is a key passphrase; see `answers`.
+const ASKPASS_KIND_ENV: &str = "DBMS_TOOL_SSH_ASKPASS_KIND";
+const PASSPHRASE: &str = "passphrase";
+
 struct Tunnel {
     /// Killed when dropped
     child: Child,
@@ -53,6 +57,7 @@ struct CloudRef {
     account: String,
 }
 
+#[derive(Clone)]
 enum Target {
     Fly { cluster: String, account: String },
     Ssh(SshConfig),
@@ -244,7 +249,17 @@ fn ssh_command(
                     "Choose the private key file for the SSH tunnel",
                 ));
             }
-            cmd.args(["-i", ssh.key_file.trim(), "-o", "IdentitiesOnly=yes"]);
+            cmd.args(["-i", ssh.key_file.trim(), "-o", "IdentitiesOnly=yes"])
+                // The askpass helper holds the key's passphrase, so a server
+                // that refuses the key must not get to ask for a password instead
+                .args([
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                ]);
         }
         SshAuth::Password => {
             if secret.is_none() {
@@ -258,6 +273,7 @@ fn ssh_command(
             ]);
         }
     }
+    // Agent mode has no secret, so it runs in batch mode below and can't leak one
     match secret.filter(|s| !s.is_empty() && ssh.auth != SshAuth::Agent) {
         // ssh asks this app (run as its askpass helper) for the password or passphrase
         Some(secret) => {
@@ -265,6 +281,9 @@ fn ssh_command(
             cmd.env("SSH_ASKPASS", exe)
                 .env("SSH_ASKPASS_REQUIRE", "force")
                 .env(ASKPASS_ENV, secret);
+            if ssh.auth == SshAuth::Key {
+                cmd.env(ASKPASS_KIND_ENV, PASSPHRASE);
+            }
             // OpenSSH before 8.4 ignores SSH_ASKPASS_REQUIRE and wants DISPLAY instead
             if std::env::var_os("DISPLAY").is_none() {
                 cmd.env("DISPLAY", "dbms-tool");
@@ -310,10 +329,22 @@ pub fn answer_askpass() -> bool {
     let Some(secret) = std::env::var_os(ASKPASS_ENV) else {
         return false;
     };
+    let kind = std::env::var(ASKPASS_KIND_ENV).ok();
+    let prompt = std::env::args().nth(1).unwrap_or_default();
+    if !answers(kind.as_deref(), &prompt) {
+        // ssh reads a failed helper as "no answer"
+        std::process::exit(1);
+    }
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{}", secret.to_string_lossy());
     let _ = out.flush();
     true
+}
+
+/// Whether the askpass helper hands its secret to `prompt`: a key passphrase
+/// only goes to ssh's passphrase prompt, never to a password prompt.
+fn answers(kind: Option<&str>, prompt: &str) -> bool {
+    kind != Some(PASSPHRASE) || prompt.to_lowercase().contains("passphrase")
 }
 
 fn command(
@@ -473,14 +504,16 @@ pub async fn ensure(key: &str) -> AppResult<()> {
     if tunnel.child.try_wait()?.is_none() {
         return Ok(());
     }
-    let Tunnel {
-        port,
-        target,
-        config,
-        secret,
-        ..
-    } = tunnels.remove(key).expect("checked above");
-    let restarted = start(target, config, secret, port).await?;
+    // The dead record stays until a restart succeeds, so a failed restart
+    // fails every later call too, rather than letting sessions dial the old
+    // port directly (another program may hold it by then)
+    let restarted = start(
+        tunnel.target.clone(),
+        tunnel.config.clone(),
+        tunnel.secret.clone(),
+        tunnel.port,
+    )
+    .await?;
     tunnels.insert(key.to_string(), restarted);
     Ok(())
 }
@@ -598,6 +631,65 @@ mod tests {
             env.iter()
                 .any(|(k, v)| *k == ASKPASS_ENV && v.map(|v| v == "pw").unwrap_or(false))
         );
+    }
+
+    #[test]
+    fn key_passphrase_never_answers_a_password_prompt() {
+        let cfg = config(serde_json::json!({
+            "ssh": { "enabled": true, "host": "b", "auth": "key", "keyFile": "/k/id" }
+        }));
+        let cmd = ssh_command(cfg.ssh_tunnel().unwrap(), &cfg, Some("phrase"), 1).unwrap();
+        let a = args(&cmd);
+        for option in [
+            "PreferredAuthentications=publickey",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+        ] {
+            assert!(a.contains(&option.to_string()), "{option}");
+        }
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(k, v)| k == ASKPASS_KIND_ENV && v == Some(PASSPHRASE.as_ref()))
+        );
+        assert!(answers(
+            Some(PASSPHRASE),
+            "Enter passphrase for key '/k/id': "
+        ));
+        assert!(!answers(Some(PASSPHRASE), "ops@b's password: "));
+        assert!(!answers(Some(PASSPHRASE), "Password: "));
+        // A password goes to whatever ssh asks
+        assert!(answers(None, "ops@b's password: "));
+    }
+
+    #[tokio::test]
+    async fn a_failed_restart_keeps_failing() {
+        let mut exited = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            Command::new("true")
+        };
+        let mut child = exited.spawn().unwrap();
+        child.wait().await.unwrap();
+        // An empty SSH server makes `start` fail before it runs anything
+        let cfg = config(serde_json::json!({ "ssh": { "enabled": true, "host": "" } }));
+        let key = "a_failed_restart_keeps_failing";
+        TUNNELS.lock().await.insert(
+            key.into(),
+            Tunnel {
+                child,
+                port: 1,
+                target: Target::Ssh(cfg.ssh.clone().unwrap()),
+                config: cfg,
+                secret: None,
+            },
+        );
+        assert!(ensure(key).await.is_err());
+        assert!(ensure(key).await.is_err());
+        close(key).await;
+        assert!(ensure(key).await.is_ok());
     }
 
     #[test]

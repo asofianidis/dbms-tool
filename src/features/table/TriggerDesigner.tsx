@@ -9,14 +9,18 @@ import { literal, qualified } from '@/lib/sql'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
 import {
+  canDisable,
   defaultFunctionName,
   dropTriggerStatement,
   editableLanguage,
   eventOptions,
+  hasCondition,
+  hasUpdateColumns,
   mysqlTriggerState,
   newTriggerDraft,
   pgTriggerState,
   singleEvent,
+  sqliteTriggerState,
   timingOptions,
   triggerDraftFrom,
   triggerStatements,
@@ -94,6 +98,8 @@ interface PgFunction {
   name: string
   language: string
   source: string
+  /** pg_get_functiondef, so replacing the body keeps the function's attributes */
+  definition: string
 }
 
 interface TriggerMeta {
@@ -118,7 +124,7 @@ async function loadMeta(
     api.table(connectionId, database, schema, table),
     dialect === 'postgres'
       ? run(
-          "SELECT n.nspname, p.proname, l.lanname, p.prosrc FROM pg_proc p \
+          "SELECT n.nspname, p.proname, l.lanname, p.prosrc, pg_get_functiondef(p.oid) FROM pg_proc p \
            JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang \
            WHERE p.prorettype = 'pg_catalog.trigger'::regtype AND p.pronargs = 0 \
              AND n.nspname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1, 2"
@@ -132,7 +138,8 @@ async function loadMeta(
       schema: text(r[0]),
       name: text(r[1]),
       language: text(r[2]),
-      source: text(r[3])
+      source: text(r[3]),
+      definition: text(r[4])
     })),
     unsupported: null,
     definition: null
@@ -147,7 +154,8 @@ async function loadMeta(
          (SELECT coalesce(json_agg(a.attname ORDER BY k.o), '[]') \
           FROM unnest(t.tgattr::int2[]) WITH ORDINALITY k(n, o) \
           JOIN pg_attribute a ON a.attrelid = t.tgrelid AND a.attnum = k.n)::text, \
-         pg_get_triggerdef(t.oid, true), CASE WHEN t.tgconstraint <> 0 THEN 'y' ELSE 'n' END \
+         pg_get_triggerdef(t.oid, true), CASE WHEN t.tgconstraint <> 0 THEN 'y' ELSE 'n' END, \
+         pg_get_functiondef(p.oid) \
        FROM pg_trigger t \
        JOIN pg_proc p ON p.oid = t.tgfoid \
        JOIN pg_namespace pn ON pn.oid = p.pronamespace \
@@ -168,7 +176,8 @@ async function loadMeta(
         source: text(row[3]),
         updateColumns: JSON.parse(text(row[4]) || '[]') as string[],
         definition: text(row[5])
-      })
+      }),
+      text(row[7])
     )
   } else if (dialect === 'mysql') {
     // The driver prefixes the stored body with a header ending in FOR EACH ROW
@@ -177,6 +186,10 @@ async function loadMeta(
     meta.initial = triggerDraftFrom(
       mysqlTriggerState(existing, at < 0 ? def : def.slice(at + 'FOR EACH ROW\n'.length))
     )
+  } else if (dialect === 'sqlite') {
+    const state = sqliteTriggerState(existing)
+    if (!state) meta.unsupported = "This trigger's definition couldn't be read."
+    else meta.initial = triggerDraftFrom(state)
   } else {
     const state = tsqlTriggerState(existing)
     if (!state) meta.unsupported = "This trigger's definition couldn't be read."
@@ -430,7 +443,7 @@ function TriggerForm({
                   ))}
                 </div>
               </Field>
-              {dialect === 'postgres' && draft.events.includes('UPDATE') && !target.isView && (
+              {hasUpdateColumns(dialect) && draft.events.includes('UPDATE') && !target.isView && (
                 <Field
                   label="Only when these columns change"
                   className="min-w-0 flex-1"
@@ -467,18 +480,22 @@ function TriggerForm({
                 </Field>
               )}
             </div>
+            {hasCondition(dialect, draft.timing) && (
+              <Field label="When (optional)">
+                <Input
+                  mono
+                  value={draft.condition}
+                  placeholder={
+                    dialect === 'sqlite'
+                      ? 'OLD.status IS NOT NEW.status'
+                      : 'OLD.status IS DISTINCT FROM NEW.status'
+                  }
+                  onChange={(e) => patch({ condition: e.target.value })}
+                />
+              </Field>
+            )}
             {dialect === 'postgres' && (
               <>
-                {draft.timing !== 'INSTEAD OF' && (
-                  <Field label="When (optional)">
-                    <Input
-                      mono
-                      value={draft.condition}
-                      placeholder="OLD.status IS DISTINCT FROM NEW.status"
-                      onChange={(e) => patch({ condition: e.target.value })}
-                    />
-                  </Field>
-                )}
                 <div className="flex gap-3">
                   <Field label="Function" className="flex-1">
                     <Select
@@ -496,7 +513,8 @@ function TriggerForm({
                             functionName: '',
                             language: 'plpgsql',
                             body: fresh.body,
-                            loadedBody: ''
+                            loadedBody: '',
+                            loadedDefinition: ''
                           })
                         } else {
                           patch({
@@ -505,7 +523,8 @@ function TriggerForm({
                             functionName: fn.name,
                             language: fn.language,
                             body: fn.source,
-                            loadedBody: fn.source
+                            loadedBody: fn.source,
+                            loadedDefinition: fn.definition
                           })
                         }
                       }}
@@ -539,7 +558,7 @@ function TriggerForm({
                 </div>
               </>
             )}
-            {dialect !== 'mysql' && !(dialect === 'postgres' && target.isView) && (
+            {canDisable(dialect, target) && (
               <Toggle
                 checked={draft.enabled}
                 onChange={(enabled) => patch({ enabled })}
@@ -572,13 +591,21 @@ function TriggerForm({
                       : 'NEW and OLD hold the row; return NEW (or NULL to skip it) from BEFORE row triggers.'
                   : dialect === 'mysql'
                     ? 'Use BEGIN … END for more than one statement. NEW and OLD hold the row.'
-                    : 'The inserted and deleted tables hold the affected rows.'}
+                    : dialect === 'sqlite'
+                      ? 'BEGIN … END around one or more statements, each ending in a semicolon. NEW and OLD hold the row.'
+                      : 'The inserted and deleted tables hold the affected rows.'}
               </p>
             </div>
             {dialect === 'mysql' && !creating && (
               <p className="text-xs text-warn">
                 MySQL can&apos;t alter a trigger, so applying changes drops it and creates it again,
                 with you as its definer.
+              </p>
+            )}
+            {dialect === 'sqlite' && !creating && (
+              <p className="text-xs text-warn">
+                SQLite can&apos;t alter a trigger, so applying changes drops it and creates it
+                again.
               </p>
             )}
           </>

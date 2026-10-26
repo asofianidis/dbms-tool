@@ -165,6 +165,14 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         }
         opts
     };
+    if opts.default_database.is_none() {
+        // The host form leaves `admin` in the credential when no auth database is set
+        let auth_source = match uri {
+            "" => Some(cfg.auth_source.as_str()),
+            _ => opts.credential.as_ref().and_then(|c| c.source.as_deref()),
+        };
+        opts.default_database = fallback_database(&cfg.database, auth_source);
+    }
     if let Some(Tls::Enabled(tls)) = opts.tls.as_mut() {
         if cfg.ssl.verifies() {
             tls.allow_invalid_certificates = Some(false);
@@ -193,6 +201,18 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
         .run_command(doc! { "ping": 1 })
         .await?;
     Ok(client)
+}
+
+/// The database to open when the connection string names none: the one in the
+/// connection settings, else the auth database. `list_databases` falls back to
+/// it for users without the listDatabases privilege.
+fn fallback_database(database: &str, auth_source: Option<&str>) -> Option<String> {
+    [Some(database), auth_source]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|db| !db.is_empty())
+        .map(str::to_string)
 }
 
 /// BSON → Extended JSON. Relaxed where lossless; Int64, Decimal128 and whole-number
@@ -247,7 +267,7 @@ fn to_docs(values: Vec<Value>) -> AppResult<Vec<Document>> {
 }
 
 /// Cursor modifiers from the shell: `.hint()`, `.maxTimeMS()`, `.collation()`, …
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorOptions {
     /// Index keys or an index name
@@ -339,7 +359,7 @@ macro_rules! with_options {
     }};
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum MongoRequest {
     Find {
@@ -453,6 +473,17 @@ pub enum MongoRequest {
 }
 
 impl MongoRequest {
+    /// Whether the user gave the operation a comment of their own
+    fn has_comment(&self) -> bool {
+        match self {
+            MongoRequest::Find { options, .. }
+            | MongoRequest::Aggregate { options, .. }
+            | MongoRequest::Count { options, .. } => options.comment.is_some(),
+            MongoRequest::RunCommand { command, .. } => command.get("comment").is_some(),
+            _ => false,
+        }
+    }
+
     pub fn is_write(&self) -> bool {
         !matches!(
             self,
@@ -602,14 +633,23 @@ pub async fn execute(
     cancel: &CancelSignal,
 ) -> AppResult<MongoOutput> {
     let started = Instant::now();
+    // Dropping the future leaves the server running the operation, so it's
+    // tagged with a comment a cancel can find it by. A comment of the user's
+    // own may not be unique, so those operations aren't tagged or killed.
+    let tag = (!request.has_comment())
+        .then(|| Bson::String(format!("dbms-tool {}", uuid::Uuid::new_v4())));
+    let max = opts.max_rows.max(1);
     let result = tokio::select! {
         biased;
         _ = cancel.wait() => None,
-        r = run(client, request, opts.max_rows.max(1)) => Some(r),
+        r = run_tagged(client, request, max, tag.as_ref()) => Some(r),
     };
     let mut out = match result {
         Some(r) => r?,
         None => {
+            if let Some(tag) = &tag {
+                kill_tagged(client, tag).await;
+            }
             let mut out = MongoOutput::documents(Vec::new(), false);
             out.cancelled = true;
             out
@@ -619,9 +659,96 @@ pub async fn execute(
     Ok(out)
 }
 
-async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<MongoOutput> {
+/// `run`, again without the tag if the server refuses the `comment` field
+/// (some MongoDB-compatible services do). The refusal comes before any work.
+async fn run_tagged(
+    client: &Client,
+    request: MongoRequest,
+    max: usize,
+    tag: Option<&Bson>,
+) -> AppResult<MongoOutput> {
+    let Some(tag) = tag else {
+        return run(client, request, max, None).await;
+    };
+    let untagged = request.clone();
+    match run(client, request, max, Some(tag)).await {
+        Err(e) if comment_refused(&e.to_string()) => run(client, untagged, max, None).await,
+        r => r,
+    }
+}
+
+fn comment_refused(error: &str) -> bool {
+    let error = error.to_lowercase();
+    error.contains("comment")
+        && error.contains("field")
+        && ["unknown", "unrecognized", "not supported", "unsupported"]
+            .iter()
+            .any(|w| error.contains(w))
+}
+
+/// Best effort: kills the server's operations tagged with `tag`, giving up
+/// quietly after a few seconds or on any error (no privilege, old server).
+async fn kill_tagged(client: &Client, tag: &Bson) {
+    let admin = client.database("admin");
+    let kill = async {
+        // `$ownOps` lists the user's own operations without the inprog privilege
+        let reply = admin
+            .run_command(doc! {
+                "currentOp": 1,
+                "$ownOps": true,
+                "$or": [
+                    { "command.comment": tag.clone() },
+                    { "comment": tag.clone() },
+                    { "cursor.originatingCommand.comment": tag.clone() },
+                    { "originatingCommand.comment": tag.clone() },
+                ],
+            })
+            .await?;
+        for op in reply
+            .get_array("inprog")
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            // A number, or `shard:number` through mongos
+            if let Some(opid) = op.as_document().and_then(|o| o.get("opid")) {
+                let _ = admin
+                    .run_command(doc! { "killOp": 1, "op": opid.clone() })
+                    .await;
+            }
+        }
+        Ok::<_, mongodb::error::Error>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), kill).await;
+}
+
+/// Adds the cancel tag to an action that takes a comment.
+macro_rules! tagged {
+    ($action:expr, $tag:expr) => {{
+        let action = $action;
+        match $tag {
+            Some(tag) => action.comment(tag.clone()),
+            None => action,
+        }
+    }};
+}
+
+async fn run(
+    client: &Client,
+    request: MongoRequest,
+    max: usize,
+    tag: Option<&Bson>,
+) -> AppResult<MongoOutput> {
     use MongoRequest::*;
     let coll = |db: &str, name: &str| client.database(db).collection::<Document>(name);
+    // Cursor options carry the tag as their comment (`has_comment` is false
+    // whenever there's a tag, so it never replaces the user's)
+    let driver = |options: CursorOptions| -> AppResult<DriverOptions> {
+        let mut options = options.driver()?;
+        if options.comment.is_none() {
+            options.comment = tag.cloned();
+        }
+        Ok(options)
+    };
     Ok(match request {
         Find {
             database,
@@ -636,7 +763,7 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
         } => {
             let c = coll(&database, &collection);
             let filter = to_doc(filter)?;
-            let options = options.driver()?;
+            let options = driver(options)?;
             let mut find = with_options!(c.find(filter.clone()), options;
                 hint, max_time, collation, allow_disk_use, comment, selection_criteria, read_concern);
             let projection = to_doc(projection)?;
@@ -677,7 +804,7 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             options,
         } => {
             let pipeline = to_docs(pipeline)?;
-            let options = options.driver()?;
+            let options = driver(options)?;
             let cursor = if collection.is_empty() {
                 let db = client.database(&database);
                 with_options!(db.aggregate(pipeline), options;
@@ -704,7 +831,7 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             let n = if filter.is_empty() && options.is_empty() {
                 c.estimated_document_count().await?
             } else {
-                let options = options.driver()?;
+                let options = driver(options)?;
                 with_options!(c.count_documents(filter), options;
                     hint, max_time, collation, comment, selection_criteria, read_concern)
                 .await?
@@ -717,9 +844,8 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             field,
             filter,
         } => {
-            let values = coll(&database, &collection)
-                .distinct(field, to_doc(filter)?)
-                .await?;
+            let c = coll(&database, &collection);
+            let values = tagged!(c.distinct(field, to_doc(filter)?), tag).await?;
             MongoOutput::value(Value::Array(values.into_iter().map(to_json).collect()))
         }
         InsertOne {
@@ -727,9 +853,8 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             collection,
             document,
         } => {
-            let r = coll(&database, &collection)
-                .insert_one(to_doc(Some(document))?)
-                .await?;
+            let c = coll(&database, &collection);
+            let r = tagged!(c.insert_one(to_doc(Some(document))?), tag).await?;
             MongoOutput::value(
                 json!({ "acknowledged": true, "insertedId": to_json(r.inserted_id) }),
             )
@@ -739,9 +864,8 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             collection,
             documents,
         } => {
-            let r = coll(&database, &collection)
-                .insert_many(to_docs(documents)?)
-                .await?;
+            let c = coll(&database, &collection);
+            let r = tagged!(c.insert_many(to_docs(documents)?), tag).await?;
             let mut ids: Vec<(usize, Bson)> = r.inserted_ids.into_iter().collect();
             ids.sort_by_key(|(i, _)| *i);
             MongoOutput::value(json!({
@@ -758,10 +882,12 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             upsert,
         } => {
             let c = coll(&database, &collection);
-            let r = c
-                .update_one(to_doc(Some(filter))?, update_modifications(update)?)
-                .upsert(upsert)
-                .await?;
+            let r = tagged!(
+                c.update_one(to_doc(Some(filter))?, update_modifications(update)?),
+                tag
+            )
+            .upsert(upsert)
+            .await?;
             update_value(r)
         }
         UpdateMany {
@@ -772,10 +898,12 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             upsert,
         } => {
             let c = coll(&database, &collection);
-            let r = c
-                .update_many(to_doc(Some(filter))?, update_modifications(update)?)
-                .upsert(upsert)
-                .await?;
+            let r = tagged!(
+                c.update_many(to_doc(Some(filter))?, update_modifications(update)?),
+                tag
+            )
+            .upsert(upsert)
+            .await?;
             update_value(r)
         }
         ReplaceOne {
@@ -785,10 +913,13 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             replacement,
             upsert,
         } => {
-            let r = coll(&database, &collection)
-                .replace_one(to_doc(Some(filter))?, to_doc(Some(replacement))?)
-                .upsert(upsert)
-                .await?;
+            let c = coll(&database, &collection);
+            let r = tagged!(
+                c.replace_one(to_doc(Some(filter))?, to_doc(Some(replacement))?),
+                tag
+            )
+            .upsert(upsert)
+            .await?;
             update_value(r)
         }
         DeleteOne {
@@ -796,9 +927,8 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             collection,
             filter,
         } => {
-            let r = coll(&database, &collection)
-                .delete_one(to_doc(Some(filter))?)
-                .await?;
+            let c = coll(&database, &collection);
+            let r = tagged!(c.delete_one(to_doc(Some(filter))?), tag).await?;
             MongoOutput::value(json!({ "acknowledged": true, "deletedCount": r.deleted_count }))
         }
         DeleteMany {
@@ -806,9 +936,8 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             collection,
             filter,
         } => {
-            let r = coll(&database, &collection)
-                .delete_many(to_doc(Some(filter))?)
-                .await?;
+            let c = coll(&database, &collection);
+            let r = tagged!(c.delete_many(to_doc(Some(filter))?), tag).await?;
             MongoOutput::value(json!({ "acknowledged": true, "deletedCount": r.deleted_count }))
         }
         ListIndexes {
@@ -840,10 +969,11 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
                 index.insert("name", index_name(&keys));
             }
             index.insert("key", keys);
-            let reply = client
-                .database(&database)
-                .run_command(doc! { "createIndexes": &collection, "indexes": [index] })
-                .await?;
+            let mut command = doc! { "createIndexes": &collection, "indexes": [index] };
+            if let Some(tag) = tag {
+                command.insert("comment", tag.clone());
+            }
+            let reply = client.database(&database).run_command(command).await?;
             MongoOutput::value(to_json(Bson::Document(reply)))
         }
         DropIndex {
@@ -879,10 +1009,11 @@ async fn run(client: &Client, request: MongoRequest, max: usize) -> AppResult<Mo
             MongoOutput::value(json!({ "ok": 1 }))
         }
         RunCommand { database, command } => {
-            let reply = client
-                .database(&database)
-                .run_command(to_doc(Some(command))?)
-                .await?;
+            let mut command = to_doc(Some(command))?;
+            if let Some(tag) = tag {
+                command.insert("comment", tag.clone());
+            }
+            let reply = client.database(&database).run_command(command).await?;
             MongoOutput::value(to_json(Bson::Document(reply)))
         }
     })
@@ -1281,6 +1412,38 @@ async fn write_export(
 mod tests {
     use super::*;
     use mongodb::bson;
+
+    #[test]
+    fn default_database_falls_back_to_the_auth_database() {
+        assert_eq!(
+            fallback_database("sales", Some("admin")).as_deref(),
+            Some("sales")
+        );
+        assert_eq!(fallback_database(" ", Some("app")).as_deref(), Some("app"));
+        assert_eq!(fallback_database("", Some("")), None);
+        assert_eq!(fallback_database("", None), None);
+    }
+
+    #[test]
+    fn only_untagged_requests_get_the_cancel_tag() {
+        let request = |v: Value| serde_json::from_value::<MongoRequest>(v).unwrap();
+        let find = request(json!({ "op": "find", "database": "d", "collection": "c" }));
+        assert!(!find.has_comment());
+        let find = request(json!({
+            "op": "find", "database": "d", "collection": "c", "options": { "comment": "mine" }
+        }));
+        assert!(find.has_comment());
+        let command = request(json!({
+            "op": "runCommand", "database": "d", "command": { "ping": 1, "comment": "x" }
+        }));
+        assert!(command.has_comment());
+        assert!(comment_refused(
+            "Location40415 (40415): BSON field 'update.comment' is an unknown field."
+        ));
+        assert!(comment_refused("Field 'comment' is not supported"));
+        assert!(!comment_refused("unknown operator: $foo"));
+        assert!(!comment_refused("E11000 duplicate key error, comment: 1"));
+    }
 
     #[test]
     fn shortens_server_selection_errors() {

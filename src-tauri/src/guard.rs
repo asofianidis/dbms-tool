@@ -52,6 +52,21 @@ const WRITE_KEYWORDS: &[&str] = &[
     "uninstall",
 ];
 
+/// T-SQL-only statements that change data or server state: Service Broker's
+/// `RECEIVE` (which dequeues, also inside `WAITFOR (…)`) and `SEND`, and
+/// `ENABLE` / `DISABLE TRIGGER`
+const TSQL_WRITE_KEYWORDS: &[&str] = &["receive", "send", "enable", "disable"];
+
+/// Service Broker statements that start with an allowed word (`END`, `BEGIN`),
+/// or lock a conversation group (`GET`, also inside `WAITFOR (…)`)
+const TSQL_WRITE_PAIRS: &[[&str; 2]] = &[
+    ["end", "conversation"],
+    ["begin", "conversation"],
+    ["begin", "dialog"],
+    ["move", "conversation"],
+    ["get", "conversation"],
+];
+
 /// Words after which a write keyword can only be a column or alias name:
 /// `SELECT refresh`, `a, update`, `AS delete`, `ORDER BY lock`, `x = replace`.
 /// Not `on`: T-SQL's `SET NOCOUNT ON` can run straight into the next statement,
@@ -294,7 +309,9 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
                 backslash_escapes,
             },
         );
-        if let Some(word) = write_keyword(&tokens).or_else(|| session_write(&tokens, engine)) {
+        if let Some(word) =
+            write_keyword(&tokens, engine).or_else(|| session_write(&tokens, engine))
+        {
             return Some(word);
         }
     }
@@ -307,20 +324,43 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
     None
 }
 
-fn write_keyword(tokens: &[Token]) -> Option<String> {
+fn write_keyword(tokens: &[Token], engine: Engine) -> Option<String> {
+    let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
     tokens
         .iter()
         .enumerate()
         .find_map(|(i, token)| match token {
             Token::Word(word)
-                if WRITE_KEYWORDS.contains(&word.as_str())
+                if (WRITE_KEYWORDS.contains(&word.as_str())
+                    || (tsql && TSQL_WRITE_KEYWORDS.contains(&word.as_str())))
                 // INTO is never a name, and `SELECT … INTO t` creates a table
                 && (word == "into" || !used_as_name(tokens, i)) =>
             {
                 Some(word.to_uppercase())
             }
+            Token::Word(word) if tsql => tsql_write_pair(tokens, i, word),
             _ => None,
         })
+}
+
+/// `END CONVERSATION @h` and the like at `i`. `END conversation` can also close
+/// a `CASE` before an alias, but then no handle follows.
+fn tsql_write_pair(tokens: &[Token], i: usize, word: &str) -> Option<String> {
+    let Some(Token::Word(next)) = tokens.get(i + 1) else {
+        return None;
+    };
+    if !TSQL_WRITE_PAIRS.contains(&[word, next.as_str()]) {
+        return None;
+    }
+    let handle = match tokens.get(i + 2) {
+        Some(Token::Word(w)) => w.starts_with('@'),
+        Some(Token::Literal) => true,
+        _ => false,
+    };
+    if word == "end" && !handle {
+        return None;
+    }
+    Some(format!("{word} {next}").to_uppercase())
 }
 
 /// Statements that switch off the server-side read-only mode of read-only
@@ -484,6 +524,40 @@ mod tests {
         assert_eq!(ms("DECLARE @x int = 1; SELECT @x"), None);
         // Other engines treat a bare name as a syntax error, not a call
         assert_eq!(pg("sp_rename 'a', 'b'"), None);
+    }
+
+    #[test]
+    fn blocks_service_broker_and_trigger_switches() {
+        for sql in [
+            "WAITFOR (RECEIVE TOP(100) * FROM q), TIMEOUT 1000",
+            "WAITFOR (GET CONVERSATION GROUP @g FROM q), TIMEOUT 1000",
+            "SELECT 1; RECEIVE * FROM q",
+            "SELECT 1; GET CONVERSATION GROUP @g FROM q",
+            "SELECT 1; DISABLE TRIGGER ALL ON DATABASE",
+            "ENABLE TRIGGER t ON x",
+            "SEND ON CONVERSATION @h MESSAGE TYPE m (@body)",
+            "END CONVERSATION @h WITH CLEANUP",
+            "IF 1 = 1 BEGIN END CONVERSATION @h END",
+            "BEGIN DIALOG CONVERSATION @h FROM SERVICE a TO SERVICE 'b'",
+            "BEGIN CONVERSATION TIMER (@h) TIMEOUT = 60",
+            "MOVE CONVERSATION @h TO @g",
+        ] {
+            assert!(ms(sql).is_some(), "{sql}");
+        }
+        assert_eq!(ms("WAITFOR DELAY '00:00:01'"), None);
+        assert_eq!(ms("WAITFOR DELAY '00:00:01'; SELECT 1"), None);
+        assert_eq!(ms("BEGIN TRAN; SELECT 1; COMMIT"), None);
+        assert_eq!(
+            ms("IF 1 = 1 BEGIN SELECT 1 END ELSE BEGIN SELECT 2 END"),
+            None
+        );
+        assert_eq!(
+            ms("SELECT CASE WHEN a = 1 THEN 1 END conversation FROM t"),
+            None
+        );
+        assert_eq!(ms("SELECT send, receive FROM t WHERE enable = 1"), None);
+        // Only T-SQL has these statements
+        assert_eq!(pg("SELECT 1; RECEIVE * FROM q"), None);
     }
 
     #[test]

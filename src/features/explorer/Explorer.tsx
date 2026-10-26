@@ -1032,7 +1032,11 @@ function SchemaNode({
               label: 'New query here',
               icon: <Terminal />,
               onSelect: () =>
-                newQueryTab(connection.id, database, `SET search_path TO ${schema};\n\n`)
+                newQueryTab(
+                  connection.id,
+                  database,
+                  `SET search_path TO ${quoteIdent('postgres', schema)};\n\n`
+                )
             },
             {
               label: 'Open diagram',

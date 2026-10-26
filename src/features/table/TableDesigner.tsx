@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { columnFeatures, serverTypes, type ColumnFeatures } from '@/lib/column-types'
+import { columnFeatures, mysqlAtLeast, serverTypes, type ColumnFeatures } from '@/lib/column-types'
 import {
   checkChange,
   checkName,
@@ -54,7 +54,7 @@ import {
 } from '@/lib/ddl'
 import { ENGINES, type Dialect } from '@/lib/engines'
 import { plural } from '@/lib/format'
-import { connectedInfo } from '@/lib/mariadb'
+import { connectedInfo, mariaDbAtLeast } from '@/lib/mariadb'
 import { queries } from '@/lib/queries'
 import {
   countPgOptionChanges,
@@ -597,6 +597,10 @@ function DesignerForm({
                 ...extensionColumnTypes(pgExtensions)
               ]}
               features={features}
+              // A computed column is renamed with RENAME COLUMN, which older MySQL and MariaDB lack
+              renameComputed={
+                dialect !== 'mysql' || mysqlAtLeast(info, 8) || mariaDbAtLeast(info, 10, 5)
+              }
             />
           ) : view === 'indexes' ? (
             <IndexesEditor
@@ -656,7 +660,8 @@ function ColumnsEditor({
   draft,
   setDraft,
   types,
-  features
+  features,
+  renameComputed
 }: {
   dialect: Dialect
   draft: TableDraft
@@ -664,6 +669,8 @@ function ColumnsEditor({
   /** Type suggestions for the connected server, including those installed extensions add */
   types: string[]
   features: ColumnFeatures
+  /** Whether the server can rename an existing computed column */
+  renameComputed: boolean
 }): React.JSX.Element {
   const creating = !draft.original
   // SQL Server keeps comments as extended properties; SQLite has none
@@ -761,12 +768,15 @@ function ColumnsEditor({
           const key = keys.includes(c.id)
           const changed = columnChanged(draft, c)
           const locked = c.dropped || c.computed
+          const fixedName = c.computed && !!c.original && !renameComputed
           return (
             <div
               key={c.id}
               className={cn(grid, 'rounded-md py-0.5', c.dropped && 'opacity-45')}
               title={
-                c.computed ? 'Computed column: it can be dropped but not altered here' : undefined
+                c.computed
+                  ? `Computed column: it can be ${fixedName ? '' : 'renamed or '}dropped but not altered here`
+                  : undefined
               }
             >
               <span className="flex justify-center" title={columnState(c, changed)}>
@@ -792,7 +802,12 @@ function ColumnsEditor({
                 className={cn(cellInput, c.dropped && 'line-through')}
                 value={c.name}
                 placeholder="column_name"
-                disabled={c.dropped}
+                disabled={c.dropped || fixedName}
+                title={
+                  fixedName
+                    ? 'Renaming a computed column needs MySQL 8.0 or MariaDB 10.5 (RENAME COLUMN)'
+                    : undefined
+                }
                 onChange={(e) => patch(c.id, { name: e.target.value })}
               />
               <Input
