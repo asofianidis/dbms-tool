@@ -13,7 +13,6 @@ import {
   Trash2,
   Undo2
 } from 'lucide-react'
-import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { columnFeatures, mysqlAtLeast, serverTypes, type ColumnFeatures } from '@/lib/column-types'
 import {
@@ -23,7 +22,6 @@ import {
   countChanges,
   ddlScript,
   draftFromTable,
-  draftId,
   draftWarnings,
   foreignKeyActions,
   foreignKeyChange,
@@ -81,6 +79,7 @@ import {
   type PgExtensions
 } from '@/lib/pg-extensions-aware'
 import { loadTableExtras, type TableExtras } from '@/lib/table-extras'
+import { draftSchemaFor, runDdl } from './designer-ops'
 import { errorMessage, toast } from '@/lib/toast'
 import { usePgExtensions } from '@/lib/use-pg-extensions'
 import {
@@ -129,6 +128,15 @@ interface Request {
   schema: string | null
   /** Table to modify; null to create one */
   name: string | null
+  /** Tab to show first */
+  view?: DesignerView
+  /** Edits to start from, e.g. a foreign key drawn on the diagram */
+  seed?: (draft: TableDraft) => TableDraft
+  /**
+   * Called after the changes are applied, in place of opening the table; `schema` is as the
+   * explorer knows it, `previous` the name before a rename (null for a new table)
+   */
+  onApplied?: (table: { schema: string | null; name: string; previous: string | null }) => void
 }
 
 const designerStore = createStore<Request | null>(null)
@@ -137,9 +145,10 @@ export function openTableDesigner(
   connectionId: string,
   database: string,
   schema: string | null,
-  name: string | null = null
+  name: string | null = null,
+  options: Pick<Request, 'view' | 'seed' | 'onApplied'> = {}
 ): void {
-  designerStore.set({ connectionId, database, schema, name })
+  designerStore.set({ connectionId, database, schema, name, ...options })
 }
 
 const close = (): void => designerStore.set(null)
@@ -272,16 +281,12 @@ function TableDesigner(request: Request): React.JSX.Element {
     )
   }
   // MySQL qualifies by database, SQLite not at all; the others by schema
-  const draftSchema =
-    connection?.engine === 'mysql'
-      ? database
-      : dialect === 'sqlite'
-        ? null
-        : (schema ?? (dialect === 'tsql' ? 'dbo' : 'public'))
-  const initial =
+  const draftSchema = draftSchemaFor(dialect, connection?.engine === 'mysql', database, schema)
+  const loaded =
     name !== null && table.data
       ? draftFromTable(dialect, draftSchema, name, table.data, extras.data)
       : newTableDraft(dialect, draftSchema)
+  const initial = request.seed ? request.seed(loaded) : loaded
   return (
     <DesignerForm
       request={request}
@@ -293,7 +298,9 @@ function TableDesigner(request: Request): React.JSX.Element {
   )
 }
 
-type View = 'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'partitions' | 'options' | 'sql'
+export type DesignerView =
+  'columns' | 'indexes' | 'foreignKeys' | 'constraints' | 'partitions' | 'options' | 'sql'
+type View = DesignerView
 
 function DesignerForm({
   request,
@@ -314,7 +321,7 @@ function DesignerForm({
   const mysql = connection?.engine === 'mysql'
   const sqlite = dialect === 'sqlite'
   const [draft, setDraft] = useState(initial)
-  const [view, setView] = useState<View>('columns')
+  const [view, setView] = useState<View>(request.view ?? 'columns')
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const creating = !draft.original
@@ -401,10 +408,8 @@ function DesignerForm({
   const apply = async (): Promise<void> => {
     setRunning(true)
     setError(null)
-    const session = `designer-${draftId()}`
     try {
-      const out = await api.execute(connectionId, session, database, script)
-      if (out.error) throw new Error(out.error.message)
+      await runDdl({ connectionId, database, dialect, mysql, options }, script)
       const newName = draft.name.trim()
       const tabSchema = mysql ? request.schema : draft.schema
       if (draft.original && newName !== draft.original.name) {
@@ -422,24 +427,17 @@ function DesignerForm({
       toast(creating ? `Created ${newName}` : `Updated ${newName}`)
       refreshConnection(connectionId)
       close()
-      openTable(connectionId, database, tabSchema, newName, 'table', 'structure')
+      if (request.onApplied)
+        request.onApplied({
+          schema: tabSchema,
+          name: newName,
+          previous: draft.original?.name ?? null
+        })
+      else openTable(connectionId, database, tabSchema, newName, 'table', 'structure')
     } catch (e) {
       setError(errorMessage(e))
-      // XACT_ABORT doesn't roll back after a compile error, which leaves the transaction open;
-      // SQLite stops at the failing statement inside its BEGIN
-      if (dialect === 'tsql' || (sqlite && !d1)) {
-        await api
-          .execute(
-            connectionId,
-            session,
-            database,
-            dialect === 'tsql' ? 'IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;' : 'ROLLBACK;'
-          )
-          .catch(() => undefined)
-      }
     } finally {
       setRunning(false)
-      void api.closeSession(connectionId, session).catch(() => undefined)
     }
   }
 
