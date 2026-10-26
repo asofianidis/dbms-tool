@@ -204,6 +204,11 @@ describe('where a result comes from', () => {
       columns: new Set(['Id', 'Name'])
     })
     expect(singleTableSource('SELECT * FROM users LIMIT 5;', 'mysql')?.parts).toEqual(['users'])
+    // Dots inside quotes belong to the name
+    expect(singleTableSource('SELECT * FROM s."a.b.c" WHERE 1', 'postgres')?.parts).toEqual([
+      's',
+      'a.b.c'
+    ])
   })
 
   it('refuses joins, grouping, subqueries and scripts', () => {

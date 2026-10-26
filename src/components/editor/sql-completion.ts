@@ -10,7 +10,7 @@ import { EditorView, showTooltip, type Tooltip } from '@codemirror/view'
 import type { CompletionTable } from '@/lib/api'
 import type { Dialect } from '@/lib/engines'
 import type { ServerVersion } from '@/lib/mariadb'
-import { resolveTable, unquoteIdent } from '@/lib/result-source'
+import { resolveTable, splitQualified, unquoteIdent } from '@/lib/result-source'
 import type { Snippet } from '@/lib/snippets'
 import { quoteIdent, stripComments } from '@/lib/sql'
 import { functionsFor } from '@/lib/sql-functions'
@@ -156,7 +156,7 @@ export function tablesInStatement(
   const add = (item: string): void => {
     const m = TABLE_ITEM.exec(item)
     if (!m) return
-    const parts = m[1].split(/\s*\.\s*/).map((p) => unquoteIdent(p, dialect))
+    const parts = splitQualified(m[1], dialect)
     const table = resolveTable(parts, tables, defaultSchema, dialect)
     if (!table) return
     const alias = m[2] && !NOT_ALIAS.has(m[2].toLowerCase()) ? unquoteIdent(m[2], dialect) : null
@@ -319,7 +319,7 @@ export function sqlAssistCompletion(options: AssistOptions): CompletionSource {
 
     const onMatch = JOIN_ON.exec(statementBefore + doc.slice(word.from, context.pos))
     if (onMatch) {
-      const parts = onMatch[1].split(/\s*\.\s*/).map((p) => unquoteIdent(p, dialect))
+      const parts = splitQualified(onMatch[1], dialect)
       const joined = resolveTable(parts, options.tables, defaultSchema, dialect)
       const alias = onMatch[2] ? unquoteIdent(onMatch[2], dialect) : null
       if (joined) {

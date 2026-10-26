@@ -37,6 +37,16 @@ const NOT_SIMPLE =
   /\b(join|union|intersect|except|minus|group\s+by|having|distinct|into|over|pivot|unpivot|apply|lateral|connect\s+by|top\s*\(\s*\d+\s*\)\s*percent)\b/i
 const ALIAS_KEYWORDS = new Set(['where', 'order', 'limit', 'offset', 'fetch', 'for', 'option'])
 
+const IDENT_PART = new RegExp(IDENT, 'g')
+
+/**
+ * The parts of a dotted name, unquoted. Dots inside quotes belong to the name
+ * (`dbo."item.group"` is two parts), so this reads identifiers, not dots.
+ */
+export function splitQualified(name: string, dialect: Dialect): string[] {
+  return Array.from(name.matchAll(IDENT_PART), (m) => unquoteIdent(m[0], dialect))
+}
+
 export function unquoteIdent(ident: string, dialect: Dialect): string {
   const t = ident.trim()
   if (t.startsWith('"')) return t.slice(1, -1).replace(/""/g, '"')
@@ -128,7 +138,7 @@ export function singleTableSource(sql: string, dialect: Dialect): SingleTableSou
   if (clause.includes('(') || clause.includes(',')) return null
   const m = TABLE_CLAUSE.exec(clause)
   if (!m) return null
-  const parts = m[1].split(/\s*\.\s*/).map((p) => unquoteIdent(p, dialect))
+  const parts = splitQualified(m[1], dialect)
   const rawAlias = m[2] && !ALIAS_KEYWORDS.has(m[2].toLowerCase()) ? m[2] : null
   const alias = rawAlias ? unquoteIdent(rawAlias, dialect) : null
   const qualifiers = new Set(
