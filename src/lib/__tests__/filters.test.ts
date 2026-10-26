@@ -40,7 +40,9 @@ describe('conditionSql', () => {
 
   it('builds case-insensitive LIKE with escaped wildcards', () => {
     const c = newCondition({ column: 'name', op: 'contains', value: '50%_off!' })
-    expect(conditionSql('postgres', c, 'text')).toBe("name::text ILIKE '%50!%!_off!!%' ESCAPE '!'")
+    expect(conditionSql('postgres', c, 'text')).toBe(
+      `name::text COLLATE "default" ILIKE '%50!%!_off!!%' ESCAPE '!'`
+    )
     expect(conditionSql('mysql', { ...c, op: 'starts', value: 'a\\b' }, 'varchar(9)')).toBe(
       "`name` LIKE 'a\\\\b%' ESCAPE '!'"
     )
