@@ -560,3 +560,108 @@ describe('MySQL column attributes', () => {
     expect(countChanges(d)).toBe(0)
   })
 })
+
+describe('renaming computed columns', () => {
+  const generated = (dialect: Dialect): TableInfo => ({
+    columns: [
+      column({ name: 'id', nullable: false, isPrimaryKey: true }),
+      column({
+        name: 'total',
+        isGenerated: true,
+        default: '(price * qty)',
+        extra: dialect === 'mysql' ? 'VIRTUAL GENERATED' : null
+      })
+    ],
+    primaryKey: ['id'],
+    indexes: [],
+    foreignKeys: [],
+    triggers: []
+  })
+  const renamed = (dialect: Dialect, schema: string): TableDraft => {
+    const d = draftFromTable(dialect, schema, 't', generated(dialect))
+    col(d, 'total').name = 'amount'
+    d.indexes.push(newIndex({ name: 'ix_amount', columns: [col(d, 'amount').id] }))
+    return d
+  }
+
+  it('renames the column before indexing the new name', () => {
+    const pg = renamed('postgres', 'public')
+    expect(countChanges(pg, 'postgres')).toBe(2)
+    expect(tableStatements('postgres', pg)).toEqual([
+      'ALTER TABLE public.t RENAME COLUMN total TO amount',
+      'CREATE INDEX ix_amount ON public.t (amount)'
+    ])
+    expect(tableStatements('tsql', renamed('tsql', 'dbo'))).toEqual([
+      "EXEC sp_rename N'[dbo].[t].[total]', N'amount', 'COLUMN'",
+      'CREATE INDEX [ix_amount] ON [dbo].[t] ([amount])'
+    ])
+    // RENAME COLUMN keeps the generation expression, which CHANGE COLUMN would have to restate
+    expect(tableStatements('mysql', renamed('mysql', 'app'))).toEqual([
+      'ALTER TABLE `app`.`t`\n  RENAME COLUMN `total` TO `amount`,\n  ADD INDEX `ix_amount` (`amount`)'
+    ])
+  })
+
+  it('still leaves the rest of a computed column alone', () => {
+    const d = draftFromTable('postgres', 'public', 't', generated('postgres'))
+    Object.assign(col(d, 'total'), { dataType: 'bigint', nullable: false, default: '1' })
+    expect(countChanges(d, 'postgres')).toBe(0)
+    expect(tableStatements('postgres', d)).toEqual([])
+    col(d, 'total').name = 'amount'
+    expect(tableStatements('postgres', d)).toEqual([
+      'ALTER TABLE public.t RENAME COLUMN total TO amount'
+    ])
+  })
+})
+
+describe('SQL Server clustered and nonclustered keys', () => {
+  const keyed = (method: string | null): TableDraft => {
+    const info = usersTable('tsql')
+    return draftFromTable('tsql', 'dbo', 'users', {
+      ...info,
+      indexes: info.indexes.map((ix) => (ix.primary ? { ...ix, method } : ix))
+    })
+  }
+
+  it('creates the key NONCLUSTERED when it was, or when another index is clustered', () => {
+    const create = (d: TableDraft): string => tableStatements('tsql', { ...d, original: null })[0]
+    expect(create(keyed('nonclustered'))).toContain(
+      'CONSTRAINT [PK_users] PRIMARY KEY NONCLUSTERED ([id])'
+    )
+    expect(create(keyed('clustered'))).toContain(
+      'CONSTRAINT [PK_users] PRIMARY KEY CLUSTERED ([id])'
+    )
+    expect(create(keyed(null))).toContain('CONSTRAINT [PK_users] PRIMARY KEY ([id])')
+    const d = keyed(null)
+    d.indexes[0].method = 'CLUSTERED'
+    expect(create(d)).toContain('PRIMARY KEY NONCLUSTERED ([id])')
+  })
+
+  it('rebuilds a clustered key NONCLUSTERED when an index becomes clustered', () => {
+    const d = keyed('clustered')
+    expect(countChanges(d, 'tsql')).toBe(0)
+    expect(tableStatements('tsql', d)).toEqual([])
+    d.indexes.push(
+      newIndex({ name: 'cx_email', columns: [col(d, 'email').id], method: 'CLUSTERED' })
+    )
+    expect(countChanges(d, 'tsql')).toBe(2)
+    expect(tableStatements('tsql', d)).toEqual([
+      'ALTER TABLE [dbo].[users] DROP CONSTRAINT [users_pkey]',
+      'ALTER TABLE [dbo].[users] ADD CONSTRAINT [PK_users] PRIMARY KEY NONCLUSTERED ([id])',
+      'CREATE CLUSTERED INDEX [cx_email] ON [dbo].[users] ([email])'
+    ])
+  })
+
+  it('leaves a NONCLUSTERED key alone beside a clustered index', () => {
+    const d = keyed('nonclustered')
+    d.indexes.push(
+      newIndex({ name: 'cx_email', columns: [col(d, 'email').id], method: 'CLUSTERED' })
+    )
+    expect(tableStatements('tsql', d)).toEqual([
+      'CREATE CLUSTERED INDEX [cx_email] ON [dbo].[users] ([email])'
+    ])
+    // Other engines have no such thing
+    expect(tableStatements('postgres', { ...load('postgres'), original: null })[0]).toContain(
+      'PRIMARY KEY (id)'
+    )
+  })
+})

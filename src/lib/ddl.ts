@@ -125,11 +125,15 @@ export interface TableDraft {
   foreignKeys: ForeignKeyDraft[]
   checks: CheckDraft[]
   uniques: UniqueDraft[]
+  /** SQL Server: the key's CLUSTERED or NONCLUSTERED as loaded, '' or absent for the default */
+  primaryKeyMethod?: string
   /** The table as loaded; null when creating one */
   original: {
     name: string
     primaryKey: string[]
     primaryKeyName: string | null
+    /** SQL Server: the loaded key's CLUSTERED or NONCLUSTERED */
+    primaryKeyMethod?: string
     /** SQLite: what a rebuild carries over from the old table */
     sqlite?: { shape: SqliteTableShape | null; triggers: string[] }
   } | null
@@ -392,6 +396,8 @@ export function draftFromTable(
   const idOf = (column: string): string =>
     columns.find((c) => c.name === column)?.id ?? `?${column}`
   const primaryKey = info.primaryKey.map(idOf)
+  const primaryKeyMethod =
+    dialect === 'tsql' ? keyMethod(info.indexes.find((ix) => ix.primary)?.method) : ''
   const constraintIndexes = new Set([
     ...(extras?.uniques.map((u) => u.index) ?? []),
     // PostgreSQL exclusion constraints own their index, which pg_get_indexdef shows without operators
@@ -448,10 +454,12 @@ export function draftFromTable(
       const state: UniqueState = { name: u.name ?? '', columns: u.columns.map(idOf) }
       return { ...state, id: draftId(), initial: state, dropped: false }
     }),
+    ...(primaryKeyMethod && { primaryKeyMethod }),
     original: {
       name,
       primaryKey,
       primaryKeyName: info.indexes.find((ix) => ix.primary)?.name ?? null,
+      ...(primaryKeyMethod && { primaryKeyMethod }),
       ...(dialect === 'sqlite' && {
         sqlite: {
           shape,
@@ -505,7 +513,20 @@ interface ColumnDiff {
 }
 
 function diffColumn(draft: TableDraft, c: ColumnDraft): ColumnDiff | null {
-  if (!c.original || c.dropped || c.computed) return null
+  if (!c.original || c.dropped) return null
+  // A computed column's definition isn't edited here; it can only be renamed
+  if (c.computed)
+    return c.name.trim() !== c.original.name
+      ? {
+          renamed: true,
+          type: false,
+          nullable: false,
+          default: false,
+          identity: false,
+          comment: false,
+          attributes: false
+        }
+      : null
   const now = effective(draft, c)
   const was = effective(draft, { ...c.original, id: undefined })
   // The original snapshot isn't tied to the current key, so compare its own nullability
@@ -534,8 +555,31 @@ export function columnChanged(draft: TableDraft, c: ColumnDraft): boolean {
 const sameList = (a: string[], b: string[]): boolean =>
   a.length === b.length && a.every((x, i) => x === b[i])
 
-function primaryKeyChanged(draft: TableDraft): boolean {
-  return !!draft.original && !sameList(primaryKeyOf(draft), draft.original.primaryKey)
+/** SQL Server's CLUSTERED or NONCLUSTERED, as a primary key spells it; '' for anything else. */
+const keyMethod = (method: string | null | undefined): string =>
+  /^(non)?clustered$/i.test(method?.trim() ?? '') ? method!.trim().toUpperCase() : ''
+
+/**
+ * SQL Server: CLUSTERED or NONCLUSTERED for the key, '' for the default. A key is
+ * clustered by default, so it's NONCLUSTERED whenever another index is clustered.
+ */
+export function primaryKeyKind(dialect: Dialect, draft: TableDraft): string {
+  if (dialect !== 'tsql') return ''
+  // Columnstore indexes can be clustered too
+  const clustered = draft.indexes.some(
+    (ix) => !ix.dropped && /^clustered\b/i.test(ix.method.trim())
+  )
+  return clustered ? 'NONCLUSTERED' : keyMethod(draft.primaryKeyMethod)
+}
+
+function primaryKeyChanged(dialect: Dialect, draft: TableDraft): boolean {
+  const original = draft.original
+  if (!original) return false
+  if (!sameList(primaryKeyOf(draft), original.primaryKey)) return true
+  // A key that has to switch between CLUSTERED and NONCLUSTERED is dropped and added again
+  const kind = primaryKeyKind(dialect, draft)
+  const was = keyMethod(original.primaryKeyMethod)
+  return !!primaryKeyOf(draft).length && !!kind && !!was && kind !== was
 }
 
 /**
@@ -632,7 +676,7 @@ export function countChanges(draft: TableDraft, dialect: Dialect = 'postgres'): 
       (uq) => !!uq.initial,
       (uq) => uniqueChange(dialect, uq)
     ) +
-    (primaryKeyChanged(draft) ? 1 : 0) +
+    (primaryKeyChanged(dialect, draft) ? 1 : 0) +
     (draft.name.trim() !== draft.original.name ? 1 : 0)
   )
 }
@@ -743,6 +787,7 @@ export function draftWarnings(
       )
     if (
       !c.dropped &&
+      !c.computed &&
       now.invisible &&
       !now.nullable &&
       !now.default &&
@@ -945,7 +990,8 @@ function primaryKeyConstraint(dialect: Dialect, draft: TableDraft): string {
   // SQL Server would otherwise name it PK__table__<random>
   const name =
     dialect === 'tsql' ? `CONSTRAINT ${quoteIdent(dialect, `PK_${draft.name.trim()}`)} ` : ''
-  return `${name}PRIMARY KEY (${columnList(dialect, draft, primaryKeyOf(draft))})`
+  const kind = primaryKeyKind(dialect, draft)
+  return `${name}PRIMARY KEY ${kind ? `${kind} ` : ''}(${columnList(dialect, draft, primaryKeyOf(draft))})`
 }
 
 /** Items to (re)create: new ones and existing ones that changed shape. */
@@ -1114,7 +1160,7 @@ function alterStatements(dialect: Dialect, draft: TableDraft, options: DdlOption
   const constrainedDefaults = dialect === 'tsql' && !options.babelfish
   const table = qualified(dialect, { schema: draft.schema, name: original.name })
   const q = (name: string): string => quoteIdent(dialect, name)
-  const pkChanged = primaryKeyChanged(draft)
+  const pkChanged = primaryKeyChanged(dialect, draft)
   const p = plan(dialect, draft)
   const droppedColumns = draft.columns.filter((c) => c.original && c.dropped)
   const addedColumns = draft.columns.filter((c) => !c.original && !c.dropped)
@@ -1145,6 +1191,11 @@ function alterStatements(dialect: Dialect, draft: TableDraft, options: DdlOption
     for (const c of draft.columns) {
       const diff = diffColumn(draft, c)
       if (!diff) continue
+      // CHANGE COLUMN would have to restate the generation expression; RENAME COLUMN (MySQL 8.0, MariaDB 10.5.2) doesn't
+      if (c.computed) {
+        clauses.push(`RENAME COLUMN ${q(c.original!.name)} TO ${q(c.name.trim())}`)
+        continue
+      }
       const now = effective(draft, c)
       const definition = columnDefinition(
         dialect,
@@ -1315,7 +1366,7 @@ export function needsRebuild(draft: TableDraft): boolean {
         (!c.original && !c.dropped && !sqliteCanAdd(draft, c))
       )
     }) ||
-    primaryKeyChanged(draft) ||
+    primaryKeyChanged(dialect, draft) ||
     p.dropForeignKeys.length + p.createForeignKeys.length > 0 ||
     p.dropChecks.length + p.createChecks.length > 0 ||
     p.dropUniques.length + p.createUniques.length > 0

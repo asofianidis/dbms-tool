@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   PUBLIC_PRINCIPAL,
   emptyGrantState,
+  grantAll,
   grantQuery,
   grantStatements,
   membershipStatements,
+  nextGrantLevel,
   parseGrantRows,
   parseMembershipRows,
   parsePrincipals,
@@ -372,5 +374,50 @@ describe('MySQL database grant patterns', () => {
     expect(grantStatements('mysql', app, db, escaped, state({}))).toEqual([
       "REVOKE DELETE ON `my\\_db`.* FROM 'app'@'%'"
     ])
+  })
+})
+
+describe('Grant checkboxes', () => {
+  const reader = role('reader')
+  const bulk: Securable = { kind: 'tables', schema: 'public', name: null, args: null }
+
+  it('grants all without dropping the grant option from privileges that have it', () => {
+    const original = state({ SELECT: 'grantable', INSERT: 'partial' })
+    const draft = grantAll(original.privileges, ['SELECT', 'INSERT', 'UPDATE'])
+    expect(draft).toEqual({ SELECT: 'grantable', INSERT: 'grant', UPDATE: 'grant' })
+    const statements = grantStatements('postgres', reader, bulk, original, state(draft))
+    expect(statements).toEqual(['GRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO reader'])
+    expect(statements.join()).not.toMatch(/REVOKE/)
+  })
+
+  it('cycles a partial privilege back to partial, which changes nothing', () => {
+    const original = state({ SELECT: 'partial' })
+    const first = nextGrantLevel('partial', 'partial')
+    const second = nextGrantLevel(first, 'partial')
+    const third = nextGrantLevel(second, 'partial')
+    expect([first, second, third]).toEqual(['grant', 'none', 'partial'])
+    expect(grantStatements('postgres', reader, bulk, original, state({ SELECT: second }))).toEqual([
+      'REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM reader'
+    ])
+    expect(grantStatements('postgres', reader, bulk, original, state({ SELECT: third }))).toEqual(
+      []
+    )
+    // Others still toggle between held and not
+    expect(nextGrantLevel('none', 'none')).toBe('grant')
+    expect(nextGrantLevel('grantable', 'grantable')).toBe('none')
+    expect(nextGrantLevel('none', 'grant')).toBe('grant')
+  })
+})
+
+describe('MySQL roles', () => {
+  it('only counts locked password-plugin accounts without a password as roles', () => {
+    const [mysql] = principalQueries('mysql', false)
+    expect(mysql).toMatch(/account_locked = 'Y' AND authentication_string = ''/)
+    expect(mysql).toMatch(
+      /plugin IN \('caching_sha2_password', 'mysql_native_password', 'sha256_password'\)/
+    )
+    // MariaDB flags its roles
+    const [maria] = principalQueries('mysql', true)
+    expect(maria).toMatch(/is_role = 'Y'/)
   })
 })

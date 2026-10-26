@@ -544,7 +544,6 @@ impl MsSession {
         out: &mut OutputBuilder,
         cancel: &CancelSignal,
     ) -> Result<(), tiberius::error::Error> {
-        let mut database = None;
         let cancelled = {
             let mut stream = self.client.simple_query_all(batch).await?;
             let mut cancelled = false;
@@ -595,14 +594,13 @@ impl MsSession {
                             out.message("info", m.message);
                         }
                     }
-                    QueryItem::DatabaseChanged(db) => database = Some(db),
+                    // Recorded at once: a later error in the batch returns
+                    // early, but the switch has happened on the server
+                    QueryItem::DatabaseChanged(db) => self.database = db,
                 }
             }
             cancelled
         };
-        if let Some(db) = database {
-            self.database = db;
-        }
         if cancelled {
             out.cancelled = true;
             if self.broken {
@@ -809,23 +807,45 @@ impl MsSession {
                 .await
                 .unwrap_or_default(),
         };
-        let fk_rows = self
+        // sys.foreign_key_columns pairs each column with the one it references
+        // (INFORMATION_SCHEMA misses keys that reference a unique index)
+        let fk_rows = match self
             .rows(
-                "SELECT rc.CONSTRAINT_NAME, k.COLUMN_NAME, k2.TABLE_SCHEMA, k2.TABLE_NAME, k2.COLUMN_NAME, \
-                   rc.UPDATE_RULE, rc.DELETE_RULE \
-                 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k \
-                   ON k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k2 \
-                   ON k2.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA \
-                  AND k2.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME \
-                  AND k2.ORDINAL_POSITION = k.ORDINAL_POSITION \
-                 WHERE k.TABLE_SCHEMA = @P1 AND k.TABLE_NAME = @P2 \
-                 ORDER BY rc.CONSTRAINT_NAME, k.ORDINAL_POSITION",
-                &[&schema, &table],
+                "SELECT fk.name, c.name, rs.name, rt.name, rc.name, \
+                   REPLACE(fk.update_referential_action_desc, '_', ' '), \
+                   REPLACE(fk.delete_referential_action_desc, '_', ' ') \
+                 FROM sys.foreign_keys fk \
+                 JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+                 JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id \
+                 JOIN sys.objects rt ON rt.object_id = fkc.referenced_object_id \
+                 JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+                 JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+                 WHERE fk.parent_object_id = OBJECT_ID(@P1) \
+                 ORDER BY fk.name, fkc.constraint_column_id",
+                &[&qualified.as_str()],
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            // Fallback (Babelfish gaps): keys that reference a primary key or unique constraint
+            Err(_) => self
+                .rows(
+                    "SELECT rc.CONSTRAINT_NAME, k.COLUMN_NAME, k2.TABLE_SCHEMA, k2.TABLE_NAME, k2.COLUMN_NAME, \
+                       rc.UPDATE_RULE, rc.DELETE_RULE \
+                     FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
+                     JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k \
+                       ON k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
+                     JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k2 \
+                       ON k2.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA \
+                      AND k2.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME \
+                      AND k2.ORDINAL_POSITION = k.ORDINAL_POSITION \
+                     WHERE k.TABLE_SCHEMA = @P1 AND k.TABLE_NAME = @P2 \
+                     ORDER BY rc.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+                    &[&schema, &table],
+                )
+                .await
+                .unwrap_or_default(),
+        };
         let trigger_rows = self
             .rows(
                 "SELECT tr.name, CASE tr.is_instead_of_trigger WHEN 1 THEN 'INSTEAD OF' ELSE 'AFTER' END, \

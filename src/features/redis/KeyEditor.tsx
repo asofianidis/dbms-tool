@@ -788,7 +788,7 @@ function HashValue({
           <tr
             key={dataText(r.field)}
             className="group hover:bg-hover/50"
-            onDoubleClick={() => !readOnly && editRow(r)}
+            onDoubleClick={() => !readOnly && !isHex(r.value) && editRow(r)}
           >
             <td className={td}>
               <Cell value={r.field} className="text-syn-prop" />
@@ -866,13 +866,23 @@ function ListValue({
               value: dataText(r.value),
               confirmLabel: 'Save',
               onSave: (_, value) =>
-                write({ op: 'listSet', database, key: keyName, index: r.index, value }, 'Saved')
+                write(
+                  {
+                    op: 'listSet',
+                    database,
+                    key: keyName,
+                    index: r.index,
+                    value,
+                    expected: r.value
+                  },
+                  'Saved'
+                )
             })
           return (
             <tr
               key={r.index}
               className="group hover:bg-hover/50"
-              onDoubleClick={() => !readOnly && editRow()}
+              onDoubleClick={() => !readOnly && !isHex(r.value) && editRow()}
             >
               <td className={cn(td, 'font-mono text-xs text-faint tabular-nums')}>{r.index}</td>
               <td className={td}>
@@ -884,7 +894,13 @@ function ListValue({
                   onEdit={isHex(r.value) ? undefined : editRow}
                   onDelete={() =>
                     void write(
-                      { op: 'listRemove', database, key: keyName, index: r.index },
+                      {
+                        op: 'listRemove',
+                        database,
+                        key: keyName,
+                        index: r.index,
+                        expected: r.value
+                      },
                       'Item removed'
                     )
                   }

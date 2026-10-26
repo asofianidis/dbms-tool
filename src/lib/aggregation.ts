@@ -87,6 +87,34 @@ function isDoc(v: Json): v is Doc {
   return bsonType(v) === 'Object'
 }
 
+/**
+ * `$exists`'s argument as MongoDB reads it: false, null and zero (in any number type)
+ * mean "missing"; anything else, even an empty string, means "present".
+ */
+export function existsFlag(v: Json): boolean {
+  switch (bsonType(v)) {
+    case 'Null':
+    case 'Undefined':
+      return false
+    case 'Boolean':
+      return v === true
+    case 'Int32':
+    case 'Int64':
+    case 'Double':
+    case 'Decimal128': {
+      const n = typeof v === 'number' ? v : Number(Object.values(v as Doc)[0])
+      return n !== 0
+    }
+    default:
+      return true
+  }
+}
+
+/** A form's `$exists` value text (`true`, `false`, `0`, …) → whether the field must exist. */
+export function existsText(text: string): boolean {
+  return existsFlag(valueFromText(text))
+}
+
 /** `'$price'` → `price`; null for anything that isn't a plain field path. */
 function refField(v: Json): string | null {
   return typeof v === 'string' && v.startsWith('$') && !v.startsWith('$$') && v.length > 1
@@ -256,7 +284,9 @@ function fieldConditions(doc: Doc): MatchCondition[] | null {
           ? Array.isArray(o[key])
             ? listText(o[key])
             : null
-          : valueToText(o[key])
+          : op === 'exists'
+            ? String(existsFlag(o[key]))
+            : valueToText(o[key])
       if (value === null) return null
       out.push({ field, op, value })
     }
@@ -292,7 +322,7 @@ function conditionOp(c: MatchCondition): Doc {
     case 'nin':
       return { [`$${c.op}`]: listValue(c.value) }
     case 'exists':
-      return { $exists: c.value.trim() !== 'false' }
+      return { $exists: existsText(c.value) }
     default:
       return { [`$${c.op}`]: valueFromText(c.value) }
   }
@@ -536,6 +566,14 @@ export function formBody(form: StageForm): Json {
 
 export function formText(form: StageForm): string {
   return bodyText(formBody(form))
+}
+
+/** Stages that write to a collection, so previews, explain and export skip or refuse them */
+export const WRITE_STAGES: ReadonlySet<string> = new Set(['$out', '$merge'])
+
+/** Whether a built stage document (`{ $out: … }`) writes. */
+export function isWriteStage(stage: unknown): boolean {
+  return !!stage && typeof stage === 'object' && Object.keys(stage).some((k) => WRITE_STAGES.has(k))
 }
 
 /** Dotted field paths seen in documents, for field pickers. */

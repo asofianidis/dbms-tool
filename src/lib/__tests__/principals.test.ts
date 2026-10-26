@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Principal } from '../grants'
 import {
   canRenamePrincipal,
+  draftPrincipal,
   dropPrincipalStatements,
   memberStatements,
   newPrincipalDraft,
@@ -134,15 +135,48 @@ describe('MySQL accounts', () => {
     ])
   })
 
-  it("doesn't rename roles, which MySQL and MariaDB refuse", () => {
+  it('renames and moves MySQL roles, which are accounts', () => {
     const loaded = parsePrincipalState('mysql', principal('reader', { host: '%', kind: 'role' }), [
       ['n', '0']
     ])!
-    expect(principalStatements('mysql', draft(principalDraftFrom(loaded), { name: 'r2' }))).toEqual(
-      []
-    )
-    expect(canRenamePrincipal('mysql', 'role')).toBe(false)
+    const d = principalDraftFrom(loaded)
+    expect(principalStatements('mysql', d)).toEqual([])
+    expect(principalStatements('mysql', draft(d, { host: 'localhost' }))).toEqual([
+      "RENAME USER 'reader'@'%' TO 'reader'@'localhost'"
+    ])
+    expect(principalStatements('mysql', draft(d, { name: 'r2' }))).toEqual([
+      "RENAME USER 'reader'@'%' TO 'r2'@'%'"
+    ])
+    expect(canRenamePrincipal('mysql', 'role')).toBe(true)
     expect(canRenamePrincipal('mysql', 'user')).toBe(true)
+  })
+
+  it("doesn't rename MariaDB roles, which it refuses", () => {
+    const loaded = parsePrincipalState('mysql', principal('reader', { host: '', kind: 'role' }), [
+      ['n', '0']
+    ])!
+    expect(
+      principalStatements('mysql', draft(principalDraftFrom(loaded), { name: 'r2' }), {
+        mariadb: true
+      })
+    ).toEqual([])
+    expect(canRenamePrincipal('mysql', 'role', { mariadb: true })).toBe(false)
+    expect(canRenamePrincipal('mysql', 'user', { mariadb: true })).toBe(true)
+  })
+
+  it('renames a role before changing its memberships under the new host', () => {
+    const loaded = parsePrincipalState('mysql', principal('app', { host: '%', kind: 'role' }), [
+      ['n', '0']
+    ])!
+    const d = draft(principalDraftFrom(loaded), { host: 'localhost' })
+    const target = draftPrincipal('mysql', d)
+    expect([
+      ...principalStatements('mysql', d),
+      ...memberStatements('mysql', target, [], {}, { 'bob@%': 'grant' })
+    ]).toEqual([
+      "RENAME USER 'app'@'%' TO 'app'@'localhost'",
+      "GRANT 'app'@'localhost' TO 'bob'@'%'"
+    ])
   })
 
   it('drops users and roles', () => {

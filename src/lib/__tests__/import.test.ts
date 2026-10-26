@@ -11,6 +11,7 @@ import {
   mongoValue,
   parseCsv,
   parseFile,
+  MAX_JSON_DEPTH,
   parseJson,
   profileColumn,
   sqlType,
@@ -317,5 +318,21 @@ describe('MongoDB documents', () => {
   it('batches by count and size', () => {
     expect(documentBatches([1, 2, 3, 4, 5], 2).map((b) => b.length)).toEqual([2, 2, 1])
     expect(documentBatches(['aaaa', 'bbbb'], 10, 8).map((b) => b.length)).toEqual([1, 1])
+  })
+})
+
+describe('parseJson nesting', () => {
+  it('refuses very deep nesting with a clear error instead of overflowing', () => {
+    const deep = '['.repeat(20000) + ']'.repeat(20000)
+    expect(() => parseJson(deep)).toThrow(/nested more than 1000 levels/)
+    const objects = '{"a":'.repeat(20000) + '1' + '}'.repeat(20000)
+    expect(() => parseJson(objects)).toThrow(/nested more than/)
+  })
+
+  it('still reads nesting up to the limit, counting depth rather than siblings', () => {
+    const ok = '['.repeat(MAX_JSON_DEPTH) + ']'.repeat(MAX_JSON_DEPTH)
+    expect(() => parseJson(ok)).not.toThrow()
+    const wide = `[${Array.from({ length: 5000 }, () => '[{}]').join(',')}]`
+    expect((parseJson(wide) as unknown[]).length).toBe(5000)
   })
 })

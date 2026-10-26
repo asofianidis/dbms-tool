@@ -215,6 +215,26 @@ pub async fn dump(server: &Server, job: &MongoDumpJob, report: &Report<'_>) -> A
     Ok(())
 }
 
+/// The outermost of `dir` and its parents that doesn't exist yet, which is what
+/// a run creates. Only a definite NotFound counts: `Path::exists` follows links
+/// and says false on any error, so a broken link or junction (a backup folder
+/// on a disconnected drive) would look missing and be removed with the dump.
+/// Links are looked at, not through, and any other error stops the walk.
+fn outermost_missing(dir: &Path) -> Option<PathBuf> {
+    let mut created = None;
+    let mut probe = Some(dir);
+    while let Some(p) = probe.filter(|p| !p.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                created = Some(p.to_path_buf());
+                probe = p.parent();
+            }
+            _ => break,
+        }
+    }
+    created
+}
+
 /// What a folder dump's target held before the run, so a failed or cancelled
 /// run removes what it wrote and leaves everything that was there alone.
 pub struct DumpFolder {
@@ -232,12 +252,7 @@ impl DumpFolder {
             return None;
         }
         let dir = Path::new(job.path.trim()).join(escape_name(job.database.trim()));
-        let mut created = None;
-        let mut probe = Some(dir.as_path());
-        while let Some(p) = probe.filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
-            created = Some(p.to_path_buf());
-            probe = p.parent();
-        }
+        let created = outermost_missing(&dir);
         let existing = std::fs::read_dir(&dir)
             .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -250,7 +265,10 @@ impl DumpFolder {
 
     pub fn discard(&self) {
         if let Some(created) = &self.created {
-            let _ = std::fs::remove_dir_all(created);
+            // Only a real folder: never a link (or junction) that appeared in its place
+            if std::fs::symlink_metadata(created).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(created);
+            }
             return;
         }
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -845,6 +863,109 @@ mod tests {
         let mut archive = job(&root);
         archive.archive = true;
         assert!(DumpFolder::before(&archive).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn dump_job(path: &Path) -> MongoDumpJob {
+        MongoDumpJob {
+            database: "shop".into(),
+            path: path.display().to_string(),
+            archive: false,
+            gzip: false,
+            exclude_collections: Vec::new(),
+        }
+    }
+
+    /// A directory link to `target`; false where the platform won't make one
+    /// (Windows without the symlink privilege falls back to a junction).
+    fn dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+                || std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn a_broken_link_is_never_taken_for_a_folder_the_run_created() {
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("drive");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("Backups");
+        if !dir_link(&target, &link) {
+            eprintln!("skipped: this platform or user can't create directory links");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        // The link's target goes away, as a disconnected drive does
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(!link.exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+
+        let folder = DumpFolder::before(&dump_job(&link)).unwrap();
+        assert_ne!(folder.created.as_deref(), Some(link.as_path()));
+        assert_ne!(folder.created.as_deref(), Some(root.as_path()));
+        folder.discard();
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the link was removed"
+        );
+
+        // A working link: the run only creates what's inside it
+        std::fs::create_dir_all(&target).unwrap();
+        let folder = DumpFolder::before(&dump_job(&link)).unwrap();
+        assert_eq!(folder.created, Some(link.join("shop")));
+        std::fs::create_dir_all(link.join("shop")).unwrap();
+        std::fs::write(link.join("shop").join("a.bson"), b"").unwrap();
+        folder.discard();
+        assert!(!target.join("shop").exists());
+        assert!(target.exists() && std::fs::symlink_metadata(&link).is_ok());
+
+        // Removing the link itself doesn't touch its target
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(&link);
+        #[cfg(not(windows))]
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paths_that_fail_to_read_are_not_taken_for_missing_ones() {
+        // An invalid path errors rather than reporting NotFound, which Path::exists treats alike
+        assert_eq!(outermost_missing(Path::new("bad\0name/shop")), None);
+
+        // A file in the way of the path
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("notes.txt");
+        std::fs::write(&file, b"keep").unwrap();
+        let folder = DumpFolder::before(&dump_job(&file)).unwrap();
+        assert_ne!(folder.created.as_deref(), Some(file.as_path()));
+        assert_ne!(folder.created.as_deref(), Some(root.as_path()));
+        // Unix reports NotADirectory, which stops the walk at once
+        #[cfg(unix)]
+        assert_eq!(folder.created, None);
+        folder.discard();
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+
+        // Missing folders under an existing one are still the run's own
+        let fresh = root.join("a").join("b");
+        assert_eq!(outermost_missing(&fresh), Some(root.join("a")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

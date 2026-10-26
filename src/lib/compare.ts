@@ -7,6 +7,7 @@ import {
   dropSchemaStatement,
   foreignKeyClause,
   newSchemaDraft,
+  primaryKeyKind,
   schemaStatements,
   tableStatements,
   writableIndexMethod,
@@ -329,19 +330,23 @@ const foreignKeySignature = (fk: ForeignKey): string =>
     fk.onUpdate ?? 'NO ACTION'
   ].join('|')
 
-/** Pairs items by name, then unmatched ones by signature (so auto-generated names don't count). */
+/**
+ * Pairs items by name, then unmatched ones by signature (so auto-generated names don't count).
+ * Without `byName`, only signatures pair them.
+ */
 function pair<T extends { name: string }>(
   dialect: Dialect,
   source: T[],
   target: T[],
-  signature: (x: T) => string
+  signature: (x: T) => string,
+  byName = true
 ): { matched: [T, T][]; added: T[]; removed: T[] } {
   const matched: [T, T][] = []
   const freeSource = new Set(source)
   const removed: T[] = []
   const unnamed: T[] = []
   for (const t of target) {
-    const s = source.find((x) => freeSource.has(x) && sameName(dialect, x.name, t.name))
+    const s = byName && source.find((x) => freeSource.has(x) && sameName(dialect, x.name, t.name))
     if (s) {
       freeSource.delete(s)
       matched.push([s, t])
@@ -355,6 +360,37 @@ function pair<T extends { name: string }>(
     } else removed.push(t)
   }
   return { matched, added: [...freeSource], removed }
+}
+
+/**
+ * Index names are unique per schema on PostgreSQL and SQLite, so comparing two
+ * tables there can't create the source's indexes under their own names. The
+ * source table's prefix becomes the target's (`a_x_idx` on a is `b_x_idx` on b);
+ * a name without it gets the target's name as a suffix. Null when names can stay:
+ * other comparisons, other engines, or tables in different schemas.
+ */
+function indexNamer(
+  ctx: CompareContext,
+  source: SnapshotObject,
+  target: SnapshotObject
+): ((name: string, taken: string[]) => string) | null {
+  const { dialect } = ctx
+  if (ctx.scope !== 'table' || (dialect !== 'postgres' && dialect !== 'sqlite')) return null
+  if (sameName(dialect, source.name, target.name)) return null
+  const from = qualifierIn(ctx, ctx.source, source.schema)
+  const to = qualifierIn(ctx, ctx.target, target.schema)
+  if (dialect === 'postgres' && from !== to) return null
+  const fold = (n: string): string => (dialect === 'postgres' ? n : n.toLowerCase())
+  const prefix = fold(`${source.name}_`)
+  return (name, taken) => {
+    const used = new Set(taken.map(fold))
+    const base = fold(name).startsWith(prefix)
+      ? `${target.name}_${name.slice(prefix.length)}`
+      : `${name}_${target.name}`
+    let out = base
+    for (let n = 2; used.has(fold(out)); n++) out = `${base}_${n}`
+    return out
+  }
 }
 
 /** The source table with its schema references renamed into the target. */
@@ -680,22 +716,48 @@ function alterTable(
     const skip = pgConstraintIndexes(extras)
     return info.indexes.filter((ix) => !ix.primary && !skip.has(ix.name))
   }
-  const indexPairs = pair(dialect, nonPrimary(s, pg?.[0]), nonPrimary(t, pg?.[1]), (ix) =>
-    indexSignature(dialect, ix)
+  // Two tables in one schema can't share index names, so only their shapes pair them
+  const namer = indexNamer(ctx, source, target)
+  const indexPairs = pair(
+    dialect,
+    nonPrimary(s, pg?.[0]),
+    nonPrimary(t, pg?.[1]),
+    (ix) => indexSignature(dialect, ix),
+    !namer
   )
+  // Names the new indexes can't take: the source's own, and the target's that stay
+  const removedIndexes = new Set(indexPairs.removed)
+  const takenNames = [
+    ...s.indexes.map((ix) => ix.name),
+    ...t.indexes.filter((ix) => !removedIndexes.has(ix)).map((ix) => ix.name)
+  ]
+  const targetNames = new Map<IndexInfo, string>()
+  const nameOf = (ix: IndexInfo): string => {
+    if (!namer) return ix.name
+    let name = targetNames.get(ix)
+    if (name === undefined) {
+      name = namer(ix.name, takenNames)
+      takenNames.push(name)
+      targetNames.set(ix, name)
+    }
+    return name
+  }
   const dropIndex = (ix: IndexInfo): void => {
     const draft = indexes.find((d) => d.original === ix)
     if (draft) draft.dropped = true
   }
   const addIndex = (ix: IndexInfo, draft: TableDraft): void => {
     // The source's definition names the source table, which a table comparison may call something else
-    if (pgDefinitionIndex(dialect, ix)) extraIndexSql.push(pgIndexSql(ix.definition!, table))
-    else indexes.push(newIndex(dialect, draft, ix))
+    if (pgDefinitionIndex(dialect, ix))
+      extraIndexSql.push(pgIndexSql(ix.definition!, table, namer ? nameOf(ix) : undefined))
+    else indexes.push(newIndex(dialect, draft, { ...ix, name: nameOf(ix) }))
   }
   const desired: TableDraft = {
     ...loaded,
     columns,
     primaryKey,
+    // SQL Server: the source's CLUSTERED or NONCLUSTERED key
+    primaryKeyMethod: wanted.primaryKeyMethod,
     indexes,
     foreignKeys: loaded.foreignKeys
   }
@@ -718,7 +780,7 @@ function alterTable(
     addIndex(si, desired)
   }
   for (const ix of indexPairs.added) {
-    changes.push({ action: 'add', what: 'index', name: ix.name, to: describeIndex(dialect, ix) })
+    changes.push({ action: 'add', what: 'index', name: nameOf(ix), to: describeIndex(dialect, ix) })
     if (scriptableIndex(dialect, ix, item.warnings)) addIndex(ix, desired)
   }
 
@@ -766,13 +828,17 @@ function alterTable(
     ids.map((id) => draft.columns.find((c) => c.id === id)?.name ?? id)
   const pkFrom = t.primaryKey
   const pkTo = pkNames(desired, primaryKey)
-  if (lowerList(pkFrom) !== lowerList(pkTo))
+  // SQL Server: the target key's CLUSTERED or NONCLUSTERED, and the one tableStatements writes
+  const kindFrom = loaded.original?.primaryKeyMethod ? ` ${loaded.original.primaryKeyMethod}` : ''
+  const kindWanted = kindFrom && pkTo.length ? primaryKeyKind(dialect, desired) : ''
+  const kindTo = kindWanted ? ` ${kindWanted}` : ''
+  if (lowerList(pkFrom) !== lowerList(pkTo) || (kindTo && kindFrom !== kindTo))
     changes.push({
       action: pkFrom.length ? (pkTo.length ? 'change' : 'drop') : 'add',
       what: 'primary key',
       name: loaded.original?.primaryKeyName ?? 'primary key',
-      from: pkFrom.length ? `(${pkFrom.join(', ')})` : undefined,
-      to: pkTo.length ? `(${pkTo.join(', ')})` : undefined
+      from: pkFrom.length ? `(${pkFrom.join(', ')})${kindFrom}` : undefined,
+      to: pkTo.length ? `(${pkTo.join(', ')})${kindTo}` : undefined
     })
   for (const c of columns) {
     if (!c.original || c.dropped || !columnChanged(desired, c)) continue

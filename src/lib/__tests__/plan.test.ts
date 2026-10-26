@@ -237,6 +237,85 @@ describe('PostgreSQL JSON plans', () => {
     expect(scan.actualRows).toBe(30)
   })
 
+  it("doesn't call a parallel scan's workers repeated scans", () => {
+    const json = JSON.stringify([
+      {
+        Plan: {
+          'Node Type': 'Gather',
+          'Workers Launched': 2,
+          'Actual Total Time': 120,
+          'Actual Rows': 300000,
+          'Actual Loops': 1,
+          Plans: [
+            {
+              'Node Type': 'Seq Scan',
+              'Parallel Aware': true,
+              'Relation Name': 'big',
+              'Plan Rows': 100000,
+              'Actual Total Time': 100,
+              'Actual Rows': 100000,
+              'Actual Loops': 3
+            }
+          ]
+        }
+      }
+    ])
+    const plan = parsePlan(output([json]), 'postgres-json')!
+    expect(plan.trees[0].root.children[0].parallel).toBe(3)
+    expect(plan.hints.map((h) => h.title).filter((t) => /scanned/.test(t))).toEqual([])
+
+    const text = [
+      'Gather  (cost=0.00..100.00 rows=300000 width=4) (actual time=0.1..120.0 rows=300000 loops=1)',
+      '  Workers Planned: 2',
+      '  Workers Launched: 2',
+      '  ->  Parallel Seq Scan on big  (cost=0.00..90.00 rows=100000 width=4) (actual time=0.1..100.0 rows=100000 loops=3)'
+    ]
+    const fromText = parsePlan(output(text), 'postgres-text')!
+    expect(fromText.trees[0].root.children[0].parallel).toBe(3)
+    expect(fromText.hints.map((h) => h.title).filter((t) => /scanned/.test(t))).toEqual([])
+  })
+
+  it('still flags a scan repeated inside parallel workers', () => {
+    const json = JSON.stringify([
+      {
+        Plan: {
+          'Node Type': 'Gather',
+          'Workers Launched': 2,
+          'Actual Total Time': 900,
+          'Actual Rows': 30,
+          'Actual Loops': 1,
+          Plans: [
+            {
+              'Node Type': 'Nested Loop',
+              'Actual Total Time': 800,
+              'Actual Rows': 10,
+              'Actual Loops': 3,
+              Plans: [
+                {
+                  'Node Type': 'Seq Scan',
+                  'Parallel Aware': true,
+                  'Relation Name': 'outer_t',
+                  'Actual Total Time': 1,
+                  'Actual Rows': 100,
+                  'Actual Loops': 3
+                },
+                {
+                  'Node Type': 'Seq Scan',
+                  'Relation Name': 'inner_t',
+                  'Actual Total Time': 2,
+                  'Actual Rows': 1000,
+                  'Actual Loops': 300
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ])
+    const titles = parsePlan(output([json]), 'postgres-json')!.hints.map((h) => h.title)
+    expect(titles.filter((t) => /scanned/.test(t))).toEqual(['inner_t is scanned 300 times'])
+  })
+
   it('charges an InitPlan to the step that evaluates it', () => {
     const json = JSON.stringify([
       {
@@ -428,12 +507,42 @@ describe('SQL Server showplan XML', () => {
     expect(scan.target).toBe('Orders o using PK_Orders')
     expect(scan.relation).toBe('dbo.Orders')
     expect(scan.actualRows).toBe(10)
-    expect(scan.loops).toBe(2)
+    // Two threads each ran it once: not a repeat
+    expect(scan.loops).toBe(1)
     expect(scan.timeMs).toBe(30)
     expect(scan.rowsRemoved).toBe(99990)
     expect(scan.filter).toContain('[CustomerId]=(42)')
     expect(scan.warnings).toEqual(['Spilled to tempdb (level 1)'])
     expect(plan.trees[0].timeMs).toBe(31)
+    expect(plan.hints.map((h) => h.title).filter((t) => /scanned/.test(t))).toEqual([])
+  })
+
+  it('counts executions per thread for parallel operators', () => {
+    const counters = (execs: number): string =>
+      [1, 2, 3, 4]
+        .map(
+          (t) =>
+            `<RunTimeCountersPerThread Thread="${t}" ActualRows="500" ActualRowsRead="5000" ActualExecutions="${execs}" ActualElapsedms="20" />`
+        )
+        .join('')
+    const xml = (execs: number): string => `<ShowPlanXML><BatchSequence><Batch><Statements>
+      <StmtSimple StatementText="SELECT * FROM big"><QueryPlan DegreeOfParallelism="4">
+        <RelOp PhysicalOp="Table Scan" LogicalOp="Table Scan" Parallel="true" EstimateRows="2000" EstimatedTotalSubtreeCost="5">
+          <RunTimeInformation>${counters(execs)}</RunTimeInformation>
+          <TableScan><Object Table="[big]" /><Predicate><ScalarOperator ScalarString="[x]=(1)" /></Predicate></TableScan>
+        </RelOp>
+      </QueryPlan></StmtSimple>
+    </Statements></Batch></BatchSequence></ShowPlanXML>`
+    const once = parsePlan(output([xml(1)]), 'showplan-xml')!
+    const scan = once.trees[0].root
+    expect(scan.loops).toBe(1)
+    expect(scan.actualRows).toBe(2000)
+    expect(scan.timeMs).toBe(20)
+    expect(once.hints.map((h) => h.title).filter((t) => /scanned/.test(t))).toEqual([])
+    // Rescanned inside each thread: still a repeat
+    const again = parsePlan(output([xml(5)]), 'showplan-xml')!
+    expect(again.trees[0].root.loops).toBe(5)
+    expect(again.hints.map((h) => h.title)).toContain('big is scanned 5 times')
   })
 
   it('turns missing index details into a CREATE INDEX', () => {

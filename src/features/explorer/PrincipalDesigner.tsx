@@ -221,7 +221,8 @@ function PrincipalForm({
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Who the principal is after the changes, as membership statements name it
+  // Who the principal is after the changes, as membership statements name it. They run after
+  // principalStatements, so after any RENAME USER
   const target = principal && builtin ? principal : draftPrincipal(dialect, draft)
 
   const memberOf = useQuery({
@@ -569,7 +570,7 @@ function GeneralFields({
 }): React.JSX.Element {
   const creating = !draft.original
   const isRole = draft.type === 'role'
-  const renamable = creating || canRenamePrincipal(dialect, draft.type)
+  const renamable = creating || canRenamePrincipal(dialect, draft.type, options)
   const hasHost = dialect === 'mysql' && !(isRole && options.mariadb)
   // PostgreSQL roles can all have passwords, but only login roles use them
   const hasPassword =
@@ -598,7 +599,7 @@ function GeneralFields({
           className="min-w-48 flex-[2]"
           hint={
             !renamable
-              ? "MySQL and MariaDB roles can't be renamed"
+              ? "MariaDB roles can't be renamed"
               : dialect === 'postgres' && !creating && draft.name !== draft.original?.name
                 ? 'Renaming clears an MD5 password; SCRAM passwords are kept'
                 : undefined

@@ -580,8 +580,8 @@ export type RedisRequest =
   | { op: 'hashSet'; database: string; key: RData; field: RData; value: RData; onlyNew?: boolean }
   | { op: 'hashDelete'; database: string; key: RData; fields: RData[] }
   | { op: 'listPush'; database: string; key: RData; values: RData[]; head?: boolean }
-  | { op: 'listSet'; database: string; key: RData; index: number; value: RData }
-  | { op: 'listRemove'; database: string; key: RData; index: number }
+  | { op: 'listSet'; database: string; key: RData; index: number; value: RData; expected?: RData }
+  | { op: 'listRemove'; database: string; key: RData; index: number; expected?: RData }
   | { op: 'setAdd' | 'setRemove'; database: string; key: RData; members: RData[] }
   /** `score` as text too: `inf`, `-inf`, which JSON numbers can't carry */
   | { op: 'zsetAdd'; database: string; key: RData; member: RData; score: number | string }

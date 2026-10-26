@@ -217,8 +217,32 @@ export function parseShell(script: string, database: string): ShellOp[] {
       op.label = op.label.replace(/\.find\(/, '.count(')
       return self()
     }
-    handle.size = handle.count
-    handle.itcount = handle.count
+    // size() and itcount() count what the cursor returns, so skip and limit apply; the
+    // count op can't take them, so that case runs the count command, which can
+    const sized = (method: string) => () => {
+      const skip = req.skip ? Math.max(0, Number(req.skip)) : 0
+      const limit = req.limit ? Math.abs(Number(req.limit)) : 0
+      if (!skip && !limit) return (handle.count as () => unknown)()
+      const { allowDiskUse: _, readPreference, readConcern, ...options } = req.options ?? {}
+      if (readPreference !== undefined)
+        throw new ShellError(`.${method}() with skip or limit can’t take a read preference`)
+      op.request = {
+        op: 'runCommand',
+        database: req.database,
+        command: {
+          count: req.collection,
+          query: req.filter ?? {},
+          ...(skip ? { skip } : {}),
+          ...(limit ? { limit } : {}),
+          ...options,
+          ...(readConcern !== undefined ? { readConcern: { level: readConcern } } : {})
+        }
+      }
+      op.label += `${skip ? `.skip(${skip})` : ''}${limit ? `.limit(${limit})` : ''}.${method}()`
+      return self()
+    }
+    handle.size = sized('size')
+    handle.itcount = sized('itcount')
     handle.explain = (verbosity = 'queryPlanner') => {
       const find: Record<string, unknown> = { find: req.collection, filter: req.filter ?? {} }
       if (req.sort) find.sort = req.sort
@@ -618,7 +642,7 @@ export function parseShell(script: string, database: string): ShellOp[] {
     .map((line) => {
       const use = line.match(/^\s*use\s+([^\s;]+)\s*;?\s*(\/\/.*)?$/)
       if (use) return `__use(${JSON.stringify(use[1])});`
-      const show = line.match(/^\s*show\s+(dbs|databases|collections|tables)\s*;?\s*$/i)
+      const show = line.match(/^\s*show\s+(dbs|databases|collections|tables)\s*;?\s*(\/\/.*)?$/i)
       if (show) return `__show(${JSON.stringify(show[1].toLowerCase())});`
       return line
     })

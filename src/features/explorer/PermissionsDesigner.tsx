@@ -9,14 +9,17 @@ import {
   PUBLIC_PRINCIPAL,
   SECURABLE_LABELS,
   defaultsQuery,
+  grantAll,
   grantQuery,
   grantStatements,
   isBulkKind,
+  isHeld,
   isObjectKind,
   levelOf,
   membershipQueries,
   membershipStatements,
   needsContainer,
+  nextGrantLevel,
   objectSecurableKind,
   parseDefaultRows,
   parseGrantRows,
@@ -147,8 +150,6 @@ function Check({
     />
   )
 }
-
-const isHeld = (level: GrantLevel): boolean => level === 'grant' || level === 'grantable'
 
 function PermissionsDesigner(request: Request): React.JSX.Element {
   const { connectionId, database } = request
@@ -656,9 +657,10 @@ function PrivilegeMatrix({
               onChange={() =>
                 onChange((s) => ({
                   ...s,
-                  privileges: Object.fromEntries(
-                    options.map((p) => [p, allHeld ? 'none' : 'grant'] as const)
-                  )
+                  // Granting all leaves the grant option where it's held
+                  privileges: allHeld
+                    ? Object.fromEntries(options.map((p) => [p, 'none'] as const))
+                    : grantAll(s.privileges, options)
                 }))
               }
             />
@@ -673,9 +675,9 @@ function PrivilegeMatrix({
                 onChange={() =>
                   onChange((s) => ({
                     ...s,
-                    defaults: Object.fromEntries(
-                      options.map((p) => [p, allFuture ? 'none' : 'grant'] as const)
-                    )
+                    defaults: allFuture
+                      ? Object.fromEntries(options.map((p) => [p, 'none'] as const))
+                      : grantAll(s.defaults, options)
                   }))
                 }
               />
@@ -715,7 +717,9 @@ function PrivilegeMatrix({
                         ? 'Held on some objects in the schema; leave it to keep them as they are'
                         : undefined
                     }
-                    onChange={() => setLevel(p, isHeld(level) ? 'none' : 'grant')}
+                    onChange={() =>
+                      setLevel(p, nextGrantLevel(level, levelOf(original.privileges, p)))
+                    }
                   />
                 </span>
                 {perPrivilegeOption && (

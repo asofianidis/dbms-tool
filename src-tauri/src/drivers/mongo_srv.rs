@@ -215,7 +215,10 @@ impl<'a> Srv<'a> {
     /// The `mongodb://` string for the looked-up hosts and TXT record, with the
     /// checks the SRV spec asks of drivers.
     fn rewrite(&self, mut hosts: Vec<(String, u16)>, txt: &[String]) -> AppResult<String> {
-        let labels: Vec<&str> = self.host.split('.').collect();
+        // DNS names compare without case or a trailing dot; replies come back lowercase
+        let name = |host: &str| host.trim_end_matches('.').to_ascii_lowercase();
+        let srv_host = name(self.host);
+        let labels: Vec<&str> = srv_host.split('.').collect();
         // Hosts must share the parent domain (or the host itself, for two labels)
         let domain = if labels.len() >= 3 {
             &labels[1..]
@@ -223,7 +226,8 @@ impl<'a> Srv<'a> {
             &labels[..]
         };
         for (host, _) in &hosts {
-            let parts: Vec<&str> = host.split('.').collect();
+            let target = name(host);
+            let parts: Vec<&str> = target.split('.').collect();
             if !parts[1..].ends_with(domain) {
                 return Err(AppError::msg(format!(
                     "SRV lookup for {} returned {host}, which isn't in the domain {}",
@@ -377,6 +381,22 @@ mod tests {
         let srv = Srv::parse("mongodb+srv://example.net/").unwrap();
         assert!(srv.rewrite(hosts(&["a.example.net"]), &[]).is_ok());
         assert!(srv.rewrite(hosts(&["example.net"]), &[]).is_err());
+    }
+
+    #[test]
+    fn domain_check_ignores_case_and_trailing_dots() {
+        let srv = Srv::parse("mongodb+srv://Cluster0.ab1cd.MongoDB.net/").unwrap();
+        assert!(
+            srv.rewrite(hosts(&["ac-1-shard-00-00.ab1cd.mongodb.net"]), &[])
+                .is_ok()
+        );
+        assert!(
+            srv.rewrite(hosts(&["ac-1-shard-00-00.ab1cd.mongodb.net."]), &[])
+                .is_ok()
+        );
+        let srv = Srv::parse("mongodb+srv://cluster0.example.net./").unwrap();
+        assert!(srv.rewrite(hosts(&["A.Example.NET"]), &[]).is_ok());
+        assert!(srv.rewrite(hosts(&["a.example.com"]), &[]).is_err());
     }
 
     #[test]

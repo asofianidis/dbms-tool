@@ -24,7 +24,8 @@ type Doc = Record<string, unknown>
 interface Member {
   name: string
   state: string
-  health: boolean
+  /** null when unknown: only `hello` could be read */
+  health: boolean | null
   self: boolean
   uptimeSecs: number | null
   optime: number | null
@@ -94,6 +95,41 @@ async function find(connectionId: string, collection: string, filter: Doc = {}):
   return out.documents as Doc[]
 }
 
+/**
+ * Replica set members as `hello` lists them, for when replSetGetStatus is denied. Only the
+ * connected member's own state is known; the rest are as the connected member last saw
+ * them (the primary) or unknown, and nobody's health is known but the connected member's.
+ */
+export function helloMembers(hello: Doc): Member[] {
+  const selfState =
+    hello.isWritablePrimary === true || hello.ismaster === true
+      ? 'PRIMARY'
+      : hello.secondary === true
+        ? 'SECONDARY'
+        : hello.arbiterOnly === true
+          ? 'ARBITER'
+          : 'UNKNOWN'
+  const member = (name: string, state: string): Member => {
+    const self = name === hello.me
+    return {
+      name,
+      state: self ? selfState : state,
+      health: self ? true : null,
+      self,
+      uptimeSecs: null,
+      optime: null,
+      pingMs: null,
+      syncSource: ''
+    }
+  }
+  return [
+    ...[...((hello.hosts ?? []) as string[]), ...((hello.passives ?? []) as string[])].map((name) =>
+      member(name, name === hello.primary ? 'PRIMARY' : 'UNKNOWN')
+    ),
+    ...((hello.arbiters ?? []) as string[]).map((name) => member(name, 'ARBITER'))
+  ]
+}
+
 async function loadCluster(connectionId: string): Promise<Cluster> {
   const hello = await command(connectionId, { hello: 1 })
   const cluster: Cluster = {
@@ -121,32 +157,7 @@ async function loadCluster(connectionId: string): Promise<Cluster> {
     } catch (e) {
       // Without clusterMonitor, hello still names the members
       cluster.membersNote = errorMessage(e)
-      const role = (host: unknown): string => (host === hello.primary ? 'PRIMARY' : 'SECONDARY')
-      cluster.members = [
-        ...((hello.hosts ?? []) as string[]),
-        ...((hello.passives ?? []) as string[])
-      ].map((name) => ({
-        name,
-        state: role(name),
-        health: true,
-        self: name === hello.me,
-        uptimeSecs: null,
-        optime: null,
-        pingMs: null,
-        syncSource: ''
-      }))
-      for (const name of (hello.arbiters ?? []) as string[]) {
-        cluster.members.push({
-          name,
-          state: 'ARBITER',
-          health: true,
-          self: false,
-          uptimeSecs: null,
-          optime: null,
-          pingMs: null,
-          syncSource: ''
-        })
-      }
+      cluster.members = helloMembers(hello)
     }
   }
 
@@ -359,9 +370,18 @@ export function ClusterPanel({ connection }: { connection: ConnectionConfig }): 
                       {m.self && <span className="ml-2 text-[11px] text-faint">(connected)</span>}
                     </td>
                     <td className={td}>
-                      <Badge tone={m.health ? stateTone(m.state) : 'danger'}>
-                        {m.health ? m.state : `${m.state} · unreachable`}
-                      </Badge>
+                      {m.health === null ? (
+                        <Badge
+                          tone="neutral"
+                          title="Health unknown: replSetGetStatus wasn't allowed"
+                        >
+                          {m.state === 'UNKNOWN' ? 'unknown' : `${m.state} · health unknown`}
+                        </Badge>
+                      ) : (
+                        <Badge tone={m.health ? stateTone(m.state) : 'danger'}>
+                          {m.health ? m.state : `${m.state} · unreachable`}
+                        </Badge>
+                      )}
                     </td>
                     <td className={cn(td, 'tabular-nums')}>
                       {m.state === 'SECONDARY' && primaryOptime !== null && m.optime !== null

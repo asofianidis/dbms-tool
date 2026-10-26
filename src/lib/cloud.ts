@@ -898,6 +898,16 @@ export interface Credentials {
 /** Fills a connection in from credentials fetched when connecting. */
 export function applyCredentials(config: ConnectionConfig, credentials: Credentials): void {
   if (credentials.uri) config.uri = credentials.uri
+  else if (credentials.host && config.uri) {
+    // A host and port without a URI: point the existing URI at them (drivers
+    // prefer a URI over the host fields), keeping its options
+    const match = config.uri.match(/^mongodb(?:\+srv)?:\/\/(?:([^@/]*)@)?[^/?]*(.*)$/i)
+    if (match) {
+      const user = credentials.username ? encodeURIComponent(credentials.username) : match[1]
+      const port = credentials.port || config.port || 27017
+      config.uri = `mongodb://${user ? `${user}@` : ''}${credentials.host}:${port}${match[2]}`
+    } else config.uri = ''
+  }
   if (credentials.host) config.host = credentials.host
   if (credentials.port) config.port = credentials.port
   if (credentials.username) config.user = credentials.username
@@ -994,11 +1004,15 @@ export function connectionFor(db: CloudDatabase): ConnectionConfig {
       `mongodb://${encodeURIComponent(db.user)}@${db.host}:${db.port}/` +
       `?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@${db.name}@`
     config.host = ''
-  } else if (db.engine === 'mongo') {
+  } else if (db.engine === 'mongo' && db.host) {
+    // Railway's MongoDB template is the stock image behind a plain TCP proxy,
+    // without TLS; DocumentDB needs it
+    const tls = db.ref.provider === 'railway' ? '' : 'tls=true&'
     const user = db.user ? `${encodeURIComponent(db.user)}@` : ''
-    config.uri = `mongodb://${user}${db.host}:${db.port || 27017}/?tls=true&retryWrites=false`
+    config.uri = `mongodb://${user}${db.host}:${db.port || 27017}/?${tls}retryWrites=false`
     config.host = ''
   }
+  // Without a host yet (looked up when connecting), applyCredentials fills it in
   return config
 }
 

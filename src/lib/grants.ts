@@ -68,6 +68,29 @@ export const emptyGrantState = (): GrantState => ({
 
 export const levelOf = (map: GrantMap, key: string): GrantLevel => map[key] ?? 'none'
 
+export const isHeld = (level: GrantLevel): boolean => level === 'grant' || level === 'grantable'
+
+/** Grants the keys not yet held, keeping the grant option on those that have it. */
+export function grantAll(map: GrantMap, keys: string[]): GrantMap {
+  return {
+    ...map,
+    ...Object.fromEntries(
+      keys.map((k) => [k, isHeld(levelOf(map, k)) ? levelOf(map, k) : 'grant'] as const)
+    )
+  }
+}
+
+/**
+ * The next level of a grant checkbox: held → none → grant. One that started out 'partial'
+ * (held on some objects of a bulk kind) goes partial → grant → none and back to partial,
+ * which leaves those objects as they are.
+ */
+export function nextGrantLevel(level: GrantLevel, original: GrantLevel): GrantLevel {
+  if (isHeld(level)) return 'none'
+  if (level === 'none' && original === 'partial') return 'partial'
+  return 'grant'
+}
+
 export const PUBLIC_PRINCIPAL: Principal = {
   name: 'PUBLIC',
   host: null,
@@ -367,8 +390,11 @@ export function principalQueries(dialect: Dialect, mariadb?: boolean): string[] 
         "CASE WHEN User IN ('mysql.sys', 'mysql.session', 'mysql.infoschema', 'mariadb.sys') THEN 'y' ELSE 'n' END"
       // MariaDB flags roles
       const maria = `SELECT User, Host, CASE WHEN is_role = 'Y' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`
-      // MySQL roles are locked accounts without a password, by convention
-      const mysql = `SELECT User, Host, CASE WHEN account_locked = 'Y' AND authentication_string = '' THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`
+      // MySQL roles are locked accounts without a password, by convention. Socket and other
+      // external plugins have no password either, so only password plugins count
+      const mysql = `SELECT User, Host, CASE WHEN account_locked = 'Y' AND authentication_string = '' \
+         AND plugin IN ('caching_sha2_password', 'mysql_native_password', 'sha256_password') \
+         THEN 'role' ELSE 'user' END, ${system} FROM mysql.user ORDER BY 1, 2`
       return [
         // Skipping the other server's query keeps its 'Unknown column' error out of the log
         ...(mariadb === false ? [] : [maria]),

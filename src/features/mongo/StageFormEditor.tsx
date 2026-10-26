@@ -3,6 +3,7 @@ import { Plus, X } from 'lucide-react'
 import {
   ACCUMULATORS,
   MATCH_OPS,
+  existsText,
   type GroupOutput,
   type MatchCondition,
   type MatchOp,
@@ -136,7 +137,7 @@ function MatchForm({
           </Select>
           {c.op === 'exists' ? (
             <Select
-              value={c.value.trim() === 'false' ? 'false' : 'true'}
+              value={existsText(c.value) ? 'true' : 'false'}
               onChange={(e) => set(replace(form.conditions, i, { value: e.target.value }))}
               className="flex-1"
               selectClassName="h-7 text-xs"

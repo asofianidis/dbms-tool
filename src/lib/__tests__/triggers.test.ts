@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import type { TriggerInfo } from '../api'
 import {
+  canDisable,
   dollarQuote,
   dropTriggerStatement,
+  eventOptions,
   mysqlTriggerState,
   newTriggerDraft,
   pgTriggerState,
+  replaceFunctionBody,
+  singleEvent,
+  sqliteTriggerState,
+  timingOptions,
   triggerDraftFrom,
   triggerStatements,
   tsqlTriggerState,
@@ -177,5 +183,129 @@ END
       'CREATE TRIGGER [dbo].[stamp]\nON [dbo].[orders]\nINSTEAD OF INSERT\nAS\nSELECT 1'
     ])
     expect(dropTriggerStatement('tsql', 'stamp', msTarget)).toBe('DROP TRIGGER [dbo].[stamp]')
+  })
+})
+
+describe('PostgreSQL trigger function attributes', () => {
+  const functionDef = `CREATE OR REPLACE FUNCTION public.log_change()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ COST 50
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  RETURN NULL;
+END;
+$function$
+`
+
+  it('swaps only the body of pg_get_functiondef', () => {
+    expect(replaceFunctionBody(functionDef, 'BEGIN\n  RETURN NEW;\nEND;')).toBe(
+      "CREATE OR REPLACE FUNCTION public.log_change()\n RETURNS trigger\n LANGUAGE plpgsql\n SECURITY DEFINER\n COST 50\n SET search_path TO 'public', 'pg_temp'\nAS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$"
+    )
+    expect(replaceFunctionBody('CREATE FUNCTION f() RETURNS trigger BEGIN ATOMIC END', 'x')).toBe(
+      null
+    )
+    expect(replaceFunctionBody('', 'x')).toBeNull()
+  })
+
+  it('keeps the attributes when the body of an existing function is edited', () => {
+    const d = triggerDraftFrom(pgExisting(), functionDef)
+    const [statement] = triggerStatements(
+      'postgres',
+      { ...d, body: 'BEGIN\n  RETURN NEW;\nEND;' },
+      target
+    )
+    expect(statement).toContain('SECURITY DEFINER')
+    expect(statement).toContain("SET search_path TO 'public', 'pg_temp'")
+    expect(statement).toContain('COST 50')
+    expect(statement).toMatch(/AS \$\$\nBEGIN\n {2}RETURN NEW;\nEND;\n\$\$$/)
+  })
+})
+
+describe('SQLite triggers', () => {
+  const liteTarget: TriggerTarget = { schema: null, table: 'orders', isView: false }
+  const viewTarget: TriggerTarget = { schema: null, table: 'v_orders', isView: true }
+
+  it('offers only what SQLite supports', () => {
+    expect(timingOptions('sqlite', liteTarget)).toEqual(['BEFORE', 'AFTER'])
+    expect(timingOptions('sqlite', viewTarget)).toEqual(['INSTEAD OF'])
+    expect(eventOptions('sqlite', liteTarget)).toEqual(['INSERT', 'UPDATE', 'DELETE'])
+    expect(singleEvent('sqlite')).toBe(true)
+    expect(canDisable('sqlite', liteTarget)).toBe(false)
+    expect(newTriggerDraft('sqlite', liteTarget).rowLevel).toBe(true)
+  })
+
+  it('creates a trigger in SQLite syntax', () => {
+    const d = {
+      ...newTriggerDraft('sqlite', liteTarget),
+      name: 'stamp',
+      timing: 'AFTER' as const,
+      events: ['UPDATE' as const],
+      updateColumns: ['status'],
+      condition: 'OLD.status IS NOT NEW.status',
+      body: 'BEGIN\n  UPDATE orders SET touched = 1 WHERE id = NEW.id;\nEND;'
+    }
+    expect(validateTrigger('sqlite', d)).toBeNull()
+    expect(triggerStatements('sqlite', d, liteTarget)).toEqual([
+      'CREATE TRIGGER stamp\nAFTER UPDATE OF status ON orders\nFOR EACH ROW\nWHEN OLD.status IS NOT NEW.status\nBEGIN\n  UPDATE orders SET touched = 1 WHERE id = NEW.id;\nEND'
+    ])
+    expect(dropTriggerStatement('sqlite', 'stamp', liteTarget)).toBe('DROP TRIGGER stamp')
+  })
+
+  it('validates one event and a BEGIN … END body', () => {
+    const d = { ...newTriggerDraft('sqlite', liteTarget), name: 't' }
+    expect(validateTrigger('sqlite', d)).toBeNull()
+    expect(validateTrigger('sqlite', { ...d, events: ['INSERT', 'DELETE'] })).toMatch(/one event/)
+    expect(validateTrigger('sqlite', { ...d, body: 'SELECT 1;' })).toMatch(/BEGIN … END/)
+  })
+
+  it('reads a trigger from sqlite_master', () => {
+    const definition = `CREATE TRIGGER IF NOT EXISTS "audit" AFTER UPDATE OF "status", [total] ON "orders"
+FOR EACH ROW WHEN NEW.note <> 'BEGIN' -- BEGIN in a comment
+BEGIN
+  INSERT INTO log VALUES (NEW.id, 'END');
+END`
+    const state = sqliteTriggerState(info({ events: ['UPDATE'], definition }))
+    expect(state).toMatchObject({
+      timing: 'AFTER',
+      events: ['UPDATE'],
+      updateColumns: ['status', 'total'],
+      condition: "NEW.note <> 'BEGIN' -- BEGIN in a comment",
+      body: "BEGIN\n  INSERT INTO log VALUES (NEW.id, 'END');\nEND"
+    })
+    // SQLite's default timing is BEFORE
+    expect(
+      sqliteTriggerState(info({ definition: 'create trigger t delete on x begin select 1; end' }))
+    ).toMatchObject({ timing: 'BEFORE', events: ['DELETE'], condition: '', updateColumns: [] })
+    expect(
+      sqliteTriggerState(
+        info({ definition: 'CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN SELECT 1; END' })
+      )
+    ).toMatchObject({ timing: 'INSTEAD OF', events: ['INSERT'] })
+    // A TEMP trigger would lose TEMP on recreation
+    expect(
+      sqliteTriggerState(
+        info({ definition: 'CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END' })
+      )
+    ).toBeNull()
+    expect(sqliteTriggerState(info({ definition: 'garbage' }))).toBeNull()
+  })
+
+  it('drops and recreates on change, since SQLite has no ALTER TRIGGER', () => {
+    const d = triggerDraftFrom(
+      sqliteTriggerState(
+        info({
+          name: 'audit',
+          definition: 'CREATE TRIGGER audit AFTER INSERT ON orders BEGIN SELECT 1; END'
+        })
+      )!
+    )
+    expect(triggerStatements('sqlite', d, liteTarget)).toEqual([])
+    expect(triggerStatements('sqlite', { ...d, name: 'audit2' }, liteTarget)).toEqual([
+      'DROP TRIGGER audit',
+      'CREATE TRIGGER audit2\nAFTER INSERT ON orders\nFOR EACH ROW\nBEGIN SELECT 1; END'
+    ])
   })
 })

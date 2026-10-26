@@ -150,6 +150,27 @@ function useMongoPanel(
   return { set, error, loading, reload: () => void reload() }
 }
 
+/**
+ * What a waiting lock looks like in each lock list's column: PostgreSQL's
+ * granted is false (a boolean, or 'f' as text), MongoDB's waitingForLock is
+ * true, and MySQL / SQL Server report a WAITING / WAIT status.
+ */
+const WAITING_VALUES: [column: string, values: Cell[]][] = [
+  ['granted', [false, 'false', 'f']],
+  ['waitingForLock', [true, 'true']],
+  ['status', ['WAITING', 'WAIT']]
+]
+
+/** How many rows of a lock list are waiting for their lock rather than holding it. */
+export function waitingLocks(set: Pick<ResultSet, 'columns' | 'rows'> | null): number {
+  if (!set) return 0
+  for (const [column, values] of WAITING_VALUES) {
+    const col = set.columns.findIndex((c) => c.name === column)
+    if (col >= 0) return set.rows.filter((r) => values.includes(r[col])).length
+  }
+  return 0
+}
+
 export function LocksSection({
   locks,
   engineKey
@@ -157,16 +178,7 @@ export function LocksSection({
   locks: SqlPanel
   engineKey: string
 }): React.JSX.Element {
-  const waiting = useMemo(() => {
-    const set = locks.set
-    if (!set) return 0
-    const col = set.columns.findIndex((c) =>
-      ['granted', 'status', 'waitingForLock'].includes(c.name)
-    )
-    if (col < 0) return 0
-    return set.rows.filter((r) => ['false', 'WAITING', 'WAIT', 'true'].includes(String(r[col])))
-      .length
-  }, [locks.set])
+  const waiting = useMemo(() => waitingLocks(locks.set), [locks.set])
   return (
     <section>
       <SectionHeading icon={<Lock className="size-3.5" />} title="Locks">

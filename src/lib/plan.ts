@@ -36,6 +36,11 @@ export interface PlanNode {
   actualRows: number | null
   /** How many times the node ran */
   loops: number | null
+  /**
+   * Processes that each ran the node once under a PostgreSQL Gather (workers
+   * plus the leader), so only loops beyond this are repeated passes
+   */
+  parallel?: number
   /** Time spent in this node and everything under it */
   timeMs: number | null
   selfMs: number | null
@@ -314,6 +319,7 @@ function pgJsonNode(raw: Json, divisor: number): PlanNode {
   n.estRows = num(raw['Plan Rows'])
   n.cost = num(raw['Total Cost'])
 
+  if (divisor > 1) n.parallel = divisor
   const loops = num(raw['Actual Loops'])
   if (loops != null) {
     n.loops = loops
@@ -407,6 +413,7 @@ function pgTextNode(m: RegExpExecArray, divisor: number): PlanNode {
   n.fullScan = /(^|\s)Seq Scan$/.test(n.op)
   n.estRows = Number(m[5])
   n.cost = Number(m[4])
+  if (divisor > 1) n.parallel = divisor
   if (m[10]) {
     n.loops = 0
     n.actualRows = 0
@@ -678,7 +685,16 @@ function msNode(rel: XmlElement): PlanNode {
         ? counters.reduce((s, c) => s + (num(c.attrs[k]) ?? 0), 0)
         : null
     n.actualRows = sum('ActualRows') ?? 0
-    n.loops = sum('ActualExecutions') ?? 0
+    // Each thread of a parallel operator runs it once, so the threads' sum
+    // isn't how often it repeated: take the busiest thread's count instead.
+    // Only parallel zones report threads other than 0
+    const parallel =
+      /^(1|true)$/i.test(a.Parallel ?? '') || counters.some((c) => (num(c.attrs.Thread) ?? 0) !== 0)
+    n.loops = parallel
+      ? counters.some((c) => c.attrs.ActualExecutions != null)
+        ? Math.max(...counters.map((c) => num(c.attrs.ActualExecutions) ?? 0))
+        : 0
+      : (sum('ActualExecutions') ?? 0)
     rowsRead = sum('ActualRowsRead')
     const elapsed = counters.map((c) => num(c.attrs.ActualElapsedms)).filter((v) => v != null)
     if (elapsed.length) n.timeMs = Math.max(...elapsed)
@@ -833,7 +849,8 @@ function planHints(plan: Plan): RawHint[] {
       const kept = node.actualRows
       const read =
         kept != null ? kept + (node.rowsRemoved ?? 0) : (node.estRows ?? 0) * (node.estLoops ?? 1)
-      if (loops > 1 && read >= 1000) {
+      // Parallel workers each running the scan once don't make it a repeat
+      if (loops > (node.parallel ?? 1) && read >= 1000) {
         hints.push({
           severity: 'high',
           node,

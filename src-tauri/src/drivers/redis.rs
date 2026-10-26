@@ -597,11 +597,17 @@ pub enum RedisRequest {
         key: Data,
         index: i64,
         value: Data,
+        /// The item the user saw at `index`; the write is refused if it's changed since
+        #[serde(default)]
+        expected: Option<Data>,
     },
     ListRemove {
         database: String,
         key: Data,
         index: i64,
+        /// The item the user saw at `index`; the removal is refused if it's changed since
+        #[serde(default)]
+        expected: Option<Data>,
     },
     SetAdd {
         database: String,
@@ -1063,6 +1069,43 @@ async fn query(conn: &mut MultiplexedConnection, c: &::redis::Cmd) -> AppResult<
     Ok(c.query_async::<RValue>(conn).await?)
 }
 
+/// A list edit refused because the item at the index isn't the one the user saw.
+const LIST_CHANGED: &str = "The list changed since it was loaded; reload and try again";
+
+/// `LSET` the item at an index, if it's still the expected one (compared as bytes).
+/// ARGV: index, new value, `1` to check, expected item. Returns 1, or 0 when it's changed.
+const LIST_SET_SCRIPT: &str = r"
+if ARGV[3] == '1' and redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[4] then return 0 end
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[2])
+return 1
+";
+
+/// Removes the item at an index, if it's still the expected one: marks it, then removes
+/// the mark. ARGV: index, unique mark, `1` to check, expected item. Returns 1, or 0.
+const LIST_REMOVE_SCRIPT: &str = r"
+if ARGV[3] == '1' and redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[4] then return 0 end
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('LREM', KEYS[1], 1, ARGV[2])
+return 1
+";
+
+/// An `EVAL` of a list script; the check and the write run atomically on the server.
+fn list_script(
+    script: &str,
+    key: Data,
+    index: i64,
+    expected: Option<&Data>,
+    value: Vec<u8>,
+) -> AppResult<::redis::Cmd> {
+    let mut c = cmd("EVAL");
+    c.arg(script).arg(1).arg(key.bytes()?).arg(index).arg(value);
+    match expected {
+        Some(e) => c.arg("1").arg(e.bytes()?),
+        None => c.arg("0").arg(""),
+    };
+    Ok(c)
+}
+
 /// Shown with key lists on a cluster node.
 const CLUSTER_SCAN_NOTICE: &str = "Redis Cluster: only keys stored on the connected node are listed; connect to each primary to browse the rest";
 
@@ -1164,33 +1207,42 @@ async fn run(
             affected(value_int(&query(conn, &c).await?).unwrap_or(0))
         }
         ListSet {
-            key, index, value, ..
+            key,
+            index,
+            value,
+            expected,
+            ..
         } => {
-            query(
-                conn,
-                cmd("LSET").arg(key.bytes()?).arg(index).arg(value.bytes()?),
-            )
-            .await?;
+            let c = list_script(
+                LIST_SET_SCRIPT,
+                key,
+                index,
+                expected.as_ref(),
+                value.bytes()?,
+            )?;
+            if value_int(&query(conn, &c).await?) != Some(1) {
+                return Err(AppError::msg(LIST_CHANGED));
+            }
             ok()
         }
-        ListRemove { key, index, .. } => {
-            // Lists have no remove-by-index: mark the item, then remove the mark, in one transaction
-            let key = key.bytes()?;
+        ListRemove {
+            key,
+            index,
+            expected,
+            ..
+        } => {
+            // Lists have no remove-by-index: mark the item, then remove the mark, in one script
             let mark = format!("__dbms_tool_removed_{}__", uuid::Uuid::new_v4());
-            ::redis::pipe()
-                .atomic()
-                .cmd("LSET")
-                .arg(&key)
-                .arg(index)
-                .arg(&mark)
-                .ignore()
-                .cmd("LREM")
-                .arg(&key)
-                .arg(1)
-                .arg(&mark)
-                .ignore()
-                .query_async::<()>(conn)
-                .await?;
+            let c = list_script(
+                LIST_REMOVE_SCRIPT,
+                key,
+                index,
+                expected.as_ref(),
+                mark.into_bytes(),
+            )?;
+            if value_int(&query(conn, &c).await?) != Some(1) {
+                return Err(AppError::msg(LIST_CHANGED));
+            }
             affected(1)
         }
         SetAdd { key, members, .. } => {
@@ -2057,6 +2109,72 @@ mod tests {
         assert_eq!(arg(json!(1e300)).unwrap().parse::<f64>().unwrap(), 1e300);
         assert!(arg(json!("nan")).is_err());
         assert!(arg(json!("abc")).is_err());
+    }
+
+    #[test]
+    fn list_edits_check_the_item_as_bytes() {
+        let request: RedisRequest = serde_json::from_value(json!({
+            "op": "listRemove", "database": "0", "key": "q", "index": 2,
+            "expected": { "$hex": "00ff" }
+        }))
+        .unwrap();
+        assert!(request.is_write());
+        let RedisRequest::ListRemove {
+            key,
+            index,
+            expected,
+            ..
+        } = request
+        else {
+            panic!("expected listRemove");
+        };
+        let c = list_script(
+            LIST_REMOVE_SCRIPT,
+            key,
+            index,
+            expected.as_ref(),
+            b"m".to_vec(),
+        )
+        .unwrap();
+        let args: Vec<Vec<u8>> = c
+            .args_iter()
+            .map(|a| match a {
+                ::redis::Arg::Simple(b) => b.to_vec(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(args[0], b"EVAL");
+        assert_eq!(args[1], LIST_REMOVE_SCRIPT.as_bytes());
+        assert_eq!(
+            args[2..],
+            [
+                b"1".to_vec(),
+                b"q".to_vec(),
+                b"2".to_vec(),
+                b"m".to_vec(),
+                b"1".to_vec(),
+                vec![0x00, 0xff]
+            ]
+        );
+
+        // Without an expected item (older callers) the script skips the check
+        let request: RedisRequest = serde_json::from_value(json!({
+            "op": "listSet", "database": "0", "key": "q", "index": 0, "value": "v"
+        }))
+        .unwrap();
+        let RedisRequest::ListSet {
+            key,
+            index,
+            value,
+            expected,
+            ..
+        } = request
+        else {
+            panic!("expected listSet");
+        };
+        assert!(expected.is_none());
+        let c = list_script(LIST_SET_SCRIPT, key, index, None, value.bytes().unwrap()).unwrap();
+        assert_eq!(c.args_iter().count(), 8);
     }
 
     #[test]

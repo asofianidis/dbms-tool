@@ -174,6 +174,11 @@ const JSON_WORDS = [
   ['false', false],
   ['null', null]
 ] as const
+/**
+ * Deepest nesting `parseJson` reads. Parsing (and the converters after it) recurse, so far
+ * deeper input would overflow the stack; MongoDB itself stops documents at 100 levels.
+ */
+export const MAX_JSON_DEPTH = 1000
 
 /**
  * JSON.parse, except that numbers come back as JsonNumber holding their
@@ -182,6 +187,7 @@ const JSON_WORDS = [
  */
 export function parseJson(text: string): unknown {
   let i = 0
+  let depth = 0
   const fail = (what?: string): never => {
     throw new SyntaxError(
       `Unexpected ${what ?? (i < text.length ? `token ${text[i]}` : 'end of JSON input')} at position ${i}`
@@ -220,15 +226,23 @@ export function parseJson(text: string): unknown {
       return fail('string')
     }
   }
+  const nest = (): void => {
+    if (++depth > MAX_JSON_DEPTH)
+      throw new SyntaxError(
+        `JSON nested more than ${MAX_JSON_DEPTH} levels deep at position ${i}; flatten the data to import it`
+      )
+  }
   const value = (): unknown => {
     space()
     const c = text[i]
     if (c === '{') {
+      nest()
       i++
       const obj: Record<string, unknown> = {}
       space()
       if (text[i] === '}') {
         i++
+        depth--
         return obj
       }
       for (;;) {
@@ -252,16 +266,19 @@ export function parseJson(text: string): unknown {
         if (text[i] === ',') i++
         else if (text[i] === '}') {
           i++
+          depth--
           return obj
         } else fail()
       }
     }
     if (c === '[') {
+      nest()
       i++
       const arr: unknown[] = []
       space()
       if (text[i] === ']') {
         i++
+        depth--
         return arr
       }
       for (;;) {
@@ -270,6 +287,7 @@ export function parseJson(text: string): unknown {
         if (text[i] === ',') i++
         else if (text[i] === ']') {
           i++
+          depth--
           return arr
         } else fail()
       }
