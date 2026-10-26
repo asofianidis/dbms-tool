@@ -452,8 +452,8 @@ interface Leftover {
  * Makes a backup on this computer readable by the server: used in place when
  * the server runs here and sees it, otherwise sent to the server's backup
  * folder. A sent copy is deleted after a restore, when another file or the
- * server side is chosen, or when the tab closes; one that couldn't be deleted
- * stays as `leftover` until a retry works.
+ * server side is chosen, or when the tab closes; copies that couldn't be
+ * deleted stay in `leftovers` until a retry works.
  */
 function useLocalBackup(
   tabId: string,
@@ -461,36 +461,38 @@ function useLocalBackup(
 ): {
   state: UploadState | null
   staged: MssqlStagedBackup | null
-  leftover: Leftover | null
+  leftovers: Leftover[]
   /** The staged backup, or null if it failed, was cancelled or was superseded */
   start: (file: string) => Promise<MssqlStagedBackup | null>
   cancel: () => void
   /** Drops the staged backup and any upload still running */
   reset: () => Promise<void>
-  retryLeftover: () => Promise<void>
+  retryLeftovers: () => Promise<void>
 } {
   const [state, setState] = useState<UploadState | null>(null)
   const [staged, setStaged] = useState<MssqlStagedBackup | null>(null)
-  const [leftover, setLeftover] = useState<Leftover | null>(null)
+  const [leftovers, setLeftovers] = useState<Leftover[]>([])
   const job = useRef<string | null>(null)
   const sent = useRef<MssqlStagedBackup | null>(null)
-  const stranded = useRef<Leftover | null>(null)
+  const stranded = useRef<Leftover[]>([])
   // Bumped by every start and reset; an upload finishing under an older one is stale
   const generation = useRef(0)
   useEffect(
     () => () => {
       generation.current++
       if (job.current) void api.backupCancel(job.current)
-      for (const path of [sent.current?.uploaded && sent.current.path, stranded.current?.path]) {
-        if (path) void api.backupMssqlDiscardUpload(connectionId, path).catch(() => undefined)
+      const paths = stranded.current.map((l) => l.path)
+      if (sent.current?.uploaded) paths.push(sent.current.path)
+      for (const path of paths) {
+        void api.backupMssqlDiscardUpload(connectionId, path).catch(() => undefined)
       }
       setRunning(tabId, false)
     },
     [tabId, connectionId]
   )
-  const strand = (next: Leftover | null): void => {
+  const strand = (next: Leftover[]): void => {
     stranded.current = next
-    setLeftover(next)
+    setLeftovers(next)
   }
   /** Deletes `copy` from the server, remembering it if that fails. */
   const remove = async (copy: MssqlStagedBackup | null): Promise<void> => {
@@ -498,21 +500,25 @@ function useLocalBackup(
     try {
       await api.backupMssqlDiscardUpload(connectionId, copy.path)
     } catch (e) {
-      strand({ path: copy.path, error: errorMessage(e) })
+      const others = stranded.current.filter((l) => l.path !== copy.path)
+      strand([...others, { path: copy.path, error: errorMessage(e) }])
     }
   }
-  const reset = async (): Promise<void> => {
-    generation.current++
+  /** Starts a new generation and cleans up the last one; returns the new one. */
+  const supersede = async (): Promise<number> => {
+    const mine = ++generation.current
     if (job.current) void api.backupCancel(job.current)
     const previous = sent.current
     sent.current = null
     setStaged(null)
     setState((s) => (s?.running ? s : null))
     await remove(previous)
+    return mine
   }
   const start = async (file: string): Promise<MssqlStagedBackup | null> => {
-    await reset()
-    const mine = generation.current
+    // Taken before the cleanup's wait, so a reset during it supersedes this start
+    const mine = await supersede()
+    if (generation.current !== mine) return null
     const id = crypto.randomUUID()
     job.current = id
     setState({ running: true, percent: null, line: '', error: null })
@@ -559,17 +565,18 @@ function useLocalBackup(
   return {
     state,
     staged,
-    leftover,
+    leftovers,
     start,
     cancel: () => {
       if (job.current) void api.backupCancel(job.current)
     },
-    reset,
-    retryLeftover: async () => {
+    reset: async () => {
+      await supersede()
+    },
+    retryLeftovers: async () => {
       const current = stranded.current
-      if (!current) return
-      strand(null)
-      await remove({ path: current.path, uploaded: true })
+      strand([])
+      for (const { path } of current) await remove({ path, uploaded: true })
     }
   }
 }
@@ -706,14 +713,20 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
 
   const title = target ? `Restore ${target}` : 'Restore a backup'
   const subtitle = `${ENGINES[connection.engine].label} · ${connection.name || connection.host}`
-  const leftover = local.leftover && (
+  const leftover = local.leftovers.length > 0 && (
     <Callout tone="warning">
       <span className="block">
-        A copy sent to the server couldn’t be deleted:{' '}
-        <span className="font-mono">{local.leftover.path}</span>
+        {local.leftovers.length === 1
+          ? 'A copy sent to the server couldn’t be deleted:'
+          : 'Copies sent to the server couldn’t be deleted:'}
       </span>
-      <span className="block whitespace-pre-wrap text-muted">{local.leftover.error}</span>
-      <Button size="xs" variant="secondary" onClick={() => void local.retryLeftover()}>
+      {local.leftovers.map((l) => (
+        <span key={l.path} className="block">
+          <span className="font-mono">{l.path}</span>
+          <span className="block whitespace-pre-wrap text-muted">{l.error}</span>
+        </span>
+      ))}
+      <Button size="xs" variant="secondary" onClick={() => void local.retryLeftovers()}>
         <RotateCcw className="size-3" /> Try again
       </Button>
     </Callout>

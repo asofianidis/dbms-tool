@@ -333,18 +333,9 @@ pub async fn upload(
         )
         .into());
     }
-    let dir = unless_cancelled(report, async {
-        Ok(text(
-            first_row(
-                client,
-                "SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS nvarchar(4000))",
-            )
-            .await,
-        ))
-    })
-    .await?
-    .filter(|d| !d.trim().is_empty())
-    .ok_or_else(|| AppError::msg("The server didn't report a default backup folder"))?;
+    let dir = unless_cancelled(report, async { Ok(backup_folder(client).await) })
+        .await?
+        .ok_or_else(|| AppError::msg("The server didn't report a default backup folder"))?;
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -363,8 +354,8 @@ pub async fn upload(
     report.line(format!("Sending {local} to {target} on the server"));
     report.set_total(size);
     if let Err(error) = send(client, file, &target, size, report).await {
-        // The write may have created the file. A cancelled session may still
-        // be mid-write, so it's closed and a fresh one deletes the copy
+        // The write may have created the file. A session cancelled mid-insert
+        // may still be busy, so it's closed and a fresh one deletes the copy
         drop(session);
         let leftover = match discard(server, &target).await {
             Ok(()) => None,
@@ -382,6 +373,28 @@ pub async fn upload(
         path: target,
         uploaded: true,
     })
+}
+
+/// The server's default backup folder: a server property from SQL Server
+/// 2019, the instance's registry setting before that.
+async fn backup_folder(client: &mut Tds) -> Option<String> {
+    let usable = |d: &String| !d.trim().is_empty();
+    let property = text(
+        first_row(
+            client,
+            "SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS nvarchar(4000))",
+        )
+        .await,
+    );
+    if let Some(dir) = property.filter(usable) {
+        return Some(dir);
+    }
+    let registry = "SET NOCOUNT ON;
+DECLARE @dir nvarchar(4000);
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE',
+    N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', N'BackupDirectory', @dir OUTPUT;
+SELECT @dir;";
+    text(first_row(client, registry).await).filter(usable)
 }
 
 /// Sends `file` into a temp table, then has the server write it to `target`.
@@ -462,7 +475,12 @@ BEGIN
 END;",
         path = literal(target)
     );
-    unless_cancelled(report, run(client, write)).await?;
+    // Not raced against Cancel: closing the connection doesn't stop the batch,
+    // which could then save the file after a cleanup found nothing to delete.
+    // It's bounded, the data being in tempdb already; a cancel during it is
+    // honoured once it ends, and `upload` deletes the finished copy
+    run(client, write).await?;
+    report.check()?;
     let written =
         unless_cancelled(report, async { Ok(size_on_server(client, target).await) }).await?;
     match written {
