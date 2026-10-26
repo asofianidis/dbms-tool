@@ -203,6 +203,17 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     Ok(client)
 }
 
+/// Whether the server answers a ping within the connect timeout. Requests on a
+/// half-open socket never fail on their own, so this bounds the wait.
+pub async fn is_alive(client: &Client) -> bool {
+    let admin = client.database("admin");
+    let ping = admin.run_command(doc! { "ping": 1 });
+    matches!(
+        tokio::time::timeout(crate::limits::connect_timeout(), ping).await,
+        Ok(Ok(_))
+    )
+}
+
 /// The database to open when the connection string names none: the one in the
 /// connection settings, else the auth database. `list_databases` falls back to
 /// it for users without the listDatabases privilege.

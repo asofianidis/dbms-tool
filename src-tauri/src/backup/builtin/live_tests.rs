@@ -837,7 +837,7 @@ async fn mongo_round_trip() {
     let Some(server) = open(Engine::Mongo, "DBMS_TEST_MONGO").await else {
         return;
     };
-    let client = server.mongo_client().unwrap();
+    let client = &server.mongo_client().await.unwrap();
     for db in ["bk_src", "bk_dst", "bk_dst2", "bk_dst3"] {
         client.database(db).drop().await.unwrap();
     }
@@ -991,7 +991,7 @@ async fn restores_the_real_tools_backups() {
     }
 
     if let Some(server) = open(Engine::Mongo, "DBMS_TEST_MONGO").await {
-        let client = server.mongo_client().unwrap();
+        let client = &server.mongo_client().await.unwrap();
         let expected = mongo_fingerprint(client, "bk_src").await;
         for (name, archive, target) in [
             ("mongo_real.archive.gz", true, "bk_from_tool_a"),

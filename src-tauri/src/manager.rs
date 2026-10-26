@@ -56,10 +56,16 @@ pub struct Slot {
     last_used: Instant,
 }
 
+/// The MongoDB client, replaced when it stops answering after sitting idle.
+struct MongoSlot {
+    client: mongodb::Client,
+    last_used: Instant,
+}
+
 pub struct Server {
     pub config: ConnectionConfig,
     password: Option<String>,
-    mongo: Option<mongodb::Client>,
+    mongo: Option<Mutex<MongoSlot>>,
     redis: Option<redis::RedisClient>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
     running: parking_lot::Mutex<HashMap<String, Arc<CancelSignal>>>,
@@ -78,14 +84,26 @@ impl Server {
     }
 
     /// The MongoDB client, for the built-in backup.
-    pub fn mongo_client(&self) -> AppResult<&mongodb::Client> {
-        self.mongo()
+    pub async fn mongo_client(&self) -> AppResult<mongodb::Client> {
+        self.mongo().await
     }
 
-    fn mongo(&self) -> AppResult<&mongodb::Client> {
-        self.mongo
+    /// The MongoDB client, pinged first when it has sat idle. Sleep, a network
+    /// change or a NAT timeout can leave its pooled sockets half-open, where
+    /// requests wait forever instead of failing, so a client that doesn't answer
+    /// is replaced (and a dropped tunnel restarted) like a stale SQL session.
+    async fn mongo(&self) -> AppResult<mongodb::Client> {
+        let slot = self
+            .mongo
             .as_ref()
-            .ok_or_else(|| AppError::Unsupported("Not a MongoDB connection".into()))
+            .ok_or_else(|| AppError::Unsupported("Not a MongoDB connection".into()))?;
+        let mut guard = slot.lock().await;
+        if guard.last_used.elapsed() > IDLE_CHECK && !mongo::is_alive(&guard.client).await {
+            tunnel::ensure(&self.config.id).await?;
+            guard.client = mongo::connect(&self.config, self.password.as_deref()).await?;
+        }
+        guard.last_used = Instant::now();
+        Ok(guard.client.clone())
     }
 
     fn redis(&self) -> AppResult<&redis::RedisClient> {
@@ -257,10 +275,10 @@ impl Server {
                 "Only reads can run here: find, aggregate, count or distinct.",
             ));
         }
-        let client = self.mongo()?;
+        let client = self.mongo().await?;
         let signal = self.begin(key);
         let deadline = Deadline::arm(opts, &signal);
-        let result = mongo::execute(client, request, opts, &signal).await;
+        let result = mongo::execute(&client, request, opts, &signal).await;
         self.end(key, &signal);
         match deadline.and_then(Deadline::disarm) {
             Some(secs) => Err(AppError::msg(timed_out_message(secs))),
@@ -376,16 +394,16 @@ impl Server {
         request: mongo::ExportRequest,
         path: &std::path::Path,
     ) -> AppResult<mongo::ExportSummary> {
-        let client = self.mongo()?;
+        let client = self.mongo().await?;
         let signal = self.begin(key);
-        let result = mongo::export(client, request, path, &signal).await;
+        let result = mongo::export(&client, request, path, &signal).await;
         self.end(key, &signal);
         result
     }
 
     pub async fn list_databases(&self) -> AppResult<Vec<DatabaseInfo>> {
-        if let Some(client) = &self.mongo {
-            return mongo::list_databases(client).await;
+        if self.mongo.is_some() {
+            return mongo::list_databases(&self.mongo().await?).await;
         }
         if let Some(client) = &self.redis {
             return redis::list_databases(client).await;
@@ -415,8 +433,8 @@ impl Server {
         database: &str,
         schema: Option<&str>,
     ) -> AppResult<Vec<DbObject>> {
-        if let Some(client) = &self.mongo {
-            return mongo::list_collections(client, database).await;
+        if self.mongo.is_some() {
+            return mongo::list_collections(&self.mongo().await?, database).await;
         }
         // Keys are browsed in the key browser, a page at a time
         if self.redis.is_some() {
@@ -591,7 +609,12 @@ impl Manager {
         let (mut mongo, mut redis) = (None, None);
         let mut sessions = HashMap::new();
         match opened {
-            Opened::Mongo(client) => mongo = Some(client),
+            Opened::Mongo(client) => {
+                mongo = Some(Mutex::new(MongoSlot {
+                    client,
+                    last_used: Instant::now(),
+                }))
+            }
             Opened::Redis(client) => redis = Some(client),
             Opened::Sql(session) => {
                 let key = if config.engine == Engine::Postgres {

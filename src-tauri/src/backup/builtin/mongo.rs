@@ -121,7 +121,7 @@ async fn metadata(db: &Database, spec: &Document) -> AppResult<Collection> {
 }
 
 pub async fn dump(server: &Server, job: &MongoDumpJob, report: &Report<'_>) -> AppResult<()> {
-    let client = server.mongo_client()?;
+    let client = server.mongo_client().await?;
     let name = job.database.trim();
     let db = client.database(name);
     let specs: Vec<Document> = db
@@ -548,9 +548,9 @@ impl<'a> Restorer<'a> {
 }
 
 pub async fn restore(server: &Server, job: &MongoRestoreJob, report: &Report<'_>) -> AppResult<()> {
-    let client = server.mongo_client()?;
+    let client = server.mongo_client().await?;
     let mut restorer = Restorer {
-        client,
+        client: &client,
         job,
         report,
         existing: HashMap::new(),
