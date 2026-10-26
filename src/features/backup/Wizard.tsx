@@ -770,93 +770,25 @@ export function useToolJob(tabId: string): {
 
 /**
  * Runs a SQL Server BACKUP or RESTORE script on its own session, polling
- * sys.dm_exec_requests for percent complete from the metadata session. With
- * `download`, a backup is then copied from the server to this computer.
+ * sys.dm_exec_requests for percent complete from the metadata session.
  */
 export function useSqlJob(tabId: string): {
   job: JobState | null
-  start: (
-    connectionId: string,
-    script: string,
-    download?: { source: string; file: string }
-  ) => Promise<boolean>
+  start: (connectionId: string, script: string) => Promise<boolean>
   cancel: () => void
   clear: () => void
 } {
   const [job, setJob] = useState<JobState | null>(null)
   const session = `backup-${tabId}`
   const running = useRef<string | null>(null)
-  // The copy to this computer, once the script has finished
-  const copying = useRef<string | null>(null)
-  // Cancelled before the copy reached the backend; it doesn't start
-  const stopped = useRef(false)
-  const stopCopy = (): void => {
-    if (!copying.current) return
-    stopped.current = true
-    // Kept by the backend even if the job hasn't registered yet
-    void api.backupCancel(copying.current)
-  }
   useEffect(
     () => () => {
       if (running.current) void api.cancel(running.current, session)
-      stopCopy()
       setRunning(tabId, false)
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [tabId, session]
   )
-  const copy = async (
-    connectionId: string,
-    download: { source: string; file: string }
-  ): Promise<boolean> => {
-    const id = crypto.randomUUID()
-    copying.current = id
-    stopped.current = false
-    setJob((s) => s && { ...s, percent: null })
-    const unlisten = await listen<BackupProgress>('backup-progress', (e) => {
-      const p = e.payload
-      if (p.job !== id) return
-      setJob(
-        (s) =>
-          s && {
-            ...s,
-            lines: p.lines.length ? appendLines(s.lines, p.lines) : s.lines,
-            percent: p.total ? Math.min(100, (100 * (p.bytes ?? 0)) / p.total) : s.percent
-          }
-      )
-    })
-    try {
-      if (stopped.current) {
-        setJob((s) => s && { ...s, status: 'cancelled', elapsedMs: Date.now() - s.startedAt })
-        return false
-      }
-      const outcome = await api.backupMssqlDownload(
-        connectionId,
-        id,
-        download.source,
-        download.file
-      )
-      setJob(
-        (s) =>
-          s && {
-            ...s,
-            status: outcome.cancelled ? 'cancelled' : 'done',
-            percent: outcome.cancelled ? s.percent : 100,
-            elapsedMs: Date.now() - s.startedAt,
-            size: outcome.size
-          }
-      )
-      return !outcome.cancelled
-    } finally {
-      unlisten()
-      copying.current = null
-    }
-  }
-  const start = async (
-    connectionId: string,
-    script: string,
-    download?: { source: string; file: string }
-  ): Promise<boolean> => {
+  const start = async (connectionId: string, script: string): Promise<boolean> => {
     running.current = connectionId
     setJob(startState())
     setRunning(tabId, true)
@@ -877,26 +809,20 @@ export function useSqlJob(tabId: string): {
         }, 1000)
       }
       const out = await api.execute(connectionId, session, 'master', script)
-      clearInterval(timer)
       const lines = out.messages.filter((m) => m.level !== 'rows').map((m) => m.text)
       const failed = out.error?.message ?? null
-      const ok = !failed && !out.cancelled
       setJob(
         (s) =>
           s && {
             ...s,
             lines: appendLines(s.lines, lines),
-            status: out.cancelled ? 'cancelled' : failed ? 'failed' : download ? 'running' : 'done',
+            status: out.cancelled ? 'cancelled' : failed ? 'failed' : 'done',
             error: failed,
-            percent: ok ? 100 : s.percent,
-            elapsedMs: download && ok ? null : out.elapsedMs
+            percent: failed || out.cancelled ? s.percent : 100,
+            elapsedMs: out.elapsedMs
           }
       )
-      if (ok && download) {
-        running.current = null
-        return await copy(connectionId, download)
-      }
-      return ok
+      return !failed && !out.cancelled
     } catch (e) {
       setJob(
         (s) =>
@@ -920,7 +846,6 @@ export function useSqlJob(tabId: string): {
     start,
     cancel: () => {
       if (running.current) void api.cancel(running.current, session)
-      stopCopy()
     },
     clear: () => setJob(null)
   }
