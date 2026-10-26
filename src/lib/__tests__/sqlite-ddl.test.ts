@@ -270,3 +270,29 @@ describe('SQLite table designer', () => {
     expect(validateDraft('sqlite', t)).toMatch(/Only a lone INTEGER primary key/)
   })
 })
+
+describe('SQLite defaults', () => {
+  /** The DEFAULT clause CREATE TABLE writes for the value */
+  const create = (value: string): string => {
+    const t = newTableDraft('sqlite', null)
+    t.name = 't'
+    t.columns.push(newColumn('sqlite', { name: 'v', default: value }))
+    return tableStatements('sqlite', t)[0].match(/DEFAULT (.*?),?\n/)![1]
+  }
+
+  it('leaves single literals bare', () => {
+    expect(create("'it''s'")).toBe("'it''s'")
+    expect(create('-1.5e3')).toBe('-1.5e3')
+    expect(create("X'00ff'")).toBe("X'00ff'")
+    expect(create('NULL')).toBe('NULL')
+    expect(create('CURRENT_TIMESTAMP')).toBe('CURRENT_TIMESTAMP')
+    expect(create("('a' || ')')")).toBe("('a' || ')')")
+  })
+
+  it('wraps expressions PRAGMA table_info reports without their parentheses', () => {
+    expect(create("'x'||'y'")).toBe("('x'||'y')")
+    expect(create('1+1')).toBe('(1+1)')
+    expect(create('(1)+(2)')).toBe('((1)+(2))')
+    expect(create("'a' || 'b' || 'c'")).toBe("('a' || 'b' || 'c')")
+  })
+})

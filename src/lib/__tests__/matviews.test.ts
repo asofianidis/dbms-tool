@@ -17,7 +17,7 @@ describe('materialized views', () => {
     expect(sql).toContain("n.nspname = 'o''brien'")
     expect(sql).toContain("c.relkind = 'm'")
     // A catalog read, so the production guard doesn't ask about it
-    expect(sqlWriteKeyword(sql)).toBeNull()
+    expect(sqlWriteKeyword(sql, 'postgres')).toBeNull()
   })
 
   it('parses text and boolean cells', () => {
@@ -47,7 +47,7 @@ describe('materialized views', () => {
     expect(refreshMatviewSql(ref, 'no-data')).toBe(
       'REFRESH MATERIALIZED VIEW app."Sales By Region" WITH NO DATA;'
     )
-    expect(sqlWriteKeyword(refreshMatviewSql(ref, 'normal'))).toBe('REFRESH')
+    expect(sqlWriteKeyword(refreshMatviewSql(ref, 'normal'), 'postgres')).toBe('REFRESH')
   })
 
   it('explains when CONCURRENTLY is unavailable', () => {

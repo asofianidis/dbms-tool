@@ -231,6 +231,18 @@ describe('where a result comes from', () => {
     expect(resolveTable(['users'], tables, undefined, 'postgres')).toBeNull()
     expect(resolveTable(['orders'], tables, 'dbo', 'tsql')?.name).toBe('Orders')
   })
+
+  it("doesn't guess a table a temporary one shadows", () => {
+    const tables: CompletionTable[] = [
+      { schema: 'public', name: 'users', columns: [], foreignKeys: [] },
+      { schema: 'pg_temp_3', name: 'users', columns: [], foreignKeys: [] },
+      { schema: 'public', name: 'orders', columns: [], foreignKeys: [] }
+    ]
+    expect(resolveTable(['users'], tables, 'public', 'postgres')).toBeNull()
+    expect(resolveTable(['public', 'users'], tables, 'public', 'postgres')?.schema).toBe('public')
+    // A name in one schema needs no default
+    expect(resolveTable(['orders'], tables, undefined, 'postgres')?.schema).toBe('public')
+  })
 })
 
 describe('snippets', () => {

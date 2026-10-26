@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Cell, ColumnMeta } from '../api'
-import { serialize, toTsv } from '../export'
+import { serialize, toTsv, uniqueKeys } from '../export'
 
 const columns: ColumnMeta[] = [
   { name: 'id', typeName: 'int4' },
@@ -48,6 +48,17 @@ describe('serialize', () => {
       '| 2 | a\\|b |',
       '| 3 | C:\\\\x\\\\\\| |'
     ])
+  })
+
+  it('keeps every column in JSON when names repeat', () => {
+    const cols: ColumnMeta[] = ['id', 'id', 'id_2', 'name', 'id'].map((name) => ({
+      name,
+      typeName: 'text'
+    }))
+    expect(JSON.parse(serialize('json', cols, [['1', '2', '3', 'n', '4']]))).toEqual([
+      { id: '1', id_2: '2', id_2_2: '3', name: 'n', id_3: '4' }
+    ])
+    expect(uniqueKeys(['a', 'b'])).toEqual(['a', 'b'])
   })
 
   it('writes NULL as NULL in SQL', () => {

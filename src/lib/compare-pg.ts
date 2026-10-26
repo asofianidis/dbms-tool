@@ -268,9 +268,45 @@ const name = (qualifier: string | null, n: string): string =>
 export const pgConstraintIndexes = (extras: PgTableExtras | undefined): Set<string> =>
   new Set((extras?.constraints ?? []).flatMap((c) => (c.index ? [c.index] : [])))
 
-/** A partitioned table's index definition replays `ON ONLY`, which wouldn't reach the partitions. */
-export const pgIndexSql = (definition: string): string =>
-  definition.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+.*?\s+ON\s+)ONLY\s+/i, '$1')
+const IDENT = String.raw`(?:"(?:[^"]|"")+"|[^\s".(]+)`
+/** `CREATE [UNIQUE] INDEX name ON [ONLY] [schema.]table`, as pg_get_indexdef starts */
+const INDEX_HEAD = new RegExp(
+  String.raw`^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?)(${IDENT})\s+ON\s+(?:ONLY\s+)?(?:${IDENT}\.)?${IDENT}`,
+  'i'
+)
+
+/** An index definition without its name and table, for telling whether two indexes match. */
+export const pgIndexShape = (definition: string): string => definition.replace(INDEX_HEAD, '$1ON')
+
+/**
+ * The index as it's created on `table`, which a comparison of two differently
+ * named tables needs. A partitioned table's index definition replays `ON ONLY`,
+ * which wouldn't reach the partitions, so that's dropped too.
+ */
+export const pgIndexSql = (definition: string, table?: string): string =>
+  table
+    ? definition.replace(
+        INDEX_HEAD,
+        (_, head: string, index: string) => `${head}${index} ON ${table}`
+      )
+    : definition.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+.*?\s+ON\s+)ONLY\s+/i, '$1')
+
+/** The source's partitions with the top-level ones moved under the target table, which may be named differently. */
+export function retargetPartitions(
+  extras: PgTableExtras,
+  from: { schema: string | null; name: string },
+  to: string
+): PgTableExtras {
+  if (from.name === to) return extras
+  return {
+    ...extras,
+    partitions: extras.partitions.map((p) =>
+      p.parent === from.name && p.parentSchema === (from.schema ?? p.parentSchema)
+        ? { ...p, parent: to }
+        : p
+    )
+  }
+}
 
 /** CREATE TABLE … (…) PARTITION BY key */
 export function withPartitionKey(sql: string, key: string | null): string {

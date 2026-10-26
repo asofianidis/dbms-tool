@@ -68,33 +68,75 @@ fn logged<T>(result: AppResult<T>, context: impl FnOnce() -> String) -> AppResul
     result
 }
 
-/// Blanks out quoted strings, so passwords (`IDENTIFIED BY '…'`) and data
-/// values never reach the log file. A doubled quote inside a string stays inside it.
-fn redact_literals(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+/// Where each character of `sql` sits relative to quoted strings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lit {
+    Outside,
+    Open,
+    Inside,
+    Close,
+}
+
+/// Scans `sql` for quoted strings. A doubled quote stays inside a string;
+/// `backslash` also treats `\` as escaping the next character (MySQL).
+fn literal_spans(sql: &[char], backslash: bool) -> Vec<Lit> {
+    let mut spans = vec![Lit::Outside; sql.len()];
     let mut quote: Option<char> = None;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < sql.len() {
+        let c = sql[i];
         match quote {
             None => {
-                out.push(c);
                 if c == '\'' || c == '"' {
                     quote = Some(c);
-                    out.push('…');
+                    spans[i] = Lit::Open;
                 }
             }
-            // MySQL's \' escape; elsewhere this can only hide more, never less
-            Some(_) if c == '\\' => {
-                chars.next();
+            Some(_) if backslash && c == '\\' => {
+                spans[i] = Lit::Inside;
+                if i + 1 < sql.len() {
+                    i += 1;
+                    spans[i] = Lit::Inside;
+                }
             }
-            Some(q) if c == q && chars.peek() == Some(&q) => {
-                chars.next();
+            Some(q) if c == q && sql.get(i + 1) == Some(&q) => {
+                spans[i] = Lit::Inside;
+                spans[i + 1] = Lit::Inside;
+                i += 1;
             }
             Some(q) if c == q => {
-                out.push(c);
+                spans[i] = Lit::Close;
                 quote = None;
             }
-            Some(_) => {}
+            Some(_) => spans[i] = Lit::Inside,
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Blanks out quoted strings, so passwords (`IDENTIFIED BY '…'`) and data
+/// values never reach the log file. Whether `\` escapes a quote depends on the
+/// dialect (and on MySQL's sql_mode), so a character is hidden when it sits
+/// inside a string under either reading.
+fn redact_literals(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let escaped = literal_spans(&chars, true);
+    let plain = literal_spans(&chars, false);
+    let hidden = |i: usize| escaped[i] == Lit::Inside || plain[i] == Lit::Inside;
+    let mut out = String::with_capacity(sql.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if hidden(i) {
+            if i == 0 || !hidden(i - 1) {
+                out.push('…');
+            }
+            continue;
+        }
+        out.push(c);
+        // An empty string still shows as '…'
+        let opens = escaped[i] == Lit::Open || plain[i] == Lit::Open;
+        if opens && (i + 1 == chars.len() || !hidden(i + 1)) {
+            out.push('…');
         }
     }
     out
@@ -775,9 +817,7 @@ pub fn state_load_all(
 #[tauri::command]
 pub fn state_save(app: tauri::AppHandle, key: String, value: String) -> AppResult<()> {
     let path = state_file(&app, &key)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, value)?;
-    std::fs::rename(&tmp, &path)?;
+    config::write_atomic(&path, value.as_bytes())?;
     Ok(())
 }
 
@@ -980,7 +1020,26 @@ mod tests {
             snippet("insert into t values ('it''s', \"x\") -- done"),
             "insert into t values ('…', \"…\") -- done"
         );
-        assert_eq!(snippet(r"SELECT 'a\'b secret' FROM t"), "SELECT '…' FROM t");
         assert_eq!(snippet("SELECT 1"), "SELECT 1");
+        assert_eq!(snippet("SELECT ''"), "SELECT '…'");
+    }
+
+    #[test]
+    fn logged_sql_hides_strings_under_either_backslash_reading() {
+        // PostgreSQL, SQL Server and SQLite: 'C:\' ends at the second quote
+        let logged = snippet(r"INSERT INTO t VALUES ('C:\', 'hunter2')");
+        assert!(!logged.contains("hunter2"), "{logged}");
+        assert!(!logged.contains("C:"), "{logged}");
+        assert!(logged.starts_with("INSERT INTO t VALUES ('…"), "{logged}");
+        // MySQL: \' stays inside the string
+        let logged = snippet(r"SELECT 'a\'b secret' FROM t");
+        assert!(!logged.contains("secret"), "{logged}");
+        let logged = snippet(r"SELECT 'x\', 'pw' FROM t WHERE a = 'b'");
+        assert!(!logged.contains("pw"), "{logged}");
+        // Without a backslash nothing changes
+        assert_eq!(
+            snippet("UPDATE u SET p = 'p1' WHERE n = 'bob'"),
+            "UPDATE u SET p = '…' WHERE n = '…'"
+        );
     }
 }

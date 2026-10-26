@@ -1,5 +1,7 @@
 //! Saved connections. Settings live in `connections.json` in the app config
-//! directory; passwords live in the OS credential store, never on disk.
+//! directory; passwords live in the OS credential store. A MongoDB or Redis
+//! connection string is saved as typed, so credentials written into it do
+//! end up in `connections.json` (the connection form says so).
 
 use std::path::PathBuf;
 
@@ -221,11 +223,20 @@ pub struct ConnectionStore {
 impl ConnectionStore {
     pub fn load(dir: PathBuf) -> Self {
         let path = dir.join("connections.json");
-        let connections = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<StoreFile>(&s).ok())
-            .map(|f| f.connections)
-            .unwrap_or_default();
+        let connections = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
+                Ok(f) => f.connections,
+                Err(e) => {
+                    set_aside(&path, &e.to_string());
+                    Vec::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                set_aside(&path, &e.to_string());
+                Vec::new()
+            }
+        };
         Self {
             path,
             connections: Mutex::new(connections),
@@ -280,11 +291,46 @@ impl ConnectionStore {
             connections: list.to_vec(),
         };
         // Write then rename so a crash never leaves a truncated file behind
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        write_atomic(&self.path, &serde_json::to_vec_pretty(&file)?)?;
         Ok(())
     }
+}
+
+/// Moves an unreadable store to `<name>.bad-<unix secs>`, so starting empty
+/// and saving again can't overwrite the connections it still holds.
+fn set_aside(path: &std::path::Path, reason: &str) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".bad-{secs}"));
+    let backup = path.with_file_name(name);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => log::warn!(
+            "Couldn't read {} ({reason}); moved it to {} and started with no saved connections",
+            path.display(),
+            backup.display()
+        ),
+        Err(e) => log::warn!(
+            "Couldn't read {} ({reason}) or move it aside ({e}); started with no saved connections",
+            path.display()
+        ),
+    }
+}
+
+/// Writes `bytes` to a temporary file, flushes it to disk, then renames it
+/// over `path`, so neither a crash nor a power loss leaves a truncated file.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 fn keyring_entry(id: &str) -> AppResult<keyring::Entry> {
@@ -346,5 +392,55 @@ mod tests {
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["sslRootCert"], "");
         assert_eq!(json["sslClientKey"], "");
+    }
+
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dbms-tool-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample(name: &str) -> ConnectionConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "", "name": name, "engine": "postgres"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn saved_connections_survive_a_reload() {
+        let dir = scratch_dir();
+        let store = ConnectionStore::load(dir.clone());
+        let saved = store.upsert(sample("one")).unwrap();
+        let reloaded = ConnectionStore::load(dir.clone());
+        assert_eq!(reloaded.get(&saved.id).unwrap().name, "one");
+        assert!(!dir.join("connections.json.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_store_is_moved_aside_not_overwritten() {
+        let dir = scratch_dir();
+        let path = dir.join("connections.json");
+        let broken = b"{\"connections\": [ {\"id\": \"x\", oops";
+        std::fs::write(&path, broken).unwrap();
+
+        let store = ConnectionStore::load(dir.clone());
+        assert!(store.list().is_empty());
+        store.upsert(sample("new")).unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("connections.json.bad-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), broken);
+        assert_eq!(ConnectionStore::load(dir.clone()).list().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

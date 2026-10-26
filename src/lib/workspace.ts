@@ -209,13 +209,14 @@ export function updateTab(id: string, patch: Partial<Tab>): void {
 export function closeTab(id: string, force = false): void {
   // Ending the session rolls back whatever the tab hasn't committed
   if (!force && openTransactionsStore.get()[id]) {
-    activateTab(id)
+    // Closing several tabs queues a confirm for each; each shows its tab when asked
     void confirm({
       title: 'Close with an open transaction?',
       message:
         'This tab has a transaction that is still open. Closing it ends the session, which rolls back the uncommitted changes.',
       confirmLabel: 'Roll back and close',
-      danger: true
+      danger: true,
+      onShow: () => activateTab(id)
     }).then((ok) => ok && closeTab(id, true))
     return
   }
@@ -674,13 +675,38 @@ export interface ConfirmRequest {
   code?: string
   /** Text the user has to type before the confirm button enables, e.g. a connection name */
   typeToConfirm?: string
+  /** Called when the dialog comes up, which can be later than asked when others wait ahead */
+  onShow?: () => void
   resolve: (ok: boolean) => void
 }
 
 export const confirmStore = createStore<ConfirmRequest | null>(null)
 
+/** Confirms asked while one is open, shown in turn as each is answered */
+const confirmQueue: ConfirmRequest[] = []
+
+function showConfirm(request: ConfirmRequest): void {
+  confirmStore.set(request)
+  request.onShow?.()
+}
+
 export function confirm(request: Omit<ConfirmRequest, 'resolve'>): Promise<boolean> {
-  return new Promise((resolve) => confirmStore.set({ ...request, resolve }))
+  return new Promise((resolve) => {
+    let answered = false
+    const entry: ConfirmRequest = {
+      ...request,
+      resolve: (ok) => {
+        if (answered) return
+        answered = true
+        resolve(ok)
+        if (confirmStore.get() === entry) confirmStore.set(null)
+        const next = confirmStore.get() ? undefined : confirmQueue.shift()
+        if (next) showConfirm(next)
+      }
+    }
+    if (confirmStore.get()) confirmQueue.push(entry)
+    else showConfirm(entry)
+  })
 }
 
 /* ---------- Per-tab run state (not persisted) ---------- */

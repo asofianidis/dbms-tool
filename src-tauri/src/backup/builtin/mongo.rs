@@ -52,7 +52,7 @@ fn escape_name(name: &str) -> String {
     out
 }
 
-fn unescape_name(name: &str) -> String {
+pub fn unescape_name(name: &str) -> String {
     let bytes = name.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -215,6 +215,57 @@ pub async fn dump(server: &Server, job: &MongoDumpJob, report: &Report<'_>) -> A
     Ok(())
 }
 
+/// What a folder dump's target held before the run, so a failed or cancelled
+/// run removes what it wrote and leaves everything that was there alone.
+pub struct DumpFolder {
+    dir: PathBuf,
+    /// The outermost folder the run creates, removed whole
+    created: Option<PathBuf>,
+    /// Files already in `dir`
+    existing: HashSet<std::ffi::OsString>,
+}
+
+impl DumpFolder {
+    /// None for archives, which are one file.
+    pub fn before(job: &MongoDumpJob) -> Option<Self> {
+        if job.archive {
+            return None;
+        }
+        let dir = Path::new(job.path.trim()).join(escape_name(job.database.trim()));
+        let mut created = None;
+        let mut probe = Some(dir.as_path());
+        while let Some(p) = probe.filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
+            created = Some(p.to_path_buf());
+            probe = p.parent();
+        }
+        let existing = std::fs::read_dir(&dir)
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        Some(Self {
+            dir,
+            created,
+            existing,
+        })
+    }
+
+    pub fn discard(&self) {
+        if let Some(created) = &self.created {
+            let _ = std::fs::remove_dir_all(created);
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !self.existing.contains(&entry.file_name())
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 async fn dump_documents(
     db: &Database,
     name: &str,
@@ -292,6 +343,16 @@ struct Restorer<'a> {
     logged: HashMap<String, u32>,
 }
 
+/// The database `db` from the backup restores into: with a source database
+/// chosen, only that one restores (as `to` when given), and nothing else.
+fn target_database(from: Option<&str>, to: Option<&str>, db: &str) -> Option<String> {
+    match (from, to) {
+        (Some(from), _) if from != db => None,
+        (_, Some(to)) => Some(to.to_string()),
+        _ => Some(db.to_string()),
+    }
+}
+
 const BATCH_DOCS: usize = 1000;
 const BATCH_BYTES: usize = 8 << 20;
 
@@ -322,12 +383,7 @@ impl<'a> Restorer<'a> {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let db = match (from, to) {
-            (Some(from), Some(to)) if from == db => to.to_string(),
-            (None, Some(to)) => to.to_string(),
-            _ => db.to_string(),
-        };
-        Some((db, coll.to_string()))
+        target_database(from, to, db).map(|db| (db, coll.to_string()))
     }
 
     fn fail(&mut self, ns: &str, message: String) -> AppResult<()> {
@@ -709,6 +765,87 @@ mod tests {
         assert_eq!(unescape_name("a%2Fb%3Ac%25"), "a/b:c%");
         assert_eq!(unescape_name("plain"), "plain");
         assert_eq!(unescape_name("50%"), "50%");
+    }
+
+    #[test]
+    fn a_chosen_source_database_is_the_only_one_restored() {
+        let t = |from, to, db| target_database(from, to, db);
+        assert_eq!(
+            t(Some("shop"), Some("shop"), "shop").as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            t(Some("shop"), Some("copy"), "shop").as_deref(),
+            Some("copy")
+        );
+        assert_eq!(t(Some("shop"), Some("copy"), "other"), None);
+        assert_eq!(t(Some("shop"), None, "other"), None);
+        assert_eq!(t(Some("shop"), None, "shop").as_deref(), Some("shop"));
+        assert_eq!(t(None, Some("copy"), "any").as_deref(), Some("copy"));
+        assert_eq!(t(None, None, "any").as_deref(), Some("any"));
+    }
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("dbms-mongo-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn folders_list_escaped_collections_and_views() {
+        let root = temp_dir();
+        let db = root.join(escape_name("my:db"));
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("a%3Ab.bson"), b"").unwrap();
+        std::fs::write(db.join("a%3Ab.metadata.json"), b"").unwrap();
+        std::fs::write(db.join("v.metadata.json.gz"), b"").unwrap();
+        let contents = folder_contents(&root).unwrap();
+        let names: Vec<(&str, &str, bool, bool)> = contents
+            .iter()
+            .map(|(d, c, data, meta)| (d.as_str(), c.as_str(), data.is_some(), meta.is_some()))
+            .collect();
+        assert_eq!(
+            names,
+            [("my:db", "a:b", true, true), ("my:db", "v", false, true)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_folder_dumps_remove_only_what_they_wrote() {
+        let job = |path: &Path| MongoDumpJob {
+            database: "shop".into(),
+            path: path.display().to_string(),
+            archive: false,
+            gzip: false,
+            exclude_collections: Vec::new(),
+        };
+        // A folder the run created goes entirely
+        let root = temp_dir();
+        let folder = DumpFolder::before(&job(&root.join("new"))).unwrap();
+        std::fs::create_dir_all(root.join("new").join("shop")).unwrap();
+        std::fs::write(root.join("new").join("shop").join("a.bson"), b"").unwrap();
+        folder.discard();
+        assert!(!root.exists());
+
+        // In an existing database folder, the user's files stay
+        let dir = root.join("shop");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+        let folder = DumpFolder::before(&job(&root)).unwrap();
+        std::fs::write(dir.join("a.bson"), b"").unwrap();
+        std::fs::write(dir.join("a.metadata.json"), b"").unwrap();
+        folder.discard();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["notes.txt"]);
+
+        // Archives are one file, which the caller removes
+        let mut archive = job(&root);
+        archive.archive = true;
+        assert!(DumpFolder::before(&archive).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

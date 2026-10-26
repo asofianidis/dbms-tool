@@ -180,6 +180,13 @@ impl RunLimits {
     }
 }
 
+fn interrupted() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+        None,
+    )
+}
+
 /// Runs every statement in `sql` on a local file, stopping at the first error.
 fn run_file(
     conn: &rusqlite::Connection,
@@ -187,15 +194,11 @@ fn run_file(
     limits: &RunLimits,
     out: &mut Vec<StatementResult>,
 ) -> rusqlite::Result<()> {
-    let max_rows = limits.max_rows;
     let mut sets = 0;
     let mut batch = rusqlite::Batch::new(conn, sql);
     while let Some(mut stmt) = batch.next()? {
         if limits.stop.load(Ordering::SeqCst) {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
-                None,
-            ));
+            return Err(interrupted());
         }
         if stmt.column_count() == 0 {
             let changes = stmt.execute([])? as u64;
@@ -225,25 +228,43 @@ fn run_file(
             columns,
             ..Default::default()
         };
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            result.total += 1;
-            if sink.is_some() || result.rows.len() < max_rows {
-                let mut values = Vec::with_capacity(width);
-                for i in 0..width {
-                    values.push(cell(row.get_ref(i)?, limits.max_binary));
-                }
-                match sink {
-                    Some(sink) if sink.failed() => break,
-                    Some(sink) => sink.row(&values),
-                    None => result.rows.push(values),
-                }
-            }
-        }
+        let read = read_rows(&mut stmt, sink, width, limits, &mut result);
+        // Closed on errors and interrupts too, so a partial export is still a valid file
         if let Some(sink) = sink {
             sink.finish();
         }
+        read?;
         out.push(result);
+    }
+    Ok(())
+}
+
+/// Reads a statement's rows into `result`, or into the export sink.
+fn read_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    sink: Option<&SinkHandle>,
+    width: usize,
+    limits: &RunLimits,
+    result: &mut StatementResult,
+) -> rusqlite::Result<()> {
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        // An interrupt that came between statements doesn't stop this one
+        if limits.stop.load(Ordering::SeqCst) {
+            return Err(interrupted());
+        }
+        result.total += 1;
+        if sink.is_some() || result.rows.len() < limits.max_rows {
+            let mut values = Vec::with_capacity(width);
+            for i in 0..width {
+                values.push(cell(row.get_ref(i)?, limits.max_binary));
+            }
+            match sink {
+                Some(sink) if sink.failed() => break,
+                Some(sink) => sink.row(&values),
+                None => result.rows.push(values),
+            }
+        }
     }
     Ok(())
 }
@@ -476,14 +497,6 @@ impl SqSession {
             .collect();
         pk.sort();
         let primary_key: Vec<String> = pk.into_iter().map(|(_, n)| n).collect();
-        // A lone INTEGER PRIMARY KEY is the rowid, which SQLite fills in
-        if primary_key.len() == 1
-            && let Some(col) = columns.iter_mut().find(|c| c.name == primary_key[0])
-            && col.data_type.eq_ignore_ascii_case("integer")
-        {
-            col.is_identity = true;
-            col.is_generated = true;
-        }
 
         let mut indexes = Vec::new();
         for r in self
@@ -514,6 +527,17 @@ impl SqSession {
                 method: None,
                 definition,
             });
+        }
+        // A lone INTEGER PRIMARY KEY is the rowid, which SQLite fills in. It
+        // isn't in a WITHOUT ROWID table or as `INTEGER PRIMARY KEY DESC`, and
+        // then (only then) the key has an index of its own
+        if primary_key.len() == 1
+            && !indexes.iter().any(|i| i.primary)
+            && let Some(col) = columns.iter_mut().find(|c| c.name == primary_key[0])
+            && col.data_type.eq_ignore_ascii_case("integer")
+        {
+            col.is_identity = true;
+            col.is_generated = true;
         }
 
         // id, seq, table, from, to, on_update, on_delete, match
@@ -689,13 +713,17 @@ impl SqSession {
         };
         let stop = limits.stop.clone();
         let run = self.backend.run(sql, limits);
+        tokio::pin!(run);
         let (results, error) = tokio::select! {
-            r = run => r,
+            r = &mut run => r,
             _ = cancel.wait() => {
                 // A local query stops at the next step; D1 can't be stopped, only abandoned
                 stop.store(true, Ordering::SeqCst);
                 if let Backend::File { interrupt, .. } = &self.backend {
                     interrupt.interrupt();
+                    // The blocking task may still be writing the export: answer
+                    // once it has stopped and closed the file
+                    let _ = run.await;
                 }
                 out.cancelled = true;
                 return out.finish(Some(MAIN.into()));
@@ -1029,6 +1057,98 @@ DELETE FROM t WHERE b = 2"
         }
         fn finish(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Counts rows and finishes, and can raise the stop flag after some rows.
+    struct Counting {
+        rows: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<std::sync::atomic::AtomicUsize>,
+        stop_after: Option<(usize, Arc<AtomicBool>)>,
+    }
+
+    impl RowSink for Counting {
+        fn begin(&mut self, _: &[ColumnMeta]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn row(&mut self, _: &[Value]) -> std::io::Result<()> {
+            let n = self.rows.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((after, stop)) = &self.stop_after
+                && n >= *after
+            {
+                stop.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn counting(
+        stop_after: Option<(usize, Arc<AtomicBool>)>,
+    ) -> (Counting, [Arc<std::sync::atomic::AtomicUsize>; 2]) {
+        let rows = Arc::<std::sync::atomic::AtomicUsize>::default();
+        let finished = Arc::<std::sync::atomic::AtomicUsize>::default();
+        (
+            Counting {
+                rows: rows.clone(),
+                finished: finished.clone(),
+                stop_after,
+            },
+            [rows, finished],
+        )
+    }
+
+    #[test]
+    fn an_export_is_finished_when_its_statement_fails_or_is_cancelled() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // The second row overflows
+        let failing = "SELECT CASE WHEN x = 2 THEN abs(-9223372036854775807 - 1) ELSE x END \
+                       FROM (SELECT 1 AS x UNION ALL SELECT 2)";
+        let (sink, [rows, finished]) = counting(None);
+        let limits = RunLimits {
+            sink: Some(SinkHandle::new(Box::new(sink), 0)),
+            ..RunLimits::all()
+        };
+        assert!(run_file(&conn, failing, &limits, &mut Vec::new()).is_err());
+        assert_eq!(rows.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+
+        // A cancel that lands mid-statement stops at the next row and still closes the file
+        let stop = Arc::<AtomicBool>::default();
+        let (sink, [rows, finished]) = counting(Some((2, stop.clone())));
+        let limits = RunLimits {
+            sink: Some(SinkHandle::new(Box::new(sink), 0)),
+            stop,
+            ..RunLimits::all()
+        };
+        let many = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) \
+                    SELECT i FROM n";
+        assert!(run_file(&conn, many, &limits, &mut Vec::new()).is_err());
+        assert_eq!(rows.load(Ordering::SeqCst), 2);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_rowid_alias_is_an_identity() {
+        let (mut s, _path) = session(
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE TABLE desc_key (id INTEGER PRIMARY KEY DESC, v TEXT);
+             CREATE TABLE no_rowid (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;",
+        )
+        .await;
+        let plain = s.describe_table("plain").await.unwrap();
+        assert!(plain.columns[0].is_identity && plain.columns[0].is_generated);
+        for table in ["desc_key", "no_rowid"] {
+            let info = s.describe_table(table).await.unwrap();
+            assert_eq!(info.primary_key, ["id"], "{table}");
+            assert!(info.columns[0].is_primary_key, "{table}");
+            assert!(
+                !info.columns[0].is_identity && !info.columns[0].is_generated,
+                "{table}"
+            );
         }
     }
 

@@ -19,7 +19,7 @@ import {
   Trash2,
   X
 } from 'lucide-react'
-import { api, type RData, type RedisKeyEntry } from '@/lib/api'
+import { api, type RData, type RedisKeyEntry, type RedisOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatCount, plural } from '@/lib/format'
 import { queries } from '@/lib/queries'
@@ -62,6 +62,11 @@ const prefsStore = createPersistentStore<{ view: 'tree' | 'list'; delimiter: str
   { view: 'tree', delimiter: ':' }
 )
 
+/** The server's caveat about a result, e.g. a cluster node listing only its own keys. */
+function noticeOf(out: RedisOutput): string | null {
+  return (out as RedisOutput & { notice?: string | null }).notice ?? null
+}
+
 export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.Element {
   const connections = connectionsStore.use()
   const statuses = statusStore.use()
@@ -79,6 +84,8 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
   const [scanned, setScanned] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  /** Caveat from the server, e.g. a cluster node listing only its own keys */
+  const [notice, setNotice] = useState<string | null>(null)
   const [open, setOpen] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<RData | null>(null)
   const [checked, setChecked] = useState<Set<string>>(new Set())
@@ -111,6 +118,7 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
         })
         setScanned((s) => (from ? s : 0) + out.scanned)
         setCursor(out.cursor)
+        setNotice(noticeOf(out))
         setError(null)
         return out.cursor
       } catch (e) {
@@ -215,7 +223,7 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
     const match = folder.match
     const ok = await confirm({
       title: `Delete everything under ${folder.prefix}?`,
-      message: `Every key matching ${dataText(match)} in database ${tab.database} is deleted, including keys that aren't loaded here (${plural(folder.count, 'key')} loaded).`,
+      message: `Every key matching ${dataText(match)} in database ${tab.database} is deleted, including keys that aren't loaded here (${plural(folder.count, 'key')} loaded).${notice ? ' On a cluster, only keys stored on the connected node are deleted.' : ''}`,
       confirmLabel: 'Delete keys',
       danger: true
     })
@@ -227,7 +235,8 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
         pattern: match
       })
       const n = out.reply?.t === 'int' ? Number(out.reply.v) : 0
-      toast(`Deleted ${plural(n, 'key')}`)
+      const caveat = noticeOf(out)
+      toast(`Deleted ${plural(n, 'key')}${caveat ? `. ${caveat}` : ''}`)
       refreshKeyCounts(tab.connectionId)
       reload()
     } catch (e) {
@@ -470,6 +479,11 @@ export function KeyBrowserTab({ tab }: { tab: TabOf<'redisKeys'> }): React.JSX.E
                 </Button>
               )}
             </div>
+            {notice && (
+              <p className="shrink-0 border-b border-line px-2 py-1 text-[11px] text-warn">
+                {notice}
+              </p>
+            )}
             {checkedKeys.length > 0 && (
               <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line bg-sel/40 px-2 text-[11px] text-bright">
                 {checkedKeys.length} selected

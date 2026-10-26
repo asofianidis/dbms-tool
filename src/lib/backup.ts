@@ -585,7 +585,8 @@ export function defaultMoves(
     let name = serverFileName(f.physical)
     if (target && source && target !== source) {
       name = name.toLowerCase().includes(source.toLowerCase())
-        ? name.replace(new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), target)
+        ? // A replacer function, so $& or $1 in the target name stay literal
+          name.replace(new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), () => target)
         : `${target}_${name}`
     }
     const dir = f.type === 'L' ? server.logDir : server.dataDir

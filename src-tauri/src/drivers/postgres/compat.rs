@@ -8,6 +8,10 @@ pub const PROKIND: i32 = 110000;
 pub const GENERATED_COLUMNS: i32 = 120000;
 /// PostgreSQL 11 added covering indexes (`INCLUDE`, `pg_index.indnkeyatts`).
 pub const INCLUDE_COLUMNS: i32 = 110000;
+/// PostgreSQL 11 added `pg_constraint.conparentid` (constraints cloned onto partitions).
+pub const CONSTRAINT_PARENT: i32 = 110000;
+/// PostgreSQL 13 added `pg_trigger.tgparentid` (triggers cloned onto partitions).
+pub const TRIGGER_PARENT: i32 = 130000;
 
 /// `pg_proc p` as an explorer kind: function | procedure | aggregate | window_function.
 pub fn routine_kind(version: i32) -> &'static str {
@@ -26,6 +30,35 @@ pub fn is_generated(version: i32) -> &'static str {
         "a.attgenerated <> ''"
     } else {
         "false"
+    }
+}
+
+/// `pg_attribute a`'s generated kind ('' | 's' | 'v'), as text; always '' before PostgreSQL 12.
+pub fn generated_kind(version: i32) -> &'static str {
+    if version >= GENERATED_COLUMNS {
+        "a.attgenerated::text"
+    } else {
+        "''::text"
+    }
+}
+
+/// `pg_constraint con` isn't a partition's clone of its parent's constraint;
+/// PostgreSQL 10 had no constraints to clone (and no `conparentid`).
+pub fn constraint_not_cloned(version: i32) -> &'static str {
+    if version >= CONSTRAINT_PARENT {
+        "con.conparentid = 0"
+    } else {
+        "true"
+    }
+}
+
+/// `pg_trigger t` isn't a partition's clone of its parent's trigger; before
+/// PostgreSQL 13 (no `tgparentid`) the clones were internal, which is filtered anyway.
+pub fn trigger_not_cloned(version: i32) -> &'static str {
+    if version >= TRIGGER_PARENT {
+        "t.tgparentid = 0"
+    } else {
+        "true"
     }
 }
 
@@ -136,5 +169,17 @@ mod tests {
         assert!(ddl.contains("a.aggmfinalmodify"));
         // Every option is a separate array element, so NULLs drop out cleanly
         assert!(!ddl.contains(",,"));
+    }
+
+    #[test]
+    fn table_ddl_columns_follow_the_version() {
+        for v in [100000, 110022, 120000, 129999] {
+            assert!(!trigger_not_cloned(v).contains("tgparentid"), "{v}");
+        }
+        assert!(!constraint_not_cloned(100023).contains("conparentid"));
+        assert_eq!(constraint_not_cloned(110000), "con.conparentid = 0");
+        assert!(!generated_kind(110022).contains("attgenerated"));
+        assert_eq!(generated_kind(120000), "a.attgenerated::text");
+        assert_eq!(trigger_not_cloned(130000), "t.tgparentid = 0");
     }
 }

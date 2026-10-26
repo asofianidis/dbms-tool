@@ -29,6 +29,7 @@ use crate::manager::Server;
 use crate::model::CancelSignal;
 
 pub use mongo::archive_contents as mongo_archive_contents;
+pub use mongo::unescape_name as mongo_unescape_name;
 
 /// Whether the built-in engine can run `job`, and why not when it can't.
 pub fn supports(job: &Job) -> AppResult<()> {
@@ -144,6 +145,10 @@ async fn execute(
     let cancel = jobs.register(job_id);
     let report = Report::new(app, job_id, cancel, input_size(job));
     report.line(describe(job).lines().next().unwrap_or_default());
+    let folder = match job {
+        Job::Mongodump(j) => mongo::DumpFolder::before(j),
+        _ => None,
+    };
     let result = match job {
         Job::PgDump(j) => postgres::dump(server, j, &report).await,
         Job::Psql(j) => postgres::restore(server, j, &report).await,
@@ -161,6 +166,12 @@ async fn execute(
         && path.is_file()
     {
         let _ = std::fs::remove_file(path);
+    }
+    // A folder dump leaves the files it wrote so far
+    if (result.is_err() || cancelled)
+        && let Some(folder) = &folder
+    {
+        folder.discard();
     }
     if let Err(e) = &result
         && !cancelled
