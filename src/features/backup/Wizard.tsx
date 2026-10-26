@@ -788,12 +788,21 @@ export function useSqlJob(tabId: string): {
   const running = useRef<string | null>(null)
   // The copy to this computer, once the script has finished
   const copying = useRef<string | null>(null)
+  // Cancelled before the copy reached the backend; it doesn't start
+  const stopped = useRef(false)
+  const stopCopy = (): void => {
+    if (!copying.current) return
+    stopped.current = true
+    // Kept by the backend even if the job hasn't registered yet
+    void api.backupCancel(copying.current)
+  }
   useEffect(
     () => () => {
       if (running.current) void api.cancel(running.current, session)
-      if (copying.current) void api.backupCancel(copying.current)
+      stopCopy()
       setRunning(tabId, false)
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [tabId, session]
   )
   const copy = async (
@@ -802,6 +811,7 @@ export function useSqlJob(tabId: string): {
   ): Promise<boolean> => {
     const id = crypto.randomUUID()
     copying.current = id
+    stopped.current = false
     setJob((s) => s && { ...s, percent: null })
     const unlisten = await listen<BackupProgress>('backup-progress', (e) => {
       const p = e.payload
@@ -816,6 +826,10 @@ export function useSqlJob(tabId: string): {
       )
     })
     try {
+      if (stopped.current) {
+        setJob((s) => s && { ...s, status: 'cancelled', elapsedMs: Date.now() - s.startedAt })
+        return false
+      }
       const outcome = await api.backupMssqlDownload(
         connectionId,
         id,
@@ -906,7 +920,7 @@ export function useSqlJob(tabId: string): {
     start,
     cancel: () => {
       if (running.current) void api.cancel(running.current, session)
-      if (copying.current) void api.backupCancel(copying.current)
+      stopCopy()
     },
     clear: () => setJob(null)
   }

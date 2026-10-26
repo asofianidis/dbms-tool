@@ -3,6 +3,7 @@
 //! connection: OPENROWSET(BULK … SINGLE_BLOB) loads it into a temp table,
 //! which is then read in chunks.
 
+use std::future::Future;
 use std::path::Path;
 
 use tiberius::Client;
@@ -66,6 +67,20 @@ fn explain(e: tiberius::error::Error) -> AppError {
     }
 }
 
+/// Runs `work` until it finishes or the job is cancelled, whichever is first.
+/// Dropping the session afterwards disconnects, which stops the query on the
+/// server.
+async fn unless_cancelled<T>(
+    report: &Report<'_>,
+    work: impl Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::select! {
+        biased;
+        _ = report.cancel.wait() => Err(AppError::msg("Cancelled")),
+        result = work => result,
+    }
+}
+
 /// The file's size, where the server can say (sys.dm_os_enumerate_filesystem
 /// needs SQL Server 2017 and sysadmin).
 async fn size_on_server(client: &mut Tds, path: &str) -> Option<u64> {
@@ -101,7 +116,8 @@ pub async fn copy(
         file.display()
     ));
 
-    let known = size_on_server(client, source).await;
+    let known =
+        unless_cancelled(report, async { Ok(size_on_server(client, source).await) }).await?;
     if let Some(size) = known {
         if size > MAX_SIZE {
             return Err(too_big(Some(size)));
@@ -120,13 +136,11 @@ pub async fn copy(
          SELECT DATALENGTH(data) FROM #backup_copy;",
         literal(source)
     );
-    let rows = tokio::select! {
-        biased;
-        // Dropping the session disconnects, which stops the load on the server
-        _ = report.cancel.wait() => return report.check(),
-        rows = async { client.simple_query(load).await?.into_first_result().await } =>
-            rows.map_err(explain)?,
-    };
+    let rows = unless_cancelled(report, async {
+        let stream = client.simple_query(load).await.map_err(explain)?;
+        stream.into_first_result().await.map_err(explain)
+    })
+    .await?;
     let total = rows
         .first()
         .and_then(|r| r.get::<i64, _>(0))
@@ -134,7 +148,11 @@ pub async fn copy(
         .unwrap_or(0);
     report.set_total(total);
 
-    let mut out = tokio::fs::File::create(file)
+    // Never someone else's file: the name is this job's own
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)
         .await
         .map_err(|e| AppError::msg(format!("Can't write {}: {e}", file.display())))?;
     let mut done: u64 = 0;
@@ -142,14 +160,16 @@ pub async fn copy(
         report.check()?;
         // SUBSTRING counts from 1
         let start = done as i64 + 1;
-        let rows = client
-            .query(
-                "SELECT SUBSTRING(data, @P1, @P2) FROM #backup_copy",
-                &[&start, &CHUNK],
-            )
-            .await?
-            .into_first_result()
-            .await?;
+        let rows = unless_cancelled(report, async {
+            let stream = client
+                .query(
+                    "SELECT SUBSTRING(data, @P1, @P2) FROM #backup_copy",
+                    &[&start, &CHUNK],
+                )
+                .await?;
+            Ok(stream.into_first_result().await?)
+        })
+        .await?;
         let chunk: &[u8] = rows.first().and_then(|r| r.get(0)).unwrap_or_default();
         if chunk.is_empty() {
             break;

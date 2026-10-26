@@ -109,7 +109,8 @@ rather than a plugin, in a fast native app that doesn't get in your way.
 - Backup and restore with the engine's own tools (`pg_dump`, `mysqldump`, `mongodump`, …) or a
   built-in engine writing the same formats when they aren't installed; SQL Server uses server-side
   `BACKUP` / `RESTORE` with full, differential and log backups, and can copy a finished backup
-  (up to 2 GB) from the server to this computer.
+  (up to 2 GB) from the server to this computer. The copy needs the ADMINISTER BULK OPERATIONS
+  permission and, while it runs, about as much free tempdb space as the backup.
 - Schema compare between two databases of the same dialect, on any connections: tables, views,
   routines and sequences, with a line diff and a dependency-ordered migration script.
 - ER diagrams with automatic layout, exported as PNG, SVG or PDF.

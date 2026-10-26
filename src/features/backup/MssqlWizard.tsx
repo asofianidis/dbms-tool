@@ -380,7 +380,8 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
               <Callout tone="info">
                 Copying uses OPENROWSET(BULK …), which needs the ADMINISTER BULK OPERATIONS
                 permission, and works for backups up to 2 GB. Compression keeps a backup well under
-                that.
+                that. While it copies, the server holds the whole backup in tempdb, so it needs
+                about as much free tempdb space as the backup’s size.
               </Callout>
             </>
           )}

@@ -204,8 +204,9 @@ async fn execute(
 }
 
 /// Copies a backup SQL Server wrote to its own disk into `file` on this
-/// computer. It's written beside `file` first, so a failed copy leaves any
-/// file already there alone.
+/// computer. It's written beside `file` first, under a name of its own, so a
+/// failed copy leaves any file already there alone and two copies to the same
+/// place don't write into each other.
 pub async fn mssql_download(
     app: &tauri::AppHandle,
     jobs: &Jobs,
@@ -220,7 +221,12 @@ pub async fn mssql_download(
         return Err(AppError::msg("Choose where to save the backup"));
     }
     let mut partial = file.clone().into_os_string();
-    partial.push(".part");
+    let tag: String = job_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect();
+    partial.push(format!(".{tag}.part"));
     let partial = PathBuf::from(partial);
     let started = Instant::now();
     let cancel = jobs.register(job_id);
