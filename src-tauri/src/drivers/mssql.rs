@@ -443,6 +443,11 @@ impl MsSession {
         Ok(stream.into_first_result().await?)
     }
 
+    /// The TDS client, for the built-in backup's file copy.
+    pub fn client(&mut self) -> &mut Client<Compat<TcpStream>> {
+        &mut self.client
+    }
+
     pub async fn ping(&mut self) -> bool {
         self.rows("SELECT 1", &[]).await.is_ok()
     }

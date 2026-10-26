@@ -925,6 +925,22 @@ pub async fn backup_run(
     crate::backup::run(&app, &state.backups, &job_id, &tool, plan).await
 }
 
+/// Copies a SQL Server backup from the server's disk to `file` on this
+/// computer, emitting `backup-progress` events tagged with `job_id`.
+#[tauri::command]
+pub async fn backup_mssql_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    job_id: String,
+    source: String,
+    file: String,
+) -> AppResult<crate::backup::Outcome> {
+    let server = state.manager.get(&id)?;
+    crate::backup::builtin::mssql_download(&app, &state.backups, &job_id, &server, &source, &file)
+        .await
+}
+
 #[tauri::command]
 pub fn backup_cancel(state: State<'_, AppState>, job_id: String) {
     state.backups.cancel(&job_id);

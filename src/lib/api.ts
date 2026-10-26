@@ -900,6 +900,9 @@ export const api = {
   /** Runs to completion; output arrives as `backup-progress` events tagged with `jobId` */
   backupRun: (id: string, jobId: string, job: BackupJob, dir?: string | null) =>
     invoke<BackupOutcome>('backup_run', { id, jobId, job, dir: dir || null }),
+  /** Copies a SQL Server backup from the server's disk to `file` on this computer */
+  backupMssqlDownload: (id: string, jobId: string, source: string, file: string) =>
+    invoke<BackupOutcome>('backup_mssql_download', { id, jobId, source, file }),
   backupCancel: (jobId: string) => invoke<void>('backup_cancel', { jobId }),
   /** Shows the error log file in the OS file manager */
   logsReveal: () => invoke<void>('logs_reveal'),

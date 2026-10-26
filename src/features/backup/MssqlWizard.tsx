@@ -7,6 +7,7 @@ import {
   defaultMoves,
   defaultMssqlBackupPath,
   fileListSql,
+  joinServerPath,
   headerOnlySql,
   mssqlBackupScript,
   mssqlRestoreScript,
@@ -17,6 +18,7 @@ import {
   parseHeaderOnly,
   parseMssqlServer,
   parseRecentBackups,
+  serverFileName,
   validateMssqlBackup,
   validateMssqlRestore,
   type MssqlBackupDraft,
@@ -43,10 +45,12 @@ import {
   Callout,
   Choice,
   JobPanel,
+  PathField,
   Section,
   StepFooter,
   Summary,
   WizardLayout,
+  defaultFolder,
   useSqlJob,
   useSteps
 } from './Wizard'
@@ -99,12 +103,21 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
   const [draft, setDraft] = useState(() => newMssqlBackupDraft(database))
   const patch = (p: Partial<MssqlBackupDraft>): void => setDraft((d) => ({ ...d, ...p }))
   const [customPath, setCustomPath] = useState<string | null>(null)
+  // Copy the finished backup from the server to this computer
+  const [download, setDownload] = useState(false)
+  const [folder, setFolder] = useState('')
+  const [customLocal, setCustomLocal] = useState<string | null>(null)
+  useEffect(() => {
+    void defaultFolder().then(setFolder)
+  }, [])
   const runner = useSqlJob(tabId)
   const dbs = useQuery(queries.databases(connection.id))
   const names = (dbs.data ?? []).filter((d) => d.name !== 'tempdb').map((d) => d.name)
   const server = useServer(connection.id, draft.database)
   const info = server.data ?? null
   const path = customPath ?? (info && draft.database ? defaultMssqlBackupPath(info, draft) : '')
+  const localPath =
+    customLocal ?? (folder && path ? joinServerPath(folder, serverFileName(path)) : '')
   const full = { ...draft, path }
   const script = mssqlBackupScript(full)
   const express = info?.edition === 4
@@ -116,7 +129,11 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
     if (steps.step === 0 && draft.type === 'log' && info?.recoveryModel === 'SIMPLE') {
       return 'Log backups need the FULL or BULK_LOGGED recovery model'
     }
-    if (steps.step >= 2) return validateMssqlBackup(full, info)
+    if (steps.step >= 2) {
+      const invalid = validateMssqlBackup(full, info)
+      if (invalid) return invalid
+      if (download && !localPath.trim()) return 'Choose where to save the backup on this computer'
+    }
     return null
   })()
 
@@ -137,6 +154,7 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
           job={runner.job}
           noun="Backup"
           onCancel={runner.cancel}
+          output={download ? localPath : undefined}
           actions={
             <Button variant="secondary" onClick={runner.clear}>
               <RotateCcw className="size-3.5" /> Back to settings
@@ -145,7 +163,17 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
         />
         {runner.job.status === 'done' && (
           <Summary
-            rows={[['Saved on the server', <span className="font-mono text-xs">{path}</span>]]}
+            rows={[
+              ['Saved on the server', <span className="font-mono text-xs">{path}</span>],
+              ...(download
+                ? [
+                    [
+                      'Copied to this computer',
+                      <span className="font-mono text-xs">{localPath}</span>
+                    ] as [string, React.ReactNode]
+                  ]
+                : [])
+            ]}
           />
         )}
       </WizardLayout>
@@ -171,7 +199,11 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
           onNext={() =>
             steps.step < STEPS.length - 1
               ? steps.go(steps.step + 1)
-              : void runner.start(connection.id, script)
+              : void runner.start(
+                  connection.id,
+                  script,
+                  download ? { source: path, file: localPath } : undefined
+                )
           }
           startLabel="Start backup"
           startIcon={<Play className="size-3.5" />}
@@ -323,6 +355,38 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
         </Section>
       )}
 
+      {steps.step === 2 && (
+        <Section title="Copy to this computer">
+          <Toggle
+            checked={download}
+            onChange={setDownload}
+            label="Download the backup when it finishes"
+            description="Reads the file back over this connection and saves it here; the copy on the server stays"
+          />
+          {download && (
+            <>
+              <PathField
+                mode="save"
+                value={localPath}
+                onChange={setCustomLocal}
+                placeholder="Where to save the backup"
+                filters={[
+                  {
+                    name: 'SQL Server backup',
+                    extensions: [draft.type === 'log' ? 'trn' : 'bak']
+                  }
+                ]}
+              />
+              <Callout tone="info">
+                Copying uses OPENROWSET(BULK …), which needs the ADMINISTER BULK OPERATIONS
+                permission, and works for backups up to 2 GB. Compression keeps a backup well under
+                that.
+              </Callout>
+            </>
+          )}
+        </Section>
+      )}
+
       {steps.step === 3 && (
         <>
           <Section title="Summary">
@@ -334,6 +398,14 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
                   `${{ full: 'Full', differential: 'Differential', log: 'Transaction log' }[draft.type]}${draft.copyOnly ? ', copy-only' : ''}`
                 ],
                 ['File on server', <span className="font-mono text-xs">{path}</span>],
+                ...(download
+                  ? [
+                      ['Copied to', <span className="font-mono text-xs">{localPath}</span>] as [
+                        string,
+                        React.ReactNode
+                      ]
+                    ]
+                  : []),
                 ['Existing backups', draft.overwrite ? 'Overwritten' : 'Kept; this one is appended']
               ]}
             />
