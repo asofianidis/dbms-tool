@@ -912,7 +912,9 @@ impl PgSession {
         let rows = self
             .strings(
                 // pg_catalog because information_schema.columns leaves out materialized
-                // views; the privilege check is the same as that view's
+                // views; the privilege check is the same as that view's. The cap is generous
+                // because schemas come from these rows: a Babelfish instance holds a schema per
+                // migrated database and schema, and a low cap hides the later ones entirely
                 "SELECT n.nspname::text, c.relname::text, array_agg(a.attname::text ORDER BY a.attnum) \
                  FROM pg_attribute a \
                  JOIN pg_class c ON c.oid = a.attrelid \
@@ -922,7 +924,7 @@ impl PgSession {
                    AND NOT pg_is_other_temp_schema(n.oid) \
                    AND (pg_has_role(c.relowner, 'USAGE') \
                      OR has_column_privilege(c.oid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES')) \
-                 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 5000",
+                 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 50000",
                 &[],
             )
             .await?;
