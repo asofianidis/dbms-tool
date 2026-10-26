@@ -162,10 +162,12 @@ export function singleTableSource(sql: string, dialect: Dialect): SingleTableSou
 const TEMP_SCHEMA = /^(pg_temp(_\d+)?|temp)$/i
 
 /**
- * The completion entry for a table named by `parts`, preferring the default
- * schema when an unqualified name exists in several. Without a default schema
- * an ambiguous name resolves to null rather than a guess, as it does whenever
- * a temporary table shares the name (it shadows whatever search_path finds).
+ * The completion entry for a table named by `parts`. An unqualified name found
+ * in several schemas resolves as PostgreSQL's search_path would, else to the
+ * default schema's. Without a default schema an ambiguous name resolves to
+ * null rather than a guess (the search_path is the metadata session's, which a
+ * SET in a query tab doesn't change), as it does whenever a temporary table
+ * shares the name (it shadows whatever search_path finds).
  */
 export function resolveTable(
   parts: string[],
@@ -184,5 +186,10 @@ export function resolveTable(
   const matches = tables.filter((t) => same(t.name, name) && (!schema || same(t.schema, schema)))
   if (matches.length <= 1) return matches[0] ?? null
   if (!schema && matches.some((t) => t.schema && TEMP_SCHEMA.test(t.schema))) return null
-  return matches.find((t) => defaultSchema && same(t.schema, defaultSchema)) ?? null
+  if (!defaultSchema) return null
+  const searched = matches
+    .filter((t) => t.searchRank !== undefined)
+    .sort((a, b) => (a.searchRank ?? 0) - (b.searchRank ?? 0))
+  if (searched.length) return searched[0]
+  return matches.find((t) => same(t.schema, defaultSchema)) ?? null
 }

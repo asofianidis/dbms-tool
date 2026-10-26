@@ -176,6 +176,9 @@ pub struct CompletionTable {
     pub columns: Vec<String>,
     /// Outgoing foreign keys, for join suggestions
     pub foreign_keys: Vec<CompletionKey>,
+    /// Where the schema falls in PostgreSQL's search_path (1 is searched first)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_rank: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]

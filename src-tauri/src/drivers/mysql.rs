@@ -798,6 +798,7 @@ impl MySession {
                     name: table,
                     columns: vec![column],
                     foreign_keys: Vec::new(),
+                    search_rank: None,
                 }),
             }
         }

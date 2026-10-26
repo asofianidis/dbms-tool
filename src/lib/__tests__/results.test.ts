@@ -248,6 +248,21 @@ describe('where a result comes from', () => {
     // A name in one schema needs no default
     expect(resolveTable(['orders'], tables, undefined, 'postgres')?.schema).toBe('public')
   })
+
+  it('resolves a name in several schemas by the search_path', () => {
+    // A Babelfish instance, its search_path set to one migrated database
+    const tables: CompletionTable[] = [
+      { schema: 'mydb_dbo', name: 'orders', columns: [], foreignKeys: [], searchRank: 2 },
+      { schema: 'mydb_sales', name: 'orders', columns: [], foreignKeys: [], searchRank: 1 },
+      { schema: 'testdb_dbo', name: 'orders', columns: [], foreignKeys: [] }
+    ]
+    expect(resolveTable(['orders'], tables, 'public', 'postgres')?.schema).toBe('mydb_sales')
+    expect(resolveTable(['testdb_dbo', 'orders'], tables, 'public', 'postgres')?.schema).toBe(
+      'testdb_dbo'
+    )
+    // Editing results in place still doesn't guess
+    expect(resolveTable(['orders'], tables, undefined, 'postgres')).toBeNull()
+  })
 })
 
 describe('snippets', () => {
