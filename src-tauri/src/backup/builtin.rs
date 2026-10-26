@@ -282,19 +282,46 @@ pub async fn mssql_upload(
     }
     let cancel = jobs.register(job_id);
     let report = Report::new(Some(app), job_id, cancel, None);
-    let result = mssql::upload(server, &file, &report).await;
+    let mut result = mssql::upload(server, &file, &report).await;
     jobs.unregister(job_id);
     let cancelled = report.cancelled();
-    if let Err(e) = &result
-        && !cancelled
+    // Cancelled just as the copy finished: it isn't wanted any more
+    if cancelled
+        && let Ok(staged) = &result
+        && staged.uploaded
     {
-        report.line(format!("ERROR: {e}"));
+        let leftover = mssql::discard(server, &staged.path)
+            .await
+            .err()
+            .map(|_| staged.path.clone());
+        result = Err(mssql::UploadFailed {
+            error: AppError::msg("Cancelled"),
+            leftover,
+        });
     }
     report.flush();
-    if cancelled {
-        return Ok(None);
-    }
-    result.map(Some)
+    let failed = match result {
+        Ok(staged) if !cancelled => return Ok(Some(staged)),
+        Ok(_) => return Ok(None),
+        Err(failed) => failed,
+    };
+    // A cancel is quiet, unless it left a copy on the server
+    let Some(path) = failed.leftover else {
+        return if cancelled {
+            Ok(None)
+        } else {
+            Err(failed.error)
+        };
+    };
+    let reason = if cancelled {
+        "Cancelled".to_string()
+    } else {
+        failed.error.to_string()
+    };
+    Err(AppError::msg(format!(
+        "{reason}\n\nA copy may still be at {path} on the server and couldn't be deleted; \
+         delete it there."
+    )))
 }
 
 /// Deletes a backup `mssql_upload` sent to the server.

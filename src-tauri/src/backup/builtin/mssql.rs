@@ -247,10 +247,31 @@ fn on_this_computer(server: &Server) -> bool {
     ) || (!machine.is_empty() && host == machine)
 }
 
+/// Why `upload` failed, and whether it may have left its copy on the server.
+pub struct UploadFailed {
+    pub error: AppError,
+    /// A copy the server may still hold, which couldn't be deleted
+    pub leftover: Option<String>,
+}
+
+impl From<AppError> for UploadFailed {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            leftover: None,
+        }
+    }
+}
+
 /// Makes `file`, on this computer, readable by the server: the file itself
 /// when the server runs here and sees it, otherwise a copy in the server's
-/// default backup folder.
-pub async fn upload(server: &Server, file: &Path, report: &Report<'_>) -> AppResult<Staged> {
+/// default backup folder. The copy is limited to 2 GB: it passes through
+/// tempdb on its way, and the server holds all of it in memory to write it.
+pub async fn upload(
+    server: &Server,
+    file: &Path,
+    report: &Report<'_>,
+) -> Result<Staged, UploadFailed> {
     let size = tokio::fs::metadata(file)
         .await
         .map_err(|e| AppError::msg(format!("Can't read {}: {e}", file.display())))?
@@ -270,37 +291,58 @@ pub async fn upload(server: &Server, file: &Path, report: &Report<'_>) -> AppRes
             uploaded: false,
         });
     }
+    if size > MAX_SIZE {
+        return Err(AppError::msg(format!(
+            "The backup is larger than 2 GB ({:.1} GB), the most this app sends to a server. \
+             Copy the file to the server another way, then choose it under \"On the server\".",
+            size as f64 / 1e9
+        ))
+        .into());
+    }
 
-    let platform = text(first_row(client, "SELECT host_platform FROM sys.dm_os_host_info").await);
+    let platform = unless_cancelled(report, async {
+        Ok(text(
+            first_row(client, "SELECT host_platform FROM sys.dm_os_host_info").await,
+        ))
+    })
+    .await?;
     if platform.as_deref() == Some("Linux") {
         return Err(AppError::msg(
             "SQL Server on Linux can't receive a backup over the connection. Copy the file \
              to the server first (for a Docker container: docker cp <file> \
              <container>:/var/opt/mssql/backup/), then choose it under \"On the server\".",
-        ));
+        )
+        .into());
     }
-    let ole = first_row(
-        client,
-        "SELECT CAST(value_in_use AS int) FROM sys.configurations \
-         WHERE name = N'Ole Automation Procedures'",
-    )
-    .await
-    .and_then(|r| r.get::<i32, _>(0));
+    let ole = unless_cancelled(report, async {
+        Ok(first_row(
+            client,
+            "SELECT CAST(value_in_use AS int) FROM sys.configurations \
+             WHERE name = N'Ole Automation Procedures'",
+        )
+        .await
+        .and_then(|r| r.get::<i32, _>(0)))
+    })
+    .await?;
     if ole != Some(1) {
         return Err(AppError::msg(
             "Sending a backup to the server writes it with OLE Automation, which is turned \
              off on this server. An administrator can turn it on with sp_configure \
              'Ole Automation Procedures', 1; or copy the file to the server and choose it \
              under \"On the server\".",
-        ));
-    }
-    let dir = text(
-        first_row(
-            client,
-            "SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS nvarchar(4000))",
         )
-        .await,
-    )
+        .into());
+    }
+    let dir = unless_cancelled(report, async {
+        Ok(text(
+            first_row(
+                client,
+                "SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS nvarchar(4000))",
+            )
+            .await,
+        ))
+    })
+    .await?
     .filter(|d| !d.trim().is_empty())
     .ok_or_else(|| AppError::msg("The server didn't report a default backup folder"))?;
     let name = file
@@ -320,10 +362,44 @@ pub async fn upload(server: &Server, file: &Path, report: &Report<'_>) -> AppRes
 
     report.line(format!("Sending {local} to {target} on the server"));
     report.set_total(size);
-    run(
-        client,
-        "SET NOCOUNT ON; CREATE TABLE #upload (seq int PRIMARY KEY, data varbinary(max) NOT NULL);"
-            .into(),
+    if let Err(error) = send(client, file, &target, size, report).await {
+        // The write may have created the file. A cancelled session may still
+        // be mid-write, so it's closed and a fresh one deletes the copy
+        drop(session);
+        let leftover = match discard(server, &target).await {
+            Ok(()) => None,
+            Err(e) => {
+                report.line(format!(
+                    "WARNING: {target} may still be on the server and couldn't be deleted: {e}"
+                ));
+                Some(target)
+            }
+        };
+        return Err(UploadFailed { error, leftover });
+    }
+    report.line(format!("Sent {size} bytes"));
+    Ok(Staged {
+        path: target,
+        uploaded: true,
+    })
+}
+
+/// Sends `file` into a temp table, then has the server write it to `target`.
+async fn send(
+    client: &mut Tds,
+    file: &Path,
+    target: &str,
+    size: u64,
+    report: &Report<'_>,
+) -> AppResult<()> {
+    unless_cancelled(
+        report,
+        run(
+            client,
+            "SET NOCOUNT ON; \
+             CREATE TABLE #upload (seq int PRIMARY KEY, data varbinary(max) NOT NULL);"
+                .into(),
+        ),
     )
     .await?;
     let mut input = tokio::fs::File::open(file)
@@ -359,23 +435,22 @@ pub async fn upload(server: &Server, file: &Path, report: &Report<'_>) -> AppRes
     }
 
     report.line("Writing the file on the server…");
+    // Each chunk leaves tempdb once it's in the stream
     let write = format!(
         "SET NOCOUNT ON;
-DECLARE @stream int, @hr int = 0, @chunk varbinary(max),
+DECLARE @stream int, @hr int = 0, @chunk varbinary(max), @seq int = 0,
+    @last int = (SELECT MAX(seq) FROM #upload),
     @source nvarchar(4000), @description nvarchar(4000), @message nvarchar(4000);
 EXEC @hr = sp_OACreate 'ADODB.Stream', @stream OUT;
 IF @hr = 0 EXEC @hr = sp_OASetProperty @stream, 'Type', 1;
 IF @hr = 0 EXEC @hr = sp_OAMethod @stream, 'Open';
-DECLARE chunks CURSOR LOCAL FAST_FORWARD FOR SELECT data FROM #upload ORDER BY seq;
-OPEN chunks;
-FETCH NEXT FROM chunks INTO @chunk;
-WHILE @hr = 0 AND @@FETCH_STATUS = 0
+WHILE @hr = 0 AND @seq <= @last
 BEGIN
+    SELECT @chunk = data FROM #upload WHERE seq = @seq;
     EXEC @hr = sp_OAMethod @stream, 'Write', NULL, @chunk;
-    FETCH NEXT FROM chunks INTO @chunk;
+    DELETE FROM #upload WHERE seq = @seq;
+    SET @seq += 1;
 END;
-CLOSE chunks;
-DEALLOCATE chunks;
 IF @hr = 0 EXEC @hr = sp_OAMethod @stream, 'SaveToFile', NULL, {path}, 2;
 IF @hr <> 0 EXEC sp_OAGetErrorInfo @stream, @source OUT, @description OUT;
 IF @stream IS NOT NULL EXEC sp_OADestroy @stream;
@@ -385,44 +460,42 @@ BEGIN
         ISNULL(@description, CONVERT(nvarchar(20), CONVERT(varbinary(4), @hr), 1)));
     THROW 50000, @message, 1;
 END;",
-        path = literal(&target)
+        path = literal(target)
     );
-    let mut written = unless_cancelled(report, run(client, write)).await;
-    if written.is_ok()
-        && let Some(n) = size_on_server(client, &target).await
-        && n != size
-    {
-        written = Err(AppError::msg(format!(
+    unless_cancelled(report, run(client, write)).await?;
+    let written =
+        unless_cancelled(report, async { Ok(size_on_server(client, target).await) }).await?;
+    match written {
+        Some(n) if n != size => Err(AppError::msg(format!(
             "The server wrote {n} of the backup's {size} bytes"
-        )));
+        ))),
+        _ => Ok(()),
     }
-    if let Err(e) = written {
-        // After a cancel the session may still be mid-write, so it's dropped
-        // instead; the file, if any, keeps its recognisable name
-        if !report.cancelled() {
-            let _ = delete_upload(client, &target).await;
-        }
-        return Err(e);
-    }
-    report.line(format!("Sent {size} bytes"));
-    Ok(Staged {
-        path: target,
-        uploaded: true,
-    })
 }
 
+/// Deletes `path` on the server if it's there; fails if it can't.
 async fn delete_upload(client: &mut Tds, path: &str) -> AppResult<()> {
     let sql = format!(
-        "DECLARE @fs int, @hr int;
+        "SET NOCOUNT ON;
+DECLARE @fs int, @hr int, @exists int = 0,
+    @source nvarchar(4000), @description nvarchar(4000), @message nvarchar(4000);
 EXEC @hr = sp_OACreate 'Scripting.FileSystemObject', @fs OUT;
-IF @hr = 0 EXEC @hr = sp_OAMethod @fs, 'DeleteFile', NULL, {};
-IF @fs IS NOT NULL EXEC sp_OADestroy @fs;",
-        literal(path)
+IF @hr = 0 EXEC @hr = sp_OAMethod @fs, 'FileExists', @exists OUT, {path};
+IF @hr = 0 AND @exists <> 0 EXEC @hr = sp_OAMethod @fs, 'DeleteFile', NULL, {path};
+IF @hr <> 0 EXEC sp_OAGetErrorInfo @fs, @source OUT, @description OUT;
+IF @fs IS NOT NULL EXEC sp_OADestroy @fs;
+IF @hr <> 0
+BEGIN
+    SET @message = CONCAT(N'Couldn''t delete the backup on the server: ',
+        ISNULL(@description, CONVERT(nvarchar(20), CONVERT(varbinary(4), @hr), 1)));
+    THROW 50000, @message, 1;
+END;",
+        path = literal(path)
     );
     run(client, sql).await
 }
 
-/// Deletes a backup `upload` copied to the server.
+/// Deletes a backup `upload` copied to the server; succeeds if it's gone already.
 pub async fn discard(server: &Server, path: &str) -> AppResult<()> {
     let name = path.rsplit(['/', '\\']).next().unwrap_or_default();
     if !name.starts_with(UPLOAD_PREFIX) {

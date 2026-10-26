@@ -1687,25 +1687,62 @@ pub struct Outcome {
     pub errors: u32,
 }
 
+/// How long a cancel for a job that hasn't registered is kept for it.
+const EARLY_CANCEL_TTL: Duration = Duration::from_secs(60);
+
+struct JobEntry {
+    signal: Arc<CancelSignal>,
+    /// Registered and not yet finished
+    running: bool,
+    since: Instant,
+}
+
 /// Running jobs, so they can be cancelled.
 #[derive(Default)]
-pub struct Jobs(parking_lot::Mutex<HashMap<String, Arc<CancelSignal>>>);
+pub struct Jobs(parking_lot::Mutex<HashMap<String, JobEntry>>);
 
 impl Jobs {
     /// Cancels `id`, even before it registers: the frontend can cancel between
-    /// choosing a job's id and the command reaching `register`.
+    /// choosing a job's id and the command reaching `register`. Cancels for
+    /// jobs that never start (or already finished) expire.
     pub fn cancel(&self, id: &str) {
-        self.0.lock().entry(id.to_string()).or_default().fire();
+        let mut jobs = self.0.lock();
+        prune(&mut jobs);
+        jobs.entry(id.to_string())
+            .or_insert_with(|| JobEntry {
+                signal: Default::default(),
+                running: false,
+                since: Instant::now(),
+            })
+            .signal
+            .fire();
     }
 
     /// Tracks a running job; one cancelled early starts out cancelled.
     pub(crate) fn register(&self, id: &str) -> Arc<CancelSignal> {
-        self.0.lock().entry(id.to_string()).or_default().clone()
+        let mut jobs = self.0.lock();
+        prune(&mut jobs);
+        let entry = jobs.entry(id.to_string()).or_insert_with(|| JobEntry {
+            signal: Default::default(),
+            running: false,
+            since: Instant::now(),
+        });
+        entry.running = true;
+        entry.signal.clone()
     }
 
     pub(crate) fn unregister(&self, id: &str) {
         self.0.lock().remove(id);
     }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
+fn prune(jobs: &mut HashMap<String, JobEntry>) {
+    jobs.retain(|_, e| e.running || e.since.elapsed() < EARLY_CANCEL_TTL);
 }
 
 /// Copies the backup at `path` into the tool's standard input. Fails if the
@@ -1812,7 +1849,7 @@ pub async fn run(
         None => Ok(()),
     };
     emit(&log);
-    jobs.0.lock().remove(job_id);
+    jobs.unregister(job_id);
     drop(secret);
 
     let failed = !matches!(&status, Some(Ok(s)) if s.success());
@@ -1853,6 +1890,25 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::config::AuthMode;
+
+    #[test]
+    fn jobs_keep_early_cancels_for_a_while() {
+        let jobs = Jobs::default();
+        jobs.cancel("early");
+        assert!(jobs.register("early").is_fired());
+        jobs.unregister("early");
+        assert_eq!(jobs.len(), 0);
+
+        // A cancel for a job that never starts expires; running jobs stay
+        jobs.register("running");
+        jobs.cancel("never");
+        jobs.0.lock().get_mut("never").unwrap().since -= EARLY_CANCEL_TTL * 2;
+        jobs.0.lock().get_mut("running").unwrap().since -= EARLY_CANCEL_TTL * 2;
+        jobs.cancel("other");
+        assert!(jobs.0.lock().contains_key("running"));
+        assert!(!jobs.0.lock().contains_key("never"));
+        assert!(!jobs.register("fresh").is_fired());
+    }
 
     fn cfg(engine: Engine) -> ConnectionConfig {
         ConnectionConfig {

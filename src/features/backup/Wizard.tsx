@@ -813,19 +813,20 @@ export function useSqlJob(tabId: string): {
     copying.current = id
     stopped.current = false
     setJob((s) => s && { ...s, percent: null })
-    const unlisten = await listen<BackupProgress>('backup-progress', (e) => {
-      const p = e.payload
-      if (p.job !== id) return
-      setJob(
-        (s) =>
-          s && {
-            ...s,
-            lines: p.lines.length ? appendLines(s.lines, p.lines) : s.lines,
-            percent: p.total ? Math.min(100, (100 * (p.bytes ?? 0)) / p.total) : s.percent
-          }
-      )
-    })
+    let unlisten: (() => void) | undefined
     try {
+      unlisten = await listen<BackupProgress>('backup-progress', (e) => {
+        const p = e.payload
+        if (p.job !== id) return
+        setJob(
+          (s) =>
+            s && {
+              ...s,
+              lines: p.lines.length ? appendLines(s.lines, p.lines) : s.lines,
+              percent: p.total ? Math.min(100, (100 * (p.bytes ?? 0)) / p.total) : s.percent
+            }
+        )
+      })
       if (stopped.current) {
         setJob((s) => s && { ...s, status: 'cancelled', elapsedMs: Date.now() - s.startedAt })
         return false
@@ -848,7 +849,7 @@ export function useSqlJob(tabId: string): {
       )
       return !outcome.cancelled
     } finally {
-      unlisten()
+      unlisten?.()
       copying.current = null
     }
   }

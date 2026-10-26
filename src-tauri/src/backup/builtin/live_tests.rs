@@ -1122,7 +1122,7 @@ async fn mssql_copies_a_backup_to_this_computer() {
             }
         }
         Err(e) => {
-            let text = e.to_string();
+            let text = e.error.to_string();
             assert!(
                 text.contains("Linux") || text.contains("OLE Automation"),
                 "{text}"

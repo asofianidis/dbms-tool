@@ -112,7 +112,8 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   (up to 2 GB) from the server to this computer. The copy needs the ADMINISTER BULK OPERATIONS
   permission and, while it runs, about as much free tempdb space as the backup. Restores can
   start from a backup on this computer: a server running here reads it in place, and a Windows
-  server with OLE Automation turned on receives a copy, deleted after the restore.
+  server with OLE Automation turned on receives a copy (up to 2 GB, staged in tempdb), deleted
+  after the restore.
 - Schema compare between two databases of the same dialect, on any connections: tables, views,
   routines and sequences, with a line diff and a dependency-ordered migration script.
 - ER diagrams with automatic layout, exported as PNG, SVG or PDF.
