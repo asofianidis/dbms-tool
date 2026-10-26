@@ -48,16 +48,20 @@ export interface QualifiedTables {
  * table's name finds it without knowing its schema first.
  */
 function qualifiedOptions(q: QualifiedTables, quote: string | null): Completion[] {
-  const close = quote === '[' ? ']' : quote
+  const close = quote === '[' ? ']' : (quote ?? '')
+  // A closing delimiter inside a name is doubled
+  const quoted = (name: string): string =>
+    `${quote}${name.replaceAll(close, close + close)}${close}`
   const out: Completion[] = []
   for (const t of q.tables) {
     if (!t.schema || t.schema === q.defaultSchema) continue
     if (quote) {
-      out.push({ label: `${quote}${t.schema}${close}.${quote}${t.name}${close}`, type: 'type' })
+      out.push({ label: `${quoted(t.schema)}.${quoted(t.name)}`, type: 'type' })
       continue
     }
     const label = `${t.schema}.${t.name}`
-    const apply = `${ident(q.dialect, t.schema)}.${ident(q.dialect, t.name)}`
+    // Quoted unless known safe, so reserved words (`order.items`) still insert valid SQL
+    const apply = `${quoteIdent(q.dialect, t.schema)}.${quoteIdent(q.dialect, t.name)}`
     out.push(apply === label ? { label, type: 'type' } : { label, type: 'type', apply })
   }
   return out

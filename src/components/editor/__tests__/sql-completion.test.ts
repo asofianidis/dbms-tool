@@ -51,7 +51,9 @@ describe('SQL name completion', () => {
     const tsql: CompletionTable[] = [
       { schema: 'dbo', name: 'users', columns: ['id'], foreignKeys: [] },
       { schema: 'event', name: 'session', columns: ['id'], foreignKeys: [] },
-      { schema: 'dbo', name: 'odd.name', columns: ['id'], foreignKeys: [] }
+      { schema: 'dbo', name: 'odd.name', columns: ['id'], foreignKeys: [] },
+      { schema: 'order', name: 'items', columns: ['id'], foreignKeys: [] },
+      { schema: 'event', name: 'session]archive', columns: ['id'], foreignKeys: [] }
     ]
     const ns = { dbo: { users: ['id'], 'odd\\.name': ['id'] }, event: { session: ['id'] } }
     const run = async (doc: string) => {
@@ -68,7 +70,12 @@ describe('SQL name completion', () => {
     )
     expect(plain.map((o) => o.label)).not.toContain('dbo.users')
     expect(plain.find((o) => o.label === 'odd.name')?.apply).toBe('"odd.name"')
-    expect((await run('SELECT * FROM [sess')).map((o) => o.label)).toContain('[event].[session]')
+    // Reserved words and odd characters are quoted when inserted
+    expect(plain.find((o) => o.label === 'order.items')?.apply).toBe('[order].[items]')
+    expect(plain.find((o) => o.label === 'event.session')?.apply).toBe('[event].[session]')
+    const bracketed = (await run('SELECT * FROM [sess')).map((o) => o.label)
+    expect(bracketed).toContain('[event].[session]')
+    expect(bracketed).toContain('[event].[session]]archive]')
     expect((await run('SELECT * FROM event.')).map((o) => o.label)).toEqual(['session'])
     expect(await run('SELECT sess')).toEqual([])
   })
