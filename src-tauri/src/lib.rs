@@ -97,6 +97,8 @@ pub fn run() {
             commands::backup_inspect,
             commands::backup_run,
             commands::backup_mssql_download,
+            commands::backup_mssql_upload,
+            commands::backup_mssql_discard_upload,
             commands::backup_cancel,
             commands::logs_reveal,
             commands::logs_read,

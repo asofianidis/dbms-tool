@@ -1099,6 +1099,42 @@ async fn mssql_copies_a_backup_to_this_computer() {
             .await
             .is_err()
     );
+
+    // And back: a Linux server can't take the file; a Windows one with OLE
+    // Automation gets a copy RESTORE can read
+    let report = super::Report::new(None, "test", Arc::new(Default::default()), None);
+    match super::mssql::upload(&server, &file, &report).await {
+        Ok(staged) => {
+            let header = format!(
+                "RESTORE HEADERONLY FROM DISK = N'{}'",
+                staged.path.replace('\'', "''")
+            );
+            let sets = client
+                .simple_query(header)
+                .await
+                .unwrap()
+                .into_first_result()
+                .await
+                .unwrap();
+            assert!(!sets.is_empty());
+            if staged.uploaded {
+                super::mssql::discard(&server, &staged.path).await.unwrap();
+            }
+        }
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("Linux") || text.contains("OLE Automation"),
+                "{text}"
+            );
+        }
+    }
+    assert!(
+        super::mssql::discard(&server, &source)
+            .await
+            .is_err_and(|e| e.to_string().contains("Only backups"))
+    );
+
     client
         .simple_query("DROP DATABASE dbms_tool_copy")
         .await

@@ -265,6 +265,43 @@ pub async fn mssql_download(
     })
 }
 
+pub use mssql::Staged as MssqlStaged;
+
+/// Makes a backup on this computer readable by SQL Server for RESTORE,
+/// sending it to the server when the server can't see it. None if cancelled.
+pub async fn mssql_upload(
+    app: &tauri::AppHandle,
+    jobs: &Jobs,
+    job_id: &str,
+    server: &Server,
+    file: &str,
+) -> AppResult<Option<MssqlStaged>> {
+    let file = PathBuf::from(file.trim());
+    if file.as_os_str().is_empty() {
+        return Err(AppError::msg("Choose a backup to restore"));
+    }
+    let cancel = jobs.register(job_id);
+    let report = Report::new(Some(app), job_id, cancel, None);
+    let result = mssql::upload(server, &file, &report).await;
+    jobs.unregister(job_id);
+    let cancelled = report.cancelled();
+    if let Err(e) = &result
+        && !cancelled
+    {
+        report.line(format!("ERROR: {e}"));
+    }
+    report.flush();
+    if cancelled {
+        return Ok(None);
+    }
+    result.map(Some)
+}
+
+/// Deletes a backup `mssql_upload` sent to the server.
+pub async fn mssql_discard_upload(server: &Server, path: &str) -> AppResult<()> {
+    mssql::discard(server, path).await
+}
+
 /* ---------- Progress ---------- */
 
 #[derive(Clone, Serialize)]

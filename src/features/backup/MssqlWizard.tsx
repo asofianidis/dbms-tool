@@ -1,7 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ArchiveRestore, DatabaseBackup, FilePlus2, Play, RotateCcw, Search } from 'lucide-react'
-import { api, type ConnectionConfig } from '@/lib/api'
+import { listen } from '@tauri-apps/api/event'
+import {
+  ArchiveRestore,
+  DatabaseBackup,
+  FilePlus2,
+  Play,
+  RotateCcw,
+  Search,
+  Square,
+  Upload
+} from 'lucide-react'
+import { api, type BackupProgress, type ConnectionConfig, type MssqlStagedBackup } from '@/lib/api'
 import {
   MSSQL_RECENT_BACKUPS_SQL,
   defaultMoves,
@@ -29,7 +39,8 @@ import { cn } from '@/lib/cn'
 import { ENGINES } from '@/lib/engines'
 import { formatBytes } from '@/lib/format'
 import { queries } from '@/lib/queries'
-import { confirm, newQueryTab, refreshConnection } from '@/lib/workspace'
+import { errorMessage } from '@/lib/toast'
+import { confirm, newQueryTab, refreshConnection, setRunning } from '@/lib/workspace'
 import { CodeEditor } from '@/components/editor/CodeEditor'
 import {
   Button,
@@ -422,12 +433,106 @@ export function MssqlBackupWizard({ tabId, connection, database }: Props): React
 
 /* ---------- Restore ---------- */
 
+interface UploadState {
+  running: boolean
+  /** 0–100 once the size is known */
+  percent: number | null
+  /** The latest line of the upload's log */
+  line: string
+  error: string | null
+}
+
+/**
+ * Makes a backup on this computer readable by the server: used in place when
+ * the server runs here and sees it, otherwise sent to the server's backup
+ * folder. A sent copy is deleted after a restore, or when the tab closes.
+ */
+function useLocalBackup(
+  tabId: string,
+  connectionId: string
+): {
+  state: UploadState | null
+  staged: MssqlStagedBackup | null
+  start: (file: string) => Promise<MssqlStagedBackup | null>
+  cancel: () => void
+  discard: () => Promise<void>
+} {
+  const [state, setState] = useState<UploadState | null>(null)
+  const [staged, setStaged] = useState<MssqlStagedBackup | null>(null)
+  const job = useRef<string | null>(null)
+  const sent = useRef<MssqlStagedBackup | null>(null)
+  useEffect(
+    () => () => {
+      if (job.current) void api.backupCancel(job.current)
+      if (sent.current?.uploaded) {
+        void api.backupMssqlDiscardUpload(connectionId, sent.current.path).catch(() => undefined)
+      }
+      setRunning(tabId, false)
+    },
+    [tabId, connectionId]
+  )
+  const discard = async (): Promise<void> => {
+    const previous = sent.current
+    sent.current = null
+    setStaged(null)
+    if (previous?.uploaded) {
+      await api.backupMssqlDiscardUpload(connectionId, previous.path).catch(() => undefined)
+    }
+  }
+  const start = async (file: string): Promise<MssqlStagedBackup | null> => {
+    await discard()
+    const id = crypto.randomUUID()
+    job.current = id
+    setState({ running: true, percent: null, line: '', error: null })
+    setRunning(tabId, true)
+    const unlisten = await listen<BackupProgress>('backup-progress', (e) => {
+      const p = e.payload
+      if (p.job !== id) return
+      setState(
+        (s) =>
+          s && {
+            ...s,
+            line: p.lines.at(-1) ?? s.line,
+            percent: p.total ? Math.min(100, (100 * (p.bytes ?? 0)) / p.total) : s.percent
+          }
+      )
+    })
+    try {
+      const result = await api.backupMssqlUpload(connectionId, id, file)
+      sent.current = result
+      setStaged(result)
+      setState(null)
+      return result
+    } catch (e) {
+      setState({ running: false, percent: null, line: '', error: errorMessage(e) })
+      return null
+    } finally {
+      unlisten()
+      job.current = null
+      setRunning(tabId, false)
+    }
+  }
+  return {
+    state,
+    staged,
+    start,
+    cancel: () => {
+      if (job.current) void api.backupCancel(job.current)
+    },
+    discard
+  }
+}
+
 export function MssqlRestoreWizard({ tabId, connection, database }: Props): React.JSX.Element {
   const steps = useSteps()
   const [draft, setDraft] = useState(() => newMssqlRestoreDraft(database))
   const patch = (p: Partial<MssqlRestoreDraft>): void => setDraft((d) => ({ ...d, ...p }))
   const [checked, setChecked] = useState('')
   const [movesEdited, setMovesEdited] = useState(false)
+  // Where the backup is: a path on the server, or a file on this computer
+  const [source, setSource] = useState<'server' | 'local'>('server')
+  const [localFile, setLocalFile] = useState('')
+  const local = useLocalBackup(tabId, connection.id)
   const runner = useSqlJob(tabId)
   const dbs = useQuery(queries.databases(connection.id))
   const names = (dbs.data ?? []).map((d) => d.name)
@@ -485,6 +590,18 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
     setMovesEdited(false)
   }
 
+  const readLocal = async (): Promise<void> => {
+    setChecked('')
+    const staged = await local.start(localFile.trim())
+    if (staged) read(staged.path)
+  }
+
+  const chooseSource = (next: 'server' | 'local'): void => {
+    setSource(next)
+    setChecked('')
+    if (next === 'server') void local.discard()
+  }
+
   const target = draft.database.trim()
   const exists = names.some((n) => n.toLowerCase() === target.toLowerCase())
   const script = mssqlRestoreScript(draft)
@@ -494,6 +611,7 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
     if (connection.readOnly) return 'This connection is read-only'
     if (azure) return 'Azure SQL Database doesn’t support RESTORE'
     if (steps.step === 0) {
+      if (local.state?.running) return 'Sending the backup to the server…'
       if (!checked) return 'Read a backup first'
       if (header.isPending) return 'Reading the backup…'
       if (header.isError) return 'The backup couldn’t be read'
@@ -517,7 +635,14 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
       if (!ok) return
     }
     const ok = await runner.start(connection.id, script)
-    if (ok) refreshConnection(connection.id)
+    if (ok) {
+      refreshConnection(connection.id)
+      // The copy sent to the server has done its job
+      if (local.staged?.uploaded) {
+        await local.discard()
+        setChecked('')
+      }
+    }
   }
 
   const title = target ? `Restore ${target}` : 'Restore a backup'
@@ -598,27 +723,87 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
 
       {steps.step === 0 && (
         <>
-          <Section title="Backup file" description={serverHint(connection)}>
-            <form
-              className="flex gap-2"
-              onSubmit={(e) => {
-                e.preventDefault()
-                read(draft.path)
-              }}
+          <Segmented
+            value={source}
+            onChange={chooseSource}
+            options={[
+              { value: 'server' as const, label: 'On the server' },
+              { value: 'local' as const, label: 'On this computer' }
+            ]}
+          />
+          {source === 'local' && (
+            <Section
+              title="Backup file"
+              description="A backup on this computer. A server running here reads it in place; otherwise it's sent to the server's backup folder and deleted after the restore."
             >
-              <Input
-                mono
-                value={draft.path}
-                placeholder="/var/opt/mssql/backup/db.bak"
-                onChange={(e) => patch({ path: e.target.value })}
-                className="min-w-0 flex-1"
-              />
-              <Button type="submit" variant="secondary" disabled={!draft.path.trim()}>
-                <Search className="size-3.5" /> Read backup
-              </Button>
-            </form>
-            {header.isError && <ErrorText error={header.error} />}
-          </Section>
+              <div className="flex gap-2">
+                <div className="min-w-0 flex-1">
+                  <PathField
+                    mode="file"
+                    value={localFile}
+                    onChange={setLocalFile}
+                    placeholder="Path to the backup"
+                    filters={[{ name: 'SQL Server backup', extensions: ['bak', 'trn'] }]}
+                  />
+                </div>
+                <Button
+                  variant="secondary"
+                  disabled={!localFile.trim() || !!local.state?.running}
+                  onClick={() => void readLocal()}
+                >
+                  <Upload className="size-3.5" /> Read backup
+                </Button>
+              </div>
+              {local.state?.running && (
+                <div className="flex items-center gap-3 rounded-lg border border-line bg-panel px-3 py-2">
+                  <Spinner />
+                  <div className="min-w-0 flex-1 text-xs">
+                    <span className="text-bright tabular-nums">
+                      {local.state.percent === null
+                        ? 'Preparing…'
+                        : `${Math.floor(local.state.percent)}%`}
+                    </span>
+                    <span className="block truncate text-muted" title={local.state.line}>
+                      {local.state.line}
+                    </span>
+                  </div>
+                  <Button size="xs" variant="secondary" onClick={local.cancel}>
+                    <Square className="size-3" /> Cancel
+                  </Button>
+                </div>
+              )}
+              {local.state?.error && <ErrorText error={local.state.error} />}
+              {local.staged?.uploaded && (
+                <p className="text-xs text-muted">
+                  Sent to <span className="font-mono">{local.staged.path}</span> on the server.
+                </p>
+              )}
+              {header.isError && <ErrorText error={header.error} />}
+            </Section>
+          )}
+          {source === 'server' && (
+            <Section title="Backup file" description={serverHint(connection)}>
+              <form
+                className="flex gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  read(draft.path)
+                }}
+              >
+                <Input
+                  mono
+                  value={draft.path}
+                  placeholder="/var/opt/mssql/backup/db.bak"
+                  onChange={(e) => patch({ path: e.target.value })}
+                  className="min-w-0 flex-1"
+                />
+                <Button type="submit" variant="secondary" disabled={!draft.path.trim()}>
+                  <Search className="size-3.5" /> Read backup
+                </Button>
+              </form>
+              {header.isError && <ErrorText error={header.error} />}
+            </Section>
+          )}
 
           {checked && sets.length > 0 && (
             <Section
@@ -664,7 +849,7 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
             </Section>
           )}
 
-          {!checked && (
+          {!checked && source === 'server' && (
             <Section title="Recent backups" description="From this server's backup history.">
               {recent.isPending ? (
                 <Spinner />
@@ -815,7 +1000,12 @@ export function MssqlRestoreWizard({ tabId, connection, database }: Props): Reac
           <Section title="Summary">
             <Summary
               rows={[
-                ['Backup', <span className="font-mono text-xs">{draft.path}</span>],
+                [
+                  'Backup',
+                  <span className="font-mono text-xs">
+                    {source === 'local' ? localFile : draft.path}
+                  </span>
+                ],
                 [
                   'Backup set',
                   chosen
