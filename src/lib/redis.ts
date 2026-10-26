@@ -307,8 +307,13 @@ export function quoteArg(s: string): string {
 
 function quoteBulk(d: RData): string {
   if (!isHex(d)) return cliQuote(d)
-  // dataText already escapes the binary bytes; only quotes need adding
-  return `"${dataText(d).replace(/"/g, '\\"')}"`
+  // Printable bytes as is, quotes and backslashes escaped, everything else as \xNN
+  const escaped = d.$hex.replace(/../g, (h) => {
+    const n = parseInt(h, 16)
+    if (n === 0x22 || n === 0x5c) return `\\${String.fromCharCode(n)}`
+    return n >= 0x20 && n < 0x7f ? String.fromCharCode(n) : `\\x${h}`
+  })
+  return `"${escaped}"`
 }
 
 /** A key or value as a console argument; binary data as `"\xNN"` escapes. */
