@@ -6,6 +6,7 @@
 //! custom, tar and directory archives still need pg_dump and pg_restore.
 
 mod mongo;
+mod mssql;
 mod mysql;
 mod postgres;
 mod split;
@@ -202,6 +203,132 @@ async fn execute(
     })
 }
 
+/// Copies a backup SQL Server wrote to its own disk into `file` on this
+/// computer. It's written beside `file` first, under a name of its own, so a
+/// failed copy leaves any file already there alone and two copies to the same
+/// place don't write into each other.
+pub async fn mssql_download(
+    app: &tauri::AppHandle,
+    jobs: &Jobs,
+    job_id: &str,
+    server: &Server,
+    source: &str,
+    file: &str,
+) -> AppResult<Outcome> {
+    let source = source.trim();
+    let file = PathBuf::from(file.trim());
+    if source.is_empty() || file.as_os_str().is_empty() {
+        return Err(AppError::msg("Choose where to save the backup"));
+    }
+    let mut partial = file.clone().into_os_string();
+    let tag: String = job_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect();
+    partial.push(format!(".{tag}.part"));
+    let partial = PathBuf::from(partial);
+    let started = Instant::now();
+    let cancel = jobs.register(job_id);
+    let report = Report::new(Some(app), job_id, cancel, None);
+    let mut result = mssql::copy(server, source, &partial, &report).await;
+    if result.is_ok() && !report.cancelled() {
+        result = std::fs::rename(&partial, &file)
+            .map_err(|e| AppError::msg(format!("Can't write {}: {e}", file.display())));
+    }
+    jobs.unregister(job_id);
+    let cancelled = report.cancelled();
+    if result.is_err() || cancelled {
+        let _ = std::fs::remove_file(&partial);
+    }
+    if let Err(e) = &result
+        && !cancelled
+    {
+        report.line(format!("ERROR: {e}"));
+    }
+    report.flush();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if cancelled {
+        return Ok(Outcome {
+            cancelled: true,
+            elapsed_ms,
+            size: None,
+            errors: 0,
+        });
+    }
+    result?;
+    Ok(Outcome {
+        cancelled: false,
+        elapsed_ms,
+        size: Some(size_of(&file)),
+        errors: 0,
+    })
+}
+
+pub use mssql::Staged as MssqlStaged;
+
+/// Makes a backup on this computer readable by SQL Server for RESTORE,
+/// sending it to the server when the server can't see it. None if cancelled.
+pub async fn mssql_upload(
+    app: &tauri::AppHandle,
+    jobs: &Jobs,
+    job_id: &str,
+    server: &Server,
+    file: &str,
+) -> AppResult<Option<MssqlStaged>> {
+    let file = PathBuf::from(file.trim());
+    if file.as_os_str().is_empty() {
+        return Err(AppError::msg("Choose a backup to restore"));
+    }
+    let cancel = jobs.register(job_id);
+    let report = Report::new(Some(app), job_id, cancel, None);
+    let mut result = mssql::upload(server, &file, &report).await;
+    jobs.unregister(job_id);
+    let cancelled = report.cancelled();
+    // Cancelled just as the copy finished: it isn't wanted any more
+    if cancelled
+        && let Ok(staged) = &result
+        && staged.uploaded
+    {
+        let leftover = mssql::discard(server, &staged.path)
+            .await
+            .err()
+            .map(|_| staged.path.clone());
+        result = Err(mssql::UploadFailed {
+            error: AppError::msg("Cancelled"),
+            leftover,
+        });
+    }
+    report.flush();
+    let failed = match result {
+        Ok(staged) if !cancelled => return Ok(Some(staged)),
+        Ok(_) => return Ok(None),
+        Err(failed) => failed,
+    };
+    // A cancel is quiet, unless it left a copy on the server
+    let Some(path) = failed.leftover else {
+        return if cancelled {
+            Ok(None)
+        } else {
+            Err(failed.error)
+        };
+    };
+    let reason = if cancelled {
+        "Cancelled".to_string()
+    } else {
+        failed.error.to_string()
+    };
+    Err(AppError::msg(format!(
+        "{reason}\n\nA copy may still be at {path} on the server and couldn't be deleted; \
+         delete it there."
+    )))
+}
+
+/// Deletes a backup `mssql_upload` sent to the server.
+pub async fn mssql_discard_upload(server: &Server, path: &str) -> AppResult<()> {
+    mssql::discard(server, path).await
+}
+
 /* ---------- Progress ---------- */
 
 #[derive(Clone, Serialize)]
@@ -223,7 +350,7 @@ pub(super) struct Report<'a> {
     last: parking_lot::Mutex<Instant>,
     /// Bytes of the input read so far
     bytes: Arc<AtomicU64>,
-    total: Option<u64>,
+    total: parking_lot::Mutex<Option<u64>>,
     errors: AtomicU32,
 }
 
@@ -243,7 +370,7 @@ impl<'a> Report<'a> {
             pending: Default::default(),
             last: parking_lot::Mutex::new(Instant::now()),
             bytes: Default::default(),
-            total,
+            total: parking_lot::Mutex::new(total),
             errors: AtomicU32::new(0),
         }
     }
@@ -271,6 +398,16 @@ impl<'a> Report<'a> {
             inner,
             bytes: self.bytes.clone(),
         }
+    }
+
+    /// Sets the size progress is measured against, once it's known.
+    pub fn set_total(&self, total: u64) {
+        *self.total.lock() = Some(total);
+    }
+
+    /// Counts `n` more bytes of the input as done.
+    pub fn advance(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn cancelled(&self) -> bool {
@@ -303,6 +440,7 @@ impl<'a> Report<'a> {
 
     fn emit(&self) {
         let lines = std::mem::take(&mut *self.pending.lock());
+        let total = *self.total.lock();
         let Some(app) = self.app else {
             for line in lines {
                 println!("{line}");
@@ -314,8 +452,8 @@ impl<'a> Report<'a> {
             Progress {
                 job: self.job,
                 lines,
-                bytes: self.total.map(|_| self.bytes.load(Ordering::Relaxed)),
-                total: self.total,
+                bytes: total.map(|_| self.bytes.load(Ordering::Relaxed)),
+                total,
             },
         );
     }
