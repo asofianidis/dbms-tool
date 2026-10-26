@@ -86,7 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push \
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --branch main \
             --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
           if [ "$runs" -gt 0 ]; then
             echo "passed=true" >> "$GITHUB_OUTPUT"
@@ -102,8 +102,9 @@ jobs:
     needs: [prepare, checks]
     # Runs after the checks pass, or when they were skipped because main's ci already passed
     if: >-
-      !cancelled() && needs.prepare.outputs.release == 'true' &&
-      (needs.checks.result == 'success' || needs.checks.result == 'skipped')
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.release == 'true' &&
+      (needs.checks.result == 'success' ||
+       (needs.checks.result == 'skipped' && needs.prepare.outputs.ci_passed == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
