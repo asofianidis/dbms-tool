@@ -636,6 +636,7 @@ impl SqSession {
                         name: object.name,
                         columns,
                         foreign_keys: Vec::new(),
+                        search_rank: None,
                     });
                 }
             }
@@ -653,6 +654,7 @@ impl SqSession {
                         name: object.name,
                         columns,
                         foreign_keys: Vec::new(),
+                        search_rank: None,
                     });
                 }
             }

@@ -358,6 +358,8 @@ export interface CompletionTable {
   columns: string[]
   /** Outgoing foreign keys, for join suggestions */
   foreignKeys: CompletionKey[]
+  /** Where the schema falls in PostgreSQL's search_path (1 is searched first) */
+  searchRank?: number
 }
 
 export interface CompletionKey {

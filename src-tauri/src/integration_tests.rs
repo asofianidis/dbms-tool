@@ -225,6 +225,12 @@ async fn postgres_end_to_end() {
             .iter()
             .any(|t| t.name == "dbms_t" && t.columns.len() == 5)
     );
+    // public is on the default search_path
+    assert!(
+        completion
+            .iter()
+            .any(|t| t.name == "dbms_t" && t.search_rank.is_some())
+    );
 
     // Cancel a long query
     let s2 = s.clone();

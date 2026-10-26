@@ -145,6 +145,19 @@ describe('statement-aware SQL completion', () => {
     ).toBe(null)
   })
 
+  it('reads dots inside a quoted name as part of it', () => {
+    const dotted: CompletionTable[] = [
+      { schema: 'tx_esc_04_dbo', name: 'escworks.item.group', columns: ['id'], foreignKeys: [] },
+      { schema: 'dbo', name: 'item.group', columns: ['id'], foreignKeys: [] }
+    ]
+    const names = (sql: string, dialect: 'postgres' | 'tsql'): string[] =>
+      tablesInStatement(sql, dotted, dialect, 'public').map((f) => f.table.name)
+    expect(names('SELECT * FROM tx_esc_04_dbo."escworks.item.group" WHERE ', 'postgres')).toEqual([
+      'escworks.item.group'
+    ])
+    expect(names('SELECT * FROM [dbo].[item.group] g WHERE ', 'tsql')).toEqual(['item.group'])
+  })
+
   it('offers the columns of the statement’s tables in SELECT and WHERE', async () => {
     const labels = await assist('SELECT na| FROM customers c')
     expect(labels).toEqual(expect.arrayContaining(['name', 'email']))

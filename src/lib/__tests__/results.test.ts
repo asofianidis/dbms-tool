@@ -204,6 +204,11 @@ describe('where a result comes from', () => {
       columns: new Set(['Id', 'Name'])
     })
     expect(singleTableSource('SELECT * FROM users LIMIT 5;', 'mysql')?.parts).toEqual(['users'])
+    // Dots inside quotes belong to the name
+    expect(singleTableSource('SELECT * FROM s."a.b.c" WHERE 1', 'postgres')?.parts).toEqual([
+      's',
+      'a.b.c'
+    ])
   })
 
   it('refuses joins, grouping, subqueries and scripts', () => {
@@ -242,6 +247,21 @@ describe('where a result comes from', () => {
     expect(resolveTable(['public', 'users'], tables, 'public', 'postgres')?.schema).toBe('public')
     // A name in one schema needs no default
     expect(resolveTable(['orders'], tables, undefined, 'postgres')?.schema).toBe('public')
+  })
+
+  it('resolves a name in several schemas by the search_path', () => {
+    // A Babelfish instance, its search_path set to one migrated database
+    const tables: CompletionTable[] = [
+      { schema: 'mydb_dbo', name: 'orders', columns: [], foreignKeys: [], searchRank: 2 },
+      { schema: 'mydb_sales', name: 'orders', columns: [], foreignKeys: [], searchRank: 1 },
+      { schema: 'testdb_dbo', name: 'orders', columns: [], foreignKeys: [] }
+    ]
+    expect(resolveTable(['orders'], tables, 'public', 'postgres')?.schema).toBe('mydb_sales')
+    expect(resolveTable(['testdb_dbo', 'orders'], tables, 'public', 'postgres')?.schema).toBe(
+      'testdb_dbo'
+    )
+    // Editing results in place still doesn't guess
+    expect(resolveTable(['orders'], tables, undefined, 'postgres')).toBeNull()
   })
 })
 

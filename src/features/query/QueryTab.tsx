@@ -99,6 +99,17 @@ function completionNamespace(tables: CompletionTable[] | undefined): SQLNamespac
   return ns as SQLNamespace
 }
 
+/**
+ * The first schema on the search_path that holds a table, which bare names
+ * complete from (a Babelfish database's `<db>_dbo`, say); `public` until known.
+ */
+function searchPathSchema(tables: CompletionTable[] | undefined): string {
+  let first: CompletionTable | undefined
+  for (const t of tables ?? [])
+    if (t.searchRank !== undefined && (!first || t.searchRank < (first.searchRank ?? 0))) first = t
+  return first?.schema ?? 'public'
+}
+
 export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const editor = useRef<CodeEditorHandle>(null)
   const resultsPanel = usePanelRef()
@@ -139,7 +150,12 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   const pgExtensions = installedExtensions(
     usePgExtensions(tab.connectionId, tab.database, connected && dialect === 'postgres')
   )
-  const defaultSchema = dialect === 'postgres' ? 'public' : dialect === 'tsql' ? 'dbo' : undefined
+  const defaultSchema =
+    dialect === 'postgres'
+      ? searchPathSchema(completion.data)
+      : dialect === 'tsql'
+        ? 'dbo'
+        : undefined
 
   const execute = useCallback(
     async (

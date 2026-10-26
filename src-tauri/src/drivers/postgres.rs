@@ -914,8 +914,11 @@ impl PgSession {
                 // pg_catalog because information_schema.columns leaves out materialized
                 // views; the privilege check is the same as that view's. The cap is generous
                 // because schemas come from these rows: a Babelfish instance holds a schema per
-                // migrated database and schema, and a low cap hides the later ones entirely
-                "SELECT n.nspname::text, c.relname::text, array_agg(a.attname::text ORDER BY a.attnum) \
+                // migrated database and schema, and a low cap hides the later ones entirely.
+                // The search_path position says which of several same-named tables a bare
+                // name means (role and database settings apply; a SET in a query tab doesn't)
+                "SELECT n.nspname::text, c.relname::text, array_agg(a.attname::text ORDER BY a.attnum), \
+                 array_position(current_schemas(false)::text[], n.nspname::text) \
                  FROM pg_attribute a \
                  JOIN pg_class c ON c.oid = a.attrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -935,6 +938,7 @@ impl PgSession {
                 name: r.get(1),
                 columns: r.get(2),
                 foreign_keys: Vec::new(),
+                search_rank: r.get(3),
             })
             .collect();
         // Join suggestions are a bonus; completion works without them
