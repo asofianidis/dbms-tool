@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useQuery } from '@tanstack/react-query'
 import {
   Camera,
+  Columns3,
   Copy,
   Download,
   EyeOff,
@@ -12,11 +13,16 @@ import {
   ListChecks,
   Maximize,
   Minus,
+  Link2,
   Network,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
   Table2,
+  TableProperties,
+  Trash2,
+  Unlink,
   Wrench
 } from 'lucide-react'
 import { open as openDialog, save } from '@tauri-apps/plugin-dialog'
@@ -36,12 +42,29 @@ import {
   type Rect
 } from '@/lib/diagram'
 import { parseLayout, serializeLayout, toDbml, toMermaid } from '@/lib/diagram-text'
+import {
+  dropForeignKey,
+  hitTest,
+  orientLink,
+  type ColumnRef,
+  type LinkSpec
+} from '@/lib/diagram-edit'
+import { ddlScript, newColumn, type TableDraft } from '@/lib/ddl'
+import { qualified } from '@/lib/sql'
 import { copyText } from '@/lib/export'
 import { queries, queryClient } from '@/lib/queries'
 import { createPersistentStore } from '@/lib/store'
 import { TOKENS, type ThemeColors } from '@/lib/themes'
 import { errorMessage, toast, toastError } from '@/lib/toast'
-import { connect, connectionsStore, openTable, statusStore, type TabOf } from '@/lib/workspace'
+import {
+  confirm,
+  connect,
+  connectionsStore,
+  openTable,
+  refreshConnection,
+  statusStore,
+  type TabOf
+} from '@/lib/workspace'
 import { showContextMenu } from '@/components/ContextMenu'
 import {
   Badge,
@@ -56,7 +79,16 @@ import {
   Toolbar,
   ToolbarDivider
 } from '@/components/ui'
-import { DiagramScene, rectOf, type SceneProps } from './DiagramScene'
+import { DiagramScene, rectOf, rowY, type SceneProps } from './DiagramScene'
+import { RelationshipDialog } from './RelationshipDialog'
+import { openTableDesigner, type DesignerView } from '../table/TableDesigner'
+import {
+  ddlTarget,
+  draftScript,
+  draftSchemaFor,
+  loadTableDraft,
+  runDdl
+} from '../table/designer-ops'
 import {
   copyPng,
   exportPalette,
@@ -216,6 +248,15 @@ const clampZoom = (k: number): number => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, k
 type Gesture =
   | { kind: 'pan'; startX: number; startY: number; view: View; moved: boolean }
   | { kind: 'drag'; key: string; startX: number; startY: number; origin: Point; moved: boolean }
+  | { kind: 'link'; key: string; column: string; startX: number; startY: number; moved: boolean }
+
+/** A relationship being drawn from a column's handle */
+interface Linking {
+  source: { key: string; column: string }
+  /** Pointer, in diagram coordinates */
+  point: Point
+  target: ColumnRef | null
+}
 
 function DiagramView({
   tab,
@@ -340,8 +381,25 @@ function DiagramView({
   /* ----- Pointer gestures ----- */
 
   const gesture = useRef<Gesture | null>(null)
+  const [linking, setLinking] = useState<Linking | null>(null)
+  const [selectedEdge, setSelectedEdge] = useState<string | null>(null)
+  const [hoverEdge, setHoverEdge] = useState<string | null>(null)
+
+  /** Client coordinates to diagram coordinates */
+  const toDiagram = (clientX: number, clientY: number): Point => {
+    const rect = containerRef.current?.getBoundingClientRect()
+    const v = viewRef.current
+    return {
+      x: (clientX - (rect?.left ?? 0) - v.x) / v.k,
+      y: (clientY - (rect?.top ?? 0) - v.y) / v.k
+    }
+  }
+
+  // Keyboard shortcuts act on the canvas once it's been clicked
+  const focusCanvas = (): void => containerRef.current?.focus({ preventScroll: true })
 
   const onBackgroundDown = (e: React.PointerEvent): void => {
+    focusCanvas()
     if (e.button !== 0 && e.button !== 1) return
     svgRef.current?.setPointerCapture(e.pointerId)
     gesture.current = {
@@ -355,10 +413,12 @@ function DiagramView({
 
   const onNodeDown = useCallback(
     (key: string, e: React.PointerEvent) => {
+      focusCanvas()
       if (e.button !== 0) return
       e.stopPropagation()
       svgRef.current?.setPointerCapture(e.pointerId)
       setSelected(key)
+      setSelectedEdge(null)
       gesture.current = {
         kind: 'drag',
         key,
@@ -371,6 +431,32 @@ function DiagramView({
     [positions]
   )
 
+  const onHandleDown = (key: string, column: string, e: React.PointerEvent): void => {
+    focusCanvas()
+    if (e.button !== 0) return
+    e.stopPropagation()
+    svgRef.current?.setPointerCapture(e.pointerId)
+    setHover(null)
+    setSelectedEdge(null)
+    gesture.current = {
+      kind: 'link',
+      key,
+      column,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false
+    }
+    setLinking({ source: { key, column }, point: toDiagram(e.clientX, e.clientY), target: null })
+  }
+
+  const onEdgeDown = (id: string, e: React.PointerEvent): void => {
+    focusCanvas()
+    if (e.button !== 0) return
+    e.stopPropagation()
+    setSelectedEdge(id)
+    setSelected(null)
+  }
+
   const onPointerMove = (e: React.PointerEvent): void => {
     const g = gesture.current
     if (!g) return
@@ -379,7 +465,13 @@ function DiagramView({
     if (!g.moved && Math.hypot(dx, dy) < 3) return
     g.moved = true
     if (g.kind === 'pan') setView({ ...g.view, x: g.view.x + dx, y: g.view.y + dy })
-    else {
+    else if (g.kind === 'link') {
+      const point = toDiagram(e.clientX, e.clientY)
+      let target = hitTest(tables, boxes, positions, prefs.mode, point)
+      if (target && target.key === g.key && (target.column === g.column || target.column === null))
+        target = null
+      setLinking({ source: { key: g.key, column: g.column }, point, target })
+    } else {
       const k = viewRef.current.k
       setDrag({
         key: g.key,
@@ -392,7 +484,17 @@ function DiagramView({
     const g = gesture.current
     gesture.current = null
     if (!g) return
-    if (g.kind === 'pan' && !g.moved) setSelected(null)
+    if (g.kind === 'pan' && !g.moved) {
+      setSelected(null)
+      setSelectedEdge(null)
+    }
+    if (g.kind === 'link') {
+      const target = linking?.target
+      setLinking(null)
+      const link = target && orientLink({ key: g.key, column: g.column }, target, byKey)
+      if (link) setRelationship(link)
+      else if (g.moved) toast('Drop onto a column of another table to link them', 'info')
+    }
     if (g.kind === 'drag' && drag) {
       const { key, at } = drag
       setPrefs((p) => ({ positions: { ...p.positions, [key]: at } }))
@@ -425,31 +527,360 @@ function DiagramView({
     [setPrefs]
   )
 
+  /* ----- Editing ----- */
+
+  const target = useMemo(() => ddlTarget(connection, tab.database), [connection, tab.database])
+  const editable = !!target && !connection.readOnly
+  const [relationship, setRelationship] = useState<LinkSpec | null>(null)
+
+  /** Pins every table where it is, so a schema change doesn't reshuffle the auto layout */
+  const freezeLayout = useCallback(
+    () => setPrefs((p) => ({ positions: { ...p.positions, ...positions } })),
+    [setPrefs, positions]
+  )
+
+  /** Pins a table that was just created or renamed where the user wants it */
+  const placeTable = useCallback(
+    (key: string, at: Point | undefined, previous?: string) =>
+      setPrefs((p) => {
+        const positions = { ...p.positions }
+        const from = previous ? (positions[previous] ?? auto[previous]) : undefined
+        if (previous) delete positions[previous]
+        const pin = at ?? from
+        if (pin) positions[key] = pin
+        return {
+          positions,
+          hidden: p.hidden.filter((h) => h !== key && h !== previous)
+        }
+      }),
+    [setPrefs, auto]
+  )
+
+  const viewCentre = (): Point => {
+    const el = containerRef.current
+    const v = viewRef.current
+    return el
+      ? { x: (el.clientWidth / 2 - v.x) / v.k - 90, y: (el.clientHeight / 2 - v.y) / v.k - 60 }
+      : { x: 0, y: 0 }
+  }
+
+  const newTable = (at: Point = viewCentre()): void => {
+    if (!editable) return
+    const spot = { x: Math.round(at.x), y: Math.round(at.y) }
+    openTableDesigner(tab.connectionId, tab.database, tab.schema, null, {
+      onApplied: ({ schema, name }) => {
+        freezeLayout()
+        placeTable(tableKey(schema, name), spot)
+        setSelected(tableKey(schema, name))
+      }
+    })
+  }
+
+  const editTable = useCallback(
+    (key: string, view: DesignerView = 'columns', seed?: (draft: TableDraft) => TableDraft) => {
+      const t = byKey.get(key)
+      if (!t || !editable) return
+      openTableDesigner(tab.connectionId, tab.database, t.schema, t.name, {
+        view,
+        seed,
+        onApplied: ({ schema, name, previous }) => {
+          freezeLayout()
+          const next = tableKey(schema, name)
+          if (previous !== null && next !== key) {
+            placeTable(next, undefined, key)
+            setSelected(next)
+          }
+        }
+      })
+    },
+    [byKey, editable, tab.connectionId, tab.database, placeTable, freezeLayout]
+  )
+
+  const addColumn = useCallback(
+    (key: string) =>
+      target &&
+      editTable(key, 'columns', (d) => ({
+        ...d,
+        columns: [...d.columns, newColumn(target.dialect)]
+      })),
+    [editTable, target]
+  )
+
+  const dropTable = useCallback(
+    async (key: string) => {
+      const t = byKey.get(key)
+      if (!t || !target || !editable) return
+      const sql = ddlScript(
+        target.dialect,
+        [
+          `DROP TABLE ${qualified(target.dialect, {
+            schema: draftSchemaFor(target.dialect, target.mysql, tab.database, t.schema),
+            name: t.name
+          })}`
+        ],
+        target.options
+      )
+      const referencedBy = [
+        ...new Set(edges.filter((e) => e.to === key && e.from !== key).map((e) => e.from))
+      ]
+      const ok = await confirm({
+        title: `Drop ${t.name}?`,
+        message: (
+          <>
+            The table and all its rows are deleted for good.
+            {referencedBy.length > 0 && (
+              <>
+                {' '}
+                {referencedBy.join(', ')} {referencedBy.length === 1 ? 'references' : 'reference'}{' '}
+                it, which will stop the drop until those foreign keys are removed.
+              </>
+            )}
+          </>
+        ),
+        code: sql,
+        danger: true,
+        confirmLabel: 'Drop table',
+        typeToConfirm: t.name
+      })
+      if (!ok) return
+      try {
+        await runDdl(target, sql)
+        freezeLayout()
+        toast(`Dropped ${t.name}`)
+        setSelected(null)
+        refreshConnection(tab.connectionId)
+      } catch (e) {
+        toastError(e)
+      }
+    },
+    [byKey, target, editable, edges, tab.connectionId, tab.database, freezeLayout]
+  )
+
+  const edgeById = useMemo(() => new Map(edges.map((e) => [e.id, e])), [edges])
+
+  const dropRelationship = useCallback(
+    async (id: string) => {
+      const edge = edgeById.get(id)
+      const t = edge && byKey.get(edge.from)
+      if (!edge || !t || !target || !editable) return
+      try {
+        const loaded = await loadTableDraft(target, t.schema, t.name)
+        const draft = dropForeignKey(loaded.draft, edge.name)
+        if (!draft) throw new Error(`${t.name} no longer has the foreign key ${edge.name}`)
+        const sql = draftScript(target, draft, loaded.versioning)
+        const ok = await confirm({
+          title: `Drop foreign key ${edge.name}?`,
+          message: `${edge.from} (${edge.fromColumns.join(', ')}) will no longer reference ${edge.to} (${edge.toColumns.join(', ')}). The columns and their data stay.`,
+          code: sql,
+          danger: true,
+          confirmLabel: 'Drop foreign key'
+        })
+        if (!ok) return
+        await runDdl(target, sql)
+        freezeLayout()
+        toast(`Dropped ${edge.name}`)
+        setSelectedEdge(null)
+        refreshConnection(tab.connectionId)
+      } catch (e) {
+        toastError(e)
+      }
+    },
+    [edgeById, byKey, target, editable, tab.connectionId, freezeLayout]
+  )
+
   const onNodeMenu = useCallback(
     (key: string, e: React.MouseEvent) => {
       setSelected(key)
+      setSelectedEdge(null)
       const t = byKey.get(key)
+      const isTable = t?.kind === 'table'
       showContextMenu(e, [
         { heading: key },
         { label: 'Open data', icon: <Table2 />, onSelect: () => openData(key) },
         { label: 'Open structure', icon: <Wrench />, onSelect: () => openData(key, 'structure') },
+        ...(editable && isTable
+          ? [
+              'separator' as const,
+              {
+                label: 'Edit table…',
+                icon: <Pencil />,
+                shortcut: 'Enter',
+                onSelect: () => editTable(key)
+              },
+              { label: 'Add column…', icon: <Columns3 />, onSelect: () => addColumn(key) },
+              {
+                label: 'Add foreign key…',
+                icon: <Link2 />,
+                title: "Or drag a column's handle onto another table",
+                onSelect: () => editTable(key, 'foreignKeys')
+              },
+              {
+                label: 'Indexes…',
+                icon: <TableProperties />,
+                onSelect: () => editTable(key, 'indexes')
+              }
+            ]
+          : []),
         'separator',
         { label: 'Hide from diagram', icon: <EyeOff />, onSelect: () => setHidden([key], true) },
         {
           label: 'Copy name',
           icon: <Copy />,
           onSelect: () => void copyText(t?.name ?? key, 'Name copied')
-        }
+        },
+        ...(editable && isTable
+          ? [
+              'separator' as const,
+              {
+                label: 'Drop table…',
+                icon: <Trash2 />,
+                danger: true,
+                onSelect: () => void dropTable(key)
+              }
+            ]
+          : [])
       ])
     },
-    [byKey, openData, setHidden]
+    [byKey, openData, setHidden, editable, editTable, addColumn, dropTable]
   )
+
+  const onEdgeMenu = (id: string, e: React.MouseEvent): void => {
+    const edge = edgeById.get(id)
+    if (!edge) return
+    setSelectedEdge(id)
+    setSelected(null)
+    showContextMenu(e, [
+      { heading: edge.name },
+      ...(editable
+        ? [
+            {
+              label: 'Edit foreign key…',
+              icon: <Pencil />,
+              shortcut: 'Enter',
+              onSelect: () => editTable(edge.from, 'foreignKeys')
+            },
+            {
+              label: 'Drop foreign key…',
+              icon: <Unlink />,
+              shortcut: 'Del',
+              danger: true,
+              onSelect: () => void dropRelationship(id)
+            },
+            'separator' as const
+          ]
+        : []),
+      { label: `Go to ${edge.from}`, onSelect: () => focusTable(edge.from) },
+      { label: `Go to ${edge.to}`, onSelect: () => focusTable(edge.to) },
+      {
+        label: 'Copy name',
+        icon: <Copy />,
+        onSelect: () => void copyText(edge.name, 'Name copied')
+      }
+    ])
+  }
+
+  const onBackgroundMenu = (e: React.MouseEvent): void => {
+    const at = toDiagram(e.clientX, e.clientY)
+    showContextMenu(e, [
+      ...(editable
+        ? [
+            {
+              label: 'New table here…',
+              icon: <Plus />,
+              shortcut: 'N',
+              onSelect: () => newTable(at)
+            },
+            'separator' as const
+          ]
+        : []),
+      { label: 'Fit to window', icon: <Maximize />, onSelect: fit },
+      {
+        label: 'Auto layout',
+        icon: <LayoutGrid />,
+        disabled: !Object.keys(prefs.positions).length,
+        onSelect: autoLayout
+      }
+    ])
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    if (e.target !== e.currentTarget || e.metaKey || e.ctrlKey || e.altKey) return
+    const handled = (): void => e.preventDefault()
+    if (e.key === 'Escape') {
+      if (gesture.current?.kind === 'link') {
+        gesture.current = null
+        setLinking(null)
+      } else {
+        setSelected(null)
+        setSelectedEdge(null)
+      }
+      handled()
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedEdge) void dropRelationship(selectedEdge)
+      else if (selected) void dropTable(selected)
+      handled()
+    } else if (e.key === 'Enter') {
+      const edge = selectedEdge && edgeById.get(selectedEdge)
+      if (edge) editTable(edge.from, 'foreignKeys')
+      else if (selected) editTable(selected)
+      handled()
+    } else if (e.key === 'n' || e.key === 'N') {
+      newTable()
+      handled()
+    } else if (e.key === 'f') {
+      fit()
+      handled()
+    }
+  }
 
   const focusTable = (key: string): void => {
     setSelected(key)
     const r = rectOf(key, boxes, positions)
     if (r) fitTo({ x: r.x - 200, y: r.y - 120, width: r.width + 400, height: r.height + 240 })
   }
+
+  /** Preview of the relationship being drawn, from the source row to the pointer or target row */
+  const linkPreview = ((): React.JSX.Element | null => {
+    if (!linking) return null
+    const from = rectOf(linking.source.key, boxes, positions)
+    const source = byKey.get(linking.source.key)
+    if (!from || !source) return null
+    const sy = rowY(source, linking.source.column, prefs.mode, from.y)
+    let end = linking.point
+    const t = linking.target
+    const to = t && rectOf(t.key, boxes, positions)
+    const targetTable = t && byKey.get(t.key)
+    if (t && to && targetTable) {
+      const right = linking.point.x > to.x + to.width / 2
+      end = {
+        x: right ? to.x + to.width : to.x,
+        y: t.column ? rowY(targetTable, t.column, prefs.mode, to.y) : to.y + 17
+      }
+    }
+    const sx = end.x > from.x + from.width / 2 ? from.x + from.width : from.x
+    const dir = end.x >= sx ? 1 : -1
+    const reach = Math.max(40, Math.min(160, Math.abs(end.x - sx) / 2))
+    return (
+      <g pointerEvents="none">
+        <path
+          d={`M ${sx} ${sy} C ${sx + dir * reach} ${sy}, ${end.x - dir * reach} ${end.y}, ${end.x} ${end.y}`}
+          fill="none"
+          stroke="var(--color-accent)"
+          strokeWidth={1.8}
+          strokeDasharray={t ? undefined : '6 4'}
+        />
+        <circle cx={sx} cy={sy} r={4} fill="var(--color-accent)" />
+        <circle
+          cx={end.x}
+          cy={end.y}
+          r={t ? 4.5 : 3.5}
+          fill={t ? 'var(--color-accent)' : 'var(--color-raised)'}
+          stroke="var(--color-accent)"
+          strokeWidth={1.5}
+        />
+      </g>
+    )
+  })()
 
   /* ----- Export ----- */
 
@@ -557,6 +988,11 @@ function DiagramView({
 
   /* ----- Render ----- */
 
+  const autoLayout = (): void => {
+    setPrefs(() => ({ positions: {} }))
+    fitted.current = false
+  }
+
   const refresh = (): void => {
     for (const kind of ['objects', 'table', 'diagram'])
       void queryClient.invalidateQueries({
@@ -613,6 +1049,12 @@ function DiagramView({
           />
         </div>
         <div className="flex-1" />
+        {editable && (
+          <Button size="xs" variant="ghost" title="New table (N)" onClick={() => newTable()}>
+            <Plus className="size-3.5" />
+            Table
+          </Button>
+        )}
         <Button
           size="icon"
           variant={panel ? 'secondary' : 'ghost'}
@@ -626,10 +1068,7 @@ function DiagramView({
           variant="ghost"
           title="Auto layout (forget moved tables)"
           disabled={!Object.keys(prefs.positions).length}
-          onClick={() => {
-            setPrefs(() => ({ positions: {} }))
-            fitted.current = false
-          }}
+          onClick={autoLayout}
         >
           <LayoutGrid className="size-4" />
         </Button>
@@ -676,7 +1115,9 @@ function DiagramView({
       <div className="flex min-h-0 flex-1">
         <div
           ref={containerRef}
-          className="relative min-w-0 flex-1 overflow-hidden bg-canvas bg-dots"
+          tabIndex={-1}
+          onKeyDown={onKeyDown}
+          className="relative min-w-0 flex-1 overflow-hidden bg-canvas bg-dots outline-none"
           style={{
             backgroundPosition: `${view.x}px ${view.y}px`,
             backgroundSize: `${18 * view.k}px ${18 * view.k}px`
@@ -699,6 +1140,13 @@ function DiagramView({
               className="bg-transparent"
               icon={<Network className="size-6" />}
               title="No tables"
+              actions={
+                editable && (
+                  <Button size="sm" variant="primary" onClick={() => newTable({ x: 0, y: 0 })}>
+                    <Plus className="size-3.5" /> New table
+                  </Button>
+                )
+              }
             >
               {prefs.views ? 'This schema has no tables or views.' : 'This schema has no tables.'}
             </EmptyState>
@@ -720,6 +1168,8 @@ function DiagramView({
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
               onPointerCancel={onPointerUp}
+              onContextMenu={onBackgroundMenu}
+              style={linking ? { cursor: 'crosshair' } : undefined}
             >
               <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
                 <DiagramScene
@@ -732,7 +1182,20 @@ function DiagramView({
                   onNodeDoubleClick={openData}
                   onNodeContextMenu={onNodeMenu}
                   onNodeHover={setHover}
+                  hovered={hover}
+                  linkSource={linking?.source}
+                  linkTarget={linking?.target}
+                  selectedEdge={hoverEdge ?? selectedEdge}
+                  onEdgePointerDown={onEdgeDown}
+                  onEdgeContextMenu={onEdgeMenu}
+                  onEdgeHover={setHoverEdge}
+                  {...(editable && {
+                    onHandlePointerDown: onHandleDown,
+                    onColumnDoubleClick: (key: string) => editTable(key),
+                    onEditTable: (key: string) => editTable(key)
+                  })}
                 />
+                {linkPreview}
               </g>
             </svg>
           )}
@@ -748,7 +1211,11 @@ function DiagramView({
                   {failed.length} couldn't be read
                 </Badge>
               )}
-              <span className="text-faint">Drag tables to arrange · Ctrl+scroll to zoom</span>
+              <span className="text-faint">
+                {editable
+                  ? "Drag a column's dot onto another column to link · Right-click to edit · Ctrl+scroll to zoom"
+                  : 'Drag tables to arrange · Ctrl+scroll to zoom'}
+              </span>
             </div>
           )}
         </div>
@@ -761,6 +1228,16 @@ function DiagramView({
           />
         )}
       </div>
+      {relationship && target && (
+        <RelationshipDialog
+          target={target}
+          link={relationship}
+          byKey={byKey}
+          label={(t) => (showSchema(t) && t.schema ? `${t.schema}.${t.name}` : t.name)}
+          onChanged={freezeLayout}
+          onClose={() => setRelationship(null)}
+        />
+      )}
       {exporting && (
         <ExportDialog name={title} onClose={() => setExporting(false)} job={job} text={text} />
       )}
