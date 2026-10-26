@@ -100,6 +100,9 @@ fn read_preference(mode: &str) -> AppResult<Option<ReadPreference>> {
     }))
 }
 
+/// Pooled sockets idle longer than this are closed instead of reused.
+const MAX_IDLE: Duration = Duration::from_secs(60);
+
 pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResult<Client> {
     // The driver's TLS library (rustls) always checks the host name, and can
     // only check the one it connects to
@@ -195,12 +198,28 @@ pub async fn connect(cfg: &ConnectionConfig, password: Option<&str>) -> AppResul
     opts.app_name = Some("dbms-tool".into());
     opts.server_selection_timeout = Some(crate::limits::connect_timeout());
     opts.connect_timeout = Some(crate::limits::connect_timeout());
+    // A ping checks one pooled socket; the rest may have gone half-open while
+    // idle too, so they're closed rather than reused (unless the URI says otherwise)
+    if opts.max_idle_time.is_none() {
+        opts.max_idle_time = Some(MAX_IDLE);
+    }
     let client = Client::with_options(opts)?;
     client
         .database("admin")
         .run_command(doc! { "ping": 1 })
         .await?;
     Ok(client)
+}
+
+/// Whether the server answers a ping within the connect timeout. Requests on a
+/// half-open socket never fail on their own, so this bounds the wait.
+pub async fn is_alive(client: &Client) -> bool {
+    let admin = client.database("admin");
+    let ping = admin.run_command(doc! { "ping": 1 });
+    matches!(
+        tokio::time::timeout(crate::limits::connect_timeout(), ping).await,
+        Ok(Ok(_))
+    )
 }
 
 /// The database to open when the connection string names none: the one in the
