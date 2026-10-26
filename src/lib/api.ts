@@ -40,6 +40,8 @@ export interface ConnectionConfig {
   cloud?: CloudRef | null
   /** SSH server the connection is tunnelled through */
   ssh?: SshConfig | null
+  /** Kubernetes cluster a temporary relay pod reaches the database from */
+  kube?: KubeConfig | null
 }
 
 export type SshAuth = 'agent' | 'key' | 'password'
@@ -55,6 +57,23 @@ export interface SshConfig {
   keyFile: string
   /** ssh -J destinations */
   jumpHost: string
+}
+
+export interface KubeConfig {
+  enabled: boolean
+  /** kubeconfig context; empty for the current one */
+  context: string
+  /** Empty for the context's namespace */
+  namespace: string
+  /** kubeconfig file; empty for kubectl's default */
+  kubeconfig: string
+  /** Relay image with socat on its PATH; empty for the default */
+  image: string
+}
+
+export interface KubeContexts {
+  contexts: string[]
+  current: string | null
 }
 
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'railway' | 'render' | 'fly' | 'cloudflare'
@@ -728,6 +747,8 @@ export const api = {
   connectionClose: (id: string) => invoke<void>('connection_close', { id }),
   /** Adds the SSH host key from a 'host_key_unknown' error to known_hosts */
   sshTrustHostKey: (token: string) => invoke<void>('ssh_trust_host_key', { token }),
+  /** The contexts in a kubeconfig (empty path for kubectl's default) */
+  kubeContexts: (kubeconfig: string) => invoke<KubeContexts>('kube_contexts', { kubeconfig }),
   /** Applies Settings' connect timeout to connections opened from now on */
   limitsSet: (connectTimeoutSecs: number) => invoke<void>('limits_set', { connectTimeoutSecs }),
 

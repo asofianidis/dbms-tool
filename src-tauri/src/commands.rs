@@ -247,6 +247,12 @@ pub async fn ssh_trust_host_key(token: String) -> AppResult<()> {
     crate::tunnel::trust_host_key(&token).await
 }
 
+/// The kubeconfig's contexts, for a Kubernetes tunnel pod
+#[tauri::command]
+pub async fn kube_contexts(kubeconfig: String) -> AppResult<crate::tunnel::KubeContexts> {
+    crate::tunnel::kube_contexts(&kubeconfig).await
+}
+
 #[tauri::command]
 pub async fn connection_close(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.manager.close(&id).await;

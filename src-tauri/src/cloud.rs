@@ -146,6 +146,16 @@ fn extra_dirs() -> Vec<PathBuf> {
         if let Ok(profile) = std::env::var("USERPROFILE") {
             dirs.push(PathBuf::from(profile).join(".fly").join("bin"));
         }
+        // kubectl from Docker Desktop
+        if let Ok(base) = std::env::var("ProgramFiles") {
+            dirs.push(
+                PathBuf::from(base)
+                    .join("Docker")
+                    .join("Docker")
+                    .join("resources")
+                    .join("bin"),
+            );
+        }
     } else {
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/snap/bin"].map(PathBuf::from));
         if let Some(home) = std::env::var_os("HOME") {
@@ -160,9 +170,22 @@ fn extra_dirs() -> Vec<PathBuf> {
 }
 
 fn locate(provider: Provider) -> Option<PathBuf> {
+    locate_program(provider.programs())
+}
+
+/// PATH plus the directories in `extra_dirs`, for CLIs that start other CLIs
+/// (kubectl's credential plugins: aws, gke-gcloud-auth-plugin, kubelogin).
+pub fn search_path() -> Option<std::ffi::OsString> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    std::env::join_paths(path_dirs.into_iter().chain(extra_dirs())).ok()
+}
+
+/// The first of `programs` found on PATH or in `extra_dirs`.
+pub fn locate_program(programs: &[&str]) -> Option<PathBuf> {
     // az and gcloud ship as .cmd wrappers on Windows, which Command won't find on its own
-    let names: Vec<String> = provider
-        .programs()
+    let names: Vec<String> = programs
         .iter()
         .flat_map(|program| {
             if cfg!(windows) {

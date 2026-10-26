@@ -37,6 +37,7 @@ import {
   statusOf
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
+import { KubeFields } from './KubeFields'
 import { SshFields } from './SshFields'
 import { TlsFields } from './TlsFields'
 
@@ -697,7 +698,7 @@ function ConnectionDialog({
 
         {!sqlite && tlsCanBeOn && <TlsFields config={config} onChange={(files) => patch(files)} />}
 
-        {!sqlite && config.cloud?.provider !== 'fly' && (
+        {!sqlite && config.cloud?.provider !== 'fly' && !config.kube?.enabled && (
           <SshFields
             ssh={config.ssh}
             onChange={(ssh) => patch({ ssh })}
@@ -709,6 +710,10 @@ function ConnectionDialog({
             hasSavedSecret={!duplicate && !!editing?.ssh && editing.ssh.auth !== 'agent'}
             uriMode={usesUri}
           />
+        )}
+
+        {!sqlite && config.cloud?.provider !== 'fly' && !config.ssh?.enabled && (
+          <KubeFields kube={config.kube} onChange={(kube) => patch({ kube })} uriMode={usesUri} />
         )}
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-3 rounded-lg border border-line bg-raised/40 p-3">

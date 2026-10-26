@@ -106,6 +106,28 @@ pub struct SshConfig {
     pub jump_host: String,
 }
 
+/// A Kubernetes cluster that can reach the database: a temporary relay pod is
+/// started there for as long as the connection is open (see `tunnel/kube.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeConfig {
+    /// Kept off rather than removed so the settings survive toggling
+    #[serde(default)]
+    pub enabled: bool,
+    /// kubeconfig context; empty for the current one
+    #[serde(default)]
+    pub context: String,
+    /// Empty for the context's namespace
+    #[serde(default)]
+    pub namespace: String,
+    /// kubeconfig file; empty for kubectl's default ($KUBECONFIG, ~/.kube/config)
+    #[serde(default)]
+    pub kubeconfig: String,
+    /// Relay image, which must have `socat` on its PATH; empty for the default
+    #[serde(default)]
+    pub image: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionConfig {
@@ -172,6 +194,8 @@ pub struct ConnectionConfig {
     pub cloud: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kube: Option<KubeConfig>,
     /// The real host and port when `host`/`port` point at a local tunnel
     #[serde(skip)]
     pub tunneled: Option<(String, u16)>,
@@ -180,6 +204,10 @@ pub struct ConnectionConfig {
 impl ConnectionConfig {
     pub fn ssh_tunnel(&self) -> Option<&SshConfig> {
         self.ssh.as_ref().filter(|s| s.enabled)
+    }
+
+    pub fn kube_tunnel(&self) -> Option<&KubeConfig> {
+        self.kube.as_ref().filter(|k| k.enabled)
     }
 
     /// Whether the server certificate chain must be valid

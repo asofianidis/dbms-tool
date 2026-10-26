@@ -1884,6 +1884,7 @@ mod tests {
             last_used: None,
             cloud: None,
             ssh: None,
+            kube: None,
             tunneled: None,
         }
     }

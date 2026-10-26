@@ -1,7 +1,8 @@
 //! Local tunnels for databases that aren't directly reachable: Fly.io Managed
-//! Postgres (only reachable through `fly mpg proxy`) and anything behind an SSH
-//! server (`ssh -L`). A tunnel runs for as long as its connection is open;
-//! sessions connect to its local port.
+//! Postgres (only reachable through `fly mpg proxy`), anything behind an SSH
+//! server (`ssh -L`) and anything a Kubernetes cluster can reach (a temporary
+//! relay pod and `kubectl port-forward`, see `kube.rs`). A tunnel runs for as
+//! long as its connection is open; sessions connect to its local port.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -15,11 +16,13 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::cloud::{self, Provider};
-use crate::config::{self, ConnectionConfig, Engine, SshAuth, SshConfig, SslMode};
+use crate::config::{self, ConnectionConfig, Engine, KubeConfig, SshAuth, SshConfig, SslMode};
 use crate::error::{AppError, AppResult};
 
 mod host_keys;
 pub use host_keys::trust as trust_host_key;
+mod kube;
+pub use kube::{Contexts as KubeContexts, contexts as kube_contexts};
 
 /// How long a tunnel gets to start listening (the Fly proxy signs in to Fly's
 /// network first; SSH may go through a jump host).
@@ -41,6 +44,9 @@ struct Tunnel {
     target: Target,
     config: ConnectionConfig,
     secret: Option<String>,
+    /// The relay a Kubernetes tunnel forwards to; deleted when dropped, after
+    /// `child` has stopped forwarding to it
+    _pod: Option<kube::Pod>,
 }
 
 static TUNNELS: LazyLock<tokio::sync::Mutex<HashMap<String, Tunnel>>> =
@@ -61,6 +67,7 @@ struct CloudRef {
 enum Target {
     Fly { cluster: String, account: String },
     Ssh(SshConfig),
+    Kube(KubeConfig),
 }
 
 /// The tunnel the connection needs, if any.
@@ -80,6 +87,9 @@ fn target(config: &ConnectionConfig) -> Option<Target> {
     }
     if config.engine == Engine::Sqlite {
         return None;
+    }
+    if let Some(kube) = config.kube_tunnel() {
+        return Some(Target::Kube(kube.clone()));
     }
     config.ssh_tunnel().cloned().map(Target::Ssh)
 }
@@ -174,6 +184,37 @@ fn ssh_arg<'a>(value: &'a str, what: &str) -> AppResult<&'a str> {
     Ok(value)
 }
 
+/// Rejects connections one forwarded port can't carry; `via` names the tunnel
+/// ("an SSH tunnel").
+fn check_forwardable(config: &ConnectionConfig, via: &str) -> AppResult<()> {
+    let uri = !config.uri.trim().is_empty();
+    let problem = match config.engine {
+        Engine::Mongo if uri => format!(
+            "Connecting through {via} needs the host and port form of a MongoDB connection, not a connection string"
+        ),
+        Engine::Mongo if config.host.contains(',') => format!(
+            "{} reaches one MongoDB host; enter a single replica set member or mongos instead of a list",
+            capitalized(via)
+        ),
+        Engine::Redis if uri => format!(
+            "Connecting through {via} needs the host and port form of a Redis connection, not a connection string"
+        ),
+        Engine::Mssql | Engine::Babelfish if config.host.contains('\\') => format!(
+            "Named SQL Server instances can't be reached through {via}; enter the instance's port instead"
+        ),
+        _ => return Ok(()),
+    };
+    Err(AppError::msg(problem))
+}
+
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// `ssh -N -L 127.0.0.1:<port>:<db host>:<db port> <server>`
 fn ssh_command(
     ssh: &SshConfig,
@@ -184,26 +225,7 @@ fn ssh_command(
     if ssh.host.trim().is_empty() {
         return Err(AppError::msg("Enter the SSH server to tunnel through"));
     }
-    if config.engine == Engine::Mongo && !config.uri.trim().is_empty() {
-        return Err(AppError::msg(
-            "SSH tunnels need the host and port form of a MongoDB connection, not a connection string",
-        ));
-    }
-    if config.engine == Engine::Mongo && config.host.contains(',') {
-        return Err(AppError::msg(
-            "An SSH tunnel reaches one MongoDB host; enter a single replica set member or mongos instead of a list",
-        ));
-    }
-    if config.engine == Engine::Redis && !config.uri.trim().is_empty() {
-        return Err(AppError::msg(
-            "SSH tunnels need the host and port form of a Redis connection, not a connection string",
-        ));
-    }
-    if matches!(config.engine, Engine::Mssql | Engine::Babelfish) && config.host.contains('\\') {
-        return Err(AppError::msg(
-            "Named SQL Server instances can't be reached through an SSH tunnel; enter the instance's port instead",
-        ));
-    }
+    check_forwardable(config, "an SSH tunnel")?;
     // Resolved on the SSH server, so localhost means the server itself
     let host = match config.host.trim() {
         "" => "localhost",
@@ -351,9 +373,14 @@ fn command(
     target: &Target,
     config: &ConnectionConfig,
     secret: Option<&str>,
+    pod: Option<&kube::Pod>,
     port: u16,
 ) -> AppResult<(Command, &'static str)> {
     let mut cmd = match target {
+        Target::Kube(_) => {
+            let pod = pod.ok_or_else(|| AppError::msg("The tunnel pod isn't running"))?;
+            return Ok((kube::port_forward(pod, port)?, "Kubernetes port-forward"));
+        }
         Target::Fly { cluster, account } => {
             let mut cmd = cloud::command(Provider::Fly, account)?;
             cmd.args(["mpg", "proxy", cluster, "--local-port", &port.to_string()]);
@@ -372,10 +399,15 @@ async fn start(
     secret: Option<String>,
     port: u16,
 ) -> AppResult<Tunnel> {
-    let (mut cmd, label) = command(&target, &config, secret.as_deref(), port)?;
+    let pod = match &target {
+        Target::Kube(kube) => Some(kube::start_pod(kube, &config).await?),
+        _ => None,
+    };
+    let (mut cmd, label) = command(&target, &config, secret.as_deref(), pod.as_ref(), port)?;
     check_port_free(port)?;
+    let kube = pod.is_some();
     let mut child = cmd
-        .stdout(Stdio::null())
+        .stdout(if kube { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| match e.kind() {
@@ -395,6 +427,10 @@ async fn start(
             output.clone(),
         ))
     });
+    // port-forward says on stdout when it holds the port
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(kube::watch_stdout(stdout, port, ready.clone()));
+    }
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -414,9 +450,10 @@ async fn start(
                 format!("{label} failed: {detail}")
             }));
         }
-        // ssh says when it holds the port. The Fly proxy doesn't, so it gets a
-        // connection test, after the check above that nothing else was listening.
-        let listening = if ssh {
+        // ssh and kubectl say when they hold the port. The Fly proxy doesn't, so
+        // it gets a connection test, after the check above that nothing else was
+        // listening.
+        let listening = if ssh || kube {
             ready.load(Ordering::Acquire)
         } else {
             tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -430,6 +467,7 @@ async fn start(
                 target,
                 config,
                 secret,
+                _pod: pod,
             });
         }
         if started.elapsed() > READY_TIMEOUT {
@@ -521,6 +559,14 @@ pub async fn ensure(key: &str) -> AppResult<()> {
 /// Stops the tunnel for `key`, if there is one.
 pub async fn close(key: &str) {
     TUNNELS.lock().await.remove(key);
+}
+
+/// Stops every tunnel as the app exits, so Kubernetes tunnel pods are deleted.
+/// Skipped if a tunnel is starting; its pod is cleaned up on the next run.
+pub fn shutdown() {
+    if let Ok(mut tunnels) = TUNNELS.try_lock() {
+        tunnels.clear();
+    }
 }
 
 #[cfg(test)]
@@ -684,6 +730,7 @@ mod tests {
                 target: Target::Ssh(cfg.ssh.clone().unwrap()),
                 config: cfg,
                 secret: None,
+                _pod: None,
             },
         );
         assert!(ensure(key).await.is_err());
