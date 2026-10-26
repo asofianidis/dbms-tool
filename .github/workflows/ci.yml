@@ -1,8 +1,10 @@
 name: ci
 
-# The release workflow also runs this before building
+# The release workflow also runs this before building, unless main's run already passed for
+# that commit. Branches are checked by their pull request, so pushes only run on main.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -21,6 +23,7 @@ jobs:
   audit:
     # Known vulnerabilities in the Rust dependency tree (RustSec advisory database)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -34,6 +37,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -64,24 +68,26 @@ jobs:
       matrix:
         os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-            libxdo-dev libssl-dev libdbus-1-dev patchelf
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
 
+      # Only main saves, so branches and PRs don't evict main's caches from the 10 GB store.
+      # The databases job reads the Linux cache through the shared key.
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri -> target
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # tauri::generate_context! expects the frontend output folder to exist
       - name: Stub frontend build
@@ -102,8 +108,10 @@ jobs:
         run: cargo test
 
   databases:
-    # End-to-end driver tests against every supported engine
-    runs-on: ubuntu-latest
+    # End-to-end driver tests against every supported engine. Same image as the Linux rust
+    # job, so it can reuse that job's build cache.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -149,10 +157,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-            libxdo-dev libssl-dev libdbus-1-dev patchelf
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -161,6 +166,8 @@ jobs:
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri -> target
+          shared-key: rust
+          save-if: false
 
       - name: Stub frontend build
         run: mkdir -p dist && echo '<!doctype html>' > dist/index.html
