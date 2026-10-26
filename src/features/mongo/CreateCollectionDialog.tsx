@@ -13,6 +13,7 @@ import {
   type ValidationAction,
   type ValidationLevel
 } from '@/lib/mongo-collections'
+import { mongoDatabaseProblem } from '@/lib/databases'
 import { queries } from '@/lib/queries'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
@@ -22,6 +23,7 @@ import { Button, Field, Input, Modal, Segmented, Select } from '@/components/ui'
 
 interface Request {
   connectionId: string
+  /** '' to create a new database along with its first collection */
   database: string
   kind?: CollectionKind
   /** For a view: the collection it starts from */
@@ -75,7 +77,22 @@ function CreateCollectionDialog({
   }))
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const collections = useQuery(queries.objects(request.connectionId, request.database, null))
+  // MongoDB creates a database when its first collection is
+  const newDatabase = request.database === ''
+  const [databaseName, setDatabaseName] = useState('')
+  const database = newDatabase ? databaseName.trim() : request.database
+  const databases = useQuery({ ...queries.databases(request.connectionId), enabled: newDatabase })
+  const databaseError =
+    newDatabase && databaseName
+      ? mongoDatabaseProblem(
+          databaseName,
+          (databases.data ?? []).map((d) => d.name)
+        )
+      : null
+  const collections = useQuery({
+    ...queries.objects(request.connectionId, request.database, null),
+    enabled: !newDatabase
+  })
   const set = (patch: Partial<NewCollection>): void => setSpec((s) => ({ ...s, ...patch }))
   const nameError = spec.name ? collectionNameError(spec.name) : null
 
@@ -88,6 +105,13 @@ function CreateCollectionDialog({
 
   const submit = async (): Promise<void> => {
     setError(null)
+    if (newDatabase) {
+      const problem = mongoDatabaseProblem(
+        databaseName,
+        (databases.data ?? []).map((d) => d.name)
+      )
+      if (problem) return setError(problem)
+    }
     let command: Record<string, unknown>
     try {
       command = createCommand(spec)
@@ -99,12 +123,16 @@ function CreateCollectionDialog({
     try {
       await api.mongo(request.connectionId, '__meta', {
         op: 'runCommand',
-        database: request.database,
+        database,
         command
       })
-      toast(`Created ${spec.kind === 'view' ? 'view' : 'collection'} ${spec.name}`)
+      toast(
+        newDatabase
+          ? `Created database ${database} with ${spec.name}`
+          : `Created ${spec.kind === 'view' ? 'view' : 'collection'} ${spec.name}`
+      )
       refreshConnection(request.connectionId)
-      openCollection(request.connectionId, request.database, spec.name)
+      openCollection(request.connectionId, database, spec.name)
       onClose()
     } catch (e) {
       setError(errorMessage(e))
@@ -117,8 +145,14 @@ function CreateCollectionDialog({
   return (
     <Modal
       width="lg"
-      title={spec.kind === 'view' ? 'Create view' : 'Create collection'}
-      description={`In ${request.database}`}
+      title={
+        newDatabase ? 'New database' : spec.kind === 'view' ? 'Create view' : 'Create collection'
+      }
+      description={
+        newDatabase
+          ? 'MongoDB creates a database with its first collection'
+          : `In ${request.database}`
+      }
       onClose={onClose}
       footer={
         <>
@@ -130,7 +164,11 @@ function CreateCollectionDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={() => void submit()} disabled={saving || !spec.name}>
+          <Button
+            variant="primary"
+            onClick={() => void submit()}
+            disabled={saving || !spec.name || (newDatabase && !database)}
+          >
             <Plus className="size-3.5" /> Create
           </Button>
         </>
@@ -143,7 +181,17 @@ function CreateCollectionDialog({
           void submit()
         }}
       >
-        <Field label="Name" hint={nameError ?? undefined}>
+        {newDatabase && (
+          <Field label="Database" hint={databaseError ?? undefined}>
+            <Input
+              value={databaseName}
+              onChange={(e) => setDatabaseName(e.target.value)}
+              placeholder="my_app"
+              mono
+            />
+          </Field>
+        )}
+        <Field label={newDatabase ? 'First collection' : 'Name'} hint={nameError ?? undefined}>
           <Input
             value={spec.name}
             onChange={(e) => set({ name: e.target.value })}
@@ -151,7 +199,12 @@ function CreateCollectionDialog({
             mono
           />
         </Field>
-        <Segmented value={spec.kind} onChange={(kind) => set({ kind })} options={KINDS} />
+        <Segmented
+          value={spec.kind}
+          onChange={(kind) => set({ kind })}
+          // A view needs a collection to read from, which a new database doesn't have yet
+          options={newDatabase ? KINDS.filter((k) => k.value !== 'view') : KINDS}
+        />
 
         {spec.kind === 'capped' && (
           <div className="grid grid-cols-2 gap-3">

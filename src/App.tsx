@@ -16,6 +16,7 @@ import { CreateCollectionHost } from './features/mongo/CreateCollectionDialog'
 import { MongoUserDesignerHost } from './features/mongo/MongoUserDesigner'
 import { Explorer } from './features/explorer/Explorer'
 import { SchemaDesignerHost } from './features/explorer/SchemaDesigner'
+import { DatabaseDesignerHost } from './features/explorer/DatabaseDesigner'
 import { HistoryPanel } from './features/history/HistoryPanel'
 import { SavedQueriesPanel } from './features/saved/SavedQueriesPanel'
 import { TableDesignerHost } from './features/table/TableDesigner'
@@ -267,6 +268,7 @@ export function App(): React.JSX.Element {
       <CreateCollectionHost />
       <TableDesignerHost />
       <SchemaDesignerHost />
+      <DatabaseDesignerHost />
       <TriggerDesignerHost />
       <PolicyDesignerHost />
       <PermissionsDesignerHost />

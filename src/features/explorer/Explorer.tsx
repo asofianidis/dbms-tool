@@ -131,6 +131,8 @@ import { openPermissionsDesigner } from './PermissionsDesigner'
 import { openPrincipalDesigner } from './PrincipalDesigner'
 import { listMongoPrincipals, openMongoUserDesigner } from '../mongo/MongoUserDesigner'
 import { openSchemaDesigner } from './SchemaDesigner'
+import { openDatabaseDesigner } from './DatabaseDesigner'
+import { canRenameDatabase, isDatabaseEngine, isSystemDatabase } from '@/lib/databases'
 import { VersionedMark } from './Versioning'
 import { EventSchedulerBadge, newEvent } from './events'
 import { MatviewRowDetail } from './matviews'
@@ -435,6 +437,19 @@ function ConnectionNode({ connection }: { connection: ConnectionConfig }): React
               icon: <ArchiveRestore />,
               disabled: !connected || connection.readOnly,
               onSelect: () => openBackup(connection.id, '', 'restore')
+            }
+          ]
+        : []),
+      ...(isDatabaseEngine(connection.engine) || connection.engine === 'mongo'
+        ? [
+            {
+              label: 'New database…',
+              icon: <Plus />,
+              disabled: !connected || connection.readOnly,
+              onSelect: () =>
+                connection.engine === 'mongo'
+                  ? openCreateCollection({ connectionId: connection.id, database: '' })
+                  : openDatabaseDesigner(connection.id)
             }
           ]
         : []),
@@ -817,6 +832,24 @@ function DatabaseNode({
           label: 'Edit schemas…',
           icon: <Layers />,
           onSelect: () => openSchemaDesigner(connection.id, database, 'dbo')
+        })
+      }
+      const engine = connection.engine
+      if (isDatabaseEngine(engine) && !isSystemDatabase(engine, database)) {
+        items.push('separator')
+        if (canRenameDatabase(engine))
+          items.push({
+            label: 'Rename database…',
+            icon: <Pencil />,
+            disabled: connection.readOnly,
+            onSelect: () => openDatabaseDesigner(connection.id, 'rename', database)
+          })
+        items.push({
+          label: 'Drop database…',
+          icon: <Trash2 />,
+          danger: true,
+          disabled: connection.readOnly,
+          onSelect: () => openDatabaseDesigner(connection.id, 'drop', database)
         })
       }
     }
