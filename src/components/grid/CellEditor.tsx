@@ -46,8 +46,6 @@ export function CellEditor({
   // What an empty input means; Backspace or Delete on an empty input switches it
   const [emptyIsNull, setEmptyIsNull] = useState(initial === null)
   const [panel, setPanel] = useState(false)
-  // Bumped to reload an open panel's draft from the inline input
-  const [panelKey, setPanelKey] = useState(0)
   const boxRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
@@ -56,6 +54,11 @@ export function CellEditor({
   const panelValue = useRef<() => string | undefined>(() => value)
   // Which field holds the latest edit, so clicking away commits that one and not the other
   const edited = useRef<'inline' | 'panel'>('inline')
+  /** An inline edit closes the panel, whose draft is now older; reopening starts from the input */
+  const editInline = (): void => {
+    edited.current = 'inline'
+    setPanel(false)
+  }
   const result = (): Cell => (value === '' && emptyIsNull ? null : value)
   const done = useRef(false)
   const finish = (v: Cell | undefined, move?: Move): void => {
@@ -87,8 +90,6 @@ export function CellEditor({
 
   const openExtra = (): void => {
     if (expandable) {
-      // Reopening after an inline edit reloads the panel, so its draft isn't older than the input
-      if (panel && edited.current === 'inline') setPanelKey((k) => k + 1)
       edited.current = 'panel'
       setPanel(true)
     } else if (temporal) {
@@ -144,7 +145,7 @@ export function CellEditor({
             : 'Backspace on an empty value switches between NULL and empty string'
         }
         onChange={(e) => {
-          edited.current = 'inline'
+          editInline()
           setValue(e.target.value)
         }}
         onFocus={(e) => e.target.select()}
@@ -162,7 +163,7 @@ export function CellEditor({
             openExtra()
           } else if ((e.key === 'Backspace' || e.key === 'Delete') && value === '') {
             e.preventDefault()
-            edited.current = 'inline'
+            editInline()
             setEmptyIsNull((n) => !n)
           }
         }}
@@ -211,7 +212,6 @@ export function CellEditor({
           >
             {kind === 'json' ? (
               <JsonPanel
-                key={panelKey}
                 initial={value}
                 valueRef={panelValue}
                 onEdit={() => (edited.current = 'panel')}
@@ -220,7 +220,6 @@ export function CellEditor({
               />
             ) : (
               <ArrayPanel
-                key={panelKey}
                 initial={array ?? []}
                 valueRef={panelValue}
                 onEdit={() => (edited.current = 'panel')}
