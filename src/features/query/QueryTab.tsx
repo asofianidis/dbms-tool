@@ -20,7 +20,7 @@ import {
   TextCursorInput,
   Undo2
 } from 'lucide-react'
-import { describePlan, describeRows, describeSchema, refusedSql } from '@/lib/ai'
+import { describePlan, describeRows, describeSchema } from '@/lib/ai'
 import { api, type CompletionTable, type StreamFormat } from '@/lib/api'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { EXTENSIONS, pickSavePath } from '@/lib/export'
@@ -260,8 +260,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           ...r,
           [tab.id]: { output, offset: runOffset, sql: toRun, spans, plan }
         }))
-        if (output.database && output.database !== tab.database)
+        if (output.database && output.database !== tab.database) {
+          // `USE other` moved the tab: a query waiting for approval was meant for the old database
+          stopAssistant(tab.id)
           updateTab(tab.id, { database: output.database })
+        }
         const rows = output.results.reduce((n, s) => n + s.rowCount, 0)
         lastRunStore.set((l) => ({
           ...l,
@@ -706,7 +709,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       const keyword = sqlWriteKeyword(code, dialect)
       return keyword ? `Runs ${keyword}` : null
     },
-    refuse: (query) => refusedSql(query, dialect),
+    // The backend's own check, so the user is only asked to approve what will run
+    refuse: async (query) => {
+      if (!(await connect(tab.connectionId))) return 'not connected'
+      return api.aiSqlCheck(tab.connectionId, query)
+    },
     readData: async (query, maxRows) => {
       if (!(await connect(tab.connectionId))) throw new Error('Not connected')
       const output = await api.aiSqlQuery(tab.connectionId, tab.id, tab.database, query, maxRows)

@@ -302,6 +302,9 @@ pub struct ExecOptions {
     /// for its own queries and the dashboards it designed
     #[serde(default)]
     pub assistant: bool,
+    /// With `assistant` on MongoDB: the only database requests may read
+    #[serde(default)]
+    pub assistant_database: Option<String>,
     /// Cancels the statement after this many seconds; `None` or 0 never times out
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -327,6 +330,7 @@ impl Default for ExecOptions {
             max_rows: default_max_rows(),
             read_only: false,
             assistant: false,
+            assistant_database: None,
             timeout_secs: None,
             max_binary_bytes: default_max_binary(),
             sink: None,

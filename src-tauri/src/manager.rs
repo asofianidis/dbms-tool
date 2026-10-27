@@ -54,6 +54,9 @@ fn timed_out_message(secs: u64) -> String {
 pub struct Slot {
     pub session: Session,
     last_used: Instant,
+    /// The session was put in read-only mode for AI assistant queries; cleared
+    /// whenever the connection behind it is replaced
+    read_only_mode: bool,
 }
 
 /// The MongoDB client, replaced when it stops answering after sitting idle.
@@ -140,6 +143,7 @@ impl Server {
                     tunnel::ensure(&self.config.id).await?;
                     guard.session =
                         Session::connect(&self.config, self.password.as_deref(), database).await?;
+                    guard.read_only_mode = false;
                 } else if wrong_db {
                     match &mut guard.session {
                         Session::My(s) => s.use_database(database).await?,
@@ -166,6 +170,7 @@ impl Server {
         let slot = Arc::new(Mutex::new(Slot {
             session,
             last_used: Instant::now(),
+            read_only_mode: false,
         }));
         sessions.insert(key, slot.clone());
         Ok(slot)
@@ -206,6 +211,14 @@ impl Server {
         sql: &str,
         opts: &ExecOptions,
     ) -> AppResult<ExecOutput> {
+        // First, so the assistant's refusals all read the same way
+        if opts.assistant
+            && let Some(keyword) = guard::assistant_blocked(sql, self.config.engine)
+        {
+            return Err(AppError::msg(format!(
+                "SQL the AI assistant wrote can only read, and this uses {keyword}, so it was not run."
+            )));
+        }
         if (self.config.read_only || opts.read_only)
             && let Some(keyword) = guard::first_write_keyword(sql, self.config.engine)
         {
@@ -217,13 +230,6 @@ impl Server {
             } else {
                 format!("Only read-only queries can run here, and this one contains {keyword}.")
             }));
-        }
-        if opts.assistant
-            && let Some(keyword) = guard::assistant_blocked(sql, self.config.engine)
-        {
-            return Err(AppError::msg(format!(
-                "Queries the AI assistant wrote can only read, and this one uses {keyword}, so it was not run."
-            )));
         }
         // Register before connecting so a cancel during connection setup isn't lost
         let signal = self.begin(key);
@@ -241,7 +247,37 @@ impl Server {
         } else {
             let mut guard = slot.lock().await;
             let deadline = Deadline::arm(opts, &signal);
-            let mut output = guard.session.execute(sql, opts, &signal).await;
+            // Assistant SQL also runs in the server's read-only mode where there is
+            // one, set once per connection (read-only connections already are)
+            let setup = match self.config.engine {
+                _ if !opts.assistant || self.config.read_only || guard.read_only_mode => None,
+                Engine::Postgres => Some("SET default_transaction_read_only = on"),
+                Engine::Mysql => Some("SET SESSION TRANSACTION READ ONLY"),
+                _ => None,
+            };
+            let refused = match setup {
+                Some(setup) => {
+                    let out = guard
+                        .session
+                        .execute(setup, &ExecOptions::default(), &signal)
+                        .await;
+                    guard.read_only_mode = out.error.is_none();
+                    out.error.is_some().then_some(out)
+                }
+                None => None,
+            };
+            let mut output = match refused {
+                Some(mut out) => {
+                    if let Some(error) = &mut out.error {
+                        error.message = format!(
+                            "Couldn't put the session in read-only mode, so the query was not run: {}",
+                            error.message
+                        );
+                    }
+                    out
+                }
+                None => guard.session.execute(sql, opts, &signal).await,
+            };
             if let Some(secs) = deadline.and_then(Deadline::disarm) {
                 let message = timed_out_message(secs);
                 output.messages.push(Message {
@@ -281,6 +317,12 @@ impl Server {
             return Err(AppError::msg(
                 "Only reads can run here: find, aggregate, count or distinct.",
             ));
+        }
+        if opts.assistant {
+            let database = opts.assistant_database.as_deref().unwrap_or_default();
+            if let Some(reason) = request.assistant_refusal(database) {
+                return Err(AppError::msg(format!("{reason}, so it was not run.")));
+            }
         }
         // Registered first so a cancel during the idle ping or reconnect counts;
         // `execute` returns at once on a signal that has already fired
@@ -648,6 +690,7 @@ impl Manager {
                     Arc::new(Mutex::new(Slot {
                         session,
                         last_used: Instant::now(),
+                        read_only_mode: false,
                     })),
                 );
             }

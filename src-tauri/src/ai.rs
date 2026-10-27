@@ -528,7 +528,9 @@ async fn cursor(model: &str, request: &ChatRequest) -> AppResult<ChatReply> {
         ));
     }
     let workspace = dir.display().to_string();
-    let mut args = vec![
+    let (program, script) = unwrap_batch_shim(&path)?;
+    let mut args: Vec<&str> = script.iter().map(String::as_str).collect();
+    args.extend([
         "--print",
         "--output-format",
         "json",
@@ -540,12 +542,12 @@ async fn cursor(model: &str, request: &ChatRequest) -> AppResult<ChatReply> {
         "enabled",
         "--workspace",
         &workspace,
-    ];
+    ]);
     if !model.is_empty() {
         args.extend(["--model", model]);
     }
     args.push(&prompt);
-    let out = run_cli(&path, &args, None, Some(dir), CHAT_TIMEOUT, None).await?;
+    let out = run_cli(&program, &args, None, Some(dir), CHAT_TIMEOUT, None).await?;
     let json: serde_json::Value = serde_json::from_str(out.trim()).map_err(|_| {
         AppError::msg(format!(
             "Unexpected output from Cursor: {}",
@@ -564,6 +566,48 @@ async fn cursor(model: &str, request: &ChatRequest) -> AppResult<ChatReply> {
         text: json["result"].as_str().unwrap_or_default().to_string(),
         model: None,
     })
+}
+
+/// The program to run for a CLI, and the arguments that lead: the CLI itself,
+/// or for a Windows batch shim (Cursor's installer puts `cursor-agent.cmd` on
+/// PATH) the `node.exe` and script it launches. Arguments to a batch file pass
+/// through cmd.exe, which mangles or refuses a multi-line prompt.
+fn unwrap_batch_shim(path: &Path) -> AppResult<(PathBuf, Vec<String>)> {
+    let batch = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if !batch {
+        return Ok((path.to_path_buf(), Vec::new()));
+    }
+    let unreadable = || {
+        AppError::msg(format!(
+            "{} is a batch script, which can't be given a multi-line prompt safely. \
+             Reinstall the Cursor CLI, or use another provider.",
+            path.display()
+        ))
+    };
+    let text = std::fs::read_to_string(path).map_err(|_| unreadable())?;
+    let dir = path.parent().ok_or_else(unreadable)?;
+    // Quoted paths in the shim, with its own folder (%~dp0, %dp0%) filled in
+    let folder = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+    let paths: Vec<PathBuf> = text
+        .split('"')
+        .map(|t| {
+            let t = t.replace("%~dp0", &folder).replace("%dp0%", &folder);
+            PathBuf::from(t.trim())
+        })
+        .filter(|p| p.is_file())
+        .collect();
+    let has = |ext: &str| {
+        paths
+            .iter()
+            .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)))
+    };
+    match (has("exe"), has("js")) {
+        (Some(node), Some(script)) => Ok((node.clone(), vec![script.display().to_string()])),
+        _ => Err(unreadable()),
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -663,6 +707,8 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(CHAT_TIMEOUT)
         .user_agent(concat!("dbms-tool/", env!("CARGO_PKG_VERSION")))
+        // A redirect would resend the prompt (schema, rows) and key somewhere else
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("HTTP client")
 });
@@ -843,21 +889,41 @@ fn session_key(session: &str) -> String {
     format!("ai-assistant:{session}")
 }
 
-fn options(max_rows: usize) -> ExecOptions {
+fn options(max_rows: usize, database: Option<String>) -> ExecOptions {
     ExecOptions {
         max_rows: max_rows.clamp(1, MAX_ROWS),
         read_only: true,
         timeout_secs: Some(QUERY_TIMEOUT_SECS),
         max_binary_bytes: 64,
         assistant: true,
+        assistant_database: database,
         ..Default::default()
     }
 }
 
-/// Runs a query the assistant asked for, after the user allowed it. Anything
-/// that writes (DELETE, DROP, UPDATE, …) or reaches outside the database is
-/// refused here, whatever the frontend did; PostgreSQL and MySQL sessions are
-/// also put in read-only mode first, so the server refuses writes too.
+/// Why the backend would refuse SQL the assistant wrote, checked before the
+/// user is asked to approve it; `None` when it would run.
+#[tauri::command]
+pub fn ai_sql_check(
+    state: State<'_, AppState>,
+    id: String,
+    sql: String,
+) -> AppResult<Option<String>> {
+    let engine = state.manager.get(&id)?.config.engine;
+    Ok(crate::guard::assistant_blocked(&sql, engine)
+        .map(|keyword| format!("it uses {keyword}, and the assistant can only read data")))
+}
+
+/// Like `ai_sql_check`, for a MongoDB read on the tab's `database`.
+#[tauri::command]
+pub fn ai_mongo_check(database: String, request: MongoRequest) -> Option<String> {
+    request.assistant_refusal(&database)
+}
+
+/// Runs a query the assistant asked for, after the user allowed it, on a
+/// session of its own. `Server::execute` refuses anything that writes (DELETE,
+/// DROP, UPDATE, …) or acts on the server, whatever the frontend did, and puts
+/// PostgreSQL and MySQL sessions in read-only mode so the server refuses writes too.
 #[tauri::command]
 pub async fn ai_sql_query(
     state: State<'_, AppState>,
@@ -868,42 +934,22 @@ pub async fn ai_sql_query(
     max_rows: usize,
 ) -> AppResult<ExecOutput> {
     let server = state.manager.get(&id)?;
-    let engine = server.config.engine;
-    if matches!(engine, Engine::Mongo | Engine::Redis) {
+    if matches!(server.config.engine, Engine::Mongo | Engine::Redis) {
         return Err(AppError::msg("SQL queries can't run on this connection"));
     }
-    if let Some(keyword) = crate::guard::assistant_blocked(&sql, engine) {
-        return Err(AppError::msg(format!(
-            "The assistant can only read data, and this query uses {keyword}, so it was not run."
-        )));
-    }
-    let key = session_key(&session);
-    // Read-only connections are in read-only mode server-side already
-    let read_only = match engine {
-        _ if server.config.read_only => None,
-        Engine::Postgres => Some("SET default_transaction_read_only = on"),
-        Engine::Mysql => Some("SET SESSION TRANSACTION READ ONLY"),
-        _ => None,
-    };
-    if let Some(setup) = read_only {
-        // Our own statement, so it skips the check that would refuse it
-        let out = server
-            .execute(&key, &database, setup, &ExecOptions::default())
-            .await?;
-        if let Some(error) = out.error {
-            return Err(AppError::msg(format!(
-                "Couldn't make the assistant's session read-only, so the query was not run: {}",
-                error.message
-            )));
-        }
-    }
     server
-        .execute(&key, &database, &sql, &options(max_rows))
+        .execute(
+            &session_key(&session),
+            &database,
+            &sql,
+            &options(max_rows, None),
+        )
         .await
 }
 
 /// Runs a MongoDB read the assistant asked for: find, aggregate (without
-/// `$out` / `$merge`), count, distinct or listIndexes. Everything else is refused.
+/// `$out` / `$merge`), count, distinct or listIndexes on the tab's `database`.
+/// `Server::mongo_execute` refuses everything else (see `assistant_refusal`).
 #[tauri::command]
 pub async fn ai_mongo_query(
     state: State<'_, AppState>,
@@ -914,26 +960,14 @@ pub async fn ai_mongo_query(
     request: MongoRequest,
     max_rows: usize,
 ) -> AppResult<MongoOutput> {
-    let allowed = matches!(
-        request,
-        MongoRequest::Find { .. }
-            | MongoRequest::Aggregate { .. }
-            | MongoRequest::Count { .. }
-            | MongoRequest::Distinct { .. }
-            | MongoRequest::ListIndexes { .. }
-    ) && !request.is_write();
-    if !allowed {
-        return Err(AppError::msg(
-            "The assistant can only read data (find, aggregate, count, distinct), so this was not run.",
-        ));
-    }
-    if let Some(reason) = mongo_out_of_bounds(&request, &database) {
-        return Err(AppError::msg(format!("{reason}, so this was not run.")));
-    }
     let server = state.manager.get(&id)?;
     let max_rows = max_rows.clamp(1, MAX_ROWS);
     let mut output = server
-        .mongo_execute(&session_key(&session), request, &options(max_rows))
+        .mongo_execute(
+            &session_key(&session),
+            request,
+            &options(max_rows, Some(database)),
+        )
         .await?;
     // `distinct` hands back every value at once, past the row limit
     if let Some(serde_json::Value::Array(values)) = &mut output.value
@@ -943,54 +977,6 @@ pub async fn ai_mongo_query(
         output.truncated = true;
     }
     Ok(output)
-}
-
-/// Why a MongoDB read reaches past what the assistant may see: another
-/// database than the tab's (`admin`, `config`), or a `system.*` collection
-/// (users, roles, profiles), directly or through `$lookup` / `$unionWith`.
-fn mongo_out_of_bounds(request: &MongoRequest, database: &str) -> Option<String> {
-    let (db, collection, pipeline) = match request {
-        MongoRequest::Aggregate {
-            database,
-            collection,
-            pipeline,
-            ..
-        } => (database, collection, Some(pipeline)),
-        MongoRequest::Find {
-            database,
-            collection,
-            ..
-        }
-        | MongoRequest::Count {
-            database,
-            collection,
-            ..
-        }
-        | MongoRequest::Distinct {
-            database,
-            collection,
-            ..
-        }
-        | MongoRequest::ListIndexes {
-            database,
-            collection,
-        } => (database, collection, None),
-        _ => return Some("The assistant can only read data".into()),
-    };
-    if db != database {
-        return Some(format!(
-            "The assistant can only read the tab's database ({database})"
-        ));
-    }
-    if collection.starts_with("system.") {
-        return Some("The assistant can't read system collections".into());
-    }
-    // Pipelines name other collections in strings, and other databases in `db`
-    let pipeline = serde_json::to_string(&pipeline).unwrap_or_default();
-    if pipeline.contains("\"system.") || pipeline.contains("\"db\"") {
-        return Some("The pipeline reaches system collections or another database".into());
-    }
-    None
 }
 
 #[tauri::command]
@@ -1093,20 +1079,34 @@ mod tests {
     }
 
     #[test]
-    fn mongo_reads_stay_in_the_tabs_database() {
-        let read =
-            |json: serde_json::Value| -> MongoRequest { serde_json::from_value(json).unwrap() };
-        let find = |db: &str, coll: &str| {
-            read(serde_json::json!({ "op": "find", "database": db, "collection": coll }))
-        };
-        assert_eq!(mongo_out_of_bounds(&find("shop", "orders"), "shop"), None);
-        assert!(mongo_out_of_bounds(&find("admin", "system.users"), "shop").is_some());
-        assert!(mongo_out_of_bounds(&find("shop", "system.profile"), "shop").is_some());
-        let lookup = read(serde_json::json!({
-            "op": "aggregate", "database": "shop", "collection": "orders",
-            "pipeline": [{ "$lookup": { "from": { "db": "admin", "coll": "x" }, "as": "y" } }]
-        }));
-        assert!(mongo_out_of_bounds(&lookup, "shop").is_some());
+    fn batch_shims_run_their_node_script() {
+        let dir = std::env::temp_dir().join(format!("dbms-tool-shim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("versions")).unwrap();
+        let node = dir.join("versions").join("node.exe");
+        let script = dir.join("versions").join("index.js");
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&script, "").unwrap();
+        let shim = dir.join("cursor-agent.cmd");
+        let sep = std::path::MAIN_SEPARATOR;
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\n\"%~dp0versions{sep}node.exe\" \"%~dp0versions{sep}index.js\" %*\r\n"
+            ),
+        )
+        .unwrap();
+        let (program, lead) = unwrap_batch_shim(&shim).unwrap();
+        assert!(program.ends_with("node.exe"), "{}", program.display());
+        assert!(lead[0].ends_with("index.js"));
+        std::fs::write(&shim, "@echo off\r\nsomething %*\r\n").unwrap();
+        assert!(unwrap_batch_shim(&shim).is_err());
+        // Anything else runs as it is
+        let plain = dir.join("cursor-agent");
+        assert_eq!(
+            unwrap_batch_shim(&plain).unwrap(),
+            (plain.clone(), Vec::new())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

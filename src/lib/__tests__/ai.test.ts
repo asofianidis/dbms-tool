@@ -11,7 +11,6 @@ import {
   parseDashboardSpec,
   parseMongoRead,
   parseReply,
-  refusedSql,
   schemaFields,
   systemPrompt,
   takeRunRequest
@@ -73,13 +72,6 @@ describe('replies', () => {
 })
 
 describe('data access', () => {
-  it('refuses writes, deletes and drops', () => {
-    expect(refusedSql('SELECT * FROM t', 'postgres')).toBeNull()
-    expect(refusedSql('DELETE FROM t', 'postgres')).toContain('DELETE')
-    expect(refusedSql('DROP TABLE t', 'mysql')).toContain('DROP')
-    expect(refusedSql('select 1; truncate t', 'tsql')).toContain('TRUNCATE')
-  })
-
   it('only lets Mongo reads through', () => {
     const base = { database: 'd', collection: 'c' }
     expect(mongoReadOnly({ op: 'find', ...base })).toBe(true)
@@ -265,5 +257,33 @@ describe('limits', () => {
     expect(roomy).toHaveLength(messages.length)
     expect(roomy[2].content).toContain('left out')
     expect(roomy[4].content).toContain('latest')
+  })
+})
+
+describe('fitting history around a data read', () => {
+  const big = (n: number): string => 'x'.repeat(n)
+  it('keeps the question being answered and cuts the result', () => {
+    const messages = [
+      { role: 'user' as const, content: 'How many open orders per region?' },
+      { role: 'assistant' as const, content: 'Checking <run_query>SELECT …</run_query>' },
+      { role: 'user' as const, content: `<query_result>\n${big(50_000)}\n</query_result>` }
+    ]
+    const fitted = fitHistory(messages, 10_000)
+    expect(fitted[0].content).toBe('How many open orders per region?')
+    expect(fitted.at(-1)?.content).toContain('cut to fit')
+    expect(fitted.reduce((n, m) => n + m.content.length, 0)).toBeLessThanOrEqual(10_000)
+  })
+
+  it('drops older turns before the current question, not after', () => {
+    const messages = [
+      { role: 'user' as const, content: big(6000) },
+      { role: 'assistant' as const, content: big(6000) },
+      { role: 'user' as const, content: 'current question' },
+      { role: 'assistant' as const, content: '<run_query>SELECT 1</run_query>' },
+      { role: 'user' as const, content: `<query_result>\n${big(3000)}\n</query_result>` }
+    ]
+    const fitted = fitHistory(messages, 8000)
+    expect(fitted[0].content).toBe('current question')
+    expect(fitted).toHaveLength(3)
   })
 })

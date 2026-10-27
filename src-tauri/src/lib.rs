@@ -111,6 +111,8 @@ pub fn run() {
             ai::ai_key_delete,
             ai::ai_chat,
             ai::ai_cancel,
+            ai::ai_sql_check,
+            ai::ai_mongo_check,
             ai::ai_sql_query,
             ai::ai_mongo_query,
             ai::ai_session_close,

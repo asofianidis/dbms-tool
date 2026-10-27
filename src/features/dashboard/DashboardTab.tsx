@@ -485,6 +485,7 @@ function DashboardView({
         <WidgetEditor
           initial={editing.widget}
           isNew={editing.isNew}
+          assistant={dashboard.source === 'assistant'}
           engine={connection.engine}
           connectionId={dashboard.connectionId}
           database={dashboard.database}

@@ -6,9 +6,7 @@ import type {
   MongoOutput,
   MongoRequest
 } from './api'
-import type { Dialect } from './engines'
 import { walkPlan, type Plan, type PlanNode } from './plan'
-import { sqlWriteKeyword } from './production'
 
 /* ---------- Providers ---------- */
 
@@ -96,18 +94,20 @@ export function historyBudget(provider: AiProvider): number {
 const RESULT_OPEN = '<query_result>'
 
 /**
- * The conversation trimmed to `budget` characters: query results before the
- * latest one shrink to a note (the model already answered from them), then
- * the oldest turns go. The latest question always stays, and it starts with a
- * user turn, as providers expect.
+ * The conversation trimmed to `budget` characters. Query results before the
+ * latest shrink to a note (the model already answered from them); a latest
+ * result too big for the budget is cut short with a note saying so; then the
+ * oldest turns go, but never the question being answered, so the model always
+ * knows what it's doing. Starts with a user turn, as providers expect.
  */
 export function fitHistory<M extends { role: 'user' | 'assistant'; content: string }>(
   messages: M[],
   budget: number
 ): M[] {
-  const lastResult = messages.findLastIndex((m) => m.content.startsWith(RESULT_OPEN))
+  const isResult = (m: M): boolean => m.content.startsWith(RESULT_OPEN)
+  const lastResult = messages.findLastIndex(isResult)
   let fitted = messages.map((m, i) =>
-    m.content.startsWith(RESULT_OPEN) && i !== lastResult
+    isResult(m) && i !== lastResult
       ? {
           ...m,
           content: `${RESULT_OPEN}\n(an earlier result, left out to save space)\n</query_result>`
@@ -115,9 +115,29 @@ export function fitHistory<M extends { role: 'user' | 'assistant'; content: stri
       : m
   )
   const size = (list: M[]): number => list.reduce((n, m) => n + m.content.length, 0)
-  while (fitted.length > 1 && size(fitted) > budget) {
+  const cut = (list: M[], limit: number): M[] =>
+    list.map((m, i) => {
+      if (i !== list.findLastIndex(isResult) || m.content.length <= limit) return m
+      const body = m.content.slice(RESULT_OPEN.length, Math.max(RESULT_OPEN.length, limit - 120))
+      return {
+        ...m,
+        content: `${RESULT_OPEN}${body}\n(The rest of this result was cut to fit; ask for fewer rows or columns.)\n</query_result>`
+      }
+    })
+  // A result never takes more than half the budget, leaving room for the conversation
+  fitted = cut(fitted, Math.floor(budget / 2))
+  // Then drop the oldest turns, up to the question being answered
+  const question = (list: M[]): number =>
+    list.findLastIndex((m) => m.role === 'user' && !isResult(m))
+  while (size(fitted) > budget && question(fitted) > 0) {
     fitted = fitted.slice(1)
     while (fitted.length > 1 && fitted[0].role !== 'user') fitted = fitted.slice(1)
+  }
+  // Still too long: the result gives way to what's left
+  const over = size(fitted) - budget
+  if (over > 0) {
+    const result = fitted.findLastIndex(isResult)
+    if (result >= 0) fitted = cut(fitted, Math.max(400, fitted[result].content.length - over))
   }
   return fitted
 }
@@ -308,12 +328,6 @@ export function takeRunRequest(text: string): { text: string; query: string | nu
     .replace(/\n?```$/, '')
     .trim()
   return { text: text.slice(0, start).trim(), query: query || null }
-}
-
-/** Why the app won't run a SQL query the assistant asked for, or null. The backend checks again. */
-export function refusedSql(sql: string, dialect: Dialect): string | null {
-  const keyword = sqlWriteKeyword(sql, dialect)
-  return keyword ? `it contains ${keyword}, and the assistant can only read data` : null
 }
 
 /** Which Mongo requests the assistant may have run, like `ai_mongo_query` in the backend. */

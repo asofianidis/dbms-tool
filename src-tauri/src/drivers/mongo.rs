@@ -515,6 +515,134 @@ impl MongoRequest {
     }
 }
 
+impl MongoRequest {
+    /// Why a request from the AI assistant (its reads, the dashboards it
+    /// designed) must not run, or `None`. It may only read `database`, never a
+    /// `system.*` collection, never run JavaScript on the server, and never use
+    /// the stages that show other sessions or server internals.
+    pub fn assistant_refusal(&self, database: &str) -> Option<String> {
+        let (db, collection, parts): (&str, &str, Vec<&Value>) = match self {
+            MongoRequest::Find {
+                database,
+                collection,
+                filter,
+                projection,
+                sort,
+                ..
+            } => (
+                database,
+                collection,
+                [filter, projection, sort].into_iter().flatten().collect(),
+            ),
+            MongoRequest::Aggregate {
+                database,
+                collection,
+                pipeline,
+                ..
+            } => (database, collection, pipeline.iter().collect()),
+            MongoRequest::Count {
+                database,
+                collection,
+                filter,
+                ..
+            }
+            | MongoRequest::Distinct {
+                database,
+                collection,
+                filter,
+                ..
+            } => (database, collection, filter.iter().collect()),
+            MongoRequest::ListIndexes {
+                database,
+                collection,
+            } => (database, collection, Vec::new()),
+            _ => {
+                return Some(
+                    "The assistant can only read data (find, aggregate, count, distinct)".into(),
+                );
+            }
+        };
+        if self.is_write() {
+            return Some("The assistant can only read data; $out and $merge write".into());
+        }
+        if db != database {
+            return Some(format!(
+                "The assistant can only read this database ({database})"
+            ));
+        }
+        if collection.starts_with("system.") {
+            return Some("The assistant can't read system collections".into());
+        }
+        parts.into_iter().find_map(|v| assistant_scan(v, database))
+    }
+}
+
+/// Operators that run JavaScript on the server
+const SERVER_JS: &[&str] = &["$where", "$function", "$accumulator"];
+
+/// Stages that show other sessions, their queries or server internals
+const ADMIN_STAGES: &[&str] = &[
+    "$currentOp",
+    "$listSessions",
+    "$listLocalSessions",
+    "$listSampledQueries",
+    "$planCacheStats",
+    "$querySettings",
+    "$shardedDataDistribution",
+];
+
+/// Walks a filter or pipeline (nested `pipeline`s and `$facet`s included) for
+/// what `assistant_refusal` forbids. Only operator keys and the collections
+/// `$lookup`, `$graphLookup` and `$unionWith` name are looked at, so values
+/// such as `{"db": "shop"}` or `"system.x"` in a `$match` still read.
+fn assistant_scan(value: &Value, database: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => map.iter().find_map(|(key, v)| {
+            if SERVER_JS.contains(&key.as_str()) {
+                return Some(format!("{key} runs JavaScript on the server"));
+            }
+            if ADMIN_STAGES.contains(&key.as_str()) {
+                return Some(format!("{key} shows server internals"));
+            }
+            let target = match key.as_str() {
+                "$lookup" | "$graphLookup" => v.get("from"),
+                "$unionWith" => Some(v.get("coll").unwrap_or(v)),
+                _ => None,
+            };
+            if let Some(target) = target
+                && let Some(reason) = foreign_collection(target, v, database)
+            {
+                return Some(reason);
+            }
+            assistant_scan(v, database)
+        }),
+        Value::Array(items) => items.iter().find_map(|v| assistant_scan(v, database)),
+        _ => None,
+    }
+}
+
+/// A `from` / `coll` naming a system collection or another database
+/// (`{"db": "admin", "coll": "x"}`, or `db` beside `coll` in `$unionWith`).
+fn foreign_collection(target: &Value, stage: &Value, database: &str) -> Option<String> {
+    let (db, coll) = match target {
+        Value::String(coll) => (stage.get("db").and_then(Value::as_str), Some(coll.as_str())),
+        Value::Object(o) => (
+            o.get("db").and_then(Value::as_str),
+            o.get("coll").and_then(Value::as_str),
+        ),
+        _ => (None, None),
+    };
+    if db.is_some_and(|db| db != database) {
+        return Some(format!(
+            "The assistant can only read this database ({database})"
+        ));
+    }
+    if coll.is_some_and(|c| c.starts_with("system.")) {
+        return Some("The assistant can't read system collections".into());
+    }
+    None
+}
+
 fn pipeline_writes(pipeline: &[Value]) -> bool {
     pipeline.iter().any(|stage| {
         stage
@@ -1431,6 +1559,50 @@ async fn write_export(
 mod tests {
     use super::*;
     use mongodb::bson;
+
+    fn request(json: Value) -> MongoRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn assistant_reads_stay_in_bounds() {
+        let ok = |json| request(json).assistant_refusal("shop").is_none();
+        assert!(ok(
+            json!({ "op": "find", "database": "shop", "collection": "orders" })
+        ));
+        // Values that only look like collection references are just data
+        assert!(ok(json!({
+            "op": "aggregate", "database": "shop", "collection": "events",
+            "pipeline": [{ "$match": { "db": "shop", "name": "system.boot" } }]
+        })));
+        assert!(ok(json!({
+            "op": "aggregate", "database": "shop", "collection": "orders",
+            "pipeline": [{ "$lookup": { "from": "customers", "localField": "c", "foreignField": "_id", "as": "c" } }]
+        })));
+        for refused in [
+            json!({ "op": "find", "database": "admin", "collection": "system.users" }),
+            json!({ "op": "find", "database": "shop", "collection": "system.profile" }),
+            json!({ "op": "find", "database": "shop", "collection": "o", "filter": { "$where": "sleep(1000)" } }),
+            json!({ "op": "find", "database": "shop", "collection": "o",
+                    "projection": { "x": { "$function": { "body": "f", "args": [], "lang": "js" } } } }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o",
+                    "pipeline": [{ "$group": { "_id": 1, "x": { "$accumulator": {} } } }] }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o",
+                    "pipeline": [{ "$lookup": { "from": { "db": "admin", "coll": "x" }, "as": "y" } }] }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o",
+                    "pipeline": [{ "$unionWith": { "coll": "system.views" } }] }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o",
+                    "pipeline": [{ "$facet": { "a": [{ "$lookup": { "from": "system.js", "as": "y" } }] } }] }),
+            json!({ "op": "aggregate", "database": "admin", "collection": "o", "pipeline": [{ "$currentOp": {} }] }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o", "pipeline": [{ "$out": "x" }] }),
+            json!({ "op": "deleteMany", "database": "shop", "collection": "o", "filter": {} }),
+        ] {
+            assert!(
+                request(refused.clone()).assistant_refusal("shop").is_some(),
+                "{refused}"
+            );
+        }
+    }
 
     #[test]
     fn default_database_falls_back_to_the_auth_database() {

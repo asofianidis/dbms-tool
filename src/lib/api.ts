@@ -439,6 +439,8 @@ export interface ExecOptions {
   readOnly?: boolean
   /** Also refuse what the AI assistant may never run (functions that act on the server…) */
   assistant?: boolean
+  /** With `assistant` on MongoDB: the only database requests may read */
+  assistantDatabase?: string
   /** Cancels the statement after this many seconds; 0 or absent never times out */
   timeoutSecs?: number
   /** Bytes of each binary cell to send (default 4096); the rest is summarized */
@@ -990,6 +992,10 @@ export const api = {
   aiChat: (requestId: string, request: AiChatRequest) =>
     invoke<AiReply>('ai_chat', { requestId, request }),
   aiCancel: (requestId: string) => invoke<void>('ai_cancel', { requestId }),
+  /** Why the backend would refuse SQL the assistant wrote, or null; asked before approval */
+  aiSqlCheck: (id: string, sql: string) => invoke<string | null>('ai_sql_check', { id, sql }),
+  aiMongoCheck: (database: string, request: MongoRequest) =>
+    invoke<string | null>('ai_mongo_check', { database, request }),
   /** A read-only query the assistant asked for, on its own session; writes are refused */
   aiSqlQuery: (id: string, session: string, database: string, sql: string, maxRows: number) =>
     invoke<ExecOutput>('ai_sql_query', { id, session, database, sql, maxRows }),

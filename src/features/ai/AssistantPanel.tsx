@@ -63,8 +63,8 @@ export interface AssistantTarget {
   insert: (code: string, mode: 'cursor' | 'replace') => void
   /** Why a code block would change data when run, for a warning on it */
   writes: (code: string) => string | null
-  /** Why the app won't run a query the assistant asked for, or null to allow it */
-  refuse: (query: string) => string | null
+  /** Why the app won't run a query the assistant asked for (the backend's checks), or null */
+  refuse: (query: string) => Promise<string | null>
   /** Runs a read-only query the assistant asked for; returns its rows as text */
   readData: (query: string, maxRows: number) => Promise<{ text: string; summary: string }>
 }
@@ -86,6 +86,8 @@ interface Entry {
   }
   /** A failed request; never sent back */
   failed?: boolean
+  /** Rows from a query the user approved, and the provider they were approved for */
+  rowsFor?: AiProvider
   model?: string | null
 }
 
@@ -108,8 +110,15 @@ const threadsStore = createStore<Record<string, Thread>>({})
 /** Answers for queries waiting on the user's approval, by entry id. */
 const approvals = new Map<string, (run: boolean) => void>()
 
-/** Tabs whose current request was stopped. */
-const stopped = new Set<string>()
+/**
+ * The run answering each tab's question. Stop marks it, and a new question
+ * starts a new one, so a stopped run still waiting on a read can't carry on
+ * into the next conversation.
+ */
+interface Run {
+  stopped: boolean
+}
+const runs = new Map<string, Run>()
 
 /** Rounds of "run this query" per question before the assistant must answer. */
 const MAX_QUERIES = 6
@@ -137,11 +146,26 @@ function patchQuery(tabId: string, id: string, query: Partial<NonNullable<Entry[
   }))
 }
 
-/** What the model gets back each round, trimmed so long conversations still fit. */
-function conversation(tabId: string, budget: number): AiMessage[] {
+/**
+ * What the model gets back each round, trimmed so long conversations still
+ * fit. Rows go only where they were approved: with data access off, or to
+ * another provider than the one they were approved for, they're withheld.
+ */
+function conversation(
+  tabId: string,
+  budget: number,
+  provider: AiProvider,
+  allowData: boolean
+): AiMessage[] {
   const messages = thread(tabId)
     .entries.filter((e) => !e.failed)
-    .map((e) => ({ role: e.role, content: e.content }))
+    .map((e) => ({
+      role: e.role,
+      content:
+        e.rowsFor && (!allowData || e.rowsFor !== provider)
+          ? '<query_result>\n(withheld: data access is off, or the rows were approved for another provider)\n</query_result>'
+          : e.content
+    }))
   return fitHistory(messages, budget)
 }
 
@@ -180,9 +204,11 @@ export function stopAssistant(tabId: string): void {
 }
 
 function stop(tabId: string): void {
+  const run = runs.get(tabId)
+  if (!run) return
+  run.stopped = true
+  runs.delete(tabId)
   const t = thread(tabId)
-  if (!t.busy) return
-  stopped.add(tabId)
   if (t.requestId) void api.aiCancel(t.requestId)
   for (const e of t.entries)
     if (e.query?.state === 'pending') {
@@ -200,14 +226,16 @@ async function ask(
   question: { content: string; display: string; attached: string[] }
 ): Promise<void> {
   const { tabId } = target
-  if (thread(tabId).busy) return
-  stopped.delete(tabId)
+  if (runs.has(tabId)) return
+  const run: Run = { stopped: false }
+  runs.set(tabId, run)
+  const stopped = (): boolean => run.stopped
   push(tabId, { role: 'user', ...question })
   update(tabId, (t) => ({ ...t, busy: true }))
   try {
     for (let round = 0; ; round++) {
       // Stop can land during any await below; nothing more goes to the provider after it
-      if (stopped.has(tabId)) return
+      if (stopped()) return
       const settings = settingsStore.get()
       const provider = settings.aiProvider
       const allowData = settings.aiAllowData && round < MAX_QUERIES
@@ -215,7 +243,7 @@ async function ask(
       try {
         schema = await target.schema(schemaBudget(provider), question.content)
       } catch (e) {
-        if (!stopped.has(tabId))
+        if (!stopped())
           push(tabId, {
             role: 'assistant',
             content: `Couldn't load the schema: ${errorMessage(e)}`,
@@ -223,7 +251,7 @@ async function ask(
           })
         return
       }
-      if (stopped.has(tabId)) return
+      if (stopped()) return
       const requestId = crypto.randomUUID()
       update(tabId, (t) => ({ ...t, requestId }))
       let reply
@@ -239,14 +267,13 @@ async function ask(
             schema: schema.text,
             data: { allowed: allowData, maxRows: settings.aiMaxRows }
           }),
-          messages: conversation(tabId, historyBudget(provider))
+          messages: conversation(tabId, historyBudget(provider), provider, settings.aiAllowData)
         })
       } catch (e) {
-        if (!stopped.has(tabId))
-          push(tabId, { role: 'assistant', content: errorMessage(e), failed: true })
+        if (!stopped()) push(tabId, { role: 'assistant', content: errorMessage(e), failed: true })
         return
       }
-      if (stopped.has(tabId)) return
+      if (stopped()) return
       const { text, query } = takeRunRequest(reply.text)
       if (!query || !allowData) {
         // Without data access a requested query is just shown, for the user to run
@@ -263,7 +290,13 @@ async function ask(
         model: reply.model,
         query: { text: query, state: 'pending' }
       })
-      const refusal = target.refuse(query)
+      let refusal: string | null
+      try {
+        refusal = await target.refuse(query)
+      } catch (e) {
+        refusal = errorMessage(e)
+      }
+      if (stopped()) return
       if (refusal) {
         patchQuery(tabId, id, { state: 'refused', note: `Not run: ${refusal}` })
         push(tabId, {
@@ -278,7 +311,7 @@ async function ask(
         !settings.aiConfirmQueries ||
         (await new Promise<boolean>((resolve) => approvals.set(id, resolve)))
       approvals.delete(id)
-      if (stopped.has(tabId)) {
+      if (stopped()) {
         patchQuery(tabId, id, { state: 'declined' })
         return
       }
@@ -296,7 +329,7 @@ async function ask(
       try {
         const result = await target.readData(query, settings.aiMaxRows)
         // Rows read after Stop are not added to the conversation
-        if (stopped.has(tabId)) {
+        if (stopped()) {
           patchQuery(tabId, id, { state: 'declined', note: 'Stopped' })
           return
         }
@@ -305,10 +338,11 @@ async function ask(
           role: 'user',
           content: `<query_result>\n${result.text}\n</query_result>`,
           display: 'Sent the result',
-          attached: [result.summary]
+          attached: [result.summary],
+          rowsFor: provider
         })
       } catch (e) {
-        if (stopped.has(tabId)) return
+        if (stopped()) return
         const message = errorMessage(e)
         patchQuery(tabId, id, { state: 'failed', note: message })
         push(tabId, {
@@ -320,7 +354,10 @@ async function ask(
       }
     }
   } finally {
-    update(tabId, (t) => ({ ...t, busy: false, requestId: undefined }))
+    // A stopped run leaves the thread to whatever replaced it
+    if (runs.get(tabId) === run) runs.delete(tabId)
+    if (!run.stopped || !runs.has(tabId))
+      update(tabId, (t) => ({ ...t, busy: false, requestId: undefined }))
   }
 }
 

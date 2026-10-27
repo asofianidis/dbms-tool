@@ -328,11 +328,12 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
     None
 }
 
-/// Functions and statements that act on the server or reach outside the
-/// database even inside a read-only transaction: ending sessions, reading
-/// server files, other servers, advisory locks. Only refused for queries the
-/// AI assistant asks to run; people can still run them themselves.
-const ASSISTANT_DENIED: &[&str] = &[
+/// Functions that act on the server or reach outside the database even inside
+/// a read-only transaction: ending sessions, resetting statistics, replication
+/// slots, server files, other servers, sequences. Matched only as calls
+/// (`name(`), so columns with these names still read. Only refused for SQL the
+/// AI assistant wrote; people can still run them themselves.
+const ASSISTANT_DENIED_CALLS: &[&str] = &[
     // PostgreSQL
     "pg_terminate_backend",
     "pg_cancel_backend",
@@ -340,50 +341,54 @@ const ASSISTANT_DENIED: &[&str] = &[
     "pg_rotate_logfile",
     "pg_promote",
     "pg_switch_wal",
-    "pg_create_restore_point",
     "pg_read_file",
     "pg_read_binary_file",
-    "pg_ls_dir",
     "pg_stat_file",
-    "lo_import",
-    "lo_export",
-    "lo_unlink",
-    "dblink",
-    "dblink_exec",
-    "dblink_connect",
     "pg_notify",
+    "pg_start_backup",
+    "pg_stop_backup",
+    "pg_import_system_collations",
+    "pg_log_backend_memory_contexts",
+    "pg_stat_statements_reset",
+    "nextval",
+    "setval",
     // Run a query given as a string, which the checks here can't read
     "query_to_xml",
     "query_to_xmlschema",
     "query_to_xml_and_xmlschema",
     "cursor_to_xml",
-    "prepare",
-    "listen",
-    "notify",
-    "unlisten",
     // MySQL
     "load_file",
     "get_lock",
     "release_lock",
     "release_all_locks",
-    "handler",
+    "benchmark",
     // SQL Server
     "openrowset",
     "opendatasource",
     "openquery",
     "xp_cmdshell",
-    // SQLite: ATTACH creates database files
-    "attach",
-    "detach",
-    "pragma",
+    // SQLite
+    "load_extension",
 ];
 
-/// Families of functions denied by prefix: every advisory lock (exclusive and
-/// shared, taken and released), every server directory listing, adminpack's
-/// file functions, every dblink call and large objects.
+/// Families of calls denied by prefix: advisory locks (exclusive and shared,
+/// taken and released), statistics resets, creating and dropping replication
+/// slots and origins, consuming logical changes, backups, server directory
+/// listings, adminpack's file functions, dblink and large objects.
 const ASSISTANT_DENIED_PREFIXES: &[&str] = &[
     "pg_advisory_",
     "pg_try_advisory_",
+    "pg_stat_reset",
+    "pg_create_",
+    "pg_drop_",
+    "pg_copy_",
+    "pg_replication_",
+    "pg_logical_slot_get_",
+    "pg_logical_emit_",
+    "pg_sync_",
+    "pg_wal_replay_",
+    "pg_backup_",
     "pg_ls_",
     "pg_logdir_",
     "pg_file_",
@@ -392,32 +397,58 @@ const ASSISTANT_DENIED_PREFIXES: &[&str] = &[
     "lo_",
 ];
 
-fn assistant_denied(name: &str) -> bool {
-    ASSISTANT_DENIED.contains(&name)
+/// Statements denied where a statement starts: notifications, prepared
+/// statements (whose text the checks can't read), MySQL's HANDLER, and
+/// SQLite's ATTACH (which creates files) and PRAGMA.
+const ASSISTANT_DENIED_STATEMENTS: &[&str] = &[
+    "listen", "notify", "unlisten", "prepare", "handler", "attach", "detach", "pragma",
+];
+
+fn denied_call(name: &str) -> bool {
+    ASSISTANT_DENIED_CALLS.contains(&name)
         || ASSISTANT_DENIED_PREFIXES
             .iter()
             .any(|p| name.starts_with(p))
 }
 
-/// Why a query the AI assistant asked for must not run: any write (DELETE,
-/// DROP and the rest, as `first_write_keyword` finds them) or one of
-/// `ASSISTANT_DENIED`. `None` when it only reads.
+/// Why SQL the AI assistant wrote must not run: any write (DELETE, DROP and
+/// the rest, as `first_write_keyword` finds them), a denied call or statement,
+/// or a sequence advancing. `None` when it only reads.
 pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
     if let Some(keyword) = first_write_keyword(sql, engine) {
         return Some(keyword);
     }
-    let tokens = tokenize(
-        sql,
-        Lexing {
-            mysql_comments: engine == Engine::Mysql,
-            bracket_idents: matches!(engine, Engine::Mssql | Engine::Babelfish | Engine::Sqlite),
-            backslash_escapes: false,
-        },
-    );
+    // Like `first_write_keyword`: whether `\'` escapes depends on server settings,
+    // so read the text both ways and block if either finds something
+    let escapes: &[bool] = match engine {
+        Engine::Mysql | Engine::Postgres => &[false, true],
+        _ => &[false],
+    };
+    escapes.iter().find_map(|&backslash_escapes| {
+        let tokens = tokenize(
+            sql,
+            Lexing {
+                mysql_comments: engine == Engine::Mysql,
+                bracket_idents: matches!(
+                    engine,
+                    Engine::Mssql | Engine::Babelfish | Engine::Sqlite
+                ),
+                backslash_escapes,
+            },
+        );
+        assistant_denied(&tokens, engine)
+    })
+}
+
+fn assistant_denied(tokens: &[Token], engine: Engine) -> Option<String> {
+    let word = |i: usize| match tokens.get(i) {
+        Some(Token::Word(w) | Token::QuotedIdent(w)) => Some(w.as_str()),
+        _ => None,
+    };
     tokens.iter().enumerate().find_map(|(i, token)| {
         let name = match token {
-            // Quoted names count too: `"pg_read_file"(…)`, `[xp_cmdshell]`, `` `load_file` ``
-            Token::Word(w) | Token::QuotedIdent(w) => w,
+            // Quoted names count too: `"pg_read_file"(…)`, `[openrowset](…)`, `` `load_file`(…) ``
+            Token::Word(w) | Token::QuotedIdent(w) => w.as_str(),
             _ => return None,
         };
         // PostgreSQL's U&"\0070g_read_file" spells a name with escapes this check can't read
@@ -431,11 +462,17 @@ pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
         {
             return Some("U& (escaped names)".into());
         }
-        // `t.listen` is a column; a schema-qualified call (`pg_catalog.pg_read_file`) still counts
-        let column = i > 0
-            && tokens[i - 1] == Token::Punct('.')
-            && tokens.get(i + 1) != Some(&Token::Punct('('));
-        (assistant_denied(name) && !column).then(|| name.to_uppercase())
+        // T-SQL's `NEXT VALUE FOR seq` advances a sequence
+        if name == "next" && word(i + 1) == Some("value") && word(i + 2) == Some("for") {
+            return Some("NEXT VALUE FOR".into());
+        }
+        let call = tokens.get(i + 1) == Some(&Token::Punct('('));
+        let starts_statement = i == 0 || tokens[i - 1] == Token::Punct(';');
+        let denied = (call && denied_call(name))
+            || (starts_statement
+                && matches!(token, Token::Word(_))
+                && ASSISTANT_DENIED_STATEMENTS.contains(&name));
+        denied.then(|| name.to_uppercase())
     })
 }
 
@@ -609,7 +646,34 @@ mod tests {
             assert!(pg(sql).is_some(), "{sql}");
         }
         assert_eq!(pg("SELECT \"name\", u.\"lock\" FROM users u"), None);
+        // A backslash-escaped quote can't hide a call: MySQL and E'' strings read `\'` as a quote
+        assert!(my(r"SELECT 'a\'', load_file('/etc/passwd'), ''").is_some());
+        assert!(pg(r"SELECT E'a\'', pg_read_file('/etc/passwd'), ''").is_some());
+        // Names that only look like denied ones: columns, tables, quoted columns
+        assert_eq!(
+            pg("SELECT lo_price, handler, notify, listen FROM lineorder"),
+            None
+        );
+        assert_eq!(pg("SELECT * FROM dblink_logs WHERE pg_file_id = 1"), None);
+        assert_eq!(pg("SELECT \"listen\", \"prepare\" FROM t"), None);
+        assert_eq!(my("SELECT attach, pragma FROM t"), None);
+        // State that changes even in a read-only transaction
+        for sql in [
+            "SELECT pg_stat_reset()",
+            "SELECT pg_stat_reset_shared('bgwriter')",
+            "SELECT pg_stat_statements_reset()",
+            "SELECT pg_drop_replication_slot('x')",
+            "SELECT * FROM pg_create_logical_replication_slot('x', 'pgoutput')",
+            "SELECT * FROM pg_logical_slot_get_changes('x', NULL, NULL)",
+            "SELECT nextval('s')",
+            "LISTEN ch",
+            "SELECT 1; PREPARE p AS SELECT 1",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+        }
+        assert!(ms("SELECT NEXT VALUE FOR dbo.order_seq").is_some());
         let lite = |sql| assistant_blocked(sql, Engine::Sqlite);
+        assert!(lite("SELECT load_extension('x')").is_some());
         assert!(lite("ATTACH DATABASE 'x.db' AS x").is_some());
         assert!(lite("PRAGMA table_info(t)").is_some());
         assert_eq!(lite("SELECT * FROM t"), None);

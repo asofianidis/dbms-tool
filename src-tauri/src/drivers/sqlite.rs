@@ -1174,6 +1174,7 @@ DELETE FROM t WHERE b = 2"
             )),
             read_only: false,
             assistant: false,
+            assistant_database: None,
         };
         let out = s
             .execute(

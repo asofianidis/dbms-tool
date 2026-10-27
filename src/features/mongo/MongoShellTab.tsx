@@ -245,7 +245,11 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       out.elapsedMs = Date.now() - started
       setRunning(tab.id, false)
     }
-    if (database !== tab.database) updateTab(tab.id, { database })
+    if (database !== tab.database) {
+      // `use other` moved the tab: a query waiting for approval was meant for the old database
+      stopAssistant(tab.id)
+      updateTab(tab.id, { database })
+    }
     shellResultsStore.set((r) => ({ ...r, [tab.id]: out }))
     setActive(out.results.length && ok ? out.results.length - 1 : 'messages')
     const docs = out.results.reduce(
@@ -422,10 +426,11 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
     },
     // Text from the model is never run through parseShell, which evaluates it as JavaScript
     writes: mongoWriteHint,
-    refuse: (query) => {
+    // Parsed here as JSON (never evaluated), then the backend's own checks
+    refuse: async (query) => {
       try {
-        parseMongoRead(query, tab.database || 'test')
-        return null
+        const database = tab.database || 'test'
+        return await api.aiMongoCheck(database, parseMongoRead(query, database))
       } catch (e) {
         return errorMessage(e)
       }
