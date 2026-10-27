@@ -46,6 +46,8 @@ export function CellEditor({
   // What an empty input means; Backspace or Delete on an empty input switches it
   const [emptyIsNull, setEmptyIsNull] = useState(initial === null)
   const [panel, setPanel] = useState(false)
+  // Bumped to reload an open panel's draft from the inline input
+  const [panelKey, setPanelKey] = useState(0)
   const boxRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
@@ -85,6 +87,8 @@ export function CellEditor({
 
   const openExtra = (): void => {
     if (expandable) {
+      // Reopening after an inline edit reloads the panel, so its draft isn't older than the input
+      if (panel && edited.current === 'inline') setPanelKey((k) => k + 1)
       edited.current = 'panel'
       setPanel(true)
     } else if (temporal) {
@@ -207,6 +211,7 @@ export function CellEditor({
           >
             {kind === 'json' ? (
               <JsonPanel
+                key={panelKey}
                 initial={value}
                 valueRef={panelValue}
                 onEdit={() => (edited.current = 'panel')}
@@ -215,6 +220,7 @@ export function CellEditor({
               />
             ) : (
               <ArrayPanel
+                key={panelKey}
                 initial={array ?? []}
                 valueRef={panelValue}
                 onEdit={() => (edited.current = 'panel')}
