@@ -1,7 +1,18 @@
 # Advisories OSV-Scanner (and the OpenSSF Scorecard "Vulnerabilities" check) should not report.
-# Each one comes in through Tauri's own pinned dependencies, so no update in this repository
-# removes it; revisit when Tauri moves on. src-tauri/.cargo/audit.toml covers the same zip
+# OSV-Scanner only reads this file from the directory of the lockfile it scans, so it lives next
+# to Cargo.lock rather than at the repository root.
+# Each one comes in through dependencies' own pinned versions, so no update in this repository
+# removes it; revisit when they move on. src-tauri/.cargo/audit.toml covers the same zip
 # advisories for cargo audit.
+
+# block-buffer 0.10 (RustCrypto digest 0.10, under sha2/hmac/pbkdf2/ed25519-dalek via
+# mysql_common, keyring and tauri-codegen): a panic in the compression callback, caught and
+# followed by further use of the buffer, corrupts its cursor. Fixed only in 0.12, which needs
+# digest 0.11. The callbacks are RustCrypto's own block functions, which don't panic, and
+# dbms-tool never catches a panic around hashing.
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "block-buffer 0.10 is pinned by the digest 0.10 stack; needs a caught panic inside hashing, which never happens here"
 
 # glib 0.18 (gtk-rs, Linux webview stack pinned by tauri/wry): unsound `VariantStrIter`, which
 # dbms-tool never calls
