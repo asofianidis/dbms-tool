@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -70,17 +70,22 @@ static OWNER: LazyLock<String> = LazyLock::new(|| {
 static SESSION: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
 
 /// Locked for as long as this run lives: another run that can lock a session's
-/// file knows that session ended, and that its pods are leftovers.
-static SESSION_LOCK: LazyLock<Option<std::fs::File>> = LazyLock::new(|| {
-    let dir = lock_dir();
-    let held = std::fs::create_dir_all(&dir).and_then(|()| {
-        let file = std::fs::File::create(lock_path(&dir, &SESSION))?;
-        file.lock()?;
-        Ok(file)
+/// file knows that session ended, and that its pods are leftovers. Only taken
+/// once a tunnel pod starts (see `hold_session_lock`); `None` inside if that failed.
+static SESSION_LOCK: OnceLock<Option<std::fs::File>> = OnceLock::new();
+
+fn hold_session_lock() {
+    SESSION_LOCK.get_or_init(|| {
+        let dir = lock_dir();
+        let held = std::fs::create_dir_all(&dir).and_then(|()| {
+            let file = std::fs::File::create(lock_path(&dir, &SESSION))?;
+            file.lock()?;
+            Ok(file)
+        });
+        held.inspect_err(|e| log::warn!("Couldn't create the tunnel session lock: {e}"))
+            .ok()
     });
-    held.inspect_err(|e| log::warn!("Couldn't create the tunnel session lock: {e}"))
-        .ok()
-});
+}
 
 /// Tunnel pods that exist, so they can be deleted on exit (see `shutdown`)
 static LIVE: LazyLock<parking_lot::Mutex<HashMap<String, KubeConfig>>> =
@@ -417,7 +422,8 @@ pub fn shutdown() {
     for (name, kube) in LIVE.lock().drain() {
         delete_pod(&name, &kube);
     }
-    if SESSION_LOCK.is_some() {
+    // Never creates the lock: runs that started no tunnel pod have none
+    if let Some(Some(_)) = SESSION_LOCK.get() {
         let _ = std::fs::remove_file(lock_path(&lock_dir(), &SESSION));
     }
 }
@@ -499,7 +505,7 @@ pub async fn start_pod(kube: &KubeConfig, config: &ConnectionConfig) -> AppResul
     let target = relay_target(config)?;
     let kube = &resolve(kube).await?;
     // Locked before this run labels a pod, so no other run takes its pods for leftovers
-    LazyLock::force(&SESSION_LOCK);
+    hold_session_lock();
     delete_leftovers(kube).await;
 
     let name = format!(
