@@ -160,9 +160,13 @@ fn extra_dirs() -> Vec<PathBuf> {
 }
 
 fn locate(provider: Provider) -> Option<PathBuf> {
+    find_program(provider.programs(), &[])
+}
+
+/// The first of `programs` on PATH, in the usual install folders, or in `more_dirs`.
+pub(crate) fn find_program(programs: &[&str], more_dirs: &[PathBuf]) -> Option<PathBuf> {
     // az and gcloud ship as .cmd wrappers on Windows, which Command won't find on its own
-    let names: Vec<String> = provider
-        .programs()
+    let names: Vec<String> = programs
         .iter()
         .flat_map(|program| {
             if cfg!(windows) {
@@ -181,6 +185,7 @@ fn locate(provider: Provider) -> Option<PathBuf> {
     path_dirs
         .into_iter()
         .chain(extra_dirs())
+        .chain(more_dirs.iter().cloned())
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|candidate| is_executable(candidate))
 }
@@ -263,7 +268,7 @@ pub fn command(provider: Provider, account: &str) -> AppResult<Command> {
 
 /// A folder for CLIs that work on "the current directory" (`railway link`),
 /// keyed by what it's for so repeated runs reuse it.
-fn workdir(key: &str) -> AppResult<PathBuf> {
+pub(crate) fn workdir(key: &str) -> AppResult<PathBuf> {
     if key.is_empty()
         || !key
             .chars()

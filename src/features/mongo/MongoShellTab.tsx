@@ -8,12 +8,14 @@ import {
   FileDown,
   FolderOpen,
   Leaf,
+  Lightbulb,
   MessageSquareText,
   Play,
   PlugZap,
   Square,
   TextCursorInput
 } from 'lucide-react'
+import { describeCollections, describeDocuments, mongoReadOnly, schemaFields } from '@/lib/ai'
 import { api, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { recordHistory } from '@/lib/history'
@@ -26,7 +28,8 @@ import {
   mongoIsWrite
 } from '@/lib/production'
 import { formatDuration } from '@/lib/format'
-import { queries } from '@/lib/queries'
+import { schemaFromSample } from '@/lib/mongo-collections'
+import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
 import { createStore } from '@/lib/store'
 import { notPickedInDialog } from '@/lib/files'
@@ -48,6 +51,12 @@ import {
 import { CodeEditor, type CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { Button, EmptyState, ProgressBar, Toolbar, ToolbarDivider } from '@/components/ui'
 import { ConnectionPicker, DatabasePicker } from '../query/pickers'
+import {
+  AssistantPanel,
+  assistantOpenStore,
+  toggleAssistant,
+  type AssistantTarget
+} from '../ai/AssistantPanel'
 import { SavedButton } from '../saved/SavedButton'
 import { mongoCompletion } from './completion'
 import { DocumentsView, type DocumentsMode } from './DocumentsView'
@@ -61,6 +70,8 @@ interface ShellResult {
 }
 
 interface ShellRun {
+  /** The text that ran */
+  script?: string
   results: ShellResult[]
   messages: { level: 'info' | 'error' | 'warning'; text: string }[]
   elapsedMs: number
@@ -89,6 +100,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
   const status = statuses[tab.connectionId]
   const connected = status?.state === 'connected'
   const layout = useDefaultLayout({ id: 'mongo-split', storage: localStorage })
+  const assistantLayout = useDefaultLayout({ id: 'mongo-assistant-split', storage: localStorage })
   const [active, setActive] = useState<number | 'messages'>(0)
   const [mode, setMode] = useState<DocumentsMode>('list')
 
@@ -118,6 +130,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       shellResultsStore.set((r) => ({
         ...r,
         [tab.id]: {
+          script,
           results: [],
           messages: [{ level: 'error', text: errorMessage(e) }],
           elapsedMs: 0
@@ -163,7 +176,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
     setRunning(tab.id, true)
     if (resultsPanel.current?.isCollapsed()) resultsPanel.current.expand()
     const started = Date.now()
-    const out: ShellRun = { results: [], messages: [], elapsedMs: 0 }
+    const out: ShellRun = { script, results: [], messages: [], elapsedMs: 0 }
     let database = tab.database
     let ok = true
     try {
@@ -287,6 +300,10 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       { key: 'Mod-Enter', run: () => (void execute('block'), true) },
       { key: 'Mod-s', run: () => (void saveFile(), true) },
       { key: 'Mod-o', run: () => (void openFile(), true) },
+      {
+        key: 'Mod-i',
+        run: () => (settingsStore.get().aiEnabled ? (toggleAssistant(tab.id), true) : false)
+      },
       { key: 'Alt-Pause', run: () => (cancel(), true) }
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -316,6 +333,122 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
   const running = !!run?.running
   const current = typeof active === 'number' ? result?.results[active] : undefined
   const errors = result?.messages.filter((m) => m.level === 'error').length ?? 0
+  // Read on every render: skipping the hook while the assistant is off changes the hook count
+  const openAssistants = assistantOpenStore.use()
+  const assistantOpen = settings.aiEnabled && !!openAssistants[tab.id]
+
+  /** Collections sampled for the assistant at most this many at a time */
+  const SAMPLED = 60
+  const parseReads = (query: string) => {
+    const ops = parseShell(query, tab.database || 'test')
+    const requests = ops.flatMap((op) => (op.kind === 'request' ? [op] : []))
+    if (requests.length !== ops.length || !requests.every((op) => mongoReadOnly(op.request)))
+      throw new Error('only find, aggregate, count and distinct can run for the assistant')
+    return requests
+  }
+  const assistant: AssistantTarget = {
+    tabId: tab.id,
+    connectionId: tab.connectionId,
+    database: tab.database,
+    engine: ['MongoDB', connected ? status.info.version : null].filter(Boolean).join(' '),
+    language: 'mongo',
+    schema: async (budget, focus) => {
+      if (!tab.database || !(await connect(tab.connectionId))) return { text: '', summary: '' }
+      const list = await queryClient.fetchQuery(
+        queries.objects(tab.connectionId, tab.database, null)
+      )
+      const words = new Set(
+        `${focus}\n${editor.current?.text() ?? ''}`.toLowerCase().match(/[\w$.-]+/g) ?? []
+      )
+      const named = (n: string): boolean =>
+        words.has(n.toLowerCase()) || words.has(`db.${n.toLowerCase()}`)
+      const ordered = [...list].sort((a, b) => Number(named(b.name)) - Number(named(a.name)))
+      // Field names and types come from a few documents read here; their values stay here
+      const collections = await Promise.all(
+        ordered.map(async (c, i) => {
+          if (i >= SAMPLED || c.kind === 'view') return { name: c.name, fields: null }
+          const fields = await queryClient
+            .fetchQuery({
+              queryKey: ['conn', tab.connectionId, 'ai-fields', tab.database, c.name],
+              staleTime: 10 * 60_000,
+              queryFn: async () => {
+                const out = await api.mongo(
+                  tab.connectionId,
+                  `${tab.id}:ai-sample`,
+                  {
+                    op: 'find',
+                    database: tab.database,
+                    collection: c.name,
+                    filter: {},
+                    limit: 20
+                  },
+                  { maxRows: 20, readOnly: true, timeoutSecs: 10 }
+                )
+                return schemaFields(schemaFromSample(out.documents as Record<string, unknown>[]))
+              }
+            })
+            .catch(() => null)
+          return { name: c.name, fields }
+        })
+      )
+      return {
+        text: describeCollections(collections, budget),
+        summary: `${list.length} collection${list.length === 1 ? '' : 's'}`
+      }
+    },
+    code: () => {
+      const ed = editor.current
+      if (!ed) return tab.text
+      return ed.selection()?.text ?? blockAt(ed.text(), ed.cursor()).text
+    },
+    error: () => {
+      const message = result?.messages.find((m) => m.level === 'error')
+      return message && result?.script
+        ? { sql: result.script, message: message.text, line: null }
+        : null
+    },
+    insert: (code, mode) => {
+      const ed = editor.current
+      if (!ed) return
+      if (mode === 'replace') ed.setText(code)
+      else {
+        const selection = ed.selection()
+        const at = ed.cursor()
+        ed.replaceRange(selection?.from ?? at, selection?.to ?? at, code)
+      }
+      ed.focus()
+    },
+    writes: (code) => {
+      try {
+        const writes = parseShell(code, tab.database || 'test').flatMap((op) =>
+          op.kind === 'request' && mongoIsWrite(op.request) ? [op.request] : []
+        )
+        if (!writes.length) return null
+        return describeMongoDanger(writes[0]) ?? `Runs ${writes[0].op}`
+      } catch {
+        return null
+      }
+    },
+    refuse: (query) => {
+      try {
+        parseReads(query)
+        return null
+      } catch (e) {
+        return errorMessage(e)
+      }
+    },
+    readData: async (query, maxRows) => {
+      if (!(await connect(tab.connectionId))) throw new Error('Not connected')
+      const parts: string[] = []
+      let count = 0
+      for (const op of parseReads(query)) {
+        const out = await api.aiMongoQuery(tab.connectionId, tab.id, op.request, maxRows)
+        count += out.kind === 'documents' ? Math.min(out.documents.length, maxRows) : 1
+        parts.push(`${op.label}:\n${describeDocuments(out, maxRows)}`)
+      }
+      return { text: parts.join('\n\n'), summary: `${count} document${count === 1 ? '' : 's'}` }
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -347,7 +480,10 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
         <ConnectionPicker
           value={tab.connectionId}
           mongo
-          onChange={(id) => updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })}
+          onChange={(id) => {
+            void api.aiSessionClose(tab.connectionId, tab.id).catch(() => {})
+            updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })
+          }}
         />
         <DatabasePicker
           connectionId={tab.connectionId}
@@ -355,6 +491,16 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
           onChange={(database) => updateTab(tab.id, { database })}
         />
         <div className="flex-1" />
+        {settings.aiEnabled && (
+          <Button
+            size="sm"
+            variant={assistantOpen ? 'secondary' : 'ghost'}
+            onClick={() => toggleAssistant(tab.id)}
+            title={`AI assistant (${MOD}I)`}
+          >
+            <Lightbulb className="size-3.5" /> Ask AI
+          </Button>
+        )}
         <SavedButton tab={tab} text={() => editor.current?.text() ?? tab.text} />
         <Button
           size="icon"
@@ -374,163 +520,184 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
         </Button>
       </Toolbar>
       <Group
-        orientation="vertical"
+        orientation="horizontal"
         className="min-h-0 flex-1"
-        defaultLayout={layout.defaultLayout}
-        onLayoutChanged={layout.onLayoutChanged}
+        defaultLayout={assistantLayout.defaultLayout}
+        onLayoutChanged={assistantLayout.onLayoutChanged}
       >
-        <Panel id="editor" minSize={80} defaultSize="45%">
-          <CodeEditor
-            ref={editor}
-            value={tab.text}
-            onChange={(text) => updateTab(tab.id, { text })}
-            language={{ kind: 'mongo' }}
-            extraCompletion={completion}
-            keys={keys}
-            fontSize={settings.editorFontSize}
-            wordWrap={settings.wordWrap}
-            onCursor={cursorStore.set}
-            placeholder={`db.collection.find({ field: 'value' }).sort({ _id: -1 }).limit(20)   ·   ${MOD}Enter runs the block at the cursor`}
-            className="h-full bg-canvas"
-            autoFocus
-          />
-        </Panel>
-        <Separator />
-        <Panel
-          id="results"
-          panelRef={resultsPanel}
-          minSize={60}
-          defaultSize="55%"
-          collapsible
-          collapsedSize={0}
-        >
-          <div className="flex h-full min-h-0 flex-col bg-canvas">
-            <div className="flex h-8 shrink-0 items-stretch border-b border-line bg-panel">
-              <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto [&::-webkit-scrollbar]:h-0">
-                {result?.results.map((r, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => setActive(i)}
-                    className={cn(
-                      'relative flex shrink-0 items-center gap-1.5 px-3 font-mono text-[11.5px]',
-                      active === i ? 'text-bright' : 'text-muted hover:text-fg'
-                    )}
-                  >
-                    {active === i && (
-                      <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-accent" />
-                    )}
-                    <Leaf className="size-3.5 text-mongo" />
-                    {r.label}
-                    {(r.output?.kind === 'documents' || r.documents) && (
-                      <span className="font-sans text-faint tabular-nums">
-                        {(r.output?.documents.length ?? r.documents?.length ?? 0).toLocaleString()}
-                      </span>
-                    )}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  onClick={() => setActive('messages')}
-                  className={cn(
-                    'relative flex shrink-0 items-center gap-1.5 px-3 text-[12px]',
-                    active === 'messages' ? 'text-bright' : 'text-muted hover:text-fg',
-                    errors > 0 && 'text-danger'
-                  )}
-                >
-                  {active === 'messages' && (
-                    <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-accent" />
-                  )}
-                  {errors ? (
-                    <AlertTriangle className="size-3.5" />
-                  ) : (
-                    <MessageSquareText className="size-3.5" />
-                  )}
-                  Messages
-                </button>
-              </div>
-              {result && (
-                <span className="flex items-center px-3 text-[11px] text-muted tabular-nums">
-                  {formatDuration(result.elapsedMs)}
-                </span>
-              )}
-            </div>
-            <ProgressBar active={running} />
-            <div className="min-h-0 flex-1">
-              {!result ? (
-                !connected ? (
-                  <EmptyState
-                    icon={<PlugZap className="size-6" />}
-                    title={
-                      connection
-                        ? `Not connected to ${connection.name || connection.host}`
-                        : 'Pick a connection'
-                    }
-                    actions={
-                      connection && (
-                        <Button
-                          size="sm"
-                          variant="primary"
-                          onClick={() => void connect(connection.id)}
-                        >
-                          Connect
-                        </Button>
-                      )
-                    }
-                  >
-                    Running a script connects automatically.
-                  </EmptyState>
-                ) : (
-                  <EmptyState title="Run a command to see results">
-                    <span className="font-mono">show collections</span>,{' '}
-                    <span className="font-mono">
-                      db.users.find({'{'} age: {'{'} $gt: 30 {'}'} {'}'})
-                    </span>
-                    , <span className="font-mono">db.orders.aggregate([…])</span>
-                  </EmptyState>
-                )
-              ) : active === 'messages' || !current ? (
-                <div className="h-full overflow-auto p-3 font-mono text-[12px] leading-relaxed select-text">
-                  {result.messages.map((m, i) => (
-                    <p
-                      key={i}
+        <Panel id="work" minSize={320}>
+          <Group
+            orientation="vertical"
+            className="h-full min-h-0"
+            defaultLayout={layout.defaultLayout}
+            onLayoutChanged={layout.onLayoutChanged}
+          >
+            <Panel id="editor" minSize={80} defaultSize="45%">
+              <CodeEditor
+                ref={editor}
+                value={tab.text}
+                onChange={(text) => updateTab(tab.id, { text })}
+                language={{ kind: 'mongo' }}
+                extraCompletion={completion}
+                keys={keys}
+                fontSize={settings.editorFontSize}
+                wordWrap={settings.wordWrap}
+                onCursor={cursorStore.set}
+                placeholder={`db.collection.find({ field: 'value' }).sort({ _id: -1 }).limit(20)   ·   ${MOD}Enter runs the block at the cursor`}
+                className="h-full bg-canvas"
+                autoFocus
+              />
+            </Panel>
+            <Separator />
+            <Panel
+              id="results"
+              panelRef={resultsPanel}
+              minSize={60}
+              defaultSize="55%"
+              collapsible
+              collapsedSize={0}
+            >
+              <div className="flex h-full min-h-0 flex-col bg-canvas">
+                <div className="flex h-8 shrink-0 items-stretch border-b border-line bg-panel">
+                  <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto [&::-webkit-scrollbar]:h-0">
+                    {result?.results.map((r, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setActive(i)}
+                        className={cn(
+                          'relative flex shrink-0 items-center gap-1.5 px-3 font-mono text-[11.5px]',
+                          active === i ? 'text-bright' : 'text-muted hover:text-fg'
+                        )}
+                      >
+                        {active === i && (
+                          <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-accent" />
+                        )}
+                        <Leaf className="size-3.5 text-mongo" />
+                        {r.label}
+                        {(r.output?.kind === 'documents' || r.documents) && (
+                          <span className="font-sans text-faint tabular-nums">
+                            {(
+                              r.output?.documents.length ??
+                              r.documents?.length ??
+                              0
+                            ).toLocaleString()}
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setActive('messages')}
                       className={cn(
-                        'border-b border-line/50 py-1 whitespace-pre-wrap',
-                        m.level === 'error' && 'text-danger',
-                        m.level === 'warning' && 'text-warn'
+                        'relative flex shrink-0 items-center gap-1.5 px-3 text-[12px]',
+                        active === 'messages' ? 'text-bright' : 'text-muted hover:text-fg',
+                        errors > 0 && 'text-danger'
                       )}
                     >
-                      {m.text}
-                    </p>
-                  ))}
-                  {!result.messages.length && <p className="text-faint">No messages</p>}
+                      {active === 'messages' && (
+                        <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-accent" />
+                      )}
+                      {errors ? (
+                        <AlertTriangle className="size-3.5" />
+                      ) : (
+                        <MessageSquareText className="size-3.5" />
+                      )}
+                      Messages
+                    </button>
+                  </div>
+                  {result && (
+                    <span className="flex items-center px-3 text-[11px] text-muted tabular-nums">
+                      {formatDuration(result.elapsedMs)}
+                    </span>
+                  )}
                 </div>
-              ) : current.output?.kind === 'value' ? (
-                <ValueView value={current.output.value} />
-              ) : (
-                <DocumentsView
-                  documents={
-                    (current.output?.documents ?? current.documents ?? []) as Record<
-                      string,
-                      unknown
-                    >[]
-                  }
-                  mode={mode}
-                  onModeChange={setMode}
-                  toolbarExtra={
-                    current.output?.truncated && (
-                      <span className="flex items-center gap-1 text-[11px] text-warn">
-                        <AlertTriangle className="size-3" /> Limited to{' '}
-                        {settings.maxRows.toLocaleString()} documents; add .limit() or raise the
-                        limit in Settings
-                      </span>
+                <ProgressBar active={running} />
+                <div className="min-h-0 flex-1">
+                  {!result ? (
+                    !connected ? (
+                      <EmptyState
+                        icon={<PlugZap className="size-6" />}
+                        title={
+                          connection
+                            ? `Not connected to ${connection.name || connection.host}`
+                            : 'Pick a connection'
+                        }
+                        actions={
+                          connection && (
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              onClick={() => void connect(connection.id)}
+                            >
+                              Connect
+                            </Button>
+                          )
+                        }
+                      >
+                        Running a script connects automatically.
+                      </EmptyState>
+                    ) : (
+                      <EmptyState title="Run a command to see results">
+                        <span className="font-mono">show collections</span>,{' '}
+                        <span className="font-mono">
+                          db.users.find({'{'} age: {'{'} $gt: 30 {'}'} {'}'})
+                        </span>
+                        , <span className="font-mono">db.orders.aggregate([…])</span>
+                      </EmptyState>
                     )
-                  }
-                />
-              )}
-            </div>
-          </div>
+                  ) : active === 'messages' || !current ? (
+                    <div className="h-full overflow-auto p-3 font-mono text-[12px] leading-relaxed select-text">
+                      {result.messages.map((m, i) => (
+                        <p
+                          key={i}
+                          className={cn(
+                            'border-b border-line/50 py-1 whitespace-pre-wrap',
+                            m.level === 'error' && 'text-danger',
+                            m.level === 'warning' && 'text-warn'
+                          )}
+                        >
+                          {m.text}
+                        </p>
+                      ))}
+                      {!result.messages.length && <p className="text-faint">No messages</p>}
+                    </div>
+                  ) : current.output?.kind === 'value' ? (
+                    <ValueView value={current.output.value} />
+                  ) : (
+                    <DocumentsView
+                      documents={
+                        (current.output?.documents ?? current.documents ?? []) as Record<
+                          string,
+                          unknown
+                        >[]
+                      }
+                      mode={mode}
+                      onModeChange={setMode}
+                      toolbarExtra={
+                        current.output?.truncated && (
+                          <span className="flex items-center gap-1 text-[11px] text-warn">
+                            <AlertTriangle className="size-3" /> Limited to{' '}
+                            {settings.maxRows.toLocaleString()} documents; add .limit() or raise the
+                            limit in Settings
+                          </span>
+                        )
+                      }
+                    />
+                  )}
+                </div>
+              </div>
+            </Panel>
+          </Group>
         </Panel>
+        {assistantOpen && (
+          <>
+            <Separator />
+            <Panel id="assistant" minSize={280} defaultSize="32%">
+              <AssistantPanel target={assistant} onClose={() => toggleAssistant(tab.id, false)} />
+            </Panel>
+          </>
+        )}
       </Group>
     </div>
   )

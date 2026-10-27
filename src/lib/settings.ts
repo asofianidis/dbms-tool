@@ -1,3 +1,4 @@
+import type { AiProvider } from './api'
 import { createPersistentStore } from './store'
 
 export type ThemeMode = 'dark' | 'light' | 'system'
@@ -43,6 +44,19 @@ export interface Settings {
   /** Read `timestamp` / `datetime` values without an offset as UTC */
   assumeUtc: boolean
   dateFormat: 'iso' | 'locale'
+  /** Show the AI assistant in query editors (opt-in) */
+  aiEnabled: boolean
+  aiProvider: AiProvider
+  /** Model per provider; empty uses the provider's default */
+  aiModels: Partial<Record<AiProvider, string>>
+  /** Base URL of the OpenAI-compatible server */
+  aiBaseUrl: string
+  /** Let the assistant run read-only queries and see their rows */
+  aiAllowData: boolean
+  /** Ask before each query the assistant wants to run */
+  aiConfirmQueries: boolean
+  /** Rows of each such query sent to the provider */
+  aiMaxRows: number
 }
 
 /** Fallback when an accent value is malformed */
@@ -80,7 +94,14 @@ export const settingsStore = createPersistentStore<Settings>('dbms.settings.v1',
   updateChannel: '',
   timeZone: '',
   assumeUtc: false,
-  dateFormat: 'iso'
+  dateFormat: 'iso',
+  aiEnabled: false,
+  aiProvider: 'claude-code',
+  aiModels: {},
+  aiBaseUrl: 'http://localhost:11434/v1',
+  aiAllowData: false,
+  aiConfirmQueries: true,
+  aiMaxRows: 50
 })
 
 function luminance(hex: string): number {

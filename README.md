@@ -59,7 +59,25 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   sent to that provider's API.
 - "This machine" network access looks up your public IP with
   [ipify](https://www.ipify.org/) (`api.ipify.org`), only when you choose that option. The app has
-  no telemetry and sends nothing else to third parties.
+  no telemetry and sends nothing else to third parties, apart from the AI assistant's requests to
+  the provider you pick, once you turn it on.
+
+**AI assistant** (off until you turn it on in Settings)
+
+- In SQL query and MongoDB shell tabs (`Ctrl+I`): ask for a query in plain English, explain the
+  query at the cursor, ask why it's slow (fed with the plan viewer's plan), or fix the error the
+  editor underlines. Answers come back as blocks to insert into the editor, where they go through
+  the usual destructive-statement and production checks before running.
+- Bring your own AI: your Claude subscription through the Claude Code CLI, your Cursor plan through
+  the Cursor CLI, an Anthropic API key, or a local model on an OpenAI-compatible server (Ollama,
+  LM Studio). Keys are kept in the OS credential manager.
+- Only the schema (table, column and foreign key names; for MongoDB, field names and types read
+  from a few documents locally) and the text you attach are sent, never rows. The CLIs run with
+  every tool, MCP server, hook and settings file turned off, in an empty folder, saving no session.
+- "Let the assistant read data" (off by default) lets it ask for read-only queries, shown to you
+  before they run. They run on a separate read-only session; `DELETE`, `DROP`, `UPDATE` and every
+  other write, and functions that act on the server (`pg_terminate_backend`, `dblink`,
+  `xp_cmdshell`…), are refused by the backend. Only a set number of rows go back.
 
 **SQLite**
 

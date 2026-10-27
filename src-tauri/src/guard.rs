@@ -324,6 +324,86 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
     None
 }
 
+/// Functions and statements that act on the server or reach outside the
+/// database even inside a read-only transaction: ending sessions, reading
+/// server files, other servers, advisory locks. Only refused for queries the
+/// AI assistant asks to run; people can still run them themselves.
+const ASSISTANT_DENIED: &[&str] = &[
+    // PostgreSQL
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_switch_wal",
+    "pg_create_restore_point",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    "lo_import",
+    "lo_export",
+    "lo_unlink",
+    "dblink",
+    "dblink_exec",
+    "dblink_connect",
+    "pg_advisory_lock",
+    "pg_advisory_xact_lock",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_xact_lock",
+    "pg_notify",
+    "listen",
+    "notify",
+    "unlisten",
+    // MySQL
+    "load_file",
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "handler",
+    // SQL Server
+    "openrowset",
+    "opendatasource",
+    "openquery",
+    "xp_cmdshell",
+    // SQLite: ATTACH creates database files
+    "attach",
+    "detach",
+    "pragma",
+];
+
+/// Why a query the AI assistant asked for must not run: any write (DELETE,
+/// DROP and the rest, as `first_write_keyword` finds them) or one of
+/// `ASSISTANT_DENIED`. `None` when it only reads.
+pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
+    if let Some(keyword) = first_write_keyword(sql, engine) {
+        return Some(keyword);
+    }
+    let tokens = tokenize(
+        sql,
+        Lexing {
+            mysql_comments: engine == Engine::Mysql,
+            bracket_idents: matches!(engine, Engine::Mssql | Engine::Babelfish | Engine::Sqlite),
+            backslash_escapes: false,
+        },
+    );
+    tokens
+        .iter()
+        .enumerate()
+        .find_map(|(i, token)| match token {
+            // `t.listen` is a column; a schema-qualified call (`pg_catalog.pg_read_file`) still counts
+            Token::Word(w)
+                if ASSISTANT_DENIED.contains(&w.as_str())
+                    && !(i > 0
+                        && tokens[i - 1] == Token::Punct('.')
+                        && tokens.get(i + 1) != Some(&Token::Punct('('))) =>
+            {
+                Some(w.to_uppercase())
+            }
+            _ => None,
+        })
+}
+
 fn write_keyword(tokens: &[Token], engine: Engine) -> Option<String> {
     let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
     tokens
@@ -440,6 +520,42 @@ mod tests {
 
     fn ms(sql: &str) -> Option<String> {
         first_write_keyword(sql, Engine::Mssql)
+    }
+
+    #[test]
+    fn assistant_queries_only_read() {
+        use super::assistant_blocked;
+        let pg = |sql| assistant_blocked(sql, Engine::Postgres);
+        assert_eq!(pg("SELECT id, name FROM users WHERE id = 1"), None);
+        assert_eq!(pg("SELECT 'pg_terminate_backend' AS note"), None);
+        assert_eq!(pg("SELECT t.listen FROM t"), None);
+        assert_eq!(pg("DELETE FROM users").as_deref(), Some("DELETE"));
+        assert_eq!(pg("DROP TABLE users").as_deref(), Some("DROP"));
+        assert_eq!(pg("TRUNCATE users").as_deref(), Some("TRUNCATE"));
+        assert_eq!(
+            pg("SELECT pg_terminate_backend(pid) FROM pg_stat_activity").as_deref(),
+            Some("PG_TERMINATE_BACKEND")
+        );
+        assert_eq!(
+            pg("SELECT pg_catalog.pg_read_file('/etc/passwd')").as_deref(),
+            Some("PG_READ_FILE")
+        );
+        assert_eq!(
+            pg("SELECT * FROM dblink('host=x', 'select 1') AS t(a int)").as_deref(),
+            Some("DBLINK")
+        );
+        let my = |sql| assistant_blocked(sql, Engine::Mysql);
+        assert_eq!(
+            my("SELECT LOAD_FILE('/etc/passwd')").as_deref(),
+            Some("LOAD_FILE")
+        );
+        let ms = |sql| assistant_blocked(sql, Engine::Mssql);
+        assert!(ms("SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'select 1')").is_some());
+        assert!(ms("EXEC xp_cmdshell 'dir'").is_some());
+        let lite = |sql| assistant_blocked(sql, Engine::Sqlite);
+        assert!(lite("ATTACH DATABASE 'x.db' AS x").is_some());
+        assert!(lite("PRAGMA table_info(t)").is_some());
+        assert_eq!(lite("SELECT * FROM t"), None);
     }
 
     #[test]

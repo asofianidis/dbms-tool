@@ -222,7 +222,12 @@ export function closeTab(id: string, force = false): void {
   }
   clearTransactionState(id)
   const tab = tabsStore.get().tabs.find((t) => t.id === id)
-  if (tab && 'connectionId' in tab) void api.closeSession(tab.connectionId, tab.id).catch(() => {})
+  if (tab && 'connectionId' in tab) {
+    void api.closeSession(tab.connectionId, tab.id).catch(() => {})
+    // The session the AI assistant's read-only queries ran on, if any
+    if (tab.kind === 'query' || tab.kind === 'mongo')
+      void api.aiSessionClose(tab.connectionId, tab.id).catch(() => {})
+  }
   runsStore.set((r) => {
     const { [id]: _, ...rest } = r
     return rest
