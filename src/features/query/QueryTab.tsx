@@ -78,6 +78,8 @@ import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components
 import {
   AssistantPanel,
   assistantOpenStore,
+  resetAssistant,
+  stopAssistant,
   toggleAssistant,
   type AssistantTarget
 } from '../ai/AssistantPanel'
@@ -679,11 +681,13 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       if (!sql) return null
       const last = sqlResultsStore.get()[tab.id]
       // A plan the tab already shows for this statement (from Explain analyze, say) is kept
-      if (!last?.plan || !last.sql.includes(sql)) {
-        await execute('statement', (s) => explainSql(s, dialect, false, babelfish, mariadb), true)
-      }
-      const plan = sqlResultsStore.get()[tab.id]?.plan
-      return plan ? { sql, text: describePlan(plan) } : null
+      if (last?.plan && last.sql.includes(sql)) return { sql, text: describePlan(last.plan) }
+      await execute('statement', (s) => explainSql(s, dialect, false, babelfish, mariadb), true)
+      // Only a plan this run produced: execute returns without one when another
+      // query is running or a parameter prompt was declined
+      const after = sqlResultsStore.get()[tab.id]
+      if (after === last || !after?.plan || !after.sql.includes(sql)) return null
+      return { sql, text: describePlan(after.plan) }
     },
     insert: (code, mode) => {
       const ed = editor.current
@@ -831,14 +835,19 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
               return
             setInTransaction(tab.id, false)
             void api.closeSession(tab.connectionId, tab.id).catch(() => {})
-            void api.aiSessionClose(tab.connectionId, tab.id).catch(() => {})
+            // The conversation was about the old connection's schema; a pending query must not run here
+            resetAssistant(tab.id, tab.connectionId)
             updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })
           }}
         />
         <DatabasePicker
           connectionId={tab.connectionId}
           value={tab.database}
-          onChange={(database) => updateTab(tab.id, { database })}
+          onChange={(database) => {
+            // A query waiting for approval was meant for the old database
+            stopAssistant(tab.id)
+            updateTab(tab.id, { database })
+          }}
         />
         <div className="flex-1" />
         {settings.aiEnabled && (

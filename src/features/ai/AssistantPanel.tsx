@@ -24,6 +24,8 @@ import { api, type AiMessage, type AiProvider } from '@/lib/api'
 import {
   AI_PROVIDER_ORDER,
   DASHBOARD_FENCE,
+  fitHistory,
+  historyBudget,
   parseDashboardSpec,
   AI_PROVIDERS,
   parseReply,
@@ -37,9 +39,10 @@ import { settingsStore } from '@/lib/settings'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
 import { createDashboard, dashboardsStore, newWidget, uniqueDashboardName } from '@/lib/dashboards'
-import { openDashboard, openSettings, promptText } from '@/lib/workspace'
+import { onTabClosed, openDashboard, openSettings, promptText } from '@/lib/workspace'
 import { showMenuAt, type MenuItem } from '@/components/ContextMenu'
 import { Badge, Button, Spinner } from '@/components/ui'
+import { aiStatusQuery } from './status'
 
 /** What the panel works on: a query or Mongo shell tab, through its editor. */
 export interface AssistantTarget {
@@ -134,20 +137,46 @@ function patchQuery(tabId: string, id: string, query: Partial<NonNullable<Entry[
   }))
 }
 
-function conversation(tabId: string): AiMessage[] {
-  return thread(tabId)
+/** What the model gets back each round, trimmed so long conversations still fit. */
+function conversation(tabId: string, budget: number): AiMessage[] {
+  const messages = thread(tabId)
     .entries.filter((e) => !e.failed)
     .map((e) => ({ role: e.role, content: e.content }))
+  return fitHistory(messages, budget)
 }
 
-/** Forgets a tab's conversation and closes the session its queries ran on. */
-export function closeAssistant(tabId: string, connectionId: string): void {
+/** The session MongoDB tabs sample field names on */
+export function sampleSession(tabId: string): string {
+  return `${tabId}:ai-sample`
+}
+
+/**
+ * Stops a tab's request, forgets its conversation and closes the sessions its
+ * queries ran on: for "Clear", a connection change and a closed tab.
+ */
+export function resetAssistant(tabId: string, connectionId: string): void {
   stop(tabId)
   threadsStore.set((all) => {
     const { [tabId]: _, ...rest } = all
     return rest
   })
   void api.aiSessionClose(connectionId, tabId).catch(() => {})
+  void api.closeSession(connectionId, sampleSession(tabId)).catch(() => {})
+}
+
+// A closed tab's request stops and everything it held goes
+onTabClosed((tab) => {
+  if (tab.kind !== 'query' && tab.kind !== 'mongo') return
+  resetAssistant(tab.id, tab.connectionId)
+  assistantOpenStore.set((s) => {
+    const { [tab.id]: _, ...rest } = s
+    return rest
+  })
+})
+
+/** Stops the request in flight, if any; a pending query is answered "don't run". */
+export function stopAssistant(tabId: string): void {
+  stop(tabId)
 }
 
 function stop(tabId: string): void {
@@ -177,10 +206,24 @@ async function ask(
   update(tabId, (t) => ({ ...t, busy: true }))
   try {
     for (let round = 0; ; round++) {
+      // Stop can land during any await below; nothing more goes to the provider after it
+      if (stopped.has(tabId)) return
       const settings = settingsStore.get()
       const provider = settings.aiProvider
       const allowData = settings.aiAllowData && round < MAX_QUERIES
-      const schema = await target.schema(schemaBudget(provider), question.content)
+      let schema
+      try {
+        schema = await target.schema(schemaBudget(provider), question.content)
+      } catch (e) {
+        if (!stopped.has(tabId))
+          push(tabId, {
+            role: 'assistant',
+            content: `Couldn't load the schema: ${errorMessage(e)}`,
+            failed: true
+          })
+        return
+      }
+      if (stopped.has(tabId)) return
       const requestId = crypto.randomUUID()
       update(tabId, (t) => ({ ...t, requestId }))
       let reply
@@ -196,7 +239,7 @@ async function ask(
             schema: schema.text,
             data: { allowed: allowData, maxRows: settings.aiMaxRows }
           }),
-          messages: conversation(tabId)
+          messages: conversation(tabId, historyBudget(provider))
         })
       } catch (e) {
         if (!stopped.has(tabId))
@@ -252,6 +295,11 @@ async function ask(
       }
       try {
         const result = await target.readData(query, settings.aiMaxRows)
+        // Rows read after Stop are not added to the conversation
+        if (stopped.has(tabId)) {
+          patchQuery(tabId, id, { state: 'declined', note: 'Stopped' })
+          return
+        }
         patchQuery(tabId, id, { state: 'ran', note: result.summary })
         push(tabId, {
           role: 'user',
@@ -260,6 +308,7 @@ async function ask(
           attached: [result.summary]
         })
       } catch (e) {
+        if (stopped.has(tabId)) return
         const message = errorMessage(e)
         patchQuery(tabId, id, { state: 'failed', note: message })
         push(tabId, {
@@ -294,11 +343,7 @@ export function AssistantPanel({
   const scroller = useRef<HTMLDivElement>(null)
   const provider = settings.aiProvider
   const info = AI_PROVIDERS[provider]
-  const status = useQuery({
-    queryKey: ['ai-status', provider, settings.aiBaseUrl],
-    queryFn: () => api.aiStatus(provider, settings.aiBaseUrl),
-    staleTime: 60_000
-  })
+  const status = useQuery(aiStatusQuery(provider, settings.aiBaseUrl))
   const lastError = target.error()
 
   useEffect(() => {
@@ -376,7 +421,7 @@ export function AssistantPanel({
           variant="ghost"
           title="Clear the conversation"
           disabled={!current.entries.length || current.busy}
-          onClick={() => closeAssistant(target.tabId, target.connectionId)}
+          onClick={() => resetAssistant(target.tabId, target.connectionId)}
         >
           <Trash2 className="size-3.5" />
         </Button>
@@ -856,7 +901,6 @@ function DashboardCard({
     const hint = target.writes(w.query)
     return hint ? [`${w.title || 'Untitled'}: ${hint}`] : []
   })
-  const mongo = target.language === 'mongo'
 
   const create = (): void => {
     const result = createDashboard(dashboardsStore.get(), {
@@ -866,9 +910,10 @@ function DashboardCard({
       refreshSecs: spec.refreshSecs,
       widgets: spec.widgets.map((w) => newWidget(w)),
       source: 'assistant',
-      // mongosh widget queries run as JavaScript in the app, so they wait for review;
-      // SQL widgets only go to the backend, which refuses anything that writes
-      unreviewed: mongo
+      // Nothing the model wrote runs until the user has read it: mongosh widget
+      // queries run as JavaScript in the app, and SQL ones could still call
+      // functions with side effects. SQL widgets also run with the assistant's checks.
+      unreviewed: true
     })
     dashboardsStore.set(result.list)
     setCreated(result.dashboard.id)
@@ -911,9 +956,7 @@ function DashboardCard({
           </p>
         ) : (
           <span className="text-[11px] text-faint">
-            {mongo
-              ? 'You review the queries before they run'
-              : 'Queries run read-only on this connection; results stay here'}
+            You review the queries before they run; results stay here
           </span>
         )}
         <div className="flex-1" />

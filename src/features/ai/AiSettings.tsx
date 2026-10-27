@@ -8,6 +8,7 @@ import { settingsStore, type Settings } from '@/lib/settings'
 import { errorMessage, toast, toastError } from '@/lib/toast'
 import { Button, Input, Select, Switch } from '@/components/ui'
 import { Row, Section } from '../settings/layout'
+import { aiStatusQuery } from './status'
 
 export function AiSettings(): React.JSX.Element {
   const settings = settingsStore.use()
@@ -88,12 +89,7 @@ function ProviderRows({
           title="Local server URL"
           description="The OpenAI-compatible API base, e.g. http://localhost:11434/v1 for Ollama or http://localhost:1234/v1 for LM Studio"
         >
-          <Input
-            mono
-            value={baseUrl}
-            onChange={(e) => settingsStore.set((s) => ({ ...s, aiBaseUrl: e.target.value }))}
-            className="w-72"
-          />
+          <BaseUrlInput value={baseUrl} />
         </Row>
       )}
       {info.auth !== 'cli' && <KeyRow provider={provider} />}
@@ -108,11 +104,7 @@ function StatusRow({
   provider: AiProvider
   baseUrl: string
 }): React.JSX.Element {
-  const status = useQuery({
-    queryKey: ['ai-status', provider, baseUrl],
-    queryFn: () => api.aiStatus(provider, baseUrl),
-    staleTime: 60_000
-  })
+  const status = useQuery(aiStatusQuery(provider, baseUrl))
   const data = status.data
   return (
     <Row
@@ -205,5 +197,24 @@ function KeyRow({ provider }: { provider: AiProvider }): React.JSX.Element {
         </div>
       )}
     </Row>
+  )
+}
+
+/** Saved when the field is left, so the server isn't probed on every keystroke. */
+function BaseUrlInput({ value }: { value: string }): React.JSX.Element {
+  const [draft, setDraft] = useState(value)
+  const commit = (): void => {
+    const url = draft.trim()
+    if (url !== value) settingsStore.set((s) => ({ ...s, aiBaseUrl: url }))
+  }
+  return (
+    <Input
+      mono
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === 'Enter' && commit()}
+      className="w-72"
+    />
   )
 }

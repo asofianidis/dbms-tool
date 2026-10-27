@@ -437,6 +437,8 @@ export interface ExecOptions {
   maxRows?: number
   /** Block writes for this call even on a writable connection */
   readOnly?: boolean
+  /** Also refuse what the AI assistant may never run (functions that act on the server…) */
+  assistant?: boolean
   /** Cancels the statement after this many seconds; 0 or absent never times out */
   timeoutSecs?: number
   /** Bytes of each binary cell to send (default 4096); the rest is summarized */
@@ -991,7 +993,13 @@ export const api = {
   /** A read-only query the assistant asked for, on its own session; writes are refused */
   aiSqlQuery: (id: string, session: string, database: string, sql: string, maxRows: number) =>
     invoke<ExecOutput>('ai_sql_query', { id, session, database, sql, maxRows }),
-  aiMongoQuery: (id: string, session: string, request: MongoRequest, maxRows: number) =>
-    invoke<MongoOutput>('ai_mongo_query', { id, session, request, maxRows }),
+  /** Reads `database` only (the tab's); other databases and system collections are refused */
+  aiMongoQuery: (
+    id: string,
+    session: string,
+    database: string,
+    request: MongoRequest,
+    maxRows: number
+  ) => invoke<MongoOutput>('ai_mongo_query', { id, session, database, request, maxRows }),
   aiSessionClose: (id: string, session: string) => invoke<void>('ai_session_close', { id, session })
 }

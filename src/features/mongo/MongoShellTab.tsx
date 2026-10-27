@@ -60,6 +60,9 @@ import { ConnectionPicker, DatabasePicker } from '../query/pickers'
 import {
   AssistantPanel,
   assistantOpenStore,
+  resetAssistant,
+  sampleSession,
+  stopAssistant,
   toggleAssistant,
   type AssistantTarget
 } from '../ai/AssistantPanel'
@@ -373,7 +376,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
               queryFn: async () => {
                 const out = await api.mongo(
                   tab.connectionId,
-                  `${tab.id}:ai-sample`,
+                  sampleSession(tab.id),
                   {
                     op: 'find',
                     database: tab.database,
@@ -430,7 +433,13 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
     readData: async (query, maxRows) => {
       if (!(await connect(tab.connectionId))) throw new Error('Not connected')
       const request = parseMongoRead(query, tab.database || 'test')
-      const out = await api.aiMongoQuery(tab.connectionId, tab.id, request, maxRows)
+      const out = await api.aiMongoQuery(
+        tab.connectionId,
+        tab.id,
+        tab.database || 'test',
+        request,
+        maxRows
+      )
       const count = out.kind === 'documents' ? Math.min(out.documents.length, maxRows) : 1
       return {
         text: describeDocuments(out, maxRows),
@@ -470,14 +479,19 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
           value={tab.connectionId}
           mongo
           onChange={(id) => {
-            void api.aiSessionClose(tab.connectionId, tab.id).catch(() => {})
+            // The conversation was about the old connection's schema; a pending query must not run here
+            resetAssistant(tab.id, tab.connectionId)
             updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })
           }}
         />
         <DatabasePicker
           connectionId={tab.connectionId}
           value={tab.database}
-          onChange={(database) => updateTab(tab.id, { database })}
+          onChange={(database) => {
+            // A query waiting for approval was meant for the old database
+            stopAssistant(tab.id)
+            updateTab(tab.id, { database })
+          }}
         />
         <div className="flex-1" />
         {settings.aiEnabled && (

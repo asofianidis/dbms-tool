@@ -77,11 +77,49 @@ export const AI_PROVIDER_ORDER: AiProvider[] = [
 
 /* ---------- Context ---------- */
 
+const WINDOWS = typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent)
+
 /** Characters of schema to send; Cursor's prompt goes on a command line */
 export function schemaBudget(provider: AiProvider): number {
-  if (provider === 'cursor') return /windows/i.test(navigator.userAgent) ? 12_000 : 60_000
+  if (provider === 'cursor') return WINDOWS ? 10_000 : 50_000
   if (provider === 'openai-compatible') return 24_000
   return 120_000
+}
+
+/** Characters of conversation to resend each round; with the schema, under Cursor's limit */
+export function historyBudget(provider: AiProvider): number {
+  if (provider === 'cursor') return WINDOWS ? 14_000 : 55_000
+  if (provider === 'openai-compatible') return 40_000
+  return 400_000
+}
+
+const RESULT_OPEN = '<query_result>'
+
+/**
+ * The conversation trimmed to `budget` characters: query results before the
+ * latest one shrink to a note (the model already answered from them), then
+ * the oldest turns go. The latest question always stays, and it starts with a
+ * user turn, as providers expect.
+ */
+export function fitHistory<M extends { role: 'user' | 'assistant'; content: string }>(
+  messages: M[],
+  budget: number
+): M[] {
+  const lastResult = messages.findLastIndex((m) => m.content.startsWith(RESULT_OPEN))
+  let fitted = messages.map((m, i) =>
+    m.content.startsWith(RESULT_OPEN) && i !== lastResult
+      ? {
+          ...m,
+          content: `${RESULT_OPEN}\n(an earlier result, left out to save space)\n</query_result>`
+        }
+      : m
+  )
+  const size = (list: M[]): number => list.reduce((n, m) => n + m.content.length, 0)
+  while (fitted.length > 1 && size(fitted) > budget) {
+    fitted = fitted.slice(1)
+    while (fitted.length > 1 && fitted[0].role !== 'user') fitted = fitted.slice(1)
+  }
+  return fitted
 }
 
 function qualified(schema: string | null | undefined, name: string): string {
@@ -316,8 +354,11 @@ export function describeRows(output: ExecOutput, maxRows: number): string {
       const rows = set.rows.slice(0, maxRows)
       const head = set.columns.map((c) => csvField(c.name)).join(',')
       const body = rows.map((r) => r.map((c) => csvField(cellText(c))).join(',')).join('\n')
+      // The backend stops reading at the limit, so past it the total isn't known
       const more =
-        set.rowCount > rows.length ? `\n(${set.rowCount - rows.length} more rows not shown)` : ''
+        set.truncated || set.rows.length > rows.length
+          ? `\n(Only the first ${rows.length} rows are shown; more matched, and how many is unknown. Use count(*) to find out.)`
+          : ''
       const label = output.results.length > 1 ? `Result set ${i + 1}:\n` : ''
       return `${label}${head}\n${body}${more}`
     })
@@ -325,7 +366,15 @@ export function describeRows(output: ExecOutput, maxRows: number): string {
 }
 
 export function describeDocuments(output: MongoOutput, maxRows: number): string {
-  if (output.kind === 'value') return JSON.stringify(output.value)
+  if (output.kind === 'value') {
+    // distinct returns every value at once; the backend caps it too
+    if (Array.isArray(output.value)) {
+      const values = output.value.slice(0, maxRows)
+      const cut = output.truncated || output.value.length > values.length
+      return `${JSON.stringify(values)}${cut ? `\n(Only the first ${values.length} values are shown; there are more.)` : ''}`
+    }
+    return JSON.stringify(output.value)
+  }
   const docs = output.documents.slice(0, maxRows).map((d) => {
     const text = JSON.stringify(d)
     return text.length > MAX_CELL * 5 ? text.slice(0, MAX_CELL * 5) + '…' : text
@@ -390,8 +439,12 @@ export function parseMongoRead(text: string, database: string): MongoRequest {
     if (typeof v !== 'object' || Array.isArray(v)) throw new Error(`${name} must be an object`)
     return v as Record<string, unknown>
   }
-  const db = typeof r.database === 'string' && r.database ? r.database : database
-  const base = { database: db, collection }
+  // Always the tab's database: the model doesn't get to pick admin or config
+  if (r.database !== undefined && r.database !== database)
+    throw new Error(`the assistant can only read the tab's database (${database})`)
+  if (collection.startsWith('system.'))
+    throw new Error("the assistant can't read system collections")
+  const base = { database, collection }
   let request: MongoRequest
   switch (r.op) {
     case 'find': {

@@ -44,12 +44,17 @@ async function runMongo(
   }
 }
 
-/** Runs a widget's query and returns its last result set. Throws on errors and on writes. */
+/**
+ * Runs a widget's query and returns its last result set. Throws on errors and on writes.
+ * `assistant` (dashboards the AI assistant designed) also refuses what the
+ * assistant may never run, like functions that end sessions or read server files.
+ */
 export async function runWidgetQuery(
   connectionId: string,
   session: string,
   database: string,
-  query: string
+  query: string,
+  { assistant = false }: { assistant?: boolean } = {}
 ): Promise<WidgetResult> {
   const connection = getConnection(connectionId)
   if (!connection) throw new Error('This dashboard’s connection no longer exists')
@@ -60,7 +65,8 @@ export async function runWidgetQuery(
   // Widgets re-run on every refresh, so the backend's read-only check refuses writes
   const out = await api.execute(connectionId, session, database, query, {
     maxRows: ROW_LIMIT,
-    readOnly: true
+    readOnly: true,
+    assistant
   })
   if (out.error) throw new Error(out.error.message)
   const set = [...out.results].reverse().find((r) => r.columns.length)

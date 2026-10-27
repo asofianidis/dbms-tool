@@ -218,6 +218,13 @@ impl Server {
                 format!("Only read-only queries can run here, and this one contains {keyword}.")
             }));
         }
+        if opts.assistant
+            && let Some(keyword) = guard::assistant_blocked(sql, self.config.engine)
+        {
+            return Err(AppError::msg(format!(
+                "Queries the AI assistant wrote can only read, and this one uses {keyword}, so it was not run."
+            )));
+        }
         // Register before connecting so a cancel during connection setup isn't lost
         let signal = self.begin(key);
         let slot = match self.session(key, database).await {

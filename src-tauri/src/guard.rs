@@ -127,8 +127,8 @@ const TSQL_STATEMENTS: &[&str] = &[
 enum Token {
     /// Unquoted word, lowercased
     Word(String),
-    /// `"x"`, `` `x` `` or `[x]`
-    QuotedIdent,
+    /// `"x"`, `` `x` `` or `[x]`, with doubled quotes undone and lowercased
+    QuotedIdent(String),
     /// String, number or dollar-quoted body
     Literal,
     Punct(char),
@@ -203,26 +203,30 @@ fn tokenize(sql: &str, lexing: Lexing) -> Vec<Token> {
             }
             '\'' | '"' | '`' | '[' if c != '[' || lexing.bracket_idents => {
                 let close = if c == '[' { ']' } else { c };
+                let mut text = String::new();
                 i += 1;
                 while i < chars.len() {
                     if lexing.backslash_escapes && chars[i] == '\\' && matches!(c, '\'' | '"') {
+                        text.extend(chars.get(i + 1));
                         i += 2;
                         continue;
                     }
                     if chars[i] == close {
                         // Doubled quote is an escaped quote, `]]` included
                         if chars.get(i + 1) == Some(&close) {
+                            text.push(close);
                             i += 2;
                             continue;
                         }
                         break;
                     }
+                    text.push(chars[i]);
                     i += 1;
                 }
                 tokens.push(if c == '\'' {
                     Token::Literal
                 } else {
-                    Token::QuotedIdent
+                    Token::QuotedIdent(text.to_lowercase())
                 });
             }
             '$' if next.is_some_and(|n| n == '$' || n.is_alphabetic() || n == '_') => {
@@ -347,11 +351,13 @@ const ASSISTANT_DENIED: &[&str] = &[
     "dblink",
     "dblink_exec",
     "dblink_connect",
-    "pg_advisory_lock",
-    "pg_advisory_xact_lock",
-    "pg_try_advisory_lock",
-    "pg_try_advisory_xact_lock",
     "pg_notify",
+    // Run a query given as a string, which the checks here can't read
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "prepare",
     "listen",
     "notify",
     "unlisten",
@@ -372,6 +378,27 @@ const ASSISTANT_DENIED: &[&str] = &[
     "pragma",
 ];
 
+/// Families of functions denied by prefix: every advisory lock (exclusive and
+/// shared, taken and released), every server directory listing, adminpack's
+/// file functions, every dblink call and large objects.
+const ASSISTANT_DENIED_PREFIXES: &[&str] = &[
+    "pg_advisory_",
+    "pg_try_advisory_",
+    "pg_ls_",
+    "pg_logdir_",
+    "pg_file_",
+    "pg_logfile_",
+    "dblink",
+    "lo_",
+];
+
+fn assistant_denied(name: &str) -> bool {
+    ASSISTANT_DENIED.contains(&name)
+        || ASSISTANT_DENIED_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
 /// Why a query the AI assistant asked for must not run: any write (DELETE,
 /// DROP and the rest, as `first_write_keyword` finds them) or one of
 /// `ASSISTANT_DENIED`. `None` when it only reads.
@@ -387,21 +414,29 @@ pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
             backslash_escapes: false,
         },
     );
-    tokens
-        .iter()
-        .enumerate()
-        .find_map(|(i, token)| match token {
-            // `t.listen` is a column; a schema-qualified call (`pg_catalog.pg_read_file`) still counts
-            Token::Word(w)
-                if ASSISTANT_DENIED.contains(&w.as_str())
-                    && !(i > 0
-                        && tokens[i - 1] == Token::Punct('.')
-                        && tokens.get(i + 1) != Some(&Token::Punct('('))) =>
-            {
-                Some(w.to_uppercase())
-            }
-            _ => None,
-        })
+    tokens.iter().enumerate().find_map(|(i, token)| {
+        let name = match token {
+            // Quoted names count too: `"pg_read_file"(…)`, `[xp_cmdshell]`, `` `load_file` ``
+            Token::Word(w) | Token::QuotedIdent(w) => w,
+            _ => return None,
+        };
+        // PostgreSQL's U&"\0070g_read_file" spells a name with escapes this check can't read
+        if engine == Engine::Postgres
+            && name == "u"
+            && tokens.get(i + 1) == Some(&Token::Punct('&'))
+            && matches!(
+                tokens.get(i + 2),
+                Some(Token::QuotedIdent(_) | Token::Literal)
+            )
+        {
+            return Some("U& (escaped names)".into());
+        }
+        // `t.listen` is a column; a schema-qualified call (`pg_catalog.pg_read_file`) still counts
+        let column = i > 0
+            && tokens[i - 1] == Token::Punct('.')
+            && tokens.get(i + 1) != Some(&Token::Punct('('));
+        (assistant_denied(name) && !column).then(|| name.to_uppercase())
+    })
 }
 
 fn write_keyword(tokens: &[Token], engine: Engine) -> Option<String> {
@@ -503,7 +538,7 @@ fn batch_procedure_call(batch: String) -> Option<String> {
         // `label:` before a statement
         Token::Word(_) if tokens.get(1) == Some(&Token::Punct(':')) => return None,
         Token::Word(w) => w.clone(),
-        Token::QuotedIdent => "procedure".to_string(),
+        Token::QuotedIdent(_) => "procedure".to_string(),
         _ => return None,
     };
     Some(format!("EXEC (calling {name} without EXEC)"))
@@ -552,6 +587,28 @@ mod tests {
         let ms = |sql| assistant_blocked(sql, Engine::Mssql);
         assert!(ms("SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'select 1')").is_some());
         assert!(ms("EXEC xp_cmdshell 'dir'").is_some());
+        // Quoted and escaped spellings of denied functions
+        assert!(pg("SELECT \"pg_terminate_backend\"(pid) FROM pg_stat_activity").is_some());
+        assert!(pg("SELECT pg_catalog.\"pg_read_file\"('/etc/passwd')").is_some());
+        assert!(pg("SELECT U&\"\\0070g_read_file\"('/etc/passwd')").is_some());
+        assert!(ms("SELECT * FROM [OPENROWSET]('x', 'y', 'z')").is_some());
+        assert!(my("SELECT `load_file`('/etc/passwd')").is_some());
+        // Every advisory lock, directory listing, dblink call and string-query runner
+        for sql in [
+            "SELECT pg_advisory_lock_shared(1)",
+            "SELECT pg_try_advisory_lock_shared(1)",
+            "SELECT pg_advisory_unlock_all()",
+            "SELECT * FROM pg_ls_logdir()",
+            "SELECT * FROM pg_ls_waldir()",
+            "SELECT * FROM pg_ls_tmpdir()",
+            "SELECT dblink_send_query('c', 'select 1')",
+            "SELECT dblink_open('c', 'select 1')",
+            "SELECT query_to_xml('select pg_read_file(''x'')', true, true, '')",
+            "SELECT lo_get(1)",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+        }
+        assert_eq!(pg("SELECT \"name\", u.\"lock\" FROM users u"), None);
         let lite = |sql| assistant_blocked(sql, Engine::Sqlite);
         assert!(lite("ATTACH DATABASE 'x.db' AS x").is_some());
         assert!(lite("PRAGMA table_info(t)").is_some());

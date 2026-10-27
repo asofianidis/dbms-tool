@@ -546,12 +546,15 @@ function WidgetCard({
     queryKey: [
       'dashboard',
       session,
+      dashboard.source,
       dashboard.connectionId,
       dashboard.database,
       widget.query
     ] as const,
     queryFn: () =>
-      runWidgetQuery(dashboard.connectionId, session, dashboard.database, widget.query),
+      runWidgetQuery(dashboard.connectionId, session, dashboard.database, widget.query, {
+        assistant: dashboard.source === 'assistant'
+      }),
     placeholderData: keepPreviousData,
     staleTime: 60_000,
     // Background tabs don't keep querying

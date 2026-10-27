@@ -623,13 +623,22 @@ async fn run_cli(
     let mut child = command
         .spawn()
         .map_err(|e| AppError::msg(format!("Couldn't start {name}: {e}")))?;
-    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(text.as_bytes()).await?;
-        drop(pipe);
-    }
+    // Written alongside waiting, under the same timeout: a CLI that never reads
+    // stdin can't stall us, and one that exits early (a bad flag) shows its own
+    // error rather than a broken pipe
+    let pipe = child.stdin.take();
+    let feed = async move {
+        if let (Some(text), Some(mut pipe)) = (stdin, pipe) {
+            let _ = pipe.write_all(text.as_bytes()).await;
+        }
+    };
+    let run = async {
+        let ((), output) = tokio::join!(feed, child.wait_with_output());
+        output
+    };
     let cancel = cancel.unwrap_or_default();
     let output = tokio::select! {
-        out = tokio::time::timeout(timeout, child.wait_with_output()) => out
+        out = tokio::time::timeout(timeout, run) => out
             .map_err(|_| AppError::msg(format!("{name} didn't answer within {}s", timeout.as_secs())))??,
         _ = cancel.cancelled() => return Err(AppError::msg("Stopped")),
     };
@@ -739,18 +748,34 @@ fn endpoint(base: &str) -> AppResult<String> {
     Ok(base.to_string())
 }
 
-fn with_key(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match load_key(Provider::OpenaiCompatible) {
-        Some(key) => builder.bearer_auth(key),
-        None => builder,
+/// Adds the saved key, which only goes over HTTPS or to this machine: plain
+/// HTTP to another host would send it in the clear.
+fn with_key(base: &str, builder: reqwest::RequestBuilder) -> AppResult<reqwest::RequestBuilder> {
+    let Some(key) = load_key(Provider::OpenaiCompatible) else {
+        return Ok(builder);
+    };
+    if !key_allowed(base) {
+        return Err(AppError::msg(
+            "The saved key is only sent over https://, or over http:// to this computer. \
+             Use an https:// URL for this server, or remove the key.",
+        ));
     }
+    Ok(builder.bearer_auth(key))
+}
+
+fn key_allowed(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return false;
+    };
+    url.scheme() == "https" || matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 async fn list_openai_models(base: &str) -> AppResult<Vec<String>> {
     let response = with_key(
+        base,
         HTTP.get(format!("{base}/models"))
             .timeout(Duration::from_secs(10)),
-    )
+    )?
     .send()
     .await
     .map_err(|e| AppError::msg(format!("Couldn't reach {base}: {e}")))?;
@@ -784,7 +809,7 @@ async fn openai_compatible(model: &str, request: &ChatRequest) -> AppResult<Chat
             .iter()
             .map(|m| serde_json::to_value(m).unwrap_or_default()),
     );
-    let response = with_key(HTTP.post(format!("{base}/chat/completions")))
+    let response = with_key(&base, HTTP.post(format!("{base}/chat/completions")))?
         .json(&serde_json::json!({ "model": model, "messages": messages, "stream": false }))
         .send()
         .await
@@ -824,6 +849,7 @@ fn options(max_rows: usize) -> ExecOptions {
         read_only: true,
         timeout_secs: Some(QUERY_TIMEOUT_SECS),
         max_binary_bytes: 64,
+        assistant: true,
         ..Default::default()
     }
 }
@@ -883,6 +909,8 @@ pub async fn ai_mongo_query(
     state: State<'_, AppState>,
     id: String,
     session: String,
+    // The tab's database: the only one the request may read
+    database: String,
     request: MongoRequest,
     max_rows: usize,
 ) -> AppResult<MongoOutput> {
@@ -899,10 +927,70 @@ pub async fn ai_mongo_query(
             "The assistant can only read data (find, aggregate, count, distinct), so this was not run.",
         ));
     }
+    if let Some(reason) = mongo_out_of_bounds(&request, &database) {
+        return Err(AppError::msg(format!("{reason}, so this was not run.")));
+    }
     let server = state.manager.get(&id)?;
-    server
+    let max_rows = max_rows.clamp(1, MAX_ROWS);
+    let mut output = server
         .mongo_execute(&session_key(&session), request, &options(max_rows))
-        .await
+        .await?;
+    // `distinct` hands back every value at once, past the row limit
+    if let Some(serde_json::Value::Array(values)) = &mut output.value
+        && values.len() > max_rows
+    {
+        values.truncate(max_rows);
+        output.truncated = true;
+    }
+    Ok(output)
+}
+
+/// Why a MongoDB read reaches past what the assistant may see: another
+/// database than the tab's (`admin`, `config`), or a `system.*` collection
+/// (users, roles, profiles), directly or through `$lookup` / `$unionWith`.
+fn mongo_out_of_bounds(request: &MongoRequest, database: &str) -> Option<String> {
+    let (db, collection, pipeline) = match request {
+        MongoRequest::Aggregate {
+            database,
+            collection,
+            pipeline,
+            ..
+        } => (database, collection, Some(pipeline)),
+        MongoRequest::Find {
+            database,
+            collection,
+            ..
+        }
+        | MongoRequest::Count {
+            database,
+            collection,
+            ..
+        }
+        | MongoRequest::Distinct {
+            database,
+            collection,
+            ..
+        }
+        | MongoRequest::ListIndexes {
+            database,
+            collection,
+        } => (database, collection, None),
+        _ => return Some("The assistant can only read data".into()),
+    };
+    if db != database {
+        return Some(format!(
+            "The assistant can only read the tab's database ({database})"
+        ));
+    }
+    if collection.starts_with("system.") {
+        return Some("The assistant can't read system collections".into());
+    }
+    // Pipelines name other collections in strings, and other databases in `db`
+    let pipeline = serde_json::to_string(&pipeline).unwrap_or_default();
+    if pipeline.contains("\"system.") || pipeline.contains("\"db\"") {
+        return Some("The pipeline reaches system collections or another database".into());
+    }
+    None
 }
 
 #[tauri::command]
@@ -992,6 +1080,33 @@ mod tests {
             "{}",
             reply.text
         );
+    }
+
+    #[test]
+    fn keys_only_travel_safely() {
+        assert!(key_allowed("https://llm.example.com/v1"));
+        assert!(key_allowed("http://localhost:11434/v1"));
+        assert!(key_allowed("http://127.0.0.1:1234/v1"));
+        assert!(key_allowed("http://[::1]:1234/v1"));
+        assert!(!key_allowed("http://192.168.1.20:11434/v1"));
+        assert!(!key_allowed("http://llm.example.com/v1"));
+    }
+
+    #[test]
+    fn mongo_reads_stay_in_the_tabs_database() {
+        let read =
+            |json: serde_json::Value| -> MongoRequest { serde_json::from_value(json).unwrap() };
+        let find = |db: &str, coll: &str| {
+            read(serde_json::json!({ "op": "find", "database": db, "collection": coll }))
+        };
+        assert_eq!(mongo_out_of_bounds(&find("shop", "orders"), "shop"), None);
+        assert!(mongo_out_of_bounds(&find("admin", "system.users"), "shop").is_some());
+        assert!(mongo_out_of_bounds(&find("shop", "system.profile"), "shop").is_some());
+        let lookup = read(serde_json::json!({
+            "op": "aggregate", "database": "shop", "collection": "orders",
+            "pipeline": [{ "$lookup": { "from": { "db": "admin", "coll": "x" }, "as": "y" } }]
+        }));
+        assert!(mongo_out_of_bounds(&lookup, "shop").is_some());
     }
 
     #[test]

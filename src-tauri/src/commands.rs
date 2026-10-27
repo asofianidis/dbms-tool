@@ -493,6 +493,7 @@ pub async fn query_export(
             sink: Some(handle.clone()),
             // Only offered for text that just reads; the backend check backs that up
             read_only: true,
+            assistant: false,
         };
         let server = state.manager.get(&id)?;
         let output = server.execute(&session, &database, &sql, &opts).await?;

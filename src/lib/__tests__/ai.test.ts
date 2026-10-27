@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { CompletionTable, ExecOutput } from '../api'
 import {
   describeCollections,
+  describeDocuments,
+  fitHistory,
   describeRows,
   describeSchema,
   mongoReadOnly,
@@ -111,7 +113,24 @@ describe('data access', () => {
       database: null,
       inTransaction: null
     }
-    expect(describeRows(output, 2)).toBe('id,note\n1,"a, b"\n2,NULL\n(1 more rows not shown)')
+    expect(describeRows(output, 2)).toBe(
+      'id,note\n1,"a, b"\n2,NULL\n(Only the first 2 rows are shown; more matched, and how many is unknown. Use count(*) to find out.)'
+    )
+    // The backend stopped at the limit: the count it gives is not the total
+    const cut = {
+      ...output,
+      results: [
+        {
+          ...output.results[0],
+          rows: output.results[0].rows.slice(0, 2),
+          rowCount: 3,
+          truncated: true
+        }
+      ]
+    }
+    expect(describeRows(cut, 2)).toContain('how many is unknown')
+    const whole = { ...output, results: [{ ...output.results[0], truncated: false }] }
+    expect(describeRows(whole, 5)).not.toContain('Only the first')
   })
 
   it('tells the model whether it may read data', () => {
@@ -194,5 +213,57 @@ describe('dashboards from the model', () => {
     expect(() => parseDashboardSpec('{')).toThrow()
     expect(() => parseDashboardSpec('{"widgets": []}')).toThrow('no widgets')
     expect(() => parseDashboardSpec('{"widgets": [{"title": "x"}]}')).toThrow('no query')
+  })
+})
+
+describe('limits', () => {
+  it('keeps MongoDB reads in the tab’s database', () => {
+    expect(() =>
+      parseMongoRead('{"op":"find","database":"admin","collection":"system.users"}', 'shop')
+    ).toThrow("tab's database")
+    expect(() => parseMongoRead('{"op":"find","collection":"system.profile"}', 'shop')).toThrow(
+      'system collections'
+    )
+    expect(
+      parseMongoRead('{"op":"count","database":"shop","collection":"o"}', 'shop')
+    ).toMatchObject({ database: 'shop' })
+  })
+
+  it('caps distinct values', () => {
+    const out = {
+      kind: 'value' as const,
+      documents: [],
+      value: ['a', 'b', 'c', 'd'],
+      total: null,
+      truncated: false,
+      elapsedMs: 1,
+      cancelled: false
+    }
+    expect(describeDocuments(out, 2)).toBe(
+      '["a","b"]\n(Only the first 2 values are shown; there are more.)'
+    )
+  })
+
+  it('trims history to the budget, keeping the latest result and question', () => {
+    const big = 'x'.repeat(1000)
+    const messages = [
+      { role: 'user' as const, content: `first ${big}` },
+      { role: 'assistant' as const, content: 'ok <run_query>SELECT 1</run_query>' },
+      { role: 'user' as const, content: `<query_result>\n${big}\n</query_result>` },
+      { role: 'assistant' as const, content: 'more <run_query>SELECT 2</run_query>' },
+      { role: 'user' as const, content: `<query_result>\nlatest ${big}\n</query_result>` },
+      { role: 'assistant' as const, content: 'answer' },
+      { role: 'user' as const, content: 'next question' }
+    ]
+    const fitted = fitHistory(messages, 1500)
+    expect(fitted[0].role).toBe('user')
+    expect(fitted.at(-1)?.content).toBe('next question')
+    expect(fitted.some((m) => m.content.includes('latest'))).toBe(true)
+    expect(fitted.reduce((n, m) => n + m.content.length, 0)).toBeLessThanOrEqual(1500)
+    // Under budget, only older results shrink
+    const roomy = fitHistory(messages, 100_000)
+    expect(roomy).toHaveLength(messages.length)
+    expect(roomy[2].content).toContain('left out')
+    expect(roomy[4].content).toContain('latest')
   })
 })
