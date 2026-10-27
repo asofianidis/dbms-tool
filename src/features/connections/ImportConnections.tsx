@@ -278,6 +278,7 @@ function ImportConnectionsDialog(): React.JSX.Element {
                     <KeyRound className="size-3.5 shrink-0 text-faint" aria-label="Has password" />
                   )}
                   {c.config.ssh?.enabled && <Badge>SSH</Badge>}
+                  {c.config.kube?.enabled && <Badge>K8s pod</Badge>}
                   {c.config.readOnly && <Badge tone="warning">read-only</Badge>}
                   {c.config.production && <Badge tone="danger">production</Badge>}
                   {duplicate && <Badge tone="info">already saved</Badge>}

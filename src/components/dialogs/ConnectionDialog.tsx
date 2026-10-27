@@ -37,6 +37,7 @@ import {
   statusOf
 } from '@/lib/workspace'
 import { Button, EngineMark, Field, Input, Modal, Segmented, Select, Textarea, Toggle } from '../ui'
+import { KubeFields } from './KubeFields'
 import { SshFields } from './SshFields'
 import { TlsFields } from './TlsFields'
 
@@ -219,6 +220,10 @@ function ConnectionDialog({
   const sqlite = config.engine === 'sqlite'
   // A SQLite connection is either a local file (host) or a D1 database (cloud ref)
   const d1 = sqlite && config.cloud?.provider === 'cloudflare'
+  // One tunnel at a time, but both show when both are on (an import) so one can be turned off
+  const canTunnel = !sqlite && config.cloud?.provider !== 'fly'
+  const showSsh = canTunnel && (!config.kube?.enabled || !!config.ssh?.enabled)
+  const showKube = canTunnel && (!config.ssh?.enabled || !!config.kube?.enabled)
   const SQLITE_FILES = [
     { name: 'SQLite databases', extensions: ['db', 'sqlite', 'sqlite3', 'db3'] },
     { name: 'All files', extensions: ['*'] }
@@ -697,7 +702,7 @@ function ConnectionDialog({
 
         {!sqlite && tlsCanBeOn && <TlsFields config={config} onChange={(files) => patch(files)} />}
 
-        {!sqlite && config.cloud?.provider !== 'fly' && (
+        {showSsh && (
           <SshFields
             ssh={config.ssh}
             onChange={(ssh) => patch({ ssh })}
@@ -709,6 +714,10 @@ function ConnectionDialog({
             hasSavedSecret={!duplicate && !!editing?.ssh && editing.ssh.auth !== 'agent'}
             uriMode={usesUri}
           />
+        )}
+
+        {showKube && (
+          <KubeFields kube={config.kube} onChange={(kube) => patch({ kube })} uriMode={usesUri} />
         )}
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-3 rounded-lg border border-line bg-raised/40 p-3">

@@ -57,6 +57,7 @@ fn config(engine: Engine, var: &str) -> Option<(ConnectionConfig, Option<String>
         last_used: None,
         cloud: None,
         ssh: None,
+        kube: None,
         tunneled: None,
     };
     if engine == Engine::Mongo || engine == Engine::Redis {
