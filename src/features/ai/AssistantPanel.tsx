@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowUp,
+  BarChart3,
+  ExternalLink,
+  LayoutDashboard,
   ChevronDown,
   Bug,
   Check,
@@ -20,6 +23,8 @@ import {
 import { api, type AiMessage, type AiProvider } from '@/lib/api'
 import {
   AI_PROVIDER_ORDER,
+  DASHBOARD_FENCE,
+  parseDashboardSpec,
   AI_PROVIDERS,
   parseReply,
   schemaBudget,
@@ -31,7 +36,8 @@ import { cn } from '@/lib/cn'
 import { settingsStore } from '@/lib/settings'
 import { createStore } from '@/lib/store'
 import { errorMessage, toast } from '@/lib/toast'
-import { openSettings, promptText } from '@/lib/workspace'
+import { createDashboard, dashboardsStore, newWidget, uniqueDashboardName } from '@/lib/dashboards'
+import { openDashboard, openSettings, promptText } from '@/lib/workspace'
 import { showMenuAt, type MenuItem } from '@/components/ContextMenu'
 import { Badge, Button, Spinner } from '@/components/ui'
 
@@ -445,6 +451,23 @@ export function AssistantPanel({
               <Gauge className="size-3" /> Why slow?
             </Button>
           )}
+          <Button
+            size="xs"
+            variant="ghost"
+            disabled={current.busy}
+            title="Design a dashboard for this database; type what it should show first to steer it"
+            onClick={() => {
+              const ask = draft.trim()
+              setDraft('')
+              void send(
+                ask
+                  ? `Build a dashboard: ${ask}`
+                  : 'Build a dashboard of the most useful numbers and trends in this database.'
+              )
+            }}
+          >
+            <LayoutDashboard className="size-3" /> Dashboard
+          </Button>
           {lastError && (
             <Button size="xs" variant="ghost" disabled={current.busy} onClick={fix}>
               <Bug className="size-3" /> Fix error
@@ -557,6 +580,12 @@ function Segment({
   target: AssistantTarget
 }): React.JSX.Element {
   if (segment.kind === 'text') return <Prose text={segment.text} />
+  // Models sometimes label the block json
+  if (
+    segment.lang === DASHBOARD_FENCE ||
+    (segment.lang === 'json' && /"widgets"\s*:/.test(segment.code))
+  )
+    return <DashboardCard code={segment.code} target={target} />
   const runnable = !['', 'text', 'plaintext', 'json', 'bash', 'sh', 'shell'].includes(segment.lang)
   const writes = runnable ? target.writes(segment.code) : null
   return (
@@ -799,5 +828,105 @@ function ModelPicker({ disabled }: { disabled: boolean }): React.JSX.Element {
       </span>
       <ChevronDown className="size-3 shrink-0" />
     </button>
+  )
+}
+
+const KIND_LABEL = { stat: 'Stat', bar: 'Bar chart', line: 'Line chart', table: 'Table' }
+
+/** A dashboard the assistant designed: its widgets and queries, and a button to create it. */
+function DashboardCard({
+  code,
+  target
+}: {
+  code: string
+  target: AssistantTarget
+}): React.JSX.Element {
+  const [created, setCreated] = useState<string | null>(null)
+  let spec
+  try {
+    spec = parseDashboardSpec(code)
+  } catch (e) {
+    return (
+      <div className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+        {errorMessage(e)}. Ask the assistant to send it again.
+      </div>
+    )
+  }
+  const writing = spec.widgets.flatMap((w) => {
+    const hint = target.writes(w.query)
+    return hint ? [`${w.title || 'Untitled'}: ${hint}`] : []
+  })
+  const mongo = target.language === 'mongo'
+
+  const create = (): void => {
+    const result = createDashboard(dashboardsStore.get(), {
+      name: uniqueDashboardName(dashboardsStore.get(), spec.name),
+      connectionId: target.connectionId,
+      database: target.database,
+      refreshSecs: spec.refreshSecs,
+      widgets: spec.widgets.map((w) => newWidget(w)),
+      source: 'assistant',
+      // mongosh widget queries run as JavaScript in the app, so they wait for review;
+      // SQL widgets only go to the backend, which refuses anything that writes
+      unreviewed: mongo
+    })
+    dashboardsStore.set(result.list)
+    setCreated(result.dashboard.id)
+    openDashboard(result.dashboard.id)
+  }
+
+  return (
+    <div className="overflow-hidden rounded-md border border-line bg-canvas">
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
+        <LayoutDashboard className="size-3.5 text-accent" />
+        <span className="truncate text-[13px] font-medium text-bright">{spec.name}</span>
+        <span className="ml-auto shrink-0 text-[11px] text-faint">
+          {spec.widgets.length} widget{spec.widgets.length === 1 ? '' : 's'}
+        </span>
+      </div>
+      <ul className="space-y-1 px-3 py-2">
+        {spec.widgets.map((w, i) => (
+          <li key={i} className="flex items-center gap-2 text-xs">
+            <BarChart3 className="size-3 shrink-0 text-muted" />
+            <span className="truncate text-fg">{w.title || 'Untitled'}</span>
+            <span className="ml-auto shrink-0 text-[11px] text-faint">{KIND_LABEL[w.kind]}</span>
+          </li>
+        ))}
+      </ul>
+      <details className="border-t border-line px-3 py-1.5">
+        <summary className="cursor-pointer text-[11px] text-muted select-none">Queries</summary>
+        <div className="space-y-2 py-2">
+          {spec.widgets.map((w, i) => (
+            <div key={i}>
+              <p className="text-[11px] text-muted">{w.title || 'Untitled'}</p>
+              <pre className="overflow-x-auto font-mono text-[11px] text-bright">{w.query}</pre>
+            </div>
+          ))}
+        </div>
+      </details>
+      <div className="flex items-center gap-2 border-t border-line px-2 py-1.5">
+        {writing.length ? (
+          <p className="text-[11px] text-warn">
+            Not created: dashboard queries can only read ({writing.join('; ')})
+          </p>
+        ) : (
+          <span className="text-[11px] text-faint">
+            {mongo
+              ? 'You review the queries before they run'
+              : 'Queries run read-only on this connection; results stay here'}
+          </span>
+        )}
+        <div className="flex-1" />
+        {created ? (
+          <Button size="xs" variant="ghost" onClick={() => openDashboard(created)}>
+            <ExternalLink className="size-3" /> Open
+          </Button>
+        ) : (
+          <Button size="xs" variant="primary" disabled={!!writing.length} onClick={create}>
+            <LayoutDashboard className="size-3" /> Create dashboard
+          </Button>
+        )}
+      </div>
+    </div>
   )
 }

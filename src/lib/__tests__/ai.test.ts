@@ -5,6 +5,9 @@ import {
   describeRows,
   describeSchema,
   mongoReadOnly,
+  mongoWriteHint,
+  parseDashboardSpec,
+  parseMongoRead,
   parseReply,
   refusedSql,
   schemaFields,
@@ -139,5 +142,57 @@ describe('Mongo schema', () => {
     expect(describeCollections([{ name: 'users', fields }], 1000)).toBe(
       'users { name: string, address: object, address.city: string, tags: array<string> }'
     )
+  })
+})
+
+describe('MongoDB requests from the model', () => {
+  it('reads JSON requests without evaluating anything', () => {
+    expect(
+      parseMongoRead('{"op":"find","collection":"orders","filter":{"a":1},"limit":5}', 'shop')
+    ).toEqual({
+      op: 'find',
+      database: 'shop',
+      collection: 'orders',
+      filter: { a: 1 },
+      projection: undefined,
+      sort: undefined,
+      limit: 5
+    })
+    expect(() => parseMongoRead('db.orders.find()', 'shop')).toThrow('JSON')
+    expect(() => parseMongoRead('{"op":"deleteMany","collection":"o"}', 'shop')).toThrow()
+    expect(() =>
+      parseMongoRead('{"op":"aggregate","collection":"o","pipeline":[{"$out":"x"}]}', 'shop')
+    ).toThrow('$out')
+  })
+
+  it('flags writes from the text alone', () => {
+    expect(mongoWriteHint('db.orders.find({})')).toBeNull()
+    expect(mongoWriteHint('db.orders.deleteMany({})')).toBe('Runs deleteMany')
+    expect(mongoWriteHint('db.o.aggregate([{ $merge: "x" }])')).toBe('Writes with $merge')
+  })
+})
+
+describe('dashboards from the model', () => {
+  it('reads and normalizes a dashboard block', () => {
+    const spec = parseDashboardSpec(
+      JSON.stringify({
+        name: 'Sales',
+        refreshSecs: 45,
+        widgets: [
+          { title: 'Orders', kind: 'stat', query: 'SELECT count(*) AS n FROM orders', y: ['n'] },
+          { title: 'By day', kind: 'pie', query: 'SELECT 1', span: 9 }
+        ]
+      })
+    )
+    expect(spec.name).toBe('Sales')
+    expect(spec.refreshSecs).toBe(0)
+    expect(spec.widgets[0]).toMatchObject({ kind: 'stat', span: 1, x: null, y: ['n'] })
+    expect(spec.widgets[1]).toMatchObject({ kind: 'table', span: 2 })
+  })
+
+  it('rejects broken blocks', () => {
+    expect(() => parseDashboardSpec('{')).toThrow()
+    expect(() => parseDashboardSpec('{"widgets": []}')).toThrow('no widgets')
+    expect(() => parseDashboardSpec('{"widgets": [{"title": "x"}]}')).toThrow('no query')
   })
 })

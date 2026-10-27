@@ -15,7 +15,13 @@ import {
   Square,
   TextCursorInput
 } from 'lucide-react'
-import { describeCollections, describeDocuments, mongoReadOnly, schemaFields } from '@/lib/ai'
+import {
+  describeCollections,
+  describeDocuments,
+  mongoWriteHint,
+  parseMongoRead,
+  schemaFields
+} from '@/lib/ai'
 import { api, type MongoOutput } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { recordHistory } from '@/lib/history'
@@ -339,13 +345,6 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
 
   /** Collections sampled for the assistant at most this many at a time */
   const SAMPLED = 60
-  const parseReads = (query: string) => {
-    const ops = parseShell(query, tab.database || 'test')
-    const requests = ops.flatMap((op) => (op.kind === 'request' ? [op] : []))
-    if (requests.length !== ops.length || !requests.every((op) => mongoReadOnly(op.request)))
-      throw new Error('only find, aggregate, count and distinct can run for the assistant')
-    return requests
-  }
   const assistant: AssistantTarget = {
     tabId: tab.id,
     connectionId: tab.connectionId,
@@ -418,20 +417,11 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
       }
       ed.focus()
     },
-    writes: (code) => {
-      try {
-        const writes = parseShell(code, tab.database || 'test').flatMap((op) =>
-          op.kind === 'request' && mongoIsWrite(op.request) ? [op.request] : []
-        )
-        if (!writes.length) return null
-        return describeMongoDanger(writes[0]) ?? `Runs ${writes[0].op}`
-      } catch {
-        return null
-      }
-    },
+    // Text from the model is never run through parseShell, which evaluates it as JavaScript
+    writes: mongoWriteHint,
     refuse: (query) => {
       try {
-        parseReads(query)
+        parseMongoRead(query, tab.database || 'test')
         return null
       } catch (e) {
         return errorMessage(e)
@@ -439,14 +429,13 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
     },
     readData: async (query, maxRows) => {
       if (!(await connect(tab.connectionId))) throw new Error('Not connected')
-      const parts: string[] = []
-      let count = 0
-      for (const op of parseReads(query)) {
-        const out = await api.aiMongoQuery(tab.connectionId, tab.id, op.request, maxRows)
-        count += out.kind === 'documents' ? Math.min(out.documents.length, maxRows) : 1
-        parts.push(`${op.label}:\n${describeDocuments(out, maxRows)}`)
+      const request = parseMongoRead(query, tab.database || 'test')
+      const out = await api.aiMongoQuery(tab.connectionId, tab.id, request, maxRows)
+      const count = out.kind === 'documents' ? Math.min(out.documents.length, maxRows) : 1
+      return {
+        text: describeDocuments(out, maxRows),
+        summary: `${count} document${count === 1 ? '' : 's'}`
       }
-      return { text: parts.join('\n\n'), summary: `${count} document${count === 1 ? '' : 's'}` }
     }
   }
 

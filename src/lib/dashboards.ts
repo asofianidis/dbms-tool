@@ -38,6 +38,8 @@ export interface Dashboard {
    * JavaScript, so nothing runs until the user has read them.
    */
   unreviewed?: boolean
+  /** Designed by the AI assistant rather than by hand or from a file */
+  source?: 'assistant'
   createdAt: number
   updatedAt: number
 }

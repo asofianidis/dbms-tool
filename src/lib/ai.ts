@@ -204,8 +204,15 @@ export function systemPrompt(target: PromptTarget): string {
       '',
       'Reading data: you cannot connect to the database, but you may ask the app to run one read-only query for you when the answer depends on the data itself (which values exist, how many rows match). To do that, end your reply with',
       `${RUN_OPEN}`,
-      target.language === 'sql' ? 'SELECT …' : 'db.collection.find({ … })',
+      target.language === 'sql'
+        ? 'SELECT …'
+        : '{"op": "find", "collection": "orders", "filter": {"status": "open"}, "sort": {"_id": -1}, "limit": 20}',
       `${RUN_CLOSE}`,
+      ...(target.language === 'mongo'
+        ? [
+            'For MongoDB the request is a JSON object, not shell code: "op" is find (with filter, projection, sort, limit), aggregate (with pipeline), count (with filter) or distinct (with field, filter). Use Extended JSON for dates and ids, e.g. {"$date": "2024-01-01T00:00:00Z"}.'
+          ]
+        : []),
       `and write nothing after it. The app shows it to the user, who may decline; then you get back at most ${target.data.maxRows} rows inside <query_result>. Only read queries run: anything that writes, deletes, drops or changes settings is refused. Keep queries small (filters, LIMIT, aggregates) and ask for one at a time. Don't ask for data when the schema alone answers the question.`
     )
   } else {
@@ -214,6 +221,18 @@ export function systemPrompt(target: PromptTarget): string {
       "Privacy: you only get the schema (names, never rows) and what the user attaches. You can't see or query data. If the answer depends on the data, give the user a query to run themselves."
     )
   }
+  lines.push(
+    '',
+    'Dashboards: when the user asks for a dashboard (or charts, a report page, KPIs), design one and reply with a short description followed by a single fenced ```dashboard block holding JSON:',
+    '{"name": "Orders overview", "refreshSecs": 0, "widgets": [{"title": "Orders today", "kind": "stat", "query": "…", "x": null, "y": ["orders"], "span": 1}]}',
+    '- kind is "stat" (one number: the first row\'s y column), "bar" or "line" (x is the category or time column, y the numeric columns, at most 8), or "table".',
+    "- span is how many of the grid's 4 columns the widget takes: 1 for stats, 2 for most charts, 4 for wide tables or long time series.",
+    target.language === 'sql'
+      ? '- query is one read-only SELECT (or WITH … SELECT) for this engine, returning exactly the columns x and y name, with clear aliases. Aggregate in SQL and keep results small (top N, recent periods); widgets cap at 5000 rows. Line charts: order by x.'
+      : '- query is one mongosh find() or aggregate() on db.<collection>, using $group / $project so field names match x and y. Keep results small; widgets cap at 5000 documents.',
+    '- 3 to 8 widgets: a few stats first, then charts, then a table. refreshSecs is 0, 30, 60, 300 or 900. Dashboard queries only read; the app runs them, and you never see their results.',
+    '- Only use tables and columns from the schema.'
+  )
   lines.push('', '<schema>', target.schema || '(no tables found)', '</schema>')
   return lines.join('\n')
 }
@@ -347,4 +366,124 @@ export function describeCollections(
     used += line.length + 1
   }
   return lines.join('\n')
+}
+
+/**
+ * A MongoDB read the assistant asked for, as JSON:
+ * `{"op":"find","collection":"orders","filter":{…},"sort":{…},"limit":20}`.
+ * Parsed as data, never evaluated: shell text runs as JavaScript in the app,
+ * so text from the model must not go through `parseShell`.
+ */
+export function parseMongoRead(text: string, database: string): MongoRequest {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text.trim())
+  } catch {
+    throw new Error('the request must be a JSON object, not shell code')
+  }
+  const r = (raw ?? {}) as Record<string, unknown>
+  const collection = r.collection
+  if (typeof collection !== 'string' || !collection)
+    throw new Error('the request names no collection')
+  const object = (v: unknown, name: string): Record<string, unknown> | undefined => {
+    if (v === undefined || v === null) return undefined
+    if (typeof v !== 'object' || Array.isArray(v)) throw new Error(`${name} must be an object`)
+    return v as Record<string, unknown>
+  }
+  const db = typeof r.database === 'string' && r.database ? r.database : database
+  const base = { database: db, collection }
+  let request: MongoRequest
+  switch (r.op) {
+    case 'find': {
+      const limit = Number(r.limit ?? 20)
+      request = {
+        op: 'find',
+        ...base,
+        filter: object(r.filter, 'filter') ?? {},
+        projection: object(r.projection, 'projection'),
+        sort: object(r.sort, 'sort'),
+        limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 20
+      }
+      break
+    }
+    case 'aggregate':
+      if (!Array.isArray(r.pipeline)) throw new Error('pipeline must be an array')
+      request = { op: 'aggregate', ...base, pipeline: r.pipeline }
+      break
+    case 'count':
+      request = { op: 'count', ...base, filter: object(r.filter, 'filter') ?? {} }
+      break
+    case 'distinct':
+      if (typeof r.field !== 'string') throw new Error('distinct needs a field')
+      request = { op: 'distinct', ...base, field: r.field, filter: object(r.filter, 'filter') }
+      break
+    default:
+      throw new Error('only find, aggregate, count and distinct can run for the assistant')
+  }
+  if (!mongoReadOnly(request)) throw new Error('$out and $merge write to collections')
+  return request
+}
+
+const MONGO_WRITE =
+  /\.\s*(insertOne|insertMany|insert|updateOne|updateMany|update|replaceOne|deleteOne|deleteMany|remove|drop|dropDatabase|dropIndex|dropIndexes|createIndex|createIndexes|createCollection|renameCollection|bulkWrite|findOneAndUpdate|findOneAndDelete|findOneAndReplace|findAndModify|runCommand|adminCommand)\s*\(|["']?\$(out|merge)["']?\s*:/
+
+/**
+ * What a MongoDB snippet would change, read from its text: shell code from the
+ * model is never evaluated just to show a badge.
+ */
+export function mongoWriteHint(code: string): string | null {
+  const m = MONGO_WRITE.exec(code)
+  if (!m) return null
+  return m[1] ? `Runs ${m[1]}` : `Writes with $${m[2]}`
+}
+
+/* ---------- Dashboards ---------- */
+
+export const DASHBOARD_FENCE = 'dashboard'
+
+export interface DashboardSpec {
+  name: string
+  refreshSecs: number
+  widgets: {
+    title: string
+    kind: 'stat' | 'bar' | 'line' | 'table'
+    query: string
+    x: string | null
+    y: string[]
+    span: 1 | 2 | 3 | 4
+  }[]
+}
+
+/** A ```dashboard block from the assistant, read as JSON. */
+export function parseDashboardSpec(text: string): DashboardSpec {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw new Error('The dashboard isn’t valid JSON')
+  }
+  const d = (raw ?? {}) as Record<string, unknown>
+  if (!Array.isArray(d.widgets) || !d.widgets.length)
+    throw new Error('The dashboard has no widgets')
+  const kinds = ['stat', 'bar', 'line', 'table'] as const
+  const widgets = d.widgets.slice(0, 24).map((item: unknown) => {
+    const w = (item ?? {}) as Record<string, unknown>
+    const kind = kinds.find((k) => k === w.kind) ?? 'table'
+    const span = Math.round(Number(w.span))
+    return {
+      title: typeof w.title === 'string' ? w.title.slice(0, 120) : '',
+      kind,
+      query: typeof w.query === 'string' ? w.query.trim() : '',
+      x: typeof w.x === 'string' && w.x ? w.x : null,
+      y: Array.isArray(w.y) ? w.y.filter((c): c is string => typeof c === 'string') : [],
+      span: (span >= 1 && span <= 4 ? span : kind === 'stat' ? 1 : 2) as 1 | 2 | 3 | 4
+    }
+  })
+  if (widgets.some((w) => !w.query)) throw new Error('A widget has no query')
+  const refresh = Number(d.refreshSecs)
+  return {
+    name: typeof d.name === 'string' && d.name.trim() ? d.name.trim().slice(0, 120) : 'Dashboard',
+    refreshSecs: [30, 60, 300, 900].includes(refresh) ? refresh : 0,
+    widgets
+  }
 }

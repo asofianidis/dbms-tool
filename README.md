@@ -68,6 +68,10 @@ rather than a plugin, in a fast native app that doesn't get in your way.
   query at the cursor, ask why it's slow (fed with the plan viewer's plan), or fix the error the
   editor underlines. Answers come back as blocks to insert into the editor, where they go through
   the usual destructive-statement and production checks before running.
+- Ask it for a dashboard ("orders and revenue this quarter", or the Dashboard button) and it
+  designs stat tiles, charts and tables over your schema; one click creates it. Widget queries only
+  read, the app runs them, and their results never go to the AI. MongoDB dashboards wait for you to
+  review their queries first.
 - Bring your own AI: your Claude subscription through the Claude Code CLI, your Cursor plan through
   the Cursor CLI, an Anthropic API key, or a local model on an OpenAI-compatible server (Ollama,
   LM Studio). Keys are kept in the OS credential manager.
