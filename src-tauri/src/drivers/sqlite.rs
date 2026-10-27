@@ -379,7 +379,7 @@ impl Backend {
 }
 
 impl SqSession {
-    fn is_d1(&self) -> bool {
+    pub(crate) fn is_d1(&self) -> bool {
         matches!(self.backend, Backend::D1(_))
     }
 
@@ -1173,6 +1173,8 @@ DELETE FROM t WHERE b = 2"
                 1,
             )),
             read_only: false,
+            assistant: false,
+            assistant_database: None,
         };
         let out = s
             .execute(

@@ -206,6 +206,17 @@ export function updateTab(id: string, patch: Partial<Tab>): void {
   }))
 }
 
+const tabClosedListeners = new Set<(tab: Tab) => void>()
+
+/**
+ * Calls `listener` with each tab as it closes, for features that hold state
+ * per tab outside the workspace (the AI assistant's requests and sessions).
+ */
+export function onTabClosed(listener: (tab: Tab) => void): () => void {
+  tabClosedListeners.add(listener)
+  return () => tabClosedListeners.delete(listener)
+}
+
 export function closeTab(id: string, force = false): void {
   // Ending the session rolls back whatever the tab hasn't committed
   if (!force && openTransactionsStore.get()[id]) {
@@ -223,6 +234,7 @@ export function closeTab(id: string, force = false): void {
   clearTransactionState(id)
   const tab = tabsStore.get().tabs.find((t) => t.id === id)
   if (tab && 'connectionId' in tab) void api.closeSession(tab.connectionId, tab.id).catch(() => {})
+  if (tab) for (const listener of tabClosedListeners) listener(tab)
   runsStore.set((r) => {
     const { [id]: _, ...rest } = r
     return rest

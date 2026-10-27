@@ -437,6 +437,10 @@ export interface ExecOptions {
   maxRows?: number
   /** Block writes for this call even on a writable connection */
   readOnly?: boolean
+  /** Also refuse what the AI assistant may never run (functions that act on the server…) */
+  assistant?: boolean
+  /** With `assistant` on MongoDB: the only database requests may read */
+  assistantDatabase?: string
   /** Cancels the statement after this many seconds; 0 or absent never times out */
   timeoutSecs?: number
   /** Bytes of each binary cell to send (default 4096); the rest is summarized */
@@ -734,6 +738,38 @@ export function isAppError(e: unknown, code?: AppError['code']): e is AppError {
   )
 }
 
+/** Where the AI assistant's answers come from (see ai.rs) */
+export type AiProvider = 'claude-code' | 'cursor' | 'anthropic' | 'openai-compatible'
+
+export interface AiStatus {
+  provider: AiProvider
+  /** The CLI found, for Claude Code and Cursor */
+  path: string | null
+  /** Whether a request can be sent as things stand */
+  ready: boolean
+  /** Who it's signed in as, or what's missing */
+  detail: string
+}
+
+export interface AiMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface AiChatRequest {
+  provider: AiProvider
+  /** Empty for the provider's default */
+  model: string
+  system: string
+  messages: AiMessage[]
+  baseUrl?: string | null
+}
+
+export interface AiReply {
+  text: string
+  model: string | null
+}
+
 export const api = {
   connectionsList: () => invoke<ConnectionConfig[]>('connections_list'),
   /** `sshSecret` is the SSH password or key passphrase, saved with the connection */
@@ -942,5 +978,34 @@ export const api = {
   /** Shows the error log file in the OS file manager */
   logsReveal: () => invoke<void>('logs_reveal'),
   /** The end of the error log; empty when nothing has failed */
-  logsRead: () => invoke<string>('logs_read')
+  logsRead: () => invoke<string>('logs_read'),
+
+  aiStatus: (provider: AiProvider, baseUrl?: string) =>
+    invoke<AiStatus>('ai_status', { provider, baseUrl: baseUrl || null }),
+  /** Models to suggest: the Cursor account's or a local server's; empty means free text */
+  aiModels: (provider: AiProvider, baseUrl?: string) =>
+    invoke<string[]>('ai_models', { provider, baseUrl: baseUrl || null }),
+  aiKeyStatus: (provider: AiProvider) => invoke<boolean>('ai_key_status', { provider }),
+  aiKeySet: (provider: AiProvider, key: string) => invoke<void>('ai_key_set', { provider, key }),
+  aiKeyDelete: (provider: AiProvider) => invoke<void>('ai_key_delete', { provider }),
+  /** Sends a conversation; `aiCancel(requestId)` stops it */
+  aiChat: (requestId: string, request: AiChatRequest) =>
+    invoke<AiReply>('ai_chat', { requestId, request }),
+  aiCancel: (requestId: string) => invoke<void>('ai_cancel', { requestId }),
+  /** Why the backend would refuse SQL the assistant wrote, or null; asked before approval */
+  aiSqlCheck: (id: string, sql: string) => invoke<string | null>('ai_sql_check', { id, sql }),
+  aiMongoCheck: (database: string, request: MongoRequest) =>
+    invoke<string | null>('ai_mongo_check', { database, request }),
+  /** A read-only query the assistant asked for, on its own session; writes are refused */
+  aiSqlQuery: (id: string, session: string, database: string, sql: string, maxRows: number) =>
+    invoke<ExecOutput>('ai_sql_query', { id, session, database, sql, maxRows }),
+  /** Reads `database` only (the tab's); other databases and system collections are refused */
+  aiMongoQuery: (
+    id: string,
+    session: string,
+    database: string,
+    request: MongoRequest,
+    maxRows: number
+  ) => invoke<MongoOutput>('ai_mongo_query', { id, session, database, request, maxRows }),
+  aiSessionClose: (id: string, session: string) => invoke<void>('ai_session_close', { id, session })
 }

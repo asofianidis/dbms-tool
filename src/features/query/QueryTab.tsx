@@ -11,6 +11,7 @@ import {
   FolderOpen,
   Gauge,
   GitCommitHorizontal,
+  Lightbulb,
   PanelBottomClose,
   Play,
   PlugZap,
@@ -19,6 +20,7 @@ import {
   TextCursorInput,
   Undo2
 } from 'lucide-react'
+import { describePlan, describeRows, describeSchema } from '@/lib/ai'
 import { api, type CompletionTable, type StreamFormat } from '@/lib/api'
 import { ENGINES, connectionLabel } from '@/lib/engines'
 import { EXTENSIONS, pickSavePath } from '@/lib/export'
@@ -37,7 +39,7 @@ import {
 } from '@/lib/params'
 import { parsePlan, planFormat } from '@/lib/plan'
 import { parseMariaDbPlan } from '@/lib/plan-mariadb'
-import { confirmProductionWrite, isProduction } from '@/lib/production'
+import { confirmProductionWrite, isProduction, sqlWriteKeyword } from '@/lib/production'
 import { queries, queryClient } from '@/lib/queries'
 import { isReadOnlyQuery, resolveTable, singleTableSource } from '@/lib/result-source'
 import { settingsStore } from '@/lib/settings'
@@ -73,6 +75,15 @@ import { editorMariaDb } from '@/components/editor/mariadb-completion'
 import { editorPostgres } from '@/components/editor/postgres-completion'
 import { showMenuAt } from '@/components/ContextMenu'
 import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components/ui'
+import {
+  AssistantPanel,
+  assistantOpenStore,
+  insertIntoEditor,
+  resetAssistant,
+  stopAssistant,
+  toggleAssistant,
+  type AssistantTarget
+} from '../ai/AssistantPanel'
 import { SavedButton } from '../saved/SavedButton'
 import { ParamsDialog } from './ParamsDialog'
 import { ResultsPanel, type ResultEditTarget, type RunResult } from './ResultsPanel'
@@ -127,6 +138,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
     (status?.state === 'connected' && !!status.info.babelfishVersion)
   const mariadb = dialect === 'mysql' && isMariaDb(connectedInfo(status))
   const layout = useDefaultLayout({ id: 'query-split', storage: localStorage })
+  const assistantLayout = useDefaultLayout({ id: 'query-assistant-split', storage: localStorage })
   const inTransaction = !!openTransactionsStore.use()[tab.id]
   const manualCommit = isManualCommit(tab.id, manualCommitStore.use(), settings.defaultCommitMode)
   const [paramPrompt, setParamPrompt] = useState<{
@@ -249,8 +261,11 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           ...r,
           [tab.id]: { output, offset: runOffset, sql: toRun, spans, plan }
         }))
-        if (output.database && output.database !== tab.database)
+        if (output.database && output.database !== tab.database) {
+          // `USE other` moved the tab: a query waiting for approval was meant for the old database
+          stopAssistant(tab.id)
           updateTab(tab.id, { database: output.database })
+        }
         const rows = output.results.reduce((n, s) => n + s.rowCount, 0)
         lastRunStore.set((l) => ({
           ...l,
@@ -593,6 +608,10 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
           return true
         }
       },
+      {
+        key: 'Mod-i',
+        run: () => (settingsStore.get().aiEnabled ? (toggleAssistant(tab.id), true) : false)
+      },
       { key: 'Alt-Pause', run: () => (cancel(), true) },
       { key: 'Mod-Pause', run: () => (cancel(), true) }
     ],
@@ -617,6 +636,87 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
   }, [tab.autorun, tab.id])
 
   const running = !!run?.running
+  // Read on every render: skipping the hook while the assistant is off changes the hook count
+  const openAssistants = assistantOpenStore.use()
+  const assistantOpen = settings.aiEnabled && !!openAssistants[tab.id]
+
+  /** The selection, else the statement at the cursor, else everything */
+  const codeAtCursor = (): string => {
+    const ed = editor.current
+    if (!ed) return tab.text
+    const selection = ed.selection()
+    if (selection) return selection.text
+    return statementAt(ed.text(), dialect, ed.cursor())?.text ?? ed.text()
+  }
+  const info = connectedInfo(status)
+  const assistant: AssistantTarget = {
+    tabId: tab.id,
+    connectionId: tab.connectionId,
+    database: tab.database,
+    engine: [
+      babelfish
+        ? 'Babelfish for Aurora PostgreSQL (T-SQL)'
+        : mariadb
+          ? 'MariaDB'
+          : ENGINES[connection?.engine ?? 'postgres'].label,
+      info?.version
+    ]
+      .filter(Boolean)
+      .join(' '),
+    language: 'sql',
+    schema: async (budget, focus) => {
+      const tables =
+        completion.data ??
+        (tab.database && (await connect(tab.connectionId))
+          ? await queryClient.fetchQuery(queries.completion(tab.connectionId, tab.database))
+          : [])
+      const schema = describeSchema(tables, budget, `${focus}\n${editor.current?.text() ?? ''}`)
+      return { text: schema.text, summary: plural(schema.tables, 'table') }
+    },
+    code: codeAtCursor,
+    error: () =>
+      result?.output?.error
+        ? { sql: result.sql, message: result.output.error.message, line: result.output.error.line }
+        : result?.error
+          ? { sql: result.sql, message: result.error, line: null }
+          : null,
+    plan: async () => {
+      const sql = codeAtCursor().trim()
+      if (!sql) return null
+      const last = sqlResultsStore.get()[tab.id]
+      // A plan the tab already shows for this statement (from Explain analyze, say) is kept
+      if (last?.plan && last.sql.includes(sql)) return { sql, text: describePlan(last.plan) }
+      await execute('statement', (s) => explainSql(s, dialect, false, babelfish, mariadb), true)
+      // Only a plan this run produced: execute returns without one when another
+      // query is running or a parameter prompt was declined
+      const after = sqlResultsStore.get()[tab.id]
+      if (after === last || !after?.plan || !after.sql.includes(sql)) return null
+      return { sql, text: describePlan(after.plan) }
+    },
+    insert: (code, mode) => insertIntoEditor(editor.current, code, mode),
+    writes: (code) => {
+      const dangers = dangerousStatements(code, dialect)
+      if (dangers.length) return dangers.join(', ')
+      const keyword = sqlWriteKeyword(code, dialect)
+      return keyword ? `Runs ${keyword}` : null
+    },
+    // The backend's own check, so the user is only asked to approve what will run
+    refuse: async (query) => {
+      if (!(await connect(tab.connectionId))) return 'not connected'
+      return api.aiSqlCheck(tab.connectionId, query)
+    },
+    readData: async (query, maxRows) => {
+      if (!(await connect(tab.connectionId))) throw new Error('Not connected')
+      const output = await api.aiSqlQuery(tab.connectionId, tab.id, tab.database, query, maxRows)
+      const rows = output.results.reduce((n, s) => n + Math.min(s.rows.length, maxRows), 0)
+      return {
+        text: describeRows(output, maxRows),
+        summary: output.error
+          ? `Error: ${output.error.message.split('\n')[0]}`
+          : plural(rows, 'row')
+      }
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -733,15 +833,31 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
               return
             setInTransaction(tab.id, false)
             void api.closeSession(tab.connectionId, tab.id).catch(() => {})
+            // The conversation was about the old connection's schema; a pending query must not run here
+            resetAssistant(tab.id, tab.connectionId)
             updateTab(tab.id, { connectionId: id, database: defaultDatabase(id) })
           }}
         />
         <DatabasePicker
           connectionId={tab.connectionId}
           value={tab.database}
-          onChange={(database) => updateTab(tab.id, { database })}
+          onChange={(database) => {
+            // A query waiting for approval was meant for the old database
+            stopAssistant(tab.id)
+            updateTab(tab.id, { database })
+          }}
         />
         <div className="flex-1" />
+        {settings.aiEnabled && (
+          <Button
+            size="sm"
+            variant={assistantOpen ? 'secondary' : 'ghost'}
+            onClick={() => toggleAssistant(tab.id)}
+            title={`AI assistant (${MOD}I)`}
+          >
+            <Lightbulb className="size-3.5" /> Ask AI
+          </Button>
+        )}
         <SavedButton tab={tab} text={() => editor.current?.text() ?? tab.text} />
         <Button
           size="icon"
@@ -781,88 +897,105 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
         </Button>
       </Toolbar>
       <Group
-        orientation="vertical"
+        orientation="horizontal"
         className="min-h-0 flex-1"
-        defaultLayout={layout.defaultLayout}
-        onLayoutChanged={layout.onLayoutChanged}
+        defaultLayout={assistantLayout.defaultLayout}
+        onLayoutChanged={assistantLayout.onLayoutChanged}
       >
-        <Panel id="editor" minSize={80} defaultSize="55%">
-          <CodeEditor
-            ref={editor}
-            value={tab.text}
-            onChange={(text) => updateTab(tab.id, { text })}
-            language={{
-              kind: 'sql',
-              dialect,
-              mariaDb: editorMariaDb(connectedInfo(status)),
-              postgres: editorPostgres(connectedInfo(status)),
-              pgExtensions
-            }}
-            completion={namespace}
-            defaultSchema={defaultSchema}
-            sqlTables={completion.data}
-            keys={keys}
-            fontSize={settings.editorFontSize}
-            wordWrap={settings.wordWrap}
-            onCursor={cursorStore.set}
-            placeholder={`Write ${ENGINES[connection?.engine ?? 'postgres'].label} SQL…   ${MOD}Enter runs the statement at the cursor, F5 runs everything`}
-            className="h-full bg-canvas"
-            autoFocus
-          />
+        <Panel id="work" minSize={320}>
+          <Group
+            orientation="vertical"
+            className="h-full min-h-0"
+            defaultLayout={layout.defaultLayout}
+            onLayoutChanged={layout.onLayoutChanged}
+          >
+            <Panel id="editor" minSize={80} defaultSize="55%">
+              <CodeEditor
+                ref={editor}
+                value={tab.text}
+                onChange={(text) => updateTab(tab.id, { text })}
+                language={{
+                  kind: 'sql',
+                  dialect,
+                  mariaDb: editorMariaDb(connectedInfo(status)),
+                  postgres: editorPostgres(connectedInfo(status)),
+                  pgExtensions
+                }}
+                completion={namespace}
+                defaultSchema={defaultSchema}
+                sqlTables={completion.data}
+                keys={keys}
+                fontSize={settings.editorFontSize}
+                wordWrap={settings.wordWrap}
+                onCursor={cursorStore.set}
+                placeholder={`Write ${ENGINES[connection?.engine ?? 'postgres'].label} SQL…   ${MOD}Enter runs the statement at the cursor, F5 runs everything`}
+                className="h-full bg-canvas"
+                autoFocus
+              />
+            </Panel>
+            <Separator />
+            <Panel
+              id="results"
+              panelRef={resultsPanel}
+              minSize={60}
+              defaultSize="45%"
+              collapsible
+              collapsedSize={0}
+            >
+              <ResultsPanel
+                result={result}
+                running={running}
+                startedAt={run?.startedAt}
+                dialect={dialect}
+                tabId={tab.id}
+                loadMore={{ run: loadMore, disabled: rerunnable ? undefined : notRerunnable }}
+                exportFull={{
+                  run: (set, format) => void exportFull(set, format),
+                  disabled: rerunnable ? undefined : notRerunnable
+                }}
+                edit={edit}
+                onJumpToError={() => {
+                  if (result?.output?.error && result.offset >= 0)
+                    showError(result.output.error, result.offset, result.sql, result.spans)
+                }}
+                emptyHint={
+                  !connected ? (
+                    <EmptyState
+                      icon={<PlugZap className="size-6" />}
+                      title={
+                        connection
+                          ? `Not connected to ${connection.name || connection.host}`
+                          : 'Pick a connection'
+                      }
+                      actions={
+                        connection && (
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={() => void connect(connection.id)}
+                            disabled={status?.state === 'connecting'}
+                          >
+                            Connect
+                          </Button>
+                        )
+                      }
+                    >
+                      Running a query connects automatically.
+                    </EmptyState>
+                  ) : undefined
+                }
+              />
+            </Panel>
+          </Group>
         </Panel>
-        <Separator />
-        <Panel
-          id="results"
-          panelRef={resultsPanel}
-          minSize={60}
-          defaultSize="45%"
-          collapsible
-          collapsedSize={0}
-        >
-          <ResultsPanel
-            result={result}
-            running={running}
-            startedAt={run?.startedAt}
-            dialect={dialect}
-            tabId={tab.id}
-            loadMore={{ run: loadMore, disabled: rerunnable ? undefined : notRerunnable }}
-            exportFull={{
-              run: (set, format) => void exportFull(set, format),
-              disabled: rerunnable ? undefined : notRerunnable
-            }}
-            edit={edit}
-            onJumpToError={() => {
-              if (result?.output?.error && result.offset >= 0)
-                showError(result.output.error, result.offset, result.sql, result.spans)
-            }}
-            emptyHint={
-              !connected ? (
-                <EmptyState
-                  icon={<PlugZap className="size-6" />}
-                  title={
-                    connection
-                      ? `Not connected to ${connection.name || connection.host}`
-                      : 'Pick a connection'
-                  }
-                  actions={
-                    connection && (
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        onClick={() => void connect(connection.id)}
-                        disabled={status?.state === 'connecting'}
-                      >
-                        Connect
-                      </Button>
-                    )
-                  }
-                >
-                  Running a query connects automatically.
-                </EmptyState>
-              ) : undefined
-            }
-          />
-        </Panel>
+        {assistantOpen && (
+          <>
+            <Separator />
+            <Panel id="assistant" minSize={280} defaultSize="32%">
+              <AssistantPanel target={assistant} onClose={() => toggleAssistant(tab.id, false)} />
+            </Panel>
+          </>
+        )}
       </Group>
       {paramPrompt && (
         <ParamsDialog

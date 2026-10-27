@@ -19,7 +19,8 @@ async function runMongo(
   connectionId: string,
   session: string,
   database: string,
-  query: string
+  query: string,
+  assistant: boolean
 ): Promise<WidgetResult> {
   const requests = parseShell(query, database || 'test').flatMap((op) =>
     op.kind === 'request' ? [op.request] : []
@@ -30,7 +31,10 @@ async function runMongo(
   // The backend refuses writes, with the same check as read-only connections
   const output = await api.mongo(connectionId, session, request, {
     maxRows: ROW_LIMIT,
-    readOnly: true
+    readOnly: true,
+    // Assistant dashboards stay in their database, off system collections and server-side JS
+    assistant,
+    assistantDatabase: assistant ? database || 'test' : undefined
   })
   if (output.kind === 'documents')
     return { set: grid(output.documents, output.truncated), elapsedMs: output.elapsedMs }
@@ -44,23 +48,30 @@ async function runMongo(
   }
 }
 
-/** Runs a widget's query and returns its last result set. Throws on errors and on writes. */
+/**
+ * Runs a widget's query and returns its last result set. Throws on errors and on writes.
+ * `assistant` (dashboards the AI assistant designed) also refuses what the
+ * assistant may never run, like functions that end sessions or read server files.
+ */
 export async function runWidgetQuery(
   connectionId: string,
   session: string,
   database: string,
-  query: string
+  query: string,
+  { assistant = false }: { assistant?: boolean } = {}
 ): Promise<WidgetResult> {
   const connection = getConnection(connectionId)
   if (!connection) throw new Error('This dashboard’s connection no longer exists')
   if (!query.trim()) throw new Error('This widget has no query yet')
   if (!(await connect(connectionId))) throw new Error('Not connected')
-  if (connection.engine === 'mongo') return runMongo(connectionId, session, database, query)
+  if (connection.engine === 'mongo')
+    return runMongo(connectionId, session, database, query, assistant)
 
   // Widgets re-run on every refresh, so the backend's read-only check refuses writes
   const out = await api.execute(connectionId, session, database, query, {
     maxRows: ROW_LIMIT,
-    readOnly: true
+    readOnly: true,
+    assistant
   })
   if (out.error) throw new Error(out.error.message)
   const set = [...out.results].reverse().find((r) => r.columns.length)

@@ -60,6 +60,7 @@ export function WidgetEditor({
   database,
   session,
   isNew,
+  assistant = false,
   onSave,
   onClose
 }: {
@@ -70,6 +71,8 @@ export function WidgetEditor({
   /** Session key previews run on, shared with the dashboard's widgets */
   session: string
   isNew: boolean
+  /** The dashboard was designed by the AI assistant: previews run with its checks too */
+  assistant?: boolean
   onSave: (widget: Widget) => void
   onClose: () => void
 }): React.JSX.Element {
@@ -90,7 +93,7 @@ export function WidgetEditor({
     setRunning(true)
     setError(null)
     try {
-      const out = await runWidgetQuery(connectionId, session, database, query)
+      const out = await runWidgetQuery(connectionId, session, database, query, { assistant })
       setResult(out)
       setDraft((d) => {
         if (d.x || d.y.length) return d

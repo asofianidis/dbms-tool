@@ -127,8 +127,8 @@ const TSQL_STATEMENTS: &[&str] = &[
 enum Token {
     /// Unquoted word, lowercased
     Word(String),
-    /// `"x"`, `` `x` `` or `[x]`
-    QuotedIdent,
+    /// `"x"`, `` `x` `` or `[x]`, with doubled quotes undone and lowercased
+    QuotedIdent(String),
     /// String, number or dollar-quoted body
     Literal,
     Punct(char),
@@ -203,26 +203,30 @@ fn tokenize(sql: &str, lexing: Lexing) -> Vec<Token> {
             }
             '\'' | '"' | '`' | '[' if c != '[' || lexing.bracket_idents => {
                 let close = if c == '[' { ']' } else { c };
+                let mut text = String::new();
                 i += 1;
                 while i < chars.len() {
                     if lexing.backslash_escapes && chars[i] == '\\' && matches!(c, '\'' | '"') {
+                        text.extend(chars.get(i + 1));
                         i += 2;
                         continue;
                     }
                     if chars[i] == close {
                         // Doubled quote is an escaped quote, `]]` included
                         if chars.get(i + 1) == Some(&close) {
+                            text.push(close);
                             i += 2;
                             continue;
                         }
                         break;
                     }
+                    text.push(chars[i]);
                     i += 1;
                 }
                 tokens.push(if c == '\'' {
                     Token::Literal
                 } else {
-                    Token::QuotedIdent
+                    Token::QuotedIdent(text.to_lowercase())
                 });
             }
             '$' if next.is_some_and(|n| n == '$' || n.is_alphabetic() || n == '_') => {
@@ -324,6 +328,213 @@ pub fn first_write_keyword(sql: &str, engine: Engine) -> Option<String> {
     None
 }
 
+/// Functions that act on the server or reach outside the database even inside
+/// a read-only transaction: ending sessions, resetting statistics, replication
+/// slots, server files, other servers, sequences. Matched only as calls
+/// (`name(`), so columns with these names still read. Only refused for SQL the
+/// AI assistant wrote; people can still run them themselves.
+const ASSISTANT_DENIED_CALLS: &[&str] = &[
+    // PostgreSQL
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_switch_wal",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_stat_file",
+    "pg_notify",
+    "pg_start_backup",
+    "pg_stop_backup",
+    "pg_import_system_collations",
+    "pg_log_backend_memory_contexts",
+    "pg_stat_statements_reset",
+    "nextval",
+    "setval",
+    // Run a query given as a string, which the checks here can't read
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    // MySQL
+    "load_file",
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "benchmark",
+    // SQL Server
+    "openrowset",
+    "opendatasource",
+    "openquery",
+    "xp_cmdshell",
+    "set_config",
+    // SQLite
+    "load_extension",
+    // SQL Server: server files, audit and trace files, and the transaction log
+    "fn_xe_file_target_read_file",
+    "fn_xe_target_read_file",
+    "fn_get_audit_file",
+    "fn_trace_gettable",
+    "fn_dblog",
+    "fn_dump_dblog",
+    "fn_full_dblog",
+];
+
+/// T-SQL table hints that take or hold locks other sessions wait on; SQL Server
+/// has no read-only mode to stop them
+const TSQL_LOCK_HINTS: &[&str] = &[
+    "tablockx", "tablock", "xlock", "updlock", "holdlock", "paglock",
+];
+
+/// Row-locking clauses (`FOR UPDATE` is already a write): PostgreSQL's
+/// `FOR SHARE` / `FOR KEY SHARE`, MySQL's `LOCK IN SHARE MODE`
+const LOCKING_PAIRS: &[[&str; 2]] = &[["for", "share"], ["key", "share"], ["share", "mode"]];
+
+/// Families of calls denied by prefix: advisory locks (exclusive and shared,
+/// taken and released), statistics resets, creating and dropping replication
+/// slots and origins, consuming logical changes, backups, server directory
+/// listings, adminpack's file functions, dblink and large objects.
+const ASSISTANT_DENIED_PREFIXES: &[&str] = &[
+    "pg_advisory_",
+    "pg_try_advisory_",
+    "pg_stat_reset",
+    "pg_create_",
+    "pg_drop_",
+    "pg_copy_",
+    "pg_replication_",
+    "pg_logical_slot_get_",
+    "pg_logical_emit_",
+    "pg_sync_",
+    "pg_wal_replay_",
+    "pg_backup_",
+    "pg_ls_",
+    "pg_logdir_",
+    "pg_file_",
+    "pg_logfile_",
+    "dblink",
+    "lo_",
+];
+
+/// Statements denied where a statement starts: notifications, prepared
+/// statements (whose text the checks can't read), MySQL's HANDLER, and
+/// SQLite's ATTACH (which creates files) and PRAGMA.
+const ASSISTANT_DENIED_STATEMENTS: &[&str] = &[
+    "listen", "notify", "unlisten", "prepare", "handler", "attach", "detach", "pragma",
+];
+
+fn denied_call(name: &str) -> bool {
+    ASSISTANT_DENIED_CALLS.contains(&name)
+        || ASSISTANT_DENIED_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Why SQL the AI assistant wrote must not run: any write (DELETE, DROP and
+/// the rest, as `first_write_keyword` finds them), a denied call or statement,
+/// or a sequence advancing. `None` when it only reads.
+pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
+    if let Some(keyword) = first_write_keyword(sql, engine) {
+        return Some(keyword);
+    }
+    // Like `first_write_keyword`: whether `\'` escapes depends on server settings,
+    // so read the text both ways and block if either finds something
+    let escapes: &[bool] = match engine {
+        Engine::Mysql | Engine::Postgres => &[false, true],
+        _ => &[false],
+    };
+    escapes.iter().find_map(|&backslash_escapes| {
+        let tokens = tokenize(
+            sql,
+            Lexing {
+                mysql_comments: engine == Engine::Mysql,
+                bracket_idents: matches!(
+                    engine,
+                    Engine::Mssql | Engine::Babelfish | Engine::Sqlite
+                ),
+                backslash_escapes,
+            },
+        );
+        assistant_denied(&tokens, engine)
+    })
+}
+
+/// Statements that start, end or split a transaction. Assistant SQL runs inside
+/// a transaction the app opens and rolls back, so it may not manage its own.
+/// T-SQL's `BEGIN` also opens a block, so there only `BEGIN TRAN…` counts.
+fn transaction_control(tokens: &[Token], i: usize, name: &str, engine: Engine) -> Option<String> {
+    let next = match tokens.get(i + 1) {
+        Some(Token::Word(w)) => w.as_str(),
+        _ => "",
+    };
+    let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
+    let starts_statement = i == 0 || tokens[i - 1] == Token::Punct(';');
+    let found = match name {
+        "commit" | "rollback" | "savepoint" => true,
+        "begin" if tsql => matches!(next, "tran" | "transaction" | "distributed"),
+        "begin" => tokens.get(i + 1) != Some(&Token::Punct('(')),
+        "start" => next == "transaction",
+        "save" => tsql && matches!(next, "tran" | "transaction"),
+        "abort" | "end" | "release" => !tsql && starts_statement,
+        _ => false,
+    };
+    found.then(|| {
+        if next.is_empty() {
+            name.to_uppercase()
+        } else {
+            format!("{name} {next}").to_uppercase()
+        }
+    })
+}
+
+fn assistant_denied(tokens: &[Token], engine: Engine) -> Option<String> {
+    let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
+    let word = |i: usize| match tokens.get(i) {
+        Some(Token::Word(w) | Token::QuotedIdent(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    tokens.iter().enumerate().find_map(|(i, token)| {
+        let name = match token {
+            // Quoted names count too: `"pg_read_file"(…)`, `[openrowset](…)`, `` `load_file`(…) ``
+            Token::Word(w) | Token::QuotedIdent(w) => w.as_str(),
+            _ => return None,
+        };
+        // PostgreSQL's U&"\0070g_read_file" spells a name with escapes this check can't read
+        if engine == Engine::Postgres
+            && name == "u"
+            && tokens.get(i + 1) == Some(&Token::Punct('&'))
+            && matches!(
+                tokens.get(i + 2),
+                Some(Token::QuotedIdent(_) | Token::Literal)
+            )
+        {
+            return Some("U& (escaped names)".into());
+        }
+        // T-SQL's `NEXT VALUE FOR seq` advances a sequence
+        if name == "next" && word(i + 1) == Some("value") && word(i + 2) == Some("for") {
+            return Some("NEXT VALUE FOR".into());
+        }
+        let bare =
+            matches!(token, Token::Word(_)) && !(i > 0 && tokens[i - 1] == Token::Punct('.'));
+        if bare && let Some(control) = transaction_control(tokens, i, name, engine) {
+            return Some(control);
+        }
+        if bare && tsql && TSQL_LOCK_HINTS.contains(&name) {
+            return Some(format!("WITH ({})", name.to_uppercase()));
+        }
+        if bare && word(i + 1).is_some_and(|next| LOCKING_PAIRS.contains(&[name, next])) {
+            return Some(format!("{name} {}", word(i + 1).unwrap_or_default()).to_uppercase());
+        }
+        let call = tokens.get(i + 1) == Some(&Token::Punct('('));
+        let starts_statement = i == 0 || tokens[i - 1] == Token::Punct(';');
+        let denied = (call && denied_call(name))
+            || (starts_statement
+                && matches!(token, Token::Word(_))
+                && ASSISTANT_DENIED_STATEMENTS.contains(&name));
+        denied.then(|| name.to_uppercase())
+    })
+}
+
 fn write_keyword(tokens: &[Token], engine: Engine) -> Option<String> {
     let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
     tokens
@@ -371,8 +582,9 @@ fn session_write(tokens: &[Token], engine: Engine) -> Option<String> {
         let words: Vec<&str> = statement
             .iter()
             .map(|t| match t {
-                // `@@session.x` and `@@x` name the same setting as `x`
-                Token::Word(w) => w.trim_start_matches("@@"),
+                // `@@session.x` and `@@x` name the same setting as `x`, and
+                // `SET "default_transaction_read_only" = off` the same as unquoted
+                Token::Word(w) | Token::QuotedIdent(w) => w.trim_start_matches("@@"),
                 _ => "",
             })
             .collect();
@@ -381,10 +593,12 @@ fn session_write(tokens: &[Token], engine: Engine) -> Option<String> {
             return Some("READ WRITE".into());
         }
         // `SELECT set_config('default_transaction_read_only', 'off', false)`
+        // Quoted too: `SELECT "set_config"(…)`
         if engine == Engine::Postgres
-            && statement
-                .windows(2)
-                .any(|w| w[0] == Token::Word("set_config".into()) && w[1] == Token::Punct('('))
+            && statement.windows(2).any(|w| {
+                matches!(&w[0], Token::Word(n) | Token::QuotedIdent(n) if n == "set_config")
+                    && w[1] == Token::Punct('(')
+            })
         {
             return Some("SET_CONFIG".into());
         }
@@ -423,7 +637,7 @@ fn batch_procedure_call(batch: String) -> Option<String> {
         // `label:` before a statement
         Token::Word(_) if tokens.get(1) == Some(&Token::Punct(':')) => return None,
         Token::Word(w) => w.clone(),
-        Token::QuotedIdent => "procedure".to_string(),
+        Token::QuotedIdent(_) => "procedure".to_string(),
         _ => return None,
     };
     Some(format!("EXEC (calling {name} without EXEC)"))
@@ -440,6 +654,127 @@ mod tests {
 
     fn ms(sql: &str) -> Option<String> {
         first_write_keyword(sql, Engine::Mssql)
+    }
+
+    #[test]
+    fn assistant_queries_only_read() {
+        use super::assistant_blocked;
+        let pg = |sql| assistant_blocked(sql, Engine::Postgres);
+        assert_eq!(pg("SELECT id, name FROM users WHERE id = 1"), None);
+        assert_eq!(pg("SELECT 'pg_terminate_backend' AS note"), None);
+        assert_eq!(pg("SELECT t.listen FROM t"), None);
+        assert_eq!(pg("DELETE FROM users").as_deref(), Some("DELETE"));
+        assert_eq!(pg("DROP TABLE users").as_deref(), Some("DROP"));
+        assert_eq!(pg("TRUNCATE users").as_deref(), Some("TRUNCATE"));
+        assert_eq!(
+            pg("SELECT pg_terminate_backend(pid) FROM pg_stat_activity").as_deref(),
+            Some("PG_TERMINATE_BACKEND")
+        );
+        assert_eq!(
+            pg("SELECT pg_catalog.pg_read_file('/etc/passwd')").as_deref(),
+            Some("PG_READ_FILE")
+        );
+        assert_eq!(
+            pg("SELECT * FROM dblink('host=x', 'select 1') AS t(a int)").as_deref(),
+            Some("DBLINK")
+        );
+        let my = |sql| assistant_blocked(sql, Engine::Mysql);
+        assert_eq!(
+            my("SELECT LOAD_FILE('/etc/passwd')").as_deref(),
+            Some("LOAD_FILE")
+        );
+        let ms = |sql| assistant_blocked(sql, Engine::Mssql);
+        assert!(ms("SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'select 1')").is_some());
+        assert!(ms("EXEC xp_cmdshell 'dir'").is_some());
+        // Quoted and escaped spellings of denied functions
+        assert!(pg("SELECT \"pg_terminate_backend\"(pid) FROM pg_stat_activity").is_some());
+        assert!(pg("SELECT pg_catalog.\"pg_read_file\"('/etc/passwd')").is_some());
+        assert!(pg("SELECT U&\"\\0070g_read_file\"('/etc/passwd')").is_some());
+        assert!(ms("SELECT * FROM [OPENROWSET]('x', 'y', 'z')").is_some());
+        assert!(my("SELECT `load_file`('/etc/passwd')").is_some());
+        // Every advisory lock, directory listing, dblink call and string-query runner
+        for sql in [
+            "SELECT pg_advisory_lock_shared(1)",
+            "SELECT pg_try_advisory_lock_shared(1)",
+            "SELECT pg_advisory_unlock_all()",
+            "SELECT * FROM pg_ls_logdir()",
+            "SELECT * FROM pg_ls_waldir()",
+            "SELECT * FROM pg_ls_tmpdir()",
+            "SELECT dblink_send_query('c', 'select 1')",
+            "SELECT dblink_open('c', 'select 1')",
+            "SELECT query_to_xml('select pg_read_file(''x'')', true, true, '')",
+            "SELECT lo_get(1)",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+        }
+        assert_eq!(pg("SELECT \"name\", u.\"lock\" FROM users u"), None);
+        // A backslash-escaped quote can't hide a call: MySQL and E'' strings read `\'` as a quote
+        assert!(my(r"SELECT 'a\'', load_file('/etc/passwd'), ''").is_some());
+        assert!(pg(r"SELECT E'a\'', pg_read_file('/etc/passwd'), ''").is_some());
+        // Names that only look like denied ones: columns, tables, quoted columns
+        assert_eq!(
+            pg("SELECT lo_price, handler, notify, listen FROM lineorder"),
+            None
+        );
+        assert_eq!(pg("SELECT * FROM dblink_logs WHERE pg_file_id = 1"), None);
+        assert_eq!(pg("SELECT \"listen\", \"prepare\" FROM t"), None);
+        assert_eq!(my("SELECT attach, pragma FROM t"), None);
+        // State that changes even in a read-only transaction
+        for sql in [
+            "SELECT pg_stat_reset()",
+            "SELECT pg_stat_reset_shared('bgwriter')",
+            "SELECT pg_stat_statements_reset()",
+            "SELECT pg_drop_replication_slot('x')",
+            "SELECT * FROM pg_create_logical_replication_slot('x', 'pgoutput')",
+            "SELECT * FROM pg_logical_slot_get_changes('x', NULL, NULL)",
+            "SELECT nextval('s')",
+            "LISTEN ch",
+            "SELECT 1; PREPARE p AS SELECT 1",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+        }
+        assert!(ms("SELECT NEXT VALUE FOR dbo.order_seq").is_some());
+        // Quoted settings and set_config can't switch read-only mode off
+        assert!(
+            pg("SELECT \"set_config\"('default_transaction_read_only', 'off', false)").is_some()
+        );
+        assert!(pg("SET \"default_transaction_read_only\" = off").is_some());
+        // The app owns the transaction assistant SQL runs in
+        for sql in [
+            "BEGIN; SELECT 1",
+            "START TRANSACTION",
+            "SELECT 1; COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT a",
+            "END",
+            "ABORT",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+            assert!(my(sql).is_some(), "{sql}");
+        }
+        assert!(ms("BEGIN TRAN; SELECT 1").is_some());
+        assert!(ms("SELECT 1 COMMIT").is_some());
+        assert_eq!(ms("IF 1 = 1 BEGIN SELECT 1 END"), None);
+        assert_eq!(pg("SELECT CASE WHEN a THEN 1 END FROM t"), None);
+        // Locks other sessions would wait on
+        assert!(ms("SELECT TOP 1 * FROM dbo.orders WITH (TABLOCKX, HOLDLOCK)").is_some());
+        assert!(ms("SELECT * FROM t WITH (UPDLOCK)").is_some());
+        assert!(pg("SELECT * FROM t FOR SHARE").is_some());
+        assert!(pg("SELECT * FROM t FOR KEY SHARE").is_some());
+        assert!(my("SELECT * FROM t LOCK IN SHARE MODE").is_some());
+        assert_eq!(ms("SELECT * FROM t WITH (NOLOCK)"), None);
+        // SQL Server's file and log readers
+        assert!(
+            ms("SELECT * FROM sys.fn_xe_file_target_read_file('C:\\x\\*.xel', NULL, NULL, NULL)")
+                .is_some()
+        );
+        assert!(ms("SELECT * FROM sys.fn_get_audit_file('x', DEFAULT, DEFAULT)").is_some());
+        assert!(ms("SELECT * FROM fn_dblog(NULL, NULL)").is_some());
+        let lite = |sql| assistant_blocked(sql, Engine::Sqlite);
+        assert!(lite("SELECT load_extension('x')").is_some());
+        assert!(lite("ATTACH DATABASE 'x.db' AS x").is_some());
+        assert!(lite("PRAGMA table_info(t)").is_some());
+        assert_eq!(lite("SELECT * FROM t"), None);
     }
 
     #[test]
@@ -648,6 +983,8 @@ mod tests {
             "SET TRANSACTION READ WRITE",
             "SELECT 1; SET default_transaction_read_only = off",
             "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT \"set_config\"('default_transaction_read_only', 'off', false)",
+            "SET \"default_transaction_read_only\" = off",
         ] {
             assert!(pg(sql).is_some(), "{sql}");
         }

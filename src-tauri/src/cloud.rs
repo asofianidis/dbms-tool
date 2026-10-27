@@ -184,6 +184,11 @@ pub fn search_path() -> Option<std::ffi::OsString> {
 
 /// The first of `programs` found on PATH or in `extra_dirs`.
 pub fn locate_program(programs: &[&str]) -> Option<PathBuf> {
+    find_program(programs, &[])
+}
+
+/// Like `locate_program`, also looking in `more_dirs` (where the AI CLIs install).
+pub(crate) fn find_program(programs: &[&str], more_dirs: &[PathBuf]) -> Option<PathBuf> {
     // az and gcloud ship as .cmd wrappers on Windows, which Command won't find on its own
     let names: Vec<String> = programs
         .iter()
@@ -204,6 +209,7 @@ pub fn locate_program(programs: &[&str]) -> Option<PathBuf> {
     path_dirs
         .into_iter()
         .chain(extra_dirs())
+        .chain(more_dirs.iter().cloned())
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|candidate| is_executable(candidate))
 }
@@ -286,7 +292,7 @@ pub fn command(provider: Provider, account: &str) -> AppResult<Command> {
 
 /// A folder for CLIs that work on "the current directory" (`railway link`),
 /// keyed by what it's for so repeated runs reuse it.
-fn workdir(key: &str) -> AppResult<PathBuf> {
+pub(crate) fn workdir(key: &str) -> AppResult<PathBuf> {
     if key.is_empty()
         || !key
             .chars()

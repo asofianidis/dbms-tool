@@ -21,8 +21,10 @@ export function ImportReview({ dashboard }: { dashboard: Dashboard }): React.JSX
               Review “{dashboard.name}” before running it
             </h2>
             <p className="text-[13px] text-muted">
-              This dashboard was imported from a file. Its widgets run the queries below against
-              your connection as soon as they’re approved.
+              {dashboard.source === 'assistant'
+                ? 'The AI assistant wrote this dashboard.'
+                : 'This dashboard was imported from a file.'}{' '}
+              Its widgets run the queries below against your connection as soon as they’re approved.
               {mongo &&
                 ' On MongoDB they run as JavaScript inside the app, so only approve queries you understand and trust.'}
             </p>

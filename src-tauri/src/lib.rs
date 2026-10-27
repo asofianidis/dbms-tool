@@ -1,3 +1,4 @@
+mod ai;
 mod backup;
 mod cloud;
 mod commands;
@@ -103,6 +104,18 @@ pub fn run() {
             commands::backup_cancel,
             commands::logs_reveal,
             commands::logs_read,
+            ai::ai_status,
+            ai::ai_models,
+            ai::ai_key_status,
+            ai::ai_key_set,
+            ai::ai_key_delete,
+            ai::ai_chat,
+            ai::ai_cancel,
+            ai::ai_sql_check,
+            ai::ai_mongo_check,
+            ai::ai_sql_query,
+            ai::ai_mongo_query,
+            ai::ai_session_close,
             #[cfg(desktop)]
             updates::update_check,
         ])

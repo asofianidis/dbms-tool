@@ -51,6 +51,24 @@ fn timed_out_message(secs: u64) -> String {
     format!("Query timed out after {secs}s and was cancelled (see Settings → Results)")
 }
 
+/// What SQL the AI assistant wrote runs inside: a transaction opened before
+/// it and always rolled back after, read-only on the server where there's
+/// such a mode. So nothing it does can last: no session setting, no write a
+/// check missed, no transaction or lock left open. SQL Server has no read-only
+/// mode, but the rollback still undoes writes and releases locks.
+fn assistant_transaction(engine: Engine) -> Option<(&'static [&'static str], &'static str)> {
+    match engine {
+        Engine::Postgres => Some((&["BEGIN READ ONLY"], "ROLLBACK")),
+        Engine::Mysql => Some((&["START TRANSACTION READ ONLY"], "ROLLBACK")),
+        // The assistant's session is a connection of its own, so query_only stays there
+        Engine::Sqlite => Some((&["PRAGMA query_only = ON", "BEGIN"], "ROLLBACK")),
+        Engine::Mssql | Engine::Babelfish => {
+            Some((&["BEGIN TRANSACTION"], "IF @@TRANCOUNT > 0 ROLLBACK"))
+        }
+        Engine::Mongo | Engine::Redis => None,
+    }
+}
+
 pub struct Slot {
     pub session: Session,
     last_used: Instant,
@@ -206,6 +224,14 @@ impl Server {
         sql: &str,
         opts: &ExecOptions,
     ) -> AppResult<ExecOutput> {
+        // First, so the assistant's refusals all read the same way
+        if opts.assistant
+            && let Some(keyword) = guard::assistant_blocked(sql, self.config.engine)
+        {
+            return Err(AppError::msg(format!(
+                "SQL the AI assistant wrote can only read, and this uses {keyword}, so it was not run."
+            )));
+        }
         if (self.config.read_only || opts.read_only)
             && let Some(keyword) = guard::first_write_keyword(sql, self.config.engine)
         {
@@ -227,6 +253,7 @@ impl Server {
                 return Err(e);
             }
         };
+        let mut discard = false;
         let output = if signal.is_fired() {
             let mut out = OutputBuilder::new(opts);
             out.cancelled = true;
@@ -234,7 +261,21 @@ impl Server {
         } else {
             let mut guard = slot.lock().await;
             let deadline = Deadline::arm(opts, &signal);
-            let mut output = guard.session.execute(sql, opts, &signal).await;
+            let d1 = matches!(&guard.session, Session::Sq(s) if s.is_d1());
+            let wrap = assistant_transaction(self.config.engine).filter(|_| opts.assistant && !d1);
+            let mut output = match wrap {
+                None => guard.session.execute(sql, opts, &signal).await,
+                Some((begin, undo)) => {
+                    let out = self
+                        .in_assistant_transaction(&mut guard, begin, undo, sql, opts, &signal)
+                        .await;
+                    // Never leave the session inside a transaction: drop it if rolling back didn't end one
+                    if guard.session.in_transaction().await != Some(false) {
+                        discard = true;
+                    }
+                    out
+                }
+            };
             if let Some(secs) = deadline.and_then(Deadline::disarm) {
                 let message = timed_out_message(secs);
                 output.messages.push(Message {
@@ -256,7 +297,59 @@ impl Server {
             output
         };
         self.end(key, &signal);
+        if discard {
+            self.close_session(key).await;
+        }
         Ok(output)
+    }
+
+    /// Runs `sql` between `begin` and `undo` on a locked session: the
+    /// transaction the AI assistant's SQL always runs in, rolled back however
+    /// it ends (a fresh signal, so Stop and the deadline can't skip it).
+    async fn in_assistant_transaction(
+        &self,
+        guard: &mut Slot,
+        begin: &[&str],
+        undo: &str,
+        sql: &str,
+        opts: &ExecOptions,
+        signal: &Arc<CancelSignal>,
+    ) -> ExecOutput {
+        for statement in begin {
+            let mut out = guard
+                .session
+                .execute(statement, &ExecOptions::default(), signal)
+                .await;
+            if out.error.is_some() || out.cancelled {
+                if let Some(error) = &mut out.error {
+                    error.message = format!(
+                        "Couldn't start the read-only transaction, so the query was not run: {}",
+                        error.message
+                    );
+                    error.position = None;
+                    error.line = None;
+                }
+                let _ = guard
+                    .session
+                    .execute(
+                        undo,
+                        &ExecOptions::default(),
+                        &Arc::new(CancelSignal::default()),
+                    )
+                    .await;
+                return out;
+            }
+        }
+        let output = guard.session.execute(sql, opts, signal).await;
+        let _ = guard
+            .session
+            .execute(
+                undo,
+                &ExecOptions::default(),
+                &Arc::new(CancelSignal::default()),
+            )
+            .await;
+        output
     }
 
     pub async fn mongo_execute(
@@ -274,6 +367,12 @@ impl Server {
             return Err(AppError::msg(
                 "Only reads can run here: find, aggregate, count or distinct.",
             ));
+        }
+        if opts.assistant {
+            let database = opts.assistant_database.as_deref().unwrap_or_default();
+            if let Some(reason) = request.assistant_refusal(database) {
+                return Err(AppError::msg(format!("{reason}, so it was not run.")));
+            }
         }
         // Registered first so a cancel during the idle ping or reconnect counts;
         // `execute` returns at once on a signal that has already fired
