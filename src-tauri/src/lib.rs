@@ -61,6 +61,7 @@ pub fn run() {
             commands::connection_open,
             commands::connection_close,
             commands::ssh_trust_host_key,
+            commands::kube_contexts,
             commands::limits_set,
             commands::db_databases,
             commands::db_schemas,
@@ -116,6 +117,11 @@ pub fn run() {
             #[cfg(desktop)]
             updates::update_check,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                tunnel::shutdown();
+            }
+        });
 }
