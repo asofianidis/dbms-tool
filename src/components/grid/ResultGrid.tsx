@@ -24,6 +24,7 @@ import {
   X
 } from 'lucide-react'
 import type { Cell, ColumnMeta } from '@/lib/api'
+import { cellEditorKind } from '@/lib/cell-edit'
 import { cn } from '@/lib/cn'
 import { displayTimestamp } from '@/lib/datetime'
 import type { Dialect } from '@/lib/engines'
@@ -44,6 +45,7 @@ import { extensionCellDisplay, extensionEditText } from '@/lib/pg-extensions-awa
 import { settingsStore } from '@/lib/settings'
 import { isNumericType } from '@/lib/sql'
 import { showContextMenu, type MenuItem } from '../ContextMenu'
+import { CellEditor } from './CellEditor'
 import { ValueInspector } from './ValueInspector'
 
 const ROW_HEIGHT = 26
@@ -1019,6 +1021,9 @@ export const ResultGrid = memo(function ResultGrid({
                         width={width}
                         style={sticky}
                         initial={editText ?? value}
+                        kind={
+                          editText === null ? cellEditorKind(dialect, columns[c].typeName) : 'text'
+                        }
                         onDone={(next, moveBy) => {
                           setEditingCell(null)
                           if (next !== undefined && next !== value && next !== editText)
@@ -1132,54 +1137,5 @@ function Padded({
       {before > 0 && <div style={{ width: before }} className="shrink-0" />}
       {children}
     </>
-  )
-}
-
-function CellEditor({
-  width,
-  style,
-  initial,
-  onDone
-}: {
-  width: number
-  style?: React.CSSProperties
-  initial: Cell
-  onDone: (value: Cell | undefined, move?: Pos) => void
-}): React.JSX.Element {
-  const [value, setValue] = useState(initial === null ? '' : String(initial))
-  // What an empty input means; Backspace or Delete on an empty input switches it
-  const [emptyIsNull, setEmptyIsNull] = useState(initial === null)
-  const result = (): Cell => (value === '' && emptyIsNull ? null : value)
-  const done = useRef(false)
-  const finish = (v: Cell | undefined, move?: Pos): void => {
-    if (done.current) return
-    done.current = true
-    onDone(v, move)
-  }
-  return (
-    <div className="relative z-10 shrink-0" style={{ width, ...style }}>
-      <input
-        autoFocus
-        value={value}
-        placeholder={emptyIsNull ? 'NULL' : 'empty string'}
-        title="Backspace on an empty value switches between NULL and empty string"
-        onChange={(e) => setValue(e.target.value)}
-        onFocus={(e) => e.target.select()}
-        onBlur={() => finish(result())}
-        onKeyDown={(e) => {
-          e.stopPropagation()
-          if (e.key === 'Enter') finish(result(), { r: 1, c: 0 })
-          else if (e.key === 'Tab') {
-            e.preventDefault()
-            finish(result(), { r: 0, c: e.shiftKey ? -1 : 1 })
-          } else if (e.key === 'Escape') finish(undefined)
-          else if ((e.key === 'Backspace' || e.key === 'Delete') && value === '') {
-            e.preventDefault()
-            setEmptyIsNull((n) => !n)
-          }
-        }}
-        className="absolute inset-0 z-10 h-full w-full bg-raised px-2 font-mono text-[12px] text-bright outline outline-2 -outline-offset-2 outline-accent placeholder:text-faint placeholder:italic"
-      />
-    </div>
   )
 }
