@@ -98,12 +98,14 @@ export function CellEditor({
     if (to && (boxRef.current?.contains(to) || panelRef.current?.contains(to))) return
     // The window lost focus (a native picker, another app): keep editing
     if (!document.hasFocus()) return
-    const next = panel ? panelValue.current() : badJson ? undefined : value
+    // Commit the field focus left: the panel's draft, or the inline input edited after it
+    const fromPanel = panel && !!panelRef.current?.contains(e.target as Node)
+    const next = fromPanel ? panelValue.current() : badJson ? undefined : value
     if (next === undefined) {
       // Enter and Apply refuse invalid JSON, so clicking away doesn't save it either
       toast('Invalid JSON was not saved', 'error')
       finish(undefined)
-    } else finish(panel ? settle(next) : result())
+    } else finish(fromPanel ? settle(next) : result())
   }
 
   const closePanel = (): void => {
