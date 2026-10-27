@@ -14,6 +14,7 @@ import {
 } from '@/lib/cell-edit'
 import { cn } from '@/lib/cn'
 import { isMod } from '@/lib/keys'
+import { toast } from '@/lib/toast'
 import { CodeEditor } from '../editor/CodeEditor'
 import { Button } from '../ui'
 
@@ -49,8 +50,8 @@ export function CellEditor({
   const inputRef = useRef<HTMLInputElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
-  // The open panel's value, committed when focus leaves the editor altogether
-  const panelValue = useRef<() => string>(() => value)
+  // The open panel's value, committed when focus leaves the editor altogether; undefined when invalid
+  const panelValue = useRef<() => string | undefined>(() => value)
   const result = (): Cell => (value === '' && emptyIsNull ? null : value)
   const done = useRef(false)
   const finish = (v: Cell | undefined, move?: Move): void => {
@@ -67,10 +68,13 @@ export function CellEditor({
   /** A panel's value, or the cell as it was when the panel only re-spaced or re-quoted it */
   const settle = (v: string): Cell => {
     if (v === value) return result()
+    // A cleared JSON editor means NULL; '' isn't JSON
+    if (kind === 'json' && v === '') return null
     if (
       kind === 'json' &&
-      (v === '' ||
-        (isValidJson(v) && isValidJson(value) && respaceJson(v, 0) === respaceJson(value, 0)))
+      isValidJson(v) &&
+      isValidJson(value) &&
+      respaceJson(v, 0) === respaceJson(value, 0)
     )
       return result()
     if (kind === 'array' && array && v === formatPgArray(array)) return result()
@@ -94,7 +98,12 @@ export function CellEditor({
     if (to && (boxRef.current?.contains(to) || panelRef.current?.contains(to))) return
     // The window lost focus (a native picker, another app): keep editing
     if (!document.hasFocus()) return
-    finish(panel ? settle(panelValue.current()) : result())
+    const next = panel ? panelValue.current() : badJson ? undefined : value
+    if (next === undefined) {
+      // Enter and Apply refuse invalid JSON, so clicking away doesn't save it either
+      toast('Invalid JSON was not saved', 'error')
+      finish(undefined)
+    } else finish(panel ? settle(next) : result())
   }
 
   const closePanel = (): void => {
@@ -257,7 +266,7 @@ function JsonPanel({
   onCancel
 }: {
   initial: string
-  valueRef: React.RefObject<() => string>
+  valueRef: React.RefObject<() => string | undefined>
   onApply: (value: string) => void
   onCancel: () => void
 }): React.JSX.Element {
@@ -265,7 +274,7 @@ function JsonPanel({
     initial.trim() && isValidJson(initial) ? respaceJson(initial, 2) : initial
   )
   const error = jsonError(draft)
-  valueRef.current = () => (error || !draft.trim() ? draft : respaceJson(draft, 0))
+  valueRef.current = () => (error ? undefined : draft.trim() ? respaceJson(draft, 0) : '')
   const apply = (): void => {
     if (error) return
     onApply(draft.trim() ? respaceJson(draft, 0) : '')
@@ -330,7 +339,7 @@ function ArrayPanel({
   onCancel
 }: {
   initial: ArrayItem[]
-  valueRef: React.RefObject<() => string>
+  valueRef: React.RefObject<() => string | undefined>
   onApply: (items: ArrayItem[]) => void
   onCancel: () => void
 }): React.JSX.Element {
@@ -354,8 +363,11 @@ function ArrayPanel({
     setFocusAt(at)
   }
   const remove = (i: number): void => {
+    const next = Math.max(0, i - 1)
+    // Move focus off the input before it unmounts, so its blur isn't taken as leaving
+    ;((next !== i ? inputs.current[next] : null) ?? rootRef.current)?.focus()
     setItems((xs) => xs.filter((_, j) => j !== i))
-    setFocusAt(Math.max(0, i - 1))
+    setFocusAt(next)
   }
 
   return (
