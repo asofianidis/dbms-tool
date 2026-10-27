@@ -569,12 +569,15 @@ async fn postgres_materialized_views() {
         .await
         .unwrap()
         .expect("definition");
-    // No DDL in the messages: CodeQL treats what this connection reads as secret
-    assert!(ddl.starts_with("CREATE MATERIALIZED VIEW dbms_mv.totals WITH (fillfactor=80) AS\n"));
-    assert!(ddl.contains("\nWITH NO DATA;"));
-    assert!(ddl.contains("CREATE UNIQUE INDEX totals_region ON dbms_mv.totals"));
-    assert!(ddl.contains("COMMENT ON MATERIALIZED VIEW dbms_mv.totals IS 'per region';"));
-    assert!(ddl.contains("COMMENT ON COLUMN dbms_mv.totals.total IS 'it''s a sum';"));
+    // No DDL in the messages: CodeQL treats what this connection reads as secret.
+    // The view body is pg_get_viewdef's PostgreSQL 17 layout (CI's image)
+    const TOTALS_DDL: &str = "CREATE MATERIALIZED VIEW dbms_mv.totals WITH (fillfactor=80) AS\n \
+        SELECT region,\n    sum(amount) AS total\n   FROM dbms_mv.orders\n  GROUP BY region\n\
+        WITH NO DATA;\n\n\
+        CREATE UNIQUE INDEX totals_region ON dbms_mv.totals USING btree (region);\n\n\
+        COMMENT ON MATERIALIZED VIEW dbms_mv.totals IS 'per region';\n\
+        COMMENT ON COLUMN dbms_mv.totals.total IS 'it''s a sum';";
+    assert!(ddl == TOTALS_DDL);
 
     // Reading it fails until it's refreshed, with the message the table tab looks for
     let out = s
@@ -592,12 +595,13 @@ async fn postgres_materialized_views() {
         .expect("matview in completion");
     assert_eq!(totals.columns, vec!["region", "total"]);
 
-    // The DDL recreates it as it was
+    // The DDL recreates it as it was. It runs from the constant it was checked
+    // against, so what the connection read never flows back into a query
     let out = s
         .execute(
             "mv",
             "",
-            &format!("DROP MATERIALIZED VIEW dbms_mv.totals; {ddl}"),
+            &format!("DROP MATERIALIZED VIEW dbms_mv.totals; {TOTALS_DDL}"),
             &opts(),
         )
         .await
@@ -607,7 +611,7 @@ async fn postgres_materialized_views() {
         .object_definition("", Some("dbms_mv"), "totals", "materialized_view", None)
         .await
         .unwrap();
-    assert_eq!(again.as_deref(), Some(ddl.as_str()));
+    assert!(again.as_deref() == Some(TOTALS_DDL));
 
     // Populated views drop WITH NO DATA and refresh concurrently on the unique index
     let out = s
