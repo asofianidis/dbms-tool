@@ -369,7 +369,14 @@ pub async fn ai_chat(request_id: String, request: ChatRequest) -> AppResult<Chat
         )));
     }
     let token = CancellationToken::new();
-    RUNNING.lock().insert(request_id.clone(), token.clone());
+    {
+        let mut running = RUNNING.lock();
+        // Stop can reach the backend before this request does
+        if EARLY_CANCELS.lock().remove(&request_id).is_some() {
+            return Err(AppError::msg("Stopped"));
+        }
+        running.insert(request_id.clone(), token.clone());
+    }
     let _running = Running(request_id);
     let work = async {
         match request.provider {
@@ -391,10 +398,21 @@ pub async fn ai_chat(request_id: String, request: ChatRequest) -> AppResult<Chat
 
 #[tauri::command]
 pub fn ai_cancel(request_id: String) {
-    if let Some(token) = RUNNING.lock().get(&request_id) {
-        token.cancel();
+    let running = RUNNING.lock();
+    match running.get(&request_id) {
+        Some(token) => token.cancel(),
+        // Not started yet: `ai_chat` refuses it when it arrives
+        None => {
+            let mut early = EARLY_CANCELS.lock();
+            early.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+            early.insert(request_id, std::time::Instant::now());
+        }
     }
 }
+
+/// Cancels that arrived before their request, kept a minute
+static EARLY_CANCELS: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The conversation as one prompt, for the CLIs, which take a single message.
 fn transcript(messages: &[ChatMessage]) -> String {
@@ -522,7 +540,7 @@ async fn cursor(model: &str, request: &ChatRequest) -> AppResult<ChatReply> {
         request.system,
         transcript(&request.messages)
     );
-    if prompt.len() > CURSOR_MAX_PROMPT {
+    if command_line_len(&prompt) > CURSOR_MAX_PROMPT {
         return Err(AppError::msg(
             "This request is too long for the Cursor CLI. Ask about fewer tables, or use another provider.",
         ));
@@ -608,6 +626,40 @@ fn unwrap_batch_shim(path: &Path) -> AppResult<(PathBuf, Vec<String>)> {
         (Some(node), Some(script)) => Ok((node.clone(), vec![script.display().to_string()])),
         _ => Err(unreadable()),
     }
+}
+
+/// How long `arg` is once on the command line. Windows quotes it, escaping each
+/// `"` and doubling the backslashes before one, so JSON-heavy prompts grow;
+/// elsewhere arguments pass as they are.
+fn command_line_len(arg: &str) -> usize {
+    if !cfg!(windows) {
+        return arg.len();
+    }
+    windows_quoted_len(arg)
+}
+
+fn windows_quoted_len(arg: &str) -> usize {
+    let mut len = 2;
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                len += backslashes * 2 + 2;
+                backslashes = 0;
+                continue;
+            }
+            _ => {
+                len += backslashes;
+                backslashes = 0;
+            }
+        }
+        if c != '\\' {
+            len += c.len_utf16();
+        }
+    }
+    // Backslashes before the closing quote double too
+    len + backslashes * 2
 }
 
 fn first_line(text: &str) -> String {
@@ -1107,6 +1159,35 @@ mod tests {
             (plain.clone(), Vec::new())
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_command_lines_count_escapes() {
+        assert_eq!(windows_quoted_len("ab"), 4);
+        // Each quote gains a backslash, and backslashes before one double
+        assert_eq!(windows_quoted_len(r#"{"a":1}"#), 2 + 7 + 2);
+        assert_eq!(windows_quoted_len(r#"a\"b"#), 2 + 1 + 2 + 2 + 1);
+        assert_eq!(windows_quoted_len(r"a\b"), 2 + 3);
+        assert_eq!(windows_quoted_len(r"a\"), 2 + 1 + 2);
+    }
+
+    #[test]
+    fn a_cancel_before_the_request_still_stops_it() {
+        ai_cancel("early".into());
+        let reply = tauri::async_runtime::block_on(ai_chat(
+            "early".into(),
+            ChatRequest {
+                provider: Provider::Anthropic,
+                model: String::new(),
+                system: String::new(),
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: "hi".into(),
+                }],
+                base_url: None,
+            },
+        ));
+        assert!(matches!(reply, Err(e) if e.to_string() == "Stopped"));
     }
 
     #[test]

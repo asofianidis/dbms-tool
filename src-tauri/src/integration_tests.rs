@@ -2394,3 +2394,101 @@ async fn postgres_listen_notify() {
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
 }
+
+fn assistant_opts() -> ExecOptions {
+    ExecOptions {
+        read_only: true,
+        assistant: true,
+        ..ExecOptions::with_max_rows(100)
+    }
+}
+
+/// SQL the AI assistant wrote runs inside a transaction that is rolled back,
+/// so none is left open to block the user's own sessions.
+#[tokio::test]
+async fn sqlite_assistant_queries_roll_back() {
+    let dir = std::env::temp_dir().join(format!("dbms-ai-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db");
+    std::fs::write(&path, b"").unwrap();
+    let c: ConnectionConfig = serde_json::from_value(json!({
+        "id": "sqlite-ai", "name": "t", "engine": "sqlite", "host": path.to_string_lossy()
+    }))
+    .unwrap();
+    let m = Manager::default();
+    m.open(c, None).await.expect("open");
+    let s = m.get("sqlite-ai").unwrap();
+    s.execute(
+        "tab",
+        "",
+        "CREATE TABLE t (x); INSERT INTO t VALUES (1)",
+        &opts(),
+    )
+    .await
+    .unwrap();
+    let read = s
+        .execute("ai-assistant:tab", "", "SELECT x FROM t", &assistant_opts())
+        .await
+        .unwrap();
+    assert!(read.error.is_none(), "{:?}", read.error);
+    assert_eq!(read.results[0].rows.len(), 1);
+    assert_eq!(read.in_transaction, Some(false));
+    // Its own transaction statements are refused, so it can't keep one open
+    assert!(
+        s.execute("ai-assistant:tab", "", "BEGIN; SELECT 1", &assistant_opts())
+            .await
+            .is_err()
+    );
+    // The user's session can still write: no lock was left behind
+    let write = s
+        .execute("tab", "", "INSERT INTO t VALUES (2)", &opts())
+        .await
+        .unwrap();
+    assert!(write.error.is_none(), "{:?}", write.error);
+    m.close("sqlite-ai").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On PostgreSQL the transaction is read-only: a function that writes (which
+/// no keyword check can see) fails, and nothing stays locked afterwards.
+#[tokio::test]
+async fn postgres_assistant_transaction_is_read_only() {
+    let Some((m, id)) = open(Engine::Postgres, "DBMS_TEST_PG").await else {
+        return;
+    };
+    let s = m.get(&id).unwrap();
+    let user = |sql: &'static str| {
+        let s = s.clone();
+        async move {
+            let out = s.execute("tab", "", sql, &opts()).await.unwrap();
+            assert!(out.error.is_none(), "{sql}: {:?}", out.error);
+        }
+    };
+    user("DROP TABLE IF EXISTS ai_orders").await;
+    user("CREATE TABLE ai_orders (id int)").await;
+    user("INSERT INTO ai_orders VALUES (1), (2)").await;
+    user(
+        "CREATE OR REPLACE FUNCTION ai_purge() RETURNS int LANGUAGE sql AS \
+         'DELETE FROM ai_orders RETURNING 1'",
+    )
+    .await;
+    let ai_opts = assistant_opts();
+    let ai = |sql: &'static str| s.execute("ai-assistant:tab", "", sql, &ai_opts);
+    let purge = ai("SELECT ai_purge()").await.unwrap();
+    let error = purge.error.expect("the write is refused by the server");
+    assert!(error.message.contains("read-only"), "{}", error.message);
+    assert_eq!(purge.in_transaction, Some(false));
+    let rows = ai("SELECT count(*) FROM ai_orders").await.unwrap();
+    assert_eq!(cell(&rows, 0, 0, 0), json!("2"));
+    // Quoted set_config can't switch read-only off
+    assert!(
+        ai("SELECT \"set_config\"('default_transaction_read_only', 'off', false)")
+            .await
+            .is_err()
+    );
+    // No lock left: the user's session changes the table at once
+    user("ALTER TABLE ai_orders ADD COLUMN note text").await;
+    user("DROP FUNCTION ai_purge()").await;
+    user("DROP TABLE ai_orders").await;
+    m.close(&id).await;
+}

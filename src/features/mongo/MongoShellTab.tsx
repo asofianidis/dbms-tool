@@ -33,7 +33,7 @@ import {
   isProduction,
   mongoIsWrite
 } from '@/lib/production'
-import { formatDuration } from '@/lib/format'
+import { formatDuration, plural } from '@/lib/format'
 import { schemaFromSample } from '@/lib/mongo-collections'
 import { queries, queryClient } from '@/lib/queries'
 import { settingsStore } from '@/lib/settings'
@@ -60,6 +60,7 @@ import { ConnectionPicker, DatabasePicker } from '../query/pickers'
 import {
   AssistantPanel,
   assistantOpenStore,
+  insertIntoEditor,
   resetAssistant,
   sampleSession,
   stopAssistant,
@@ -413,17 +414,7 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
         ? { sql: result.script, message: message.text, line: null }
         : null
     },
-    insert: (code, mode) => {
-      const ed = editor.current
-      if (!ed) return
-      if (mode === 'replace') ed.setText(code)
-      else {
-        const selection = ed.selection()
-        const at = ed.cursor()
-        ed.replaceRange(selection?.from ?? at, selection?.to ?? at, code)
-      }
-      ed.focus()
-    },
+    insert: (code, mode) => insertIntoEditor(editor.current, code, mode),
     // Text from the model is never run through parseShell, which evaluates it as JavaScript
     writes: mongoWriteHint,
     // Parsed here as JSON (never evaluated), then the backend's own checks
@@ -445,11 +436,13 @@ export function MongoShellTab({ tab }: { tab: TabOf<'mongo'> }): React.JSX.Eleme
         request,
         maxRows
       )
-      const count = out.kind === 'documents' ? Math.min(out.documents.length, maxRows) : 1
-      return {
-        text: describeDocuments(out, maxRows),
-        summary: `${count} document${count === 1 ? '' : 's'}`
-      }
+      // distinct returns its values, count a number: say what actually went to the provider
+      const values = Array.isArray(out.value) ? Math.min(out.value.length, maxRows) : 1
+      const summary =
+        out.kind === 'documents'
+          ? plural(Math.min(out.documents.length, maxRows), 'document')
+          : plural(values, 'value')
+      return { text: describeDocuments(out, maxRows), summary }
     }
   }
 

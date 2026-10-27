@@ -41,6 +41,7 @@ import { errorMessage, toast } from '@/lib/toast'
 import { createDashboard, dashboardsStore, newWidget, uniqueDashboardName } from '@/lib/dashboards'
 import { onTabClosed, openDashboard, openSettings, promptText } from '@/lib/workspace'
 import { showMenuAt, type MenuItem } from '@/components/ContextMenu'
+import type { CodeEditorHandle } from '@/components/editor/CodeEditor'
 import { Badge, Button, Spinner } from '@/components/ui'
 import { aiStatusQuery } from './status'
 
@@ -81,7 +82,8 @@ interface Entry {
   /** A query the assistant asked to run */
   query?: {
     text: string
-    state: 'pending' | 'ran' | 'declined' | 'refused' | 'failed'
+    /** `checking` while the backend looks at it; Run shows once it can be answered */
+    state: 'checking' | 'pending' | 'running' | 'ran' | 'declined' | 'refused' | 'failed'
     note?: string
   }
   /** A failed request; never sent back */
@@ -95,6 +97,22 @@ interface Thread {
   entries: Entry[]
   busy: boolean
   requestId?: string
+}
+
+/** Puts code from an answer in an editor: over the selection or at the cursor, or replacing everything. */
+export function insertIntoEditor(
+  editor: CodeEditorHandle | null,
+  code: string,
+  mode: 'cursor' | 'replace'
+): void {
+  if (!editor) return
+  if (mode === 'replace') editor.setText(code)
+  else {
+    const selection = editor.selection()
+    const at = editor.cursor()
+    editor.replaceRange(selection?.from ?? at, selection?.to ?? at, code)
+  }
+  editor.focus()
 }
 
 /** Tabs showing the assistant panel */
@@ -179,7 +197,7 @@ export function sampleSession(tabId: string): string {
  * queries ran on: for "Clear", a connection change and a closed tab.
  */
 export function resetAssistant(tabId: string, connectionId: string): void {
-  stop(tabId)
+  stopAssistant(tabId)
   threadsStore.set((all) => {
     const { [tabId]: _, ...rest } = all
     return rest
@@ -200,21 +218,17 @@ onTabClosed((tab) => {
 
 /** Stops the request in flight, if any; a pending query is answered "don't run". */
 export function stopAssistant(tabId: string): void {
-  stop(tabId)
-}
-
-function stop(tabId: string): void {
   const run = runs.get(tabId)
   if (!run) return
   run.stopped = true
   runs.delete(tabId)
   const t = thread(tabId)
   if (t.requestId) void api.aiCancel(t.requestId)
-  for (const e of t.entries)
-    if (e.query?.state === 'pending') {
-      approvals.get(e.id)?.(false)
-      approvals.delete(e.id)
-    }
+  // Whatever its card shows, a query waiting on an answer gets "don't run"
+  for (const e of t.entries) {
+    approvals.get(e.id)?.(false)
+    approvals.delete(e.id)
+  }
 }
 
 /**
@@ -288,7 +302,7 @@ async function ask(
         content: reply.text,
         display: text,
         model: reply.model,
-        query: { text: query, state: 'pending' }
+        query: { text: query, state: 'checking' }
       })
       let refusal: string | null
       try {
@@ -307,10 +321,15 @@ async function ask(
         })
         continue
       }
-      const approved =
-        !settings.aiConfirmQueries ||
-        (await new Promise<boolean>((resolve) => approvals.set(id, resolve)))
+      let approved = true
+      if (settings.aiConfirmQueries) {
+        // The answer is registered before Run shows, so no click is lost
+        const answer = new Promise<boolean>((resolve) => approvals.set(id, resolve))
+        patchQuery(tabId, id, { state: 'pending' })
+        approved = await answer
+      }
       approvals.delete(id)
+      if (approved && !stopped()) patchQuery(tabId, id, { state: 'running' })
       if (stopped()) {
         patchQuery(tabId, id, { state: 'declined' })
         return
@@ -516,11 +535,14 @@ export function AssistantPanel({
         {current.entries.map((entry) => (
           <EntryView key={entry.id} entry={entry} target={target} />
         ))}
-        {current.busy && !current.entries.some((e) => e.query?.state === 'pending') && (
-          <div className="flex items-center gap-2 text-xs text-muted">
-            <Spinner className="size-3.5" /> Thinking…
-          </div>
-        )}
+        {current.busy &&
+          !current.entries.some(
+            (e) => e.query && ['checking', 'pending', 'running'].includes(e.query.state)
+          ) && (
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <Spinner className="size-3.5" /> Thinking…
+            </div>
+          )}
       </div>
 
       <div className="shrink-0 space-y-2 border-t border-line p-2">
@@ -595,7 +617,7 @@ export function AssistantPanel({
                 size="icon-sm"
                 variant="danger"
                 title="Stop"
-                onClick={() => stop(target.tabId)}
+                onClick={() => stopAssistant(target.tabId)}
               >
                 <Square className="size-3 fill-current" />
               </Button>
@@ -737,15 +759,19 @@ function QueryCard({
     >
       <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-muted">
         <Database className="size-3" />
-        {query.state === 'pending'
-          ? 'The assistant wants to run this read-only query'
-          : query.state === 'ran'
-            ? 'Ran for the assistant'
-            : query.state === 'declined'
-              ? 'Not run'
-              : query.state === 'refused'
-                ? 'Refused'
-                : 'Failed'}
+        {query.state === 'checking'
+          ? 'Checking the query…'
+          : query.state === 'pending'
+            ? 'The assistant wants to run this read-only query'
+            : query.state === 'running'
+              ? 'Running…'
+              : query.state === 'ran'
+                ? 'Ran for the assistant'
+                : query.state === 'declined'
+                  ? 'Not run'
+                  : query.state === 'refused'
+                    ? 'Refused'
+                    : 'Failed'}
       </div>
       <pre className="overflow-x-auto font-mono text-xs text-bright">{query.text}</pre>
       {query.note && (

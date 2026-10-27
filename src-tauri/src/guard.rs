@@ -368,9 +368,28 @@ const ASSISTANT_DENIED_CALLS: &[&str] = &[
     "opendatasource",
     "openquery",
     "xp_cmdshell",
+    "set_config",
     // SQLite
     "load_extension",
+    // SQL Server: server files, audit and trace files, and the transaction log
+    "fn_xe_file_target_read_file",
+    "fn_xe_target_read_file",
+    "fn_get_audit_file",
+    "fn_trace_gettable",
+    "fn_dblog",
+    "fn_dump_dblog",
+    "fn_full_dblog",
 ];
+
+/// T-SQL table hints that take or hold locks other sessions wait on; SQL Server
+/// has no read-only mode to stop them
+const TSQL_LOCK_HINTS: &[&str] = &[
+    "tablockx", "tablock", "xlock", "updlock", "holdlock", "paglock",
+];
+
+/// Row-locking clauses (`FOR UPDATE` is already a write): PostgreSQL's
+/// `FOR SHARE` / `FOR KEY SHARE`, MySQL's `LOCK IN SHARE MODE`
+const LOCKING_PAIRS: &[[&str; 2]] = &[["for", "share"], ["key", "share"], ["share", "mode"]];
 
 /// Families of calls denied by prefix: advisory locks (exclusive and shared,
 /// taken and released), statistics resets, creating and dropping replication
@@ -440,7 +459,36 @@ pub fn assistant_blocked(sql: &str, engine: Engine) -> Option<String> {
     })
 }
 
+/// Statements that start, end or split a transaction. Assistant SQL runs inside
+/// a transaction the app opens and rolls back, so it may not manage its own.
+/// T-SQL's `BEGIN` also opens a block, so there only `BEGIN TRAN…` counts.
+fn transaction_control(tokens: &[Token], i: usize, name: &str, engine: Engine) -> Option<String> {
+    let next = match tokens.get(i + 1) {
+        Some(Token::Word(w)) => w.as_str(),
+        _ => "",
+    };
+    let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
+    let starts_statement = i == 0 || tokens[i - 1] == Token::Punct(';');
+    let found = match name {
+        "commit" | "rollback" | "savepoint" => true,
+        "begin" if tsql => matches!(next, "tran" | "transaction" | "distributed"),
+        "begin" => tokens.get(i + 1) != Some(&Token::Punct('(')),
+        "start" => next == "transaction",
+        "save" => tsql && matches!(next, "tran" | "transaction"),
+        "abort" | "end" | "release" => !tsql && starts_statement,
+        _ => false,
+    };
+    found.then(|| {
+        if next.is_empty() {
+            name.to_uppercase()
+        } else {
+            format!("{name} {next}").to_uppercase()
+        }
+    })
+}
+
 fn assistant_denied(tokens: &[Token], engine: Engine) -> Option<String> {
+    let tsql = matches!(engine, Engine::Mssql | Engine::Babelfish);
     let word = |i: usize| match tokens.get(i) {
         Some(Token::Word(w) | Token::QuotedIdent(w)) => Some(w.as_str()),
         _ => None,
@@ -465,6 +513,17 @@ fn assistant_denied(tokens: &[Token], engine: Engine) -> Option<String> {
         // T-SQL's `NEXT VALUE FOR seq` advances a sequence
         if name == "next" && word(i + 1) == Some("value") && word(i + 2) == Some("for") {
             return Some("NEXT VALUE FOR".into());
+        }
+        let bare =
+            matches!(token, Token::Word(_)) && !(i > 0 && tokens[i - 1] == Token::Punct('.'));
+        if bare && let Some(control) = transaction_control(tokens, i, name, engine) {
+            return Some(control);
+        }
+        if bare && tsql && TSQL_LOCK_HINTS.contains(&name) {
+            return Some(format!("WITH ({})", name.to_uppercase()));
+        }
+        if bare && word(i + 1).is_some_and(|next| LOCKING_PAIRS.contains(&[name, next])) {
+            return Some(format!("{name} {}", word(i + 1).unwrap_or_default()).to_uppercase());
         }
         let call = tokens.get(i + 1) == Some(&Token::Punct('('));
         let starts_statement = i == 0 || tokens[i - 1] == Token::Punct(';');
@@ -523,8 +582,9 @@ fn session_write(tokens: &[Token], engine: Engine) -> Option<String> {
         let words: Vec<&str> = statement
             .iter()
             .map(|t| match t {
-                // `@@session.x` and `@@x` name the same setting as `x`
-                Token::Word(w) => w.trim_start_matches("@@"),
+                // `@@session.x` and `@@x` name the same setting as `x`, and
+                // `SET "default_transaction_read_only" = off` the same as unquoted
+                Token::Word(w) | Token::QuotedIdent(w) => w.trim_start_matches("@@"),
                 _ => "",
             })
             .collect();
@@ -533,10 +593,12 @@ fn session_write(tokens: &[Token], engine: Engine) -> Option<String> {
             return Some("READ WRITE".into());
         }
         // `SELECT set_config('default_transaction_read_only', 'off', false)`
+        // Quoted too: `SELECT "set_config"(…)`
         if engine == Engine::Postgres
-            && statement
-                .windows(2)
-                .any(|w| w[0] == Token::Word("set_config".into()) && w[1] == Token::Punct('('))
+            && statement.windows(2).any(|w| {
+                matches!(&w[0], Token::Word(n) | Token::QuotedIdent(n) if n == "set_config")
+                    && w[1] == Token::Punct('(')
+            })
         {
             return Some("SET_CONFIG".into());
         }
@@ -672,6 +734,42 @@ mod tests {
             assert!(pg(sql).is_some(), "{sql}");
         }
         assert!(ms("SELECT NEXT VALUE FOR dbo.order_seq").is_some());
+        // Quoted settings and set_config can't switch read-only mode off
+        assert!(
+            pg("SELECT \"set_config\"('default_transaction_read_only', 'off', false)").is_some()
+        );
+        assert!(pg("SET \"default_transaction_read_only\" = off").is_some());
+        // The app owns the transaction assistant SQL runs in
+        for sql in [
+            "BEGIN; SELECT 1",
+            "START TRANSACTION",
+            "SELECT 1; COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT a",
+            "END",
+            "ABORT",
+        ] {
+            assert!(pg(sql).is_some(), "{sql}");
+            assert!(my(sql).is_some(), "{sql}");
+        }
+        assert!(ms("BEGIN TRAN; SELECT 1").is_some());
+        assert!(ms("SELECT 1 COMMIT").is_some());
+        assert_eq!(ms("IF 1 = 1 BEGIN SELECT 1 END"), None);
+        assert_eq!(pg("SELECT CASE WHEN a THEN 1 END FROM t"), None);
+        // Locks other sessions would wait on
+        assert!(ms("SELECT TOP 1 * FROM dbo.orders WITH (TABLOCKX, HOLDLOCK)").is_some());
+        assert!(ms("SELECT * FROM t WITH (UPDLOCK)").is_some());
+        assert!(pg("SELECT * FROM t FOR SHARE").is_some());
+        assert!(pg("SELECT * FROM t FOR KEY SHARE").is_some());
+        assert!(my("SELECT * FROM t LOCK IN SHARE MODE").is_some());
+        assert_eq!(ms("SELECT * FROM t WITH (NOLOCK)"), None);
+        // SQL Server's file and log readers
+        assert!(
+            ms("SELECT * FROM sys.fn_xe_file_target_read_file('C:\\x\\*.xel', NULL, NULL, NULL)")
+                .is_some()
+        );
+        assert!(ms("SELECT * FROM sys.fn_get_audit_file('x', DEFAULT, DEFAULT)").is_some());
+        assert!(ms("SELECT * FROM fn_dblog(NULL, NULL)").is_some());
         let lite = |sql| assistant_blocked(sql, Engine::Sqlite);
         assert!(lite("SELECT load_extension('x')").is_some());
         assert!(lite("ATTACH DATABASE 'x.db' AS x").is_some());
@@ -885,6 +983,8 @@ mod tests {
             "SET TRANSACTION READ WRITE",
             "SELECT 1; SET default_transaction_read_only = off",
             "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT \"set_config\"('default_transaction_read_only', 'off', false)",
+            "SET \"default_transaction_read_only\" = off",
         ] {
             assert!(pg(sql).is_some(), "{sql}");
         }

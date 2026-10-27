@@ -589,6 +589,7 @@ const ADMIN_STAGES: &[&str] = &[
     "$planCacheStats",
     "$querySettings",
     "$shardedDataDistribution",
+    "$queryStats",
 ];
 
 /// Walks a filter or pipeline (nested `pipeline`s and `$facet`s included) for
@@ -1594,6 +1595,7 @@ mod tests {
             json!({ "op": "aggregate", "database": "shop", "collection": "o",
                     "pipeline": [{ "$facet": { "a": [{ "$lookup": { "from": "system.js", "as": "y" } }] } }] }),
             json!({ "op": "aggregate", "database": "admin", "collection": "o", "pipeline": [{ "$currentOp": {} }] }),
+            json!({ "op": "aggregate", "database": "shop", "collection": "o", "pipeline": [{ "$queryStats": {} }] }),
             json!({ "op": "aggregate", "database": "shop", "collection": "o", "pipeline": [{ "$out": "x" }] }),
             json!({ "op": "deleteMany", "database": "shop", "collection": "o", "filter": {} }),
         ] {

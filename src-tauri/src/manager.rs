@@ -51,12 +51,27 @@ fn timed_out_message(secs: u64) -> String {
     format!("Query timed out after {secs}s and was cancelled (see Settings → Results)")
 }
 
+/// What SQL the AI assistant wrote runs inside: a transaction opened before
+/// it and always rolled back after, read-only on the server where there's
+/// such a mode. So nothing it does can last: no session setting, no write a
+/// check missed, no transaction or lock left open. SQL Server has no read-only
+/// mode, but the rollback still undoes writes and releases locks.
+fn assistant_transaction(engine: Engine) -> Option<(&'static [&'static str], &'static str)> {
+    match engine {
+        Engine::Postgres => Some((&["BEGIN READ ONLY"], "ROLLBACK")),
+        Engine::Mysql => Some((&["START TRANSACTION READ ONLY"], "ROLLBACK")),
+        // The assistant's session is a connection of its own, so query_only stays there
+        Engine::Sqlite => Some((&["PRAGMA query_only = ON", "BEGIN"], "ROLLBACK")),
+        Engine::Mssql | Engine::Babelfish => {
+            Some((&["BEGIN TRANSACTION"], "IF @@TRANCOUNT > 0 ROLLBACK"))
+        }
+        Engine::Mongo | Engine::Redis => None,
+    }
+}
+
 pub struct Slot {
     pub session: Session,
     last_used: Instant,
-    /// The session was put in read-only mode for AI assistant queries; cleared
-    /// whenever the connection behind it is replaced
-    read_only_mode: bool,
 }
 
 /// The MongoDB client, replaced when it stops answering after sitting idle.
@@ -143,7 +158,6 @@ impl Server {
                     tunnel::ensure(&self.config.id).await?;
                     guard.session =
                         Session::connect(&self.config, self.password.as_deref(), database).await?;
-                    guard.read_only_mode = false;
                 } else if wrong_db {
                     match &mut guard.session {
                         Session::My(s) => s.use_database(database).await?,
@@ -170,7 +184,6 @@ impl Server {
         let slot = Arc::new(Mutex::new(Slot {
             session,
             last_used: Instant::now(),
-            read_only_mode: false,
         }));
         sessions.insert(key, slot.clone());
         Ok(slot)
@@ -240,6 +253,7 @@ impl Server {
                 return Err(e);
             }
         };
+        let mut discard = false;
         let output = if signal.is_fired() {
             let mut out = OutputBuilder::new(opts);
             out.cancelled = true;
@@ -247,36 +261,20 @@ impl Server {
         } else {
             let mut guard = slot.lock().await;
             let deadline = Deadline::arm(opts, &signal);
-            // Assistant SQL also runs in the server's read-only mode where there is
-            // one, set once per connection (read-only connections already are)
-            let setup = match self.config.engine {
-                _ if !opts.assistant || self.config.read_only || guard.read_only_mode => None,
-                Engine::Postgres => Some("SET default_transaction_read_only = on"),
-                Engine::Mysql => Some("SET SESSION TRANSACTION READ ONLY"),
-                _ => None,
-            };
-            let refused = match setup {
-                Some(setup) => {
-                    let out = guard
-                        .session
-                        .execute(setup, &ExecOptions::default(), &signal)
+            let d1 = matches!(&guard.session, Session::Sq(s) if s.is_d1());
+            let wrap = assistant_transaction(self.config.engine).filter(|_| opts.assistant && !d1);
+            let mut output = match wrap {
+                None => guard.session.execute(sql, opts, &signal).await,
+                Some((begin, undo)) => {
+                    let out = self
+                        .in_assistant_transaction(&mut guard, begin, undo, sql, opts, &signal)
                         .await;
-                    guard.read_only_mode = out.error.is_none();
-                    out.error.is_some().then_some(out)
-                }
-                None => None,
-            };
-            let mut output = match refused {
-                Some(mut out) => {
-                    if let Some(error) = &mut out.error {
-                        error.message = format!(
-                            "Couldn't put the session in read-only mode, so the query was not run: {}",
-                            error.message
-                        );
+                    // Never leave the session inside a transaction: drop it if rolling back didn't end one
+                    if guard.session.in_transaction().await != Some(false) {
+                        discard = true;
                     }
                     out
                 }
-                None => guard.session.execute(sql, opts, &signal).await,
             };
             if let Some(secs) = deadline.and_then(Deadline::disarm) {
                 let message = timed_out_message(secs);
@@ -299,7 +297,59 @@ impl Server {
             output
         };
         self.end(key, &signal);
+        if discard {
+            self.close_session(key).await;
+        }
         Ok(output)
+    }
+
+    /// Runs `sql` between `begin` and `undo` on a locked session: the
+    /// transaction the AI assistant's SQL always runs in, rolled back however
+    /// it ends (a fresh signal, so Stop and the deadline can't skip it).
+    async fn in_assistant_transaction(
+        &self,
+        guard: &mut Slot,
+        begin: &[&str],
+        undo: &str,
+        sql: &str,
+        opts: &ExecOptions,
+        signal: &Arc<CancelSignal>,
+    ) -> ExecOutput {
+        for statement in begin {
+            let mut out = guard
+                .session
+                .execute(statement, &ExecOptions::default(), signal)
+                .await;
+            if out.error.is_some() || out.cancelled {
+                if let Some(error) = &mut out.error {
+                    error.message = format!(
+                        "Couldn't start the read-only transaction, so the query was not run: {}",
+                        error.message
+                    );
+                    error.position = None;
+                    error.line = None;
+                }
+                let _ = guard
+                    .session
+                    .execute(
+                        undo,
+                        &ExecOptions::default(),
+                        &Arc::new(CancelSignal::default()),
+                    )
+                    .await;
+                return out;
+            }
+        }
+        let output = guard.session.execute(sql, opts, signal).await;
+        let _ = guard
+            .session
+            .execute(
+                undo,
+                &ExecOptions::default(),
+                &Arc::new(CancelSignal::default()),
+            )
+            .await;
+        output
     }
 
     pub async fn mongo_execute(
@@ -690,7 +740,6 @@ impl Manager {
                     Arc::new(Mutex::new(Slot {
                         session,
                         last_used: Instant::now(),
-                        read_only_mode: false,
                     })),
                 );
             }

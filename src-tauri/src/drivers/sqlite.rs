@@ -379,7 +379,7 @@ impl Backend {
 }
 
 impl SqSession {
-    fn is_d1(&self) -> bool {
+    pub(crate) fn is_d1(&self) -> bool {
         matches!(self.backend, Backend::D1(_))
     }
 

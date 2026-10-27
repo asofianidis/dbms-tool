@@ -78,6 +78,7 @@ import { Badge, Button, EmptyState, Toolbar, ToolbarDivider } from '@/components
 import {
   AssistantPanel,
   assistantOpenStore,
+  insertIntoEditor,
   resetAssistant,
   stopAssistant,
   toggleAssistant,
@@ -692,17 +693,7 @@ export function QueryTab({ tab }: { tab: TabOf<'query'> }): React.JSX.Element {
       if (after === last || !after?.plan || !after.sql.includes(sql)) return null
       return { sql, text: describePlan(after.plan) }
     },
-    insert: (code, mode) => {
-      const ed = editor.current
-      if (!ed) return
-      if (mode === 'replace') ed.setText(code)
-      else {
-        const selection = ed.selection()
-        const at = ed.cursor()
-        ed.replaceRange(selection?.from ?? at, selection?.to ?? at, code)
-      }
-      ed.focus()
-    },
+    insert: (code, mode) => insertIntoEditor(editor.current, code, mode),
     writes: (code) => {
       const dangers = dangerousStatements(code, dialect)
       if (dangers.length) return dangers.join(', ')
