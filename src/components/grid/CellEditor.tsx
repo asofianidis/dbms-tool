@@ -52,6 +52,8 @@ export function CellEditor({
   const panelRef = useRef<HTMLDivElement>(null)
   // The open panel's value, committed when focus leaves the editor altogether; undefined when invalid
   const panelValue = useRef<() => string | undefined>(() => value)
+  // Which field holds the latest edit, so clicking away commits that one and not the other
+  const edited = useRef<'inline' | 'panel'>('inline')
   const result = (): Cell => (value === '' && emptyIsNull ? null : value)
   const done = useRef(false)
   const finish = (v: Cell | undefined, move?: Move): void => {
@@ -82,8 +84,10 @@ export function CellEditor({
   }
 
   const openExtra = (): void => {
-    if (expandable) setPanel(true)
-    else if (temporal) {
+    if (expandable) {
+      edited.current = 'panel'
+      setPanel(true)
+    } else if (temporal) {
       try {
         pickerRef.current?.showPicker()
       } catch {
@@ -98,8 +102,8 @@ export function CellEditor({
     if (to && (boxRef.current?.contains(to) || panelRef.current?.contains(to))) return
     // The window lost focus (a native picker, another app): keep editing
     if (!document.hasFocus()) return
-    // Commit the field focus left: the panel's draft, or the inline input edited after it
-    const fromPanel = panel && !!panelRef.current?.contains(e.target as Node)
+    // Commit the field edited last: the panel's draft, or the inline input edited after it
+    const fromPanel = panel && edited.current === 'panel'
     const next = fromPanel ? panelValue.current() : badJson ? undefined : value
     if (next === undefined) {
       // Enter and Apply refuse invalid JSON, so clicking away doesn't save it either
@@ -135,7 +139,10 @@ export function CellEditor({
             ? 'Not valid JSON'
             : 'Backspace on an empty value switches between NULL and empty string'
         }
-        onChange={(e) => setValue(e.target.value)}
+        onChange={(e) => {
+          edited.current = 'inline'
+          setValue(e.target.value)
+        }}
         onFocus={(e) => e.target.select()}
         onBlur={onBlur}
         onKeyDown={(e) => {
@@ -151,6 +158,7 @@ export function CellEditor({
             openExtra()
           } else if ((e.key === 'Backspace' || e.key === 'Delete') && value === '') {
             e.preventDefault()
+            edited.current = 'inline'
             setEmptyIsNull((n) => !n)
           }
         }}
@@ -169,6 +177,7 @@ export function CellEditor({
           aria-hidden
           value={pickerValue(value, temporal)}
           onChange={(e) => {
+            edited.current = 'inline'
             setValue(mergePicked(value, e.target.value, temporal))
             inputRef.current?.focus()
           }}
@@ -200,6 +209,7 @@ export function CellEditor({
               <JsonPanel
                 initial={value}
                 valueRef={panelValue}
+                onEdit={() => (edited.current = 'panel')}
                 onApply={(v) => finish(settle(v))}
                 onCancel={closePanel}
               />
@@ -207,6 +217,7 @@ export function CellEditor({
               <ArrayPanel
                 initial={array ?? []}
                 valueRef={panelValue}
+                onEdit={() => (edited.current = 'panel')}
                 onApply={(items) => finish(settle(formatPgArray(items)))}
                 onCancel={closePanel}
               />
@@ -264,17 +275,23 @@ function Popover({
 function JsonPanel({
   initial,
   valueRef,
+  onEdit,
   onApply,
   onCancel
 }: {
   initial: string
   valueRef: React.RefObject<() => string | undefined>
+  onEdit: () => void
   onApply: (value: string) => void
   onCancel: () => void
 }): React.JSX.Element {
-  const [draft, setDraft] = useState(() =>
+  const [draft, setDraftState] = useState(() =>
     initial.trim() && isValidJson(initial) ? respaceJson(initial, 2) : initial
   )
+  const setDraft = (v: string): void => {
+    onEdit()
+    setDraftState(v)
+  }
   const error = jsonError(draft)
   valueRef.current = () => (error ? undefined : draft.trim() ? respaceJson(draft, 0) : '')
   const apply = (): void => {
@@ -337,15 +354,21 @@ function jsonError(text: string): string | null {
 function ArrayPanel({
   initial,
   valueRef,
+  onEdit,
   onApply,
   onCancel
 }: {
   initial: ArrayItem[]
   valueRef: React.RefObject<() => string | undefined>
+  onEdit: () => void
   onApply: (items: ArrayItem[]) => void
   onCancel: () => void
 }): React.JSX.Element {
-  const [items, setItems] = useState<ArrayItem[]>(initial)
+  const [items, setItemsState] = useState<ArrayItem[]>(initial)
+  const setItems = (update: (xs: ArrayItem[]) => ArrayItem[]): void => {
+    onEdit()
+    setItemsState(update)
+  }
   valueRef.current = () => formatPgArray(items)
   const rootRef = useRef<HTMLDivElement>(null)
   const inputs = useRef<(HTMLInputElement | null)[]>([])
