@@ -1,8 +1,9 @@
-import { useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArchiveRestore,
   Braces,
   CalendarClock,
+  ChevronDown,
   Cloud,
   Code2,
   DatabaseBackup,
@@ -39,7 +40,7 @@ import {
   tabsStore,
   type Tab
 } from '@/lib/workspace'
-import { showContextMenu } from '../ContextMenu'
+import { showContextMenu, showMenuAt } from '../ContextMenu'
 
 export function tabTitle(tab: Tab): string {
   switch (tab.kind) {
@@ -153,10 +154,50 @@ export function TabBar(): React.JSX.Element {
   // Dashboard tabs are titled by the dashboard's current name
   dashboardsStore.use()
   const dragId = useRef<string | null>(null)
+  const stripRef = useRef<HTMLDivElement>(null)
+  const [overflowing, setOverflowing] = useState(false)
+
+  // Track whether the tabs fit, so the "all tabs" menu only shows when some are hidden
+  useEffect(() => {
+    const strip = stripRef.current
+    if (!strip) return
+    const update = (): void => setOverflowing(strip.scrollWidth > strip.clientWidth + 1)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(strip)
+    for (const child of Array.from(strip.children)) observer.observe(child)
+    return () => observer.disconnect()
+  }, [tabs])
+
+  // Keep the active tab visible when it changes or tabs are added
+  useEffect(() => {
+    const strip = stripRef.current
+    const el = strip?.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(active ?? '')}"]`)
+    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [active, tabs.length])
+
+  const showAllTabs = (button: HTMLElement): void =>
+    showMenuAt(
+      button,
+      tabs.map((tab) => ({
+        label: `${isDirty(tab) ? '● ' : ''}${tabTitle(tab)}`,
+        icon: <TabIcon tab={tab} />,
+        onSelect: () => activateTab(tab.id)
+      }))
+    )
 
   return (
     <div className="flex h-9 shrink-0 items-stretch border-b border-line bg-panel">
-      <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto [&::-webkit-scrollbar]:h-0">
+      <div
+        ref={stripRef}
+        // A vertical mouse wheel scrolls the tab strip sideways
+        onWheel={(e) => {
+          if (e.deltaY !== 0 && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+            e.currentTarget.scrollLeft += e.deltaY
+          }
+        }}
+        className="flex min-w-0 flex-1 items-stretch overflow-x-auto [&::-webkit-scrollbar]:h-0"
+      >
         {tabs.map((tab, index) => {
           const connection =
             'connectionId' in tab ? connections.find((c) => c.id === tab.connectionId) : undefined
@@ -168,6 +209,7 @@ export function TabBar(): React.JSX.Element {
           return (
             <div
               key={tab.id}
+              data-tab-id={tab.id}
               draggable
               onDragStart={() => (dragId.current = tab.id)}
               onDragOver={(e) => e.preventDefault()}
@@ -232,6 +274,17 @@ export function TabBar(): React.JSX.Element {
           )
         })}
       </div>
+      {overflowing && (
+        <button
+          type="button"
+          title="All tabs"
+          aria-label="All tabs"
+          onClick={(e) => showAllTabs(e.currentTarget)}
+          className="flex w-8 shrink-0 items-center justify-center border-l border-line text-muted hover:bg-hover hover:text-bright"
+        >
+          <ChevronDown className="size-4" />
+        </button>
+      )}
       <button
         type="button"
         title={`New query (${MOD}N)`}
