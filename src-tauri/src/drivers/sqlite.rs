@@ -211,7 +211,6 @@ fn run_file(
         }
         let columns: Vec<ColumnMeta> = stmt
             .columns()
-            .iter()
             .map(|c| ColumnMeta {
                 name: c.name().to_string(),
                 type_name: c.decl_type().unwrap_or("").to_string(),
